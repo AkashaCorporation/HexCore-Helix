@@ -1,0 +1,17 @@
+[package]
+name = "hexcore-helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NAPI-RS bridge for the HexCore Helix decompilation engine — Node.js/VS Code integration"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { workspace = true }
+napi-derive = { workspace = true }
+helix-core = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"

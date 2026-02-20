@@ -1,0 +1,166 @@
+// HexCore Helix — Abstract Syntax Tree Schema
+// Defines the binary format for decompiled AST transport.
+
+include "common.fbs";
+
+namespace helix.schema;
+
+/// Data type kinds for the type system.
+enum TypeKind : byte {
+    Void = 0,
+    Bool = 1,
+    Int = 2,
+    Float = 3,
+    Pointer = 4,
+    Array = 5,
+    Struct = 6,
+    Union = 7,
+    FuncPtr = 8,
+    Unknown = 255,
+}
+
+/// A recovered/inferred data type.
+table DataType {
+    kind: TypeKind;
+    /// For Int: signed flag.
+    is_signed: bool;
+    /// For Int/Float: bit width.
+    bits: uint16;
+    /// For Pointer/Array: element type.
+    element_type: DataType;
+    /// For Array: length (0 = unsized).
+    array_length: uint64;
+    /// For Struct/Union: name.
+    name: string;
+    /// For Struct/Union: fields.
+    fields: [StructField];
+    /// For FuncPtr: return type.
+    return_type: DataType;
+    /// For FuncPtr: parameter types.
+    param_types: [DataType];
+}
+
+/// A struct/union field.
+table StructField {
+    name: string;
+    type: DataType;
+    offset: uint64;
+}
+
+/// Variable storage class.
+enum StorageClass : byte {
+    Stack = 0,
+    Register = 1,
+    Global = 2,
+    Parameter = 3,
+}
+
+/// A recovered variable.
+table Variable {
+    name: string;
+    type: DataType;
+    storage: StorageClass;
+    stack_offset: int64;
+}
+
+/// Expression node types.
+enum ExprKind : byte {
+    IntLit = 0,
+    FloatLit = 1,
+    StringLit = 2,
+    VarRef = 3,
+    Unary = 4,
+    Binary = 5,
+    Cast = 6,
+    Call = 7,
+    Subscript = 8,
+    Member = 9,
+    DerefMember = 10,
+    Ternary = 11,
+    AddressLit = 12,
+    Unknown = 255,
+}
+
+/// An expression node (tree structure via children).
+table Expression {
+    kind: ExprKind;
+    /// For IntLit:
+    int_value: int64;
+    /// For FloatLit:
+    float_value: float64;
+    /// For StringLit, VarRef name, Member field, Unknown:
+    string_value: string;
+    /// For Unary/Binary: operator name (e.g., "+", "!", ">>").
+    operator: string;
+    /// For Cast: target type.
+    cast_type: DataType;
+    /// Child expressions (operands, call arguments, etc.)
+    children: [Expression];
+    /// Variable reference (for VarRef).
+    variable: Variable;
+    /// Address value (for AddressLit).
+    address: Address;
+}
+
+/// Statement node types.
+enum StmtKind : byte {
+    VarDecl = 0,
+    Assign = 1,
+    ExprStmt = 2,
+    Return = 3,
+    If = 4,
+    While = 5,
+    DoWhile = 6,
+    For = 7,
+    Switch = 8,
+    Break = 9,
+    Continue = 10,
+    Goto = 11,
+    Label = 12,
+    Asm = 13,
+    Comment = 14,
+}
+
+/// A switch case.
+table SwitchCase {
+    values: [int64];
+    body: [Statement];
+}
+
+/// A statement node.
+table Statement {
+    kind: StmtKind;
+    /// For VarDecl: the variable.
+    variable: Variable;
+    /// Expressions (lhs, rhs, condition, etc.)
+    expressions: [Expression];
+    /// Sub-statements (body, then, else, cases).
+    children: [Statement];
+    /// Switch cases.
+    cases: [SwitchCase];
+    /// Label name / goto target / asm / comment text.
+    text: string;
+}
+
+/// A fully decompiled function.
+table DecompiledFunction {
+    name: string;
+    address: Address;
+    return_type: DataType;
+    params: [Variable];
+    locals: [Variable];
+    body: [Statement];
+    calling_convention: string;
+    is_variadic: bool;
+}
+
+/// Top-level decompiled module.
+table AstModule {
+    name: string;
+    functions: [DecompiledFunction];
+    global_vars: [Variable];
+    type_defs: [DataType];
+}
+
+root_type AstModule;
+file_identifier "HAST";

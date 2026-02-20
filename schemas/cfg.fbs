@@ -1,0 +1,59 @@
+// HexCore Helix — Control Flow Graph Schema
+// Defines the binary format for CFG transport between engine and UI.
+
+include "common.fbs";
+
+namespace helix.schema;
+
+/// Type of control flow edge.
+enum EdgeKind : byte {
+    Unconditional = 0,
+    ConditionalTrue = 1,
+    ConditionalFalse = 2,
+    Call = 3,
+    Exception = 4,
+}
+
+/// A directed edge between basic blocks.
+table CfgEdge {
+    source: Address;
+    target: Address;
+    kind: EdgeKind;
+}
+
+/// A basic block — maximal straight-line instruction sequence.
+table CfgBlock {
+    /// Start address of the block.
+    start: Address;
+    /// End address (exclusive).
+    end: Address;
+    /// Instructions in order.
+    instructions: [Instruction];
+    /// Outgoing edges.
+    successors: [CfgEdge];
+}
+
+/// A function's control flow graph.
+table CfgFunction {
+    /// Function name (recovered or synthesized).
+    name: string;
+    /// Entry point address.
+    entry: Address;
+    /// Target architecture.
+    arch: Arch;
+    /// Ordered list of basic blocks (entry block first).
+    blocks: [CfgBlock];
+    /// Total instruction count (cached for UI).
+    instruction_count: uint32;
+}
+
+/// A module containing multiple function CFGs.
+table CfgModule {
+    /// Module/binary name.
+    name: string;
+    /// All function CFGs in this module.
+    functions: [CfgFunction];
+}
+
+root_type CfgModule;
+file_identifier "HCFG";

@@ -1,0 +1,15 @@
+[package]
+name = "helix-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types, traits, and FFI boundary for the HexCore Helix decompilation engine"
+
+[dependencies]
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+flatbuffers = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"

@@ -1,0 +1,52 @@
+{
+    "name": "@hexcore/helix",
+    "version": "0.1.0",
+    "description": "HexCore Helix — Next-generation decompilation engine powered by Rust, C++23/MLIR, and FlatBuffers",
+    "main": "index.js",
+    "types": "index.d.ts",
+    "files": [
+        "index.js",
+        "index.d.ts",
+        "README.md"
+    ],
+    "napi": {
+        "binaryName": "hexcore-helix",
+        "targets": [
+            "x86_64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin"
+        ]
+    },
+    "scripts": {
+        "artifacts": "napi artifacts",
+        "build": "napi build --platform --release --manifest-path crates/hexcore-helix/Cargo.toml",
+        "build:debug": "napi build --platform --manifest-path crates/hexcore-helix/Cargo.toml",
+        "report:logs": "cargo run -p helix-core --example benchmark_logs -- --label latest --iterations 25 --output tests/reports/latest.md log1.txt log2.txt log3.txt",
+        "prepublishOnly": "napi prepublish -t npm",
+        "version": "napi version",
+        "test": "echo \"Tests pending — Phase 2\""
+    },
+    "devDependencies": {
+        "@napi-rs/cli": "^3.5.1",
+        "typescript": "^5.9.3"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/LXrdKnowkill/HexCore-Helix"
+    },
+    "license": "Apache-2.0",
+    "engines": {
+        "node": ">= 22"
+    },
+    "keywords": [
+        "hexcore",
+        "decompiler",
+        "reverse-engineering",
+        "binary-analysis",
+        "mlir",
+        "llvm",
+        "napi-rs",
+        "native"
+    ]
+}
