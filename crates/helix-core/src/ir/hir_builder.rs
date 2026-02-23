@@ -338,7 +338,15 @@ fn lower_insn(b: &mut FuncBuilder, insn: &RemillInsn) {
 
     match &insn.semantic {
         // ── Skip padding ──────────────────────────────────────────────
-        Semantic::Nop | Semantic::Int3 => {}
+        Semantic::Nop | Semantic::Int3 => {
+            // Emit a comment for NOP so it's visible in the output
+            if insn.semantic == Semantic::Nop {
+                b.emit(HirStmt::Comment {
+                    text: "nop".to_string(),
+                    span,
+                });
+            }
+        }
 
         // ── MOV: dst = src ────────────────────────────────────────────
         Semantic::Mov => {
@@ -396,13 +404,31 @@ fn lower_insn(b: &mut FuncBuilder, insn: &RemillInsn) {
                     lower_operand_rhs(b, insn.srcs.first(), span),
                     lower_operand_rhs(b, insn.srcs.get(1), span),
                 ) {
-                    let ty = src1.ty();
-                    let rhs = HirExpr::Binary {
-                        op,
-                        lhs: Box::new(src1),
-                        rhs: Box::new(src2),
-                        ty,
-                        span,
+                    // Peephole: mul(expr, 1) or mul(1, expr) → expr
+                    let rhs = if op == HirBinOp::Mul {
+                        if matches!(&src2, HirExpr::IntLit { value: 1, .. }) {
+                            src1
+                        } else if matches!(&src1, HirExpr::IntLit { value: 1, .. }) {
+                            src2
+                        } else {
+                            let ty = src1.ty();
+                            HirExpr::Binary {
+                                op,
+                                lhs: Box::new(src1),
+                                rhs: Box::new(src2),
+                                ty,
+                                span,
+                            }
+                        }
+                    } else {
+                        let ty = src1.ty();
+                        HirExpr::Binary {
+                            op,
+                            lhs: Box::new(src1),
+                            rhs: Box::new(src2),
+                            ty,
+                            span,
+                        }
                     };
                     b.emit(HirStmt::Assign { lhs, rhs, span });
                 }
@@ -568,8 +594,45 @@ fn lower_insn(b: &mut FuncBuilder, insn: &RemillInsn) {
         // ── POP: dst = [rsp]; rsp += 8 ───────────────────────────────
         Semantic::Pop => {
             if let Some(lhs) = lower_operand_lhs(b, &insn.dst, span) {
+                // Emit a comment showing the POP instruction
+                let dst_name = insn.dst.as_ref().map(|o| o.to_string()).unwrap_or_default();
                 b.emit(HirStmt::Comment {
-                    text: format!("pop → {}", format_expr_brief(&lhs)),
+                    text: format!("POP {}", dst_name),
+                    span,
+                });
+
+                // R = *(uint64_t*)RSP
+                let rsp_id = b.reg_var("RSP", span);
+                let rsp_expr = HirExpr::Var { id: rsp_id, span };
+                let deref_rsp = HirExpr::Unary {
+                    op: HirUnaryOp::Deref,
+                    operand: Box::new(rsp_expr.clone()),
+                    ty: HirType::u64(),
+                    span,
+                };
+                b.emit(HirStmt::Assign {
+                    lhs,
+                    rhs: deref_rsp,
+                    span,
+                });
+
+                // RSP = RSP + 8
+                let eight = HirExpr::IntLit {
+                    value: 8,
+                    ty: HirType::u64(),
+                    span,
+                };
+                let rsp_plus_8 = HirExpr::Binary {
+                    op: HirBinOp::Add,
+                    lhs: Box::new(rsp_expr),
+                    rhs: Box::new(eight),
+                    ty: HirType::u64(),
+                    span,
+                };
+                let rsp_lhs = HirExpr::Var { id: rsp_id, span };
+                b.emit(HirStmt::Assign {
+                    lhs: rsp_lhs,
+                    rhs: rsp_plus_8,
                     span,
                 });
             }
@@ -1113,6 +1176,123 @@ fn format_expr_brief(expr: &HirExpr) -> String {
     }
 }
 
+// ─── Boilerplate Elimination ────────────────────────────────────────────────
+
+/// Remill internal bookkeeping variables that should not appear in decompiled output.
+/// These are matched against the lowercase variable names stored in HirVar.
+const REMILL_BOILERPLATE_VARS: &[&str] = &[
+    "pc", "next_pc", "memory", "monitor", "state",
+    "csbase", "ssbase", "esbase", "dsbase",
+];
+
+/// Returns true if the given variable name is a Remill boilerplate variable.
+fn is_boilerplate_var(name: &str) -> bool {
+    REMILL_BOILERPLATE_VARS.contains(&name)
+}
+
+/// Check if an expression references a boilerplate variable by looking up
+/// the var ID in the provided variable table.
+fn expr_is_boilerplate(expr: &HirExpr, vars: &[HirVar]) -> bool {
+    if let HirExpr::Var { id, .. } = expr {
+        if let Some(var) = vars.iter().find(|v| v.id.0 == id.0) {
+            return is_boilerplate_var(&var.name);
+        }
+    }
+    false
+}
+
+/// Remove assignments and declarations of Remill boilerplate variables from
+/// the function body. This eliminates internal bookkeeping (PC, NEXT_PC,
+/// MEMORY, MONITOR, STATE, segment bases) that should not appear in
+/// decompiled output.
+///
+/// Also removes the boilerplate variables from the locals list.
+pub fn eliminate_boilerplate(func: &mut HirFunction) {
+    // Collect IDs of boilerplate variables from locals
+    let boilerplate_ids: Vec<u32> = func
+        .locals
+        .iter()
+        .filter(|v| is_boilerplate_var(&v.name))
+        .map(|v| v.id.0)
+        .collect();
+
+    // Remove statements that assign to or declare boilerplate variables
+    func.body.retain(|stmt| {
+        match stmt {
+            HirStmt::Assign { lhs, .. } => {
+                !expr_is_boilerplate(lhs, &func.locals)
+            }
+            HirStmt::VarDecl { var_id, .. } => {
+                !boilerplate_ids.contains(&var_id.0)
+            }
+            _ => true,
+        }
+    });
+
+    // Remove boilerplate variables from locals
+    func.locals.retain(|v| !is_boilerplate_var(&v.name));
+}
+
+/// Win64 calling convention parameter registers in order.
+const WIN64_PARAM_REGS: &[&str] = &["rcx", "rdx", "r8", "r9"];
+
+/// Rewrite the function signature from the generic Remill lifted form
+/// `void* lifted_N(void* state, uint64_t pc, void* memory)` to a cleaner
+/// signature with recovered parameters and return type.
+///
+/// - Renames `lifted_NNNN` to `sub_XXXX` (hex address)
+/// - Detects Win64 parameter registers (RCX, RDX, R8, R9) used in the body
+/// - Sets return type based on RAX usage
+/// - Removes the generic state/pc/memory parameters
+pub fn rewrite_function_signature(func: &mut HirFunction) {
+    // Rename from lifted_NNNN (decimal) to sub_XXXX (hex) if applicable
+    if func.name.starts_with("lifted_") {
+        func.name = format!("sub_{:x}", func.address);
+    }
+
+    // Remove generic Remill parameters (state, pc, memory)
+    func.params.retain(|p| {
+        let name = p.name.as_str();
+        name != "state" && name != "pc" && name != "memory"
+            && name != "program_counter"
+    });
+
+    // Collect all variable names referenced in the body to detect which
+    // Win64 parameter registers are actually used
+    let all_vars: Vec<&HirVar> = func.locals.iter().chain(func.params.iter()).collect();
+    let mut used_param_regs: Vec<String> = Vec::new();
+
+    for reg_name in WIN64_PARAM_REGS {
+        if all_vars.iter().any(|v| v.name == *reg_name && v.storage == HirStorage::Register) {
+            used_param_regs.push(reg_name.to_string());
+        }
+    }
+
+    // Promote detected Win64 parameter registers to function parameters
+    if !used_param_regs.is_empty() {
+        let mut new_params: Vec<HirVar> = Vec::new();
+        for (idx, reg_name) in used_param_regs.iter().enumerate() {
+            // Find the variable in locals and move it to params
+            if let Some(pos) = func.locals.iter().position(|v| v.name == *reg_name) {
+                let mut var = func.locals.remove(pos);
+                var.storage = HirStorage::Parameter(idx as u8);
+                new_params.push(var);
+            }
+        }
+        // Prepend detected params before any existing params
+        new_params.append(&mut func.params);
+        func.params = new_params;
+    }
+
+    // Detect return type based on RAX usage: if RAX is assigned in the body,
+    // the function likely returns a value
+    let uses_rax = func.locals.iter().any(|v| v.name == "rax")
+        || func.params.iter().any(|v| v.name == "rax");
+    if uses_rax {
+        func.return_type = HirType::i64();
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1146,6 +1326,9 @@ mod tests {
             source_file: "test.exe".into(),
             function_boundaries: vec![0],
             instructions: insns,
+            register_metadata: std::collections::HashMap::new(),
+            target_triple: String::new(),
+            declared_intrinsics: Vec::new(),
         }
     }
 
@@ -1334,6 +1517,9 @@ mod tests {
             arch: "amd64".into(),
             source_file: "test.exe".into(),
             function_boundaries: vec![0, 3],
+            register_metadata: std::collections::HashMap::new(),
+            target_triple: String::new(),
+            declared_intrinsics: Vec::new(),
             instructions: vec![
                 mk_insn(
                     0x100,
@@ -1650,5 +1836,232 @@ mod tests {
                 rhs
             );
         }
+    }
+
+    // ─── Boilerplate Elimination Tests ──────────────────────────────────
+
+    #[test]
+    fn eliminate_boilerplate_removes_pc_assignments() {
+        let mut func = HirFunction {
+            name: "sub_1000".into(),
+            address: 0x1000,
+            return_type: HirType::Void,
+            params: vec![],
+            locals: vec![
+                HirVar { id: HirVarId(0), name: "pc".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+                HirVar { id: HirVarId(1), name: "next_pc".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+                HirVar { id: HirVarId(2), name: "rax".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+            ],
+            body: vec![
+                HirStmt::Assign {
+                    lhs: HirExpr::Var { id: HirVarId(0), span: Span::single(0) },
+                    rhs: HirExpr::IntLit { value: 0x1000, ty: HirType::i64(), span: Span::single(0) },
+                    span: Span::single(0),
+                },
+                HirStmt::Assign {
+                    lhs: HirExpr::Var { id: HirVarId(1), span: Span::single(0) },
+                    rhs: HirExpr::IntLit { value: 0x1004, ty: HirType::i64(), span: Span::single(0) },
+                    span: Span::single(0),
+                },
+                HirStmt::Assign {
+                    lhs: HirExpr::Var { id: HirVarId(2), span: Span::single(0) },
+                    rhs: HirExpr::IntLit { value: 42, ty: HirType::i64(), span: Span::single(0) },
+                    span: Span::single(0),
+                },
+            ],
+            calling_convention: None,
+            is_variadic: false,
+            span: Span::single(0x1000),
+        };
+
+        eliminate_boilerplate(&mut func);
+
+        // Only the RAX assignment should remain
+        assert_eq!(func.body.len(), 1);
+        // PC and NEXT_PC should be removed from locals
+        assert!(func.locals.iter().all(|v| v.name != "pc" && v.name != "next_pc"));
+        assert!(func.locals.iter().any(|v| v.name == "rax"));
+    }
+
+    #[test]
+    fn eliminate_boilerplate_removes_all_boilerplate_vars() {
+        let boilerplate_names = ["pc", "next_pc", "memory", "monitor", "state", "csbase", "ssbase", "esbase", "dsbase"];
+        let mut locals = Vec::new();
+        let mut body = Vec::new();
+
+        for (i, name) in boilerplate_names.iter().enumerate() {
+            let id = HirVarId(i as u32);
+            locals.push(HirVar {
+                id, name: name.to_string(), ty: HirType::i64(),
+                storage: HirStorage::Register, span: Span::single(0),
+            });
+            body.push(HirStmt::Assign {
+                lhs: HirExpr::Var { id, span: Span::single(0) },
+                rhs: HirExpr::IntLit { value: 0, ty: HirType::i64(), span: Span::single(0) },
+                span: Span::single(0),
+            });
+        }
+
+        // Add a non-boilerplate variable
+        let real_id = HirVarId(100);
+        locals.push(HirVar {
+            id: real_id, name: "rbx".into(), ty: HirType::i64(),
+            storage: HirStorage::Register, span: Span::single(0),
+        });
+        body.push(HirStmt::Assign {
+            lhs: HirExpr::Var { id: real_id, span: Span::single(0) },
+            rhs: HirExpr::IntLit { value: 1, ty: HirType::i64(), span: Span::single(0) },
+            span: Span::single(0),
+        });
+
+        let mut func = HirFunction {
+            name: "sub_1000".into(), address: 0x1000, return_type: HirType::Void,
+            params: vec![], locals, body,
+            calling_convention: None, is_variadic: false, span: Span::single(0x1000),
+        };
+
+        eliminate_boilerplate(&mut func);
+
+        assert_eq!(func.body.len(), 1, "only non-boilerplate assignment should remain");
+        assert_eq!(func.locals.len(), 1, "only non-boilerplate local should remain");
+        assert_eq!(func.locals[0].name, "rbx");
+    }
+
+    #[test]
+    fn eliminate_boilerplate_removes_var_decls() {
+        let mut func = HirFunction {
+            name: "sub_1000".into(), address: 0x1000, return_type: HirType::Void,
+            params: vec![],
+            locals: vec![
+                HirVar { id: HirVarId(0), name: "memory".into(), ty: HirType::void_ptr(), storage: HirStorage::Register, span: Span::single(0) },
+            ],
+            body: vec![
+                HirStmt::VarDecl { var_id: HirVarId(0), init: None, span: Span::single(0) },
+            ],
+            calling_convention: None, is_variadic: false, span: Span::single(0x1000),
+        };
+
+        eliminate_boilerplate(&mut func);
+
+        assert!(func.body.is_empty(), "VarDecl for boilerplate should be removed");
+        assert!(func.locals.is_empty(), "boilerplate local should be removed");
+    }
+
+    #[test]
+    fn eliminate_boilerplate_preserves_non_boilerplate() {
+        let mut func = HirFunction {
+            name: "sub_1000".into(), address: 0x1000, return_type: HirType::Void,
+            params: vec![],
+            locals: vec![
+                HirVar { id: HirVarId(0), name: "rax".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+                HirVar { id: HirVarId(1), name: "rbx".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+            ],
+            body: vec![
+                HirStmt::Assign {
+                    lhs: HirExpr::Var { id: HirVarId(0), span: Span::single(0) },
+                    rhs: HirExpr::Var { id: HirVarId(1), span: Span::single(0) },
+                    span: Span::single(0),
+                },
+                HirStmt::Comment { text: "hello".into(), span: Span::single(0) },
+            ],
+            calling_convention: None, is_variadic: false, span: Span::single(0x1000),
+        };
+
+        eliminate_boilerplate(&mut func);
+
+        assert_eq!(func.body.len(), 2, "non-boilerplate statements should be preserved");
+        assert_eq!(func.locals.len(), 2, "non-boilerplate locals should be preserved");
+    }
+
+    // ─── Function Signature Rewriting Tests ─────────────────────────────
+
+    #[test]
+    fn rewrite_signature_renames_lifted_to_sub() {
+        let mut func = HirFunction {
+            name: "lifted_5368907311".into(), address: 0x14000102F,
+            return_type: HirType::Void, params: vec![], locals: vec![],
+            body: vec![], calling_convention: None, is_variadic: false,
+            span: Span::single(0x14000102F),
+        };
+
+        rewrite_function_signature(&mut func);
+
+        assert_eq!(func.name, "sub_14000102f");
+    }
+
+    #[test]
+    fn rewrite_signature_removes_generic_params() {
+        let mut func = HirFunction {
+            name: "lifted_100".into(), address: 0x100,
+            return_type: HirType::Void,
+            params: vec![
+                HirVar { id: HirVarId(0), name: "state".into(), ty: HirType::void_ptr(), storage: HirStorage::Parameter(0), span: Span::single(0) },
+                HirVar { id: HirVarId(1), name: "pc".into(), ty: HirType::i64(), storage: HirStorage::Parameter(1), span: Span::single(0) },
+                HirVar { id: HirVarId(2), name: "memory".into(), ty: HirType::void_ptr(), storage: HirStorage::Parameter(2), span: Span::single(0) },
+            ],
+            locals: vec![], body: vec![],
+            calling_convention: None, is_variadic: false, span: Span::single(0x100),
+        };
+
+        rewrite_function_signature(&mut func);
+
+        assert!(func.params.is_empty(), "generic Remill params should be removed");
+    }
+
+    #[test]
+    fn rewrite_signature_detects_win64_params() {
+        let mut func = HirFunction {
+            name: "lifted_100".into(), address: 0x100,
+            return_type: HirType::Void, params: vec![],
+            locals: vec![
+                HirVar { id: HirVarId(0), name: "rcx".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+                HirVar { id: HirVarId(1), name: "rdx".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+                HirVar { id: HirVarId(2), name: "rax".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+            ],
+            body: vec![],
+            calling_convention: None, is_variadic: false, span: Span::single(0x100),
+        };
+
+        rewrite_function_signature(&mut func);
+
+        assert_eq!(func.params.len(), 2, "RCX and RDX should become params");
+        assert_eq!(func.params[0].name, "rcx");
+        assert_eq!(func.params[1].name, "rdx");
+        assert!(matches!(func.params[0].storage, HirStorage::Parameter(0)));
+        assert!(matches!(func.params[1].storage, HirStorage::Parameter(1)));
+        // RAX should remain as local (not a Win64 param register)
+        assert!(func.locals.iter().any(|v| v.name == "rax"));
+    }
+
+    #[test]
+    fn rewrite_signature_sets_return_type_from_rax() {
+        let mut func = HirFunction {
+            name: "lifted_100".into(), address: 0x100,
+            return_type: HirType::Void, params: vec![],
+            locals: vec![
+                HirVar { id: HirVarId(0), name: "rax".into(), ty: HirType::i64(), storage: HirStorage::Register, span: Span::single(0) },
+            ],
+            body: vec![], calling_convention: None, is_variadic: false,
+            span: Span::single(0x100),
+        };
+
+        rewrite_function_signature(&mut func);
+
+        assert_eq!(func.return_type, HirType::i64(), "RAX usage should set return type to i64");
+    }
+
+    #[test]
+    fn rewrite_signature_preserves_sub_prefix() {
+        let mut func = HirFunction {
+            name: "sub_1000".into(), address: 0x1000,
+            return_type: HirType::Void, params: vec![], locals: vec![],
+            body: vec![], calling_convention: None, is_variadic: false,
+            span: Span::single(0x1000),
+        };
+
+        rewrite_function_signature(&mut func);
+
+        // Should not change name that already has sub_ prefix
+        assert_eq!(func.name, "sub_1000");
     }
 }

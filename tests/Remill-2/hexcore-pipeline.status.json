@@ -1,0 +1,40 @@
+{
+  "jobFile": "c:\\Users\\Mazum\\Desktop\\DesafiosHTB-HexCore\\.hexcore_job.json",
+  "file": "C:/Users/Mazum/Desktop/DesafiosHTB-HexCore/WorldWar Z 2/wwzRetailEgs.exe",
+  "outDir": "C:/Users/Mazum/Desktop/DesafiosHTB-HexCore/hexcore-reports/Remill-2",
+  "status": "ok",
+  "startedAt": "2026-02-23T05:51:09.155Z",
+  "steps": [
+    {
+      "cmd": "hexcore.disasm.analyzeAll",
+      "resolvedCmd": "hexcore.disasm.analyzeAll",
+      "status": "ok",
+      "startedAt": "2026-02-23T05:51:09.158Z",
+      "finishedAt": "2026-02-23T05:51:27.471Z",
+      "durationMs": 18313,
+      "attemptCount": 1,
+      "outputPath": "C:\\Users\\Mazum\\Desktop\\DesafiosHTB-HexCore\\hexcore-reports\\Remill-2\\01-hexcore.disasm.analyzeall.json"
+    },
+    {
+      "cmd": "hexcore.disasm.liftToIR",
+      "resolvedCmd": "hexcore.disasm.liftToIR",
+      "status": "ok",
+      "startedAt": "2026-02-23T05:51:27.472Z",
+      "finishedAt": "2026-02-23T05:51:55.574Z",
+      "durationMs": 28102,
+      "attemptCount": 1,
+      "outputPath": "C:\\Users\\Mazum\\Desktop\\DesafiosHTB-HexCore\\hexcore-reports\\Remill-2\\01-aim-assist-init.ll"
+    },
+    {
+      "cmd": "hexcore.rellic.decompile",
+      "resolvedCmd": "hexcore.rellic.decompile",
+      "status": "ok",
+      "startedAt": "2026-02-23T05:51:55.575Z",
+      "finishedAt": "2026-02-23T05:52:07.066Z",
+      "durationMs": 11491,
+      "attemptCount": 1,
+      "outputPath": "C:\\Users\\Mazum\\Desktop\\DesafiosHTB-HexCore\\hexcore-reports\\Remill-2\\02-aim-assist-init.c"
+    }
+  ],
+  "finishedAt": "2026-02-23T05:52:07.067Z"
+}

@@ -167,8 +167,8 @@ fn recover_function_calls(
                 };
 
                 if used && effective_ret != HirType::Void {
-                    // Create a named result variable
-                    let result_name = format!("v{}", var_counter);
+                    // Create a named result variable with descriptive name
+                    let result_name = derive_result_name(target, signatures, var_counter);
                     var_counter += 1;
 
                     let result_var_id = HirVarId(1000 + result.results_named as u32);
@@ -672,6 +672,8 @@ fn eliminate_dead_register_stmts(
     // Keep statements that either:
     // - Write to a non-register variable (stack, param, temp, result)
     // - Write to a register that is actually read
+    // - Have side effects (calls)
+    // - Read from memory (POP pattern: reg = *rsp)
     // - Are not pure register assignments
     body.into_iter()
         .filter(|stmt| {
@@ -693,6 +695,12 @@ fn eliminate_dead_register_stmts(
                     }
                     // Keep if the RHS has side effects (calls)
                     if has_side_effects(rhs) {
+                        return true;
+                    }
+                    // Keep if the RHS reads from memory (e.g., POP: reg = *rsp).
+                    // These represent meaningful data flow from the stack and
+                    // should be visible in decompiled output.
+                    if rhs_reads_memory(rhs) {
                         return true;
                     }
                     // Pure register-to-register bookkeeping — remove
@@ -808,6 +816,19 @@ fn has_side_effects(expr: &HirExpr) -> bool {
     }
 }
 
+/// Check if an expression reads from memory (e.g., `*rsp` from a POP).
+/// These assignments should be preserved even if the destination register
+/// is never read again, because they represent meaningful data flow.
+fn rhs_reads_memory(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Unary { op: HirUnaryOp::Deref, .. } => true,
+        HirExpr::Subscript { .. } => true,
+        HirExpr::Binary { lhs, rhs, .. } => rhs_reads_memory(lhs) || rhs_reads_memory(rhs),
+        HirExpr::Cast { expr, .. } => rhs_reads_memory(expr),
+        _ => false,
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Check if a statement is a prologue/epilogue comment (push/pop).
@@ -818,6 +839,37 @@ fn is_prologue_comment(stmt: &HirStmt) -> bool {
     } else {
         false
     }
+}
+
+/// Derive a descriptive name for a call result variable based on the call target.
+///
+/// - Known signature → abbreviated name (e.g., `result_CreateFile`)
+/// - Unknown target → `result_` + last 4 hex digits of address (e.g., `result_bf18`)
+/// - Fallback → `v{counter}`
+fn derive_result_name(target: &HirExpr, signatures: &SignatureDb, counter: u32) -> String {
+    if let HirExpr::AddrLit { address, .. } = target {
+        if let Some(sig) = signatures.lookup(*address) {
+            // Use abbreviated function name
+            let name = &sig.name;
+            // Truncate long names
+            let short = if name.len() > 16 {
+                &name[..16]
+            } else {
+                name
+            };
+            return format!("result_{}", short);
+        }
+        // Use last 4 hex digits of address
+        let suffix = format!("{:x}", address);
+        let short_suffix = if suffix.len() > 4 {
+            &suffix[suffix.len() - 4..]
+        } else {
+            &suffix
+        };
+        return format!("result_{}", short_suffix);
+    }
+    // Fallback
+    format!("v{}", counter)
 }
 
 /// Check if an expression is simple enough to inline when substituting.
@@ -987,9 +1039,9 @@ mod tests {
 
         assert_eq!(result.results_named, 1, "should create 1 named result");
 
-        // Should have a new local variable named v0
-        let has_v0 = func.locals.iter().any(|v| v.name == "v0");
-        assert!(has_v0, "should have v0 in locals: {:?}", func.locals.iter().map(|v| &v.name).collect::<Vec<_>>());
+        // Should have a new local variable with descriptive name
+        let has_result = func.locals.iter().any(|v| v.name.starts_with("result_"));
+        assert!(has_result, "should have result_ var in locals: {:?}", func.locals.iter().map(|v| &v.name).collect::<Vec<_>>());
     }
 
     #[test]

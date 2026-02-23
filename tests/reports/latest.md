@@ -1,16 +1,16 @@
 # Helix Log Comparison Report
 
 - Label: `baseline`
-- Generated at: `SystemTime { intervals: 134157057863756295 }`
+- Generated at: `SystemTime { intervals: 134163389113487295 }`
 - Logs analyzed: `3`
 
 ## Summary Table
 
 | Log | Scenario | Binary | Arch | Address | IR lines | Source lines | Functions | Instructions | Diagnostics | Mean (ms) | Min/Max (ms) | Instr/ms |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
-| `log1.txt` | ROTTR sample A (calls + register moves) | ROTTR.exe | amd64 | 0x14003062f | 516 | 50 | 3 | 52 | 3 | 0.877 | 0.672/2.286 | 59.30 |
-| `log2.txt` | ROTTR sample B (LEA + memory stores) | ROTTR.exe | amd64 | 0x14000b2fb | 671 | 45 | 6 | 48 | 6 | 1.646 | 0.882/14.238 | 29.17 |
-| `log3.txt` | ROTTR sample C (branch-heavy) - Tomb Raider | ROTTR.exe | amd64 | 0x1400027e7 | 639 | 50 | 2 | 65 | 2 | 16.885 | 0.979/188.399 | 3.85 |
+| `log1.txt` | ROTTR sample A (calls + register moves) | ROTTR.exe | amd64 | 0x14003062f | 516 | 50 | 3 | 52 | 3 | 0.545 | 0.502/0.792 | 95.44 |
+| `log2.txt` | ROTTR sample B (LEA + memory stores) | ROTTR.exe | amd64 | 0x14000b2fb | 671 | 45 | 6 | 48 | 6 | 0.601 | 0.579/0.670 | 79.92 |
+| `log3.txt` | ROTTR sample C (branch-heavy) - Tomb Raider | ROTTR.exe | amd64 | 0x1400027e7 | 639 | 50 | 2 | 65 | 2 | 0.654 | 0.625/0.761 | 99.37 |
 
 ## Per-Log Details
 
@@ -23,8 +23,8 @@
 - Architecture: amd64
 - Lift generated: 2026-02-13T19:15:55.894Z
 - Output: 3 functions, 52 instructions, 50 source lines
-- Benchmark: 25 runs, mean 0.877 ms, min 0.672 ms, max 2.286 ms, std 0.300 ms
-- Throughput: 59.30 instr/ms
+- Benchmark: 25 runs, mean 0.545 ms, min 0.502 ms, max 0.792 ms, std 0.055 ms
+- Throughput: 95.44 instr/ms
 
 Diagnostics:
 - `sub_14003062f: frame=0B, locals=2`
@@ -57,8 +57,8 @@ void sub_14003062f(void) {
 - Architecture: amd64
 - Lift generated: 2026-02-14T12:17:50.151Z
 - Output: 6 functions, 48 instructions, 45 source lines
-- Benchmark: 25 runs, mean 1.646 ms, min 0.882 ms, max 14.238 ms, std 2.605 ms
-- Throughput: 29.17 instr/ms
+- Benchmark: 25 runs, mean 0.601 ms, min 0.579 ms, max 0.670 ms, std 0.019 ms
+- Throughput: 79.92 instr/ms
 
 Diagnostics:
 - `sub_14000b2fb: frame=0B, locals=0`
@@ -94,8 +94,8 @@ void sub_14000b320(void) {
 - Architecture: amd64
 - Lift generated: 2026-02-14T15:47:09.336Z
 - Output: 2 functions, 65 instructions, 50 source lines
-- Benchmark: 25 runs, mean 16.885 ms, min 0.979 ms, max 188.399 ms, std 47.991 ms
-- Throughput: 3.85 instr/ms
+- Benchmark: 25 runs, mean 0.654 ms, min 0.625 ms, max 0.761 ms, std 0.033 ms
+- Throughput: 99.37 instr/ms
 
 Diagnostics:
 - `sub_1400027e7: frame=0B, locals=2`

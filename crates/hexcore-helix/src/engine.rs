@@ -7,7 +7,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use helix_core::pipeline::remill_lifter::RemillIrLifter;
-use helix_core::pipeline::{IrLifter, IrPipeline, LiftIrInput};
+use helix_core::pipeline::{IrPipeline, LiftIrInput};
 
 // ─── Architecture Enum (JS-visible) ────────────────────────────────────────────
 
@@ -119,8 +119,7 @@ impl HelixEngine {
     /// Get the engine version string.
     #[napi]
     pub fn version(&self) -> String {
-        let native = helix_core::ffi::EngineHandle::version();
-        format!("helix-js={} native={}", env!("CARGO_PKG_VERSION"), native)
+        format!("helix-js={} native=pending", env!("CARGO_PKG_VERSION"))
     }
 
     /// Get the target architecture name.
@@ -202,9 +201,32 @@ impl HelixEngine {
         let input = LiftIrInput { ir_text };
 
         let pipeline = IrPipeline::new(Box::new(lifter));
-        let (output, metrics) = pipeline
+        let (output, _metrics) = pipeline
             .execute(&input)
             .map_err(|e| Error::from_reason(format!("Decompilation failed: {}", e)))?;
+
+        // Construir buffers FlatBuffer
+        let cfg_buffer = {
+            let cfg_data = crate::transport::build_cfg_data(
+                "module",
+                output.function_count,
+                output.instruction_count,
+            );
+            helix_core::flatbuf::cfg::serialize_cfg(&cfg_data)
+                .ok()
+                .map(Buffer::from)
+        };
+
+        let ast_buffer = {
+            let ast_data = crate::transport::build_ast_data(
+                "module",
+                &output.source,
+                output.function_count,
+            );
+            helix_core::flatbuf::ast::serialize_ast(&ast_data)
+                .ok()
+                .map(Buffer::from)
+        };
 
         Ok(DecompileResult {
             source: output.source,
@@ -212,8 +234,8 @@ impl HelixEngine {
             entry_address: String::new(),
             block_count: output.function_count as u32,
             instruction_count: output.instruction_count as u32,
-            cfg_buffer: None,
-            ast_buffer: None,
+            cfg_buffer,
+            ast_buffer,
         })
     }
 
@@ -245,14 +267,37 @@ impl HelixEngine {
             .execute(&input)
             .map_err(|e| Error::from_reason(format!("Decompilation failed: {}", e)))?;
 
+        // Construir buffers antes de mover output.source
+        let cfg_buffer = {
+            let cfg_data = crate::transport::build_cfg_data(
+                "module",
+                output.function_count,
+                output.instruction_count,
+            );
+            helix_core::flatbuf::cfg::serialize_cfg(&cfg_data)
+                .ok()
+                .map(Buffer::from)
+        };
+
+        let ast_buffer = {
+            let ast_data = crate::transport::build_ast_data(
+                "module",
+                &output.source,
+                output.function_count,
+            );
+            helix_core::flatbuf::ast::serialize_ast(&ast_data)
+                .ok()
+                .map(Buffer::from)
+        };
+
         let result = DecompileResult {
             source: output.source,
             function_name: format!("module_{}", output.function_count),
             entry_address: String::new(),
             block_count: output.function_count as u32,
             instruction_count: output.instruction_count as u32,
-            cfg_buffer: None,
-            ast_buffer: None,
+            cfg_buffer,
+            ast_buffer,
         };
 
         let metrics_result = PipelineMetricsResult {

@@ -35,12 +35,12 @@ Aqui é onde matamos o Rellic. Em vez de uma tradução direta, usaremos dialeto
 * **Criação do Dialeto Helix (MLIR):** Definir o dialeto MLIR personalizado que permite representar operações de descompilação (recuperação de *loops*, *if-else* e *structs*) de forma mais flexível que o LLVM IR "flat".
 * **Passagens de Transformação:** Escrever as "passes" em C++23 para converter o código do dialeto de baixo nível para o dialeto de alto nível (Helix High-Level).
 
-### Fase 3: Sistema Nervoso de Alta Velocidade (FlatBuffers)
+### Fase 3: Sistema Nervoso de Alta Velocidade (FlatBuffers) ✅
 
 Para evitar que a interface da HexCore trave ao carregar funções gigantes, eliminaremos o JSON.
 
-* **Schema FlatBuffers:** Definir o esquema de dados para o Grafo de Fluxo de Controle (CFG) e a Árvore de Sintaxe Abstrata (AST) descompilada.
-* **Zero-Copy Access:** Implementar a leitura direta da memória da Helix pelo TypeScript, permitindo renderização instantânea no Webview do VS Code.
+* ✅ **Schema FlatBuffers:** Definir o esquema de dados para o Grafo de Fluxo de Controle (CFG) e a Árvore de Sintaxe Abstrata (AST) descompilada.
+* ✅ **Zero-Copy Access:** Implementar a leitura direta da memória da Helix pelo TypeScript, permitindo renderização instantânea no Webview do VS Code.
 
 ### Fase 4: Integração com a HexCore IDE
 

@@ -1,0 +1,25 @@
+[2026-02-23T05:51:09.155Z] ============================================================
+[2026-02-23T05:51:09.155Z] HexCore Pipeline Runner
+[2026-02-23T05:51:09.156Z] Workspace: c:\Users\Mazum\Desktop\DesafiosHTB-HexCore
+[2026-02-23T05:51:09.156Z] Job file:  c:\Users\Mazum\Desktop\DesafiosHTB-HexCore\.hexcore_job.json
+[2026-02-23T05:51:09.156Z] Target:    C:/Users/Mazum/Desktop/DesafiosHTB-HexCore/WorldWar Z 2/wwzRetailEgs.exe
+[2026-02-23T05:51:09.156Z] Output:    C:/Users/Mazum/Desktop/DesafiosHTB-HexCore/hexcore-reports/Remill-2
+[2026-02-23T05:51:09.157Z] Steps:     3
+[2026-02-23T05:51:09.157Z] Started:   2026-02-23T05:51:09.155Z
+[2026-02-23T05:51:09.157Z] ============================================================
+[2026-02-23T05:51:09.158Z] [Step 1] hexcore.disasm.analyzeAll -> hexcore.disasm.analyzeAll
+[2026-02-23T05:51:09.158Z] [Step 1] Timeout: 300000ms
+[2026-02-23T05:51:09.158Z] [Step 1] Retries: 0 (delay=1000ms)
+[2026-02-23T05:51:09.161Z] [Step 1] Attempt 1/1
+[2026-02-23T05:51:27.471Z] [Step 1] OK (18313ms, attempts=1)
+[2026-02-23T05:51:27.472Z] [Step 2] hexcore.disasm.liftToIR -> hexcore.disasm.liftToIR
+[2026-02-23T05:51:27.473Z] [Step 2] Timeout: 120000ms
+[2026-02-23T05:51:27.473Z] [Step 2] Retries: 0 (delay=1000ms)
+[2026-02-23T05:51:27.482Z] [Step 2] Attempt 1/1
+[2026-02-23T05:51:55.574Z] [Step 2] OK (28102ms, attempts=1)
+[2026-02-23T05:51:55.575Z] [Step 3] hexcore.rellic.decompile -> hexcore.rellic.decompile
+[2026-02-23T05:51:55.575Z] [Step 3] Timeout: 180000ms
+[2026-02-23T05:51:55.575Z] [Step 3] Retries: 0 (delay=1000ms)
+[2026-02-23T05:51:55.579Z] [Step 3] Attempt 1/1
+[2026-02-23T05:52:07.066Z] [Step 3] OK (11491ms, attempts=1)
+[2026-02-23T05:52:07.068Z] Job finished with status: ok

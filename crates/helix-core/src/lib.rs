@@ -25,7 +25,8 @@ pub mod ast;
 pub mod decompile;
 pub mod diagnostics;
 pub mod error;
-pub mod ffi;
+// pub mod ffi;
+pub mod flatbuf;
 pub mod ir;
 pub mod metrics;
 pub mod pipeline;
@@ -39,8 +40,6 @@ pub use decompile::{decompile_ir, decompile_ir_via_hir};
 pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSink, Severity};
 pub use error::HelixError;
 pub use metrics::PipelineMetrics;
-pub use pipeline::{
-    Emitter, EmitFormat, EmitOutput, IrLifter, IrPipeline, Lifter, LiftInput, LiftIrInput,
-    Pipeline, TransformPass,
-};
 pub use types::{Address, ArchKind, BasicBlock, ControlFlowGraph, Instruction, Register};
+
+

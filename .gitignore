@@ -27,8 +27,15 @@ crates/helix-core/src/generated/
 # IDE
 .vscode/settings.json
 .idea/
+.kiro/
 *.swp
 *.swo
+
+# Build logs & artifacts
+*.rlib
+log*.txt
+build_error.log
+cmake_gen.log
 
 # OS
 .DS_Store

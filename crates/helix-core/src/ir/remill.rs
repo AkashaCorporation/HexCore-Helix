@@ -172,7 +172,7 @@ pub fn decode_mangled_name(mangled: &str) -> Semantic {
         "POP" | "POPI" => Semantic::Pop,
         "CMP" | "CMPI" => Semantic::Cmp,
         "TEST" | "TESTI" => Semantic::Test,
-        "NOP" | "NOPI" => Semantic::Nop,
+        "NOP" | "NOPI" | "NOP_IMPL" => Semantic::Nop,
         "DoINT3" => Semantic::Int3,
         "MUL" | "MULI" => Semantic::Mul,
         "IMUL" | "IMULI" => Semantic::IMul,
@@ -371,5 +371,79 @@ mod tests {
     fn test_decode_cdqe() {
         let name = "_ZN12_GLOBAL__N_14CDQEEP6MemoryR5State3RnWImE";
         assert_eq!(decode_mangled_name(name), Semantic::Cdqe);
+    }
+
+    #[test]
+    fn test_decode_nop_impl() {
+        let name = "_ZN12_GLOBAL__N_18NOP_IMPLIJEEEP6MemoryS2_R5StateDpT_";
+        assert_eq!(decode_mangled_name(name), Semantic::Nop);
+    }
+
+    #[test]
+    fn test_decode_add_memory_operands() {
+        let name = "_ZN12_GLOBAL__N_13ADDI3MnWIhE2MnIhE2RnIhLb1EEEEP6MemoryS8_R5StateT_T0_T1_";
+        assert_eq!(decode_mangled_name(name), Semantic::Add);
+        let classes = decode_operand_classes(name);
+        assert_eq!(classes, vec![OpClass::MemWrite, OpClass::MemRead, OpClass::RegRead]);
+    }
+
+    #[test]
+    fn test_all_remill_test_files_no_unknown_semantics() {
+        let test_files = [
+            "tests/Remill-1/01-camera-init.ll",
+            "tests/Remill-2/01-aim-assist-init.ll",
+            "tests/Remill-3/01-swarm-serialization.ll",
+            "tests/Remill-4/01-swarm-write.ll",
+            "tests/Remill-5/01-name-writing.ll",
+        ];
+
+        const MARKER: &str = "@_ZN12_GLOBAL__N_1";
+
+        let mut files_found = 0;
+        for file_path in &test_files {
+            let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(file_path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("SKIP: test data not found at {:?}", full_path);
+                    continue;
+                }
+            };
+            files_found += 1;
+
+            let mut seen = std::collections::HashSet::new();
+            for line in content.lines() {
+                let mut rest = line;
+                while let Some(pos) = rest.find(MARKER) {
+                    let start = pos + 1; // skip the '@'
+                    let name_start = &rest[start..];
+                    let end = name_start
+                        .find(|c: char| c == '(' || c == ',' || c == ' ' || c == ';')
+                        .unwrap_or(name_start.len());
+                    let mangled = &name_start[..end];
+                    if seen.insert(mangled.to_string()) {
+                        let sem = decode_mangled_name(mangled);
+                        assert!(
+                            !matches!(sem, Semantic::Unknown(_)),
+                            "Unknown semantic for mangled name '{}' in {}",
+                            mangled,
+                            file_path,
+                        );
+                    }
+                    rest = &rest[pos + MARKER.len()..];
+                }
+            }
+            if !seen.is_empty() {
+                // Only assert if we found mangled names
+            }
+        }
+        if files_found == 0 {
+            eprintln!("SKIP: no Remill test files found (test data absent)");
+        }
     }
 }

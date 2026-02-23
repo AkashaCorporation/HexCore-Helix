@@ -99,6 +99,22 @@ pub fn decompile_ir_via_hir(ir_text: &str) -> Result<DecompileOutput, String> {
         ),
     );
 
+    // Stage 5.5: Boilerplate elimination (Remill internal variables + signature rewriting)
+    for func in &mut hir_module.functions {
+        hir_builder::eliminate_boilerplate(func);
+        hir_builder::rewrite_function_signature(func);
+    }
+
+    // Stage 5.6: Dead code elimination (remove unreachable code after return)
+    for func in &mut hir_module.functions {
+        control_flow::eliminate_dead_code(&mut func.body);
+    }
+
+    // Stage 5.7: Redundant goto elimination (cleanup fallthrough gotos and orphan labels)
+    for func in &mut hir_module.functions {
+        control_flow::eliminate_redundant_gotos(&mut func.body);
+    }
+
     // Stage 6: Validation pass
     let _validation_result = validation::validate_module(&hir_module, &signatures, &mut sink);
 
@@ -118,7 +134,10 @@ pub fn decompile_ir_via_hir(ir_text: &str) -> Result<DecompileOutput, String> {
     }
 
     // Stage 7: Emit pseudo-C from the typed HIR
-    let options = EmitOptions::default();
+    let options = EmitOptions {
+        include_addresses: true,
+        ..EmitOptions::default()
+    };
     let source = hir_emitter::emit_module(&hir_module, &signatures, &options);
 
     // Count total instructions (non-padding)

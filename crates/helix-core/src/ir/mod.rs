@@ -3,6 +3,8 @@
 //! Consumes LLVM IR text from Remill's lifting pass and transforms it
 //! into high-level decoded instructions ready for decompilation.
 
+use std::collections::HashMap;
+
 pub mod hir;
 pub mod hir_builder;
 pub mod hir_emitter;
@@ -81,4 +83,10 @@ pub struct LiftedModule {
     pub instructions: Vec<RemillInsn>,
     /// Indices where sub-functions begin (split at RET+INT3 boundaries).
     pub function_boundaries: Vec<usize>,
+    /// Map of metadata ID → register name (e.g., 6 → "RAX"). Empty for old format.
+    pub register_metadata: HashMap<u32, String>,
+    /// Target triple extracted from IR (e.g., "x86_64-unknown-windows-msvc-coff"). Empty for old format.
+    pub target_triple: String,
+    /// Remill intrinsics declared in the module. Empty for old format.
+    pub declared_intrinsics: Vec<String>,
 }

@@ -97,14 +97,31 @@ fn emit_function(
 
     out.push_str(&format!("{} {}({}) {{\n", ret_type, func.name, params));
 
-    // Local variable declarations (only stack and temporaries that aren't registers)
-    let visible_locals: Vec<&HirVar> = func
+    // Local variable declarations
+    // Show stack locals with offset comments, and register variables as typed declarations
+    let stack_locals: Vec<&HirVar> = func
         .locals
         .iter()
         .filter(|v| matches!(v.storage, HirStorage::Stack(_)))
         .collect();
 
-    for local in &visible_locals {
+    let reg_locals: Vec<&HirVar> = func
+        .locals
+        .iter()
+        .filter(|v| matches!(v.storage, HirStorage::Register))
+        .collect();
+
+    // Emit register variable declarations
+    if !reg_locals.is_empty() {
+        out.push_str(&format!("{}// Register variables\n", options.indent));
+        for local in &reg_locals {
+            let ty = format_type(&local.ty);
+            out.push_str(&format!("{}{}  {};\n", options.indent, ty, local.name));
+        }
+    }
+
+    // Emit stack variable declarations
+    for local in &stack_locals {
         let ty = format_type(&local.ty);
         let comment = match local.storage {
             HirStorage::Stack(off) if options.include_stack_offsets => {
@@ -115,7 +132,7 @@ fn emit_function(
         out.push_str(&format!("{}{}  {};{}\n", options.indent, ty, local.name, comment));
     }
 
-    if !visible_locals.is_empty() {
+    if !stack_locals.is_empty() || !reg_locals.is_empty() {
         out.push('\n');
     }
 
@@ -188,7 +205,7 @@ fn emit_stmt(
             let addr_comment = addr_suffix(span, options);
 
             // Special case: skip RSP/RBP bookkeeping (sub rsp, add rsp)
-            if is_stack_pointer_bookkeeping(lhs, rhs) {
+            if is_stack_pointer_bookkeeping(lhs, rhs, names) {
                 return;
             }
 
@@ -547,14 +564,38 @@ fn resolve_call_target(
 
 fn format_call_args(args: &[HirExpr], signatures: &SignatureDb, names: &VarNameMap) -> String {
     args.iter()
-        .map(|a| format_expr(a, signatures, names))
+        .map(|a| format_arg_expr(a, signatures, names))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
+/// Format an expression used as a call argument.
+///
+/// Unlike `format_expr`, this renders unresolved `AddrLit` as `(void*)0xADDRESS`
+/// instead of `sub_ADDRESS`, since an address used as an argument is a data
+/// pointer, not a call target.
+fn format_arg_expr(expr: &HirExpr, signatures: &SignatureDb, names: &VarNameMap) -> String {
+    match expr {
+        HirExpr::AddrLit { address, .. } => {
+            if let Some(sig) = signatures.lookup(*address) {
+                sig.name.clone()
+            } else {
+                format!("(void*)0x{:x}", address)
+            }
+        }
+        _ => format_expr(expr, signatures, names),
+    }
+}
+
 // ─── Misc Helpers ───────────────────────────────────────────────────────────
 
-fn is_stack_pointer_bookkeeping(lhs: &HirExpr, rhs: &HirExpr) -> bool {
+/// Stack pointer register names that should have their bookkeeping hidden.
+const STACK_POINTER_REGS: &[&str] = &["rsp", "rbp", "esp", "ebp", "sp"];
+
+fn is_stack_pointer_bookkeeping(lhs: &HirExpr, rhs: &HirExpr, names: &VarNameMap) -> bool {
+    // Only hide `rsp = rsp ± N` and `rbp = rbp ± N` patterns.
+    // Other `x = x ± literal` patterns (e.g., rax = rax + 1) are real
+    // arithmetic and must be preserved.
     if let HirExpr::Var { id: lhs_id, .. } = lhs {
         if let HirExpr::Binary {
             lhs: bin_lhs,
@@ -567,7 +608,10 @@ fn is_stack_pointer_bookkeeping(lhs: &HirExpr, rhs: &HirExpr) -> bool {
                 if let HirExpr::Var { id: rhs_id, .. } = bin_lhs.as_ref() {
                     if lhs_id == rhs_id {
                         if let HirExpr::IntLit { .. } = bin_rhs.as_ref() {
-                            return true;
+                            // Check if the variable is a stack pointer register
+                            if let Some(name) = names.get(lhs_id) {
+                                return STACK_POINTER_REGS.contains(&name.as_str());
+                            }
                         }
                     }
                 }
@@ -735,7 +779,13 @@ mod tests {
                 address: 0x300,
                 return_type: HirType::Void,
                 params: vec![],
-                locals: vec![],
+                locals: vec![HirVar {
+                    id: HirVarId(0),
+                    name: "rsp".into(),
+                    ty: HirType::u64(),
+                    storage: HirStorage::Register,
+                    span: Span::single(0x300),
+                }],
                 body: vec![
                     // sub rsp, 0x38 → rsp = rsp - 0x38
                     HirStmt::Assign {
@@ -790,5 +840,142 @@ mod tests {
         assert_eq!(format_type(&HirType::void_ptr()), "void*");
         assert_eq!(format_type(&HirType::Unknown), "auto");
         assert_eq!(format_type(&HirType::Bool), "bool");
+    }
+
+    // ─── Task 8.5: Emitter handles while, else, goto, label ────────────────
+
+    #[test]
+    fn emit_while_loop() {
+        let module = HirModule {
+            name: "test.exe".into(),
+            arch: "amd64".into(),
+            functions: vec![HirFunction {
+                name: "sub_loop".into(),
+                address: 0x100,
+                return_type: HirType::Void,
+                params: vec![],
+                locals: vec![],
+                body: vec![
+                    HirStmt::While {
+                        cond: HirExpr::Binary {
+                            op: HirBinOp::Ne,
+                            lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: Span::single(0x100) }),
+                            rhs: Box::new(HirExpr::IntLit { value: 0, ty: HirType::i32(), span: Span::single(0x100) }),
+                            ty: HirType::Bool,
+                            span: Span::single(0x100),
+                        },
+                        body: vec![
+                            HirStmt::Assign {
+                                lhs: HirExpr::Var { id: HirVarId(0), span: Span::single(0x104) },
+                                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: Span::single(0x104) },
+                                span: Span::single(0x104),
+                            },
+                        ],
+                        span: Span::single(0x100),
+                    },
+                ],
+                calling_convention: None,
+                is_variadic: false,
+                span: Span::single(0x100),
+            }],
+        };
+
+        let sigs = SignatureDb::new();
+        let options = EmitOptions::default();
+        let source = emit_module(&module, &sigs, &options);
+
+        assert!(source.contains("while ("), "should emit while: {}", source);
+        assert!(source.contains("!="), "should emit condition: {}", source);
+    }
+
+    #[test]
+    fn emit_if_else() {
+        let module = HirModule {
+            name: "test.exe".into(),
+            arch: "amd64".into(),
+            functions: vec![HirFunction {
+                name: "sub_ifelse".into(),
+                address: 0x100,
+                return_type: HirType::Void,
+                params: vec![],
+                locals: vec![],
+                body: vec![
+                    HirStmt::If {
+                        cond: HirExpr::Binary {
+                            op: HirBinOp::Eq,
+                            lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: Span::single(0x100) }),
+                            rhs: Box::new(HirExpr::IntLit { value: 0, ty: HirType::i32(), span: Span::single(0x100) }),
+                            ty: HirType::Bool,
+                            span: Span::single(0x100),
+                        },
+                        then_body: vec![
+                            HirStmt::Assign {
+                                lhs: HirExpr::Var { id: HirVarId(1), span: Span::single(0x104) },
+                                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: Span::single(0x104) },
+                                span: Span::single(0x104),
+                            },
+                        ],
+                        else_body: Some(vec![
+                            HirStmt::Assign {
+                                lhs: HirExpr::Var { id: HirVarId(1), span: Span::single(0x108) },
+                                rhs: HirExpr::IntLit { value: 2, ty: HirType::i32(), span: Span::single(0x108) },
+                                span: Span::single(0x108),
+                            },
+                        ]),
+                        span: Span::single(0x100),
+                    },
+                ],
+                calling_convention: None,
+                is_variadic: false,
+                span: Span::single(0x100),
+            }],
+        };
+
+        let sigs = SignatureDb::new();
+        let options = EmitOptions::default();
+        let source = emit_module(&module, &sigs, &options);
+
+        assert!(source.contains("if ("), "should emit if: {}", source);
+        assert!(source.contains("} else {"), "should emit else: {}", source);
+    }
+
+    #[test]
+    fn emit_goto_and_label() {
+        let module = HirModule {
+            name: "test.exe".into(),
+            arch: "amd64".into(),
+            functions: vec![HirFunction {
+                name: "sub_goto".into(),
+                address: 0x100,
+                return_type: HirType::Void,
+                params: vec![],
+                locals: vec![],
+                body: vec![
+                    HirStmt::Label {
+                        name: "loc_100".to_string(),
+                        span: Span::single(0x100),
+                    },
+                    HirStmt::Assign {
+                        lhs: HirExpr::Var { id: HirVarId(0), span: Span::single(0x104) },
+                        rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: Span::single(0x104) },
+                        span: Span::single(0x104),
+                    },
+                    HirStmt::Goto {
+                        label: "loc_100".to_string(),
+                        span: Span::single(0x108),
+                    },
+                ],
+                calling_convention: None,
+                is_variadic: false,
+                span: Span::single(0x100),
+            }],
+        };
+
+        let sigs = SignatureDb::new();
+        let options = EmitOptions::default();
+        let source = emit_module(&module, &sigs, &options);
+
+        assert!(source.contains("loc_100:"), "should emit label: {}", source);
+        assert!(source.contains("goto loc_100;"), "should emit goto: {}", source);
     }
 }

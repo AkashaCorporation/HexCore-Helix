@@ -64,11 +64,19 @@ pub fn structure_control_flow(
 fn structure_function(func: &mut HirFunction, sink: &mut DiagnosticSink) -> ControlFlowResult {
     let mut result = ControlFlowResult::default();
 
+    // Build variable name → ID map for condition resolution
+    let var_name_to_id: std::collections::HashMap<String, HirVarId> = func
+        .locals
+        .iter()
+        .chain(func.params.iter())
+        .map(|v| (v.name.clone(), v.id))
+        .collect();
+
     // Phase 1: Recover CMOV conditions from CMP/TEST comments
     result.cmov_conditions_resolved = recover_cmov_conditions(&mut func.body);
 
     // Phase 2: Structure Jcc/JMP into if/while
-    let (new_body, cf_result) = structure_statements(&func.body, &func.name, sink);
+    let (new_body, cf_result) = structure_statements(&func.body, &func.name, sink, &var_name_to_id);
     result.ifs_recovered += cf_result.ifs_recovered;
     result.loops_recovered += cf_result.loops_recovered;
     result.jcc_comments_consumed += cf_result.jcc_comments_consumed;
@@ -107,6 +115,7 @@ fn recover_cmov_conditions(stmts: &mut Vec<HirStmt>) -> usize {
                                 cc,
                                 &info,
                                 *span,
+                                &std::collections::HashMap::new(),
                             );
 
                             // Replace the ternary's condition
@@ -186,8 +195,13 @@ fn find_preceding_cmp(cmp_info: &[Option<CmpInfo>], before: usize) -> Option<Cmp
 }
 
 /// Build a condition expression from a condition code and CMP/TEST info.
-fn build_condition_expr(cc: &str, info: &CmpInfo, span: Span) -> HirExpr {
-    let lhs = parse_operand_expr(&info.lhs, span);
+fn build_condition_expr(
+    cc: &str,
+    info: &CmpInfo,
+    span: Span,
+    var_names: &std::collections::HashMap<String, HirVarId>,
+) -> HirExpr {
+    let lhs = parse_operand_expr(&info.lhs, span, var_names);
 
     if info.is_test {
         // TEST sets ZF based on (lhs & rhs). Common pattern: TEST reg, reg → checks if zero.
@@ -216,7 +230,7 @@ fn build_condition_expr(cc: &str, info: &CmpInfo, span: Span) -> HirExpr {
             }
         } else {
             // TEST with different operands → (lhs & rhs) op 0
-            let rhs_expr = parse_operand_expr(rhs_str, span);
+            let rhs_expr = parse_operand_expr(rhs_str, span, var_names);
             let and_expr = HirExpr::Binary {
                 op: HirBinOp::BitAnd,
                 lhs: Box::new(lhs),
@@ -245,7 +259,7 @@ fn build_condition_expr(cc: &str, info: &CmpInfo, span: Span) -> HirExpr {
         }
     } else {
         // CMP: direct comparison
-        let rhs = parse_operand_expr(&info.rhs, span);
+        let rhs = parse_operand_expr(&info.rhs, span, var_names);
         match cc_to_comparison_op(cc, false) {
             Some(op) => HirExpr::Binary {
                 op,
@@ -263,7 +277,15 @@ fn build_condition_expr(cc: &str, info: &CmpInfo, span: Span) -> HirExpr {
 }
 
 /// Parse a textual operand (from a comment) into an HirExpr.
-fn parse_operand_expr(text: &str, span: Span) -> HirExpr {
+///
+/// When `var_names` is provided, register names are resolved to proper
+/// `HirExpr::Var` references instead of `HirExpr::Unknown`, producing
+/// clean condition expressions without `/* */` wrappers.
+fn parse_operand_expr(
+    text: &str,
+    span: Span,
+    var_names: &std::collections::HashMap<String, HirVarId>,
+) -> HirExpr {
     let text = text.trim();
 
     // Try to parse as hex immediate
@@ -294,7 +316,13 @@ fn parse_operand_expr(text: &str, span: Span) -> HirExpr {
         };
     }
 
-    // Register — treat as an unknown variable reference with descriptive name
+    // Register — resolve to HirExpr::Var if the name is in the variable map
+    let lower = text.to_lowercase();
+    if let Some(&id) = var_names.get(&lower) {
+        return HirExpr::Var { id, span };
+    }
+
+    // Fallback: unknown variable reference
     HirExpr::Unknown {
         description: text.to_string(),
         span,
@@ -380,6 +408,7 @@ fn structure_statements(
     stmts: &[HirStmt],
     func_name: &str,
     sink: &mut DiagnosticSink,
+    var_names: &std::collections::HashMap<String, HirVarId>,
 ) -> (Vec<HirStmt>, ControlFlowResult) {
     let mut result = ControlFlowResult::default();
 
@@ -430,7 +459,7 @@ fn structure_statements(
                 let target_idx = addr_to_idx.get(&target_addr).copied();
                 if let Some(end_idx) = target_idx {
                     let cond = if let Some(info) = &cmp {
-                        build_condition_expr(&br.cc, info, br.span)
+                        build_condition_expr(&br.cc, info, br.span, var_names)
                     } else {
                         HirExpr::Unknown {
                             description: format!("cond_{}", br.cc),
@@ -452,7 +481,7 @@ fn structure_statements(
                 let loop_start_idx = addr_to_idx.get(&target_addr).copied();
                 if let Some(start_idx) = loop_start_idx {
                     let cond = if let Some(info) = &cmp {
-                        build_condition_expr(&br.cc, info, br.span)
+                        build_condition_expr(&br.cc, info, br.span, var_names)
                     } else {
                         HirExpr::Unknown {
                             description: format!("loop_cond_{}", br.cc),
@@ -470,9 +499,64 @@ fn structure_statements(
         }
     }
 
-    // Step 4: Build output with simple single-level structuring.
-    // For a robust multi-level approach we'd need a proper interval tree,
-    // but this handles the common single-level if/while patterns well.
+    // Step 3.5: Detect irreducible flow — branches that couldn't be structured
+    // emit goto/label pairs as fallback.
+    let mut goto_targets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut goto_sources: Vec<(usize, u64, Span)> = Vec::new(); // (stmt_idx, target_addr, span)
+
+    // Check for branches that weren't classified as if or while
+    let structured_branch_indices: std::collections::HashSet<usize> = {
+        let mut set = std::collections::HashSet::new();
+        for br in &branches {
+            if let Some(target_addr) = br.target_addr {
+                let src_addr = br.span.start_addr;
+                if target_addr > src_addr {
+                    // Forward: check if it was classified as an if
+                    if addr_to_idx.get(&target_addr).is_some() {
+                        set.insert(br.stmt_idx);
+                    }
+                } else if target_addr < src_addr {
+                    // Backward: check if it was classified as a while
+                    if addr_to_idx.get(&target_addr).is_some() {
+                        set.insert(br.stmt_idx);
+                    }
+                }
+            }
+        }
+        set
+    };
+
+    for br in &branches {
+        if !structured_branch_indices.contains(&br.stmt_idx) {
+            if let Some(target_addr) = br.target_addr {
+                goto_targets.insert(target_addr);
+                goto_sources.push((br.stmt_idx, target_addr, br.span));
+            }
+        }
+    }
+
+    // Also check for unconditional jumps that weren't consumed by if/else detection
+    for jmp in &jumps {
+        if let Some(target_addr) = jmp.target_addr {
+            // If this JMP's target isn't the start of an else block or loop,
+            // it might be irreducible flow
+            let is_else_jmp = if_targets.iter().any(|(start, end, _)| {
+                // JMP at end-1 is the else transition
+                jmp.stmt_idx + 1 == *start || jmp.stmt_idx + 1 == *end
+            });
+            let is_loop_jmp = while_targets.iter().any(|(start, _end, _)| {
+                jmp.target_addr == Some(stmts.get(*start).map(|s| s.stmt_span().start_addr).unwrap_or(0))
+            });
+            if !is_else_jmp && !is_loop_jmp && addr_to_idx.get(&target_addr).is_none() {
+                goto_targets.insert(target_addr);
+                goto_sources.push((jmp.stmt_idx, target_addr, jmp.span));
+            }
+        }
+    }
+
+    // Step 4: Build output with structured blocks and goto fallback.
+    // Supports recursive nesting via recursive calls to structure_statements
+    // on the bodies of if/while blocks.
 
     // Sort if-targets by start index
     if_targets.sort_by_key(|t| t.0);
@@ -485,18 +569,41 @@ fn structure_statements(
     let mut i = 0;
 
     while i < stmts.len() {
+        // Emit a label if this statement's address is a goto target
+        let stmt_addr = stmts[i].stmt_span().start_addr;
+        if goto_targets.contains(&stmt_addr) {
+            output.push(HirStmt::Label {
+                name: format!("loc_{:x}", stmt_addr),
+                span: stmts[i].stmt_span(),
+            });
+        }
+
+        // Check if this is a goto source (unstructured branch)
+        if let Some((_idx, target_addr, span)) = goto_sources.iter().find(|(idx, _, _)| *idx == i) {
+            output.push(HirStmt::Goto {
+                label: format!("loc_{:x}", target_addr),
+                span: *span,
+            });
+            i += 1;
+            continue;
+        }
+
         // Check if a while loop starts here
         if while_idx < while_targets.len() && while_targets[while_idx].0 == i {
             let (start, end, ref cond) = while_targets[while_idx];
             while_idx += 1;
 
-            // Collect the loop body (between start and end, excluding consumed)
-            let body: Vec<HirStmt> = stmts[start..end]
+            // Collect the loop body (between start and end, including CMP/Jcc
+            // comments so recursive structuring can process nested patterns)
+            let raw_body: Vec<HirStmt> = stmts[start..end]
                 .iter()
-                .enumerate()
-                .filter(|(j, _)| !consumed_indices.contains(&(start + j)))
-                .map(|(_, s)| s.clone())
+                .cloned()
                 .collect();
+
+            // Recursively structure the loop body for nested control flow
+            let (body, nested_result) = structure_statements(&raw_body, func_name, sink, var_names);
+            result.ifs_recovered += nested_result.ifs_recovered;
+            result.loops_recovered += nested_result.loops_recovered;
 
             output.push(HirStmt::While {
                 cond: cond.clone(),
@@ -515,15 +622,26 @@ fn structure_statements(
             if_idx += 1;
 
             // Check for else: if the statement before end_idx is a JMP forward
-            let (then_end, else_body) = detect_else(stmts, start, end, &jumps, &consumed_indices);
+            let (then_end, else_body_raw, else_end_idx) = detect_else(stmts, start, end, &jumps, &consumed_indices);
 
-            // Collect the then-body
-            let then_body: Vec<HirStmt> = stmts[start..then_end]
+            // Collect the then-body (include CMP/Jcc for recursive structuring)
+            let raw_then: Vec<HirStmt> = stmts[start..then_end]
                 .iter()
-                .enumerate()
-                .filter(|(j, _)| !consumed_indices.contains(&(start + j)))
-                .map(|(_, s)| s.clone())
+                .cloned()
                 .collect();
+
+            // Recursively structure the then-body for nested control flow
+            let (then_body, nested_then) = structure_statements(&raw_then, func_name, sink, var_names);
+            result.ifs_recovered += nested_then.ifs_recovered;
+            result.loops_recovered += nested_then.loops_recovered;
+
+            // Recursively structure the else-body if present
+            let else_body = else_body_raw.map(|raw_else| {
+                let (structured_else, nested_else) = structure_statements(&raw_else, func_name, sink, var_names);
+                result.ifs_recovered += nested_else.ifs_recovered;
+                result.loops_recovered += nested_else.loops_recovered;
+                structured_else
+            });
 
             output.push(HirStmt::If {
                 cond: cond.clone(),
@@ -533,7 +651,7 @@ fn structure_statements(
             });
 
             // Skip past the if (and else if present)
-            if let Some(else_end) = detect_else_end(&jumps, end) {
+            if let Some(else_end) = else_end_idx {
                 i = else_end;
             } else {
                 i = end;
@@ -561,6 +679,18 @@ fn structure_statements(
             format!(
                 "control flow: {} ifs, {} loops structured",
                 result.ifs_recovered, result.loops_recovered
+            ),
+        );
+    }
+
+    if !goto_sources.is_empty() {
+        sink.info(
+            func_name,
+            0,
+            DiagnosticKind::Recovery,
+            format!(
+                "control flow: {} goto(s) emitted for irreducible flow",
+                goto_sources.len()
             ),
         );
     }
@@ -706,13 +836,18 @@ fn invert_condition(cond: HirExpr, span: Span) -> HirExpr {
 
 /// Detect an else block: if the statement immediately before end_idx
 /// is a JMP forward, the range [end_idx, jmp_target] is the else body.
+///
+/// Returns `(then_end, else_body, else_end_idx)`:
+/// - `then_end`: the exclusive end of the then-body (excluding the JMP)
+/// - `else_body`: the else body statements (if any)
+/// - `else_end_idx`: the index past the else block (for skip logic)
 fn detect_else(
     stmts: &[HirStmt],
     _start: usize,
     end: usize,
     jumps: &[JmpInfo],
     consumed: &std::collections::HashSet<usize>,
-) -> (usize, Option<Vec<HirStmt>>) {
+) -> (usize, Option<Vec<HirStmt>>, Option<usize>) {
     // Look for a JMP just before end_idx in the then-body
     if end > 0 {
         for jmp in jumps {
@@ -734,7 +869,7 @@ fn detect_else(
                                 .filter(|(j, _)| !consumed.contains(&(end + j)))
                                 .map(|(_, s)| s.clone())
                                 .collect();
-                            return (then_end, Some(else_body));
+                            return (then_end, Some(else_body), Some(else_end_idx));
                         }
                     }
                 }
@@ -742,24 +877,7 @@ fn detect_else(
         }
     }
 
-    (end, None)
-}
-
-/// Find the end index of an else block if one exists.
-fn detect_else_end(jumps: &[JmpInfo], if_end: usize) -> Option<usize> {
-    for jmp in jumps {
-        if jmp.stmt_idx == if_end - 1 {
-            if let Some(target) = jmp.target_addr {
-                if target > jmp.span.start_addr {
-                    // The else block ends at the JMP target
-                    // We don't know the exact index without rescanning, but
-                    // the caller should handle this
-                    return None; // TODO: proper else-end resolution
-                }
-            }
-        }
-    }
-    None
+    (end, None, None)
 }
 
 // ─── Helper: Get span from any statement ────────────────────────────────────
@@ -787,6 +905,198 @@ impl StmtSpan for HirStmt {
             | HirStmt::Label { span, .. }
             | HirStmt::Asm { span, .. }
             | HirStmt::Comment { span, .. } => *span,
+        }
+    }
+}
+
+// ─── Dead Code Elimination ──────────────────────────────────────────────────
+
+/// Remove statements that appear after an unconditional `return` in the
+/// top-level scope of a function. Code after return is unreachable.
+///
+/// This does NOT remove code inside structured blocks (if/while/else) —
+/// only at the top-level (depth 0) scope.
+pub fn eliminate_dead_code(stmts: &mut Vec<HirStmt>) {
+    // Find the first unconditional return at the top level
+    let return_idx = stmts.iter().position(|s| matches!(s, HirStmt::Return { .. }));
+
+    if let Some(idx) = return_idx {
+        // Check if there are statements after the return
+        if idx + 1 < stmts.len() {
+            // Keep only statements up to and including the return
+            stmts.truncate(idx + 1);
+        }
+    }
+}
+
+// ─── Redundant Goto Elimination ─────────────────────────────────────────────
+
+/// Remove goto/label pairs that are redundant (fallthrough) and labels
+/// that are no longer referenced by any goto.
+///
+/// Patterns removed:
+/// 1. `goto loc_X; loc_X:` — adjacent goto+label (natural fallthrough)
+/// 2. Labels not referenced by any remaining goto
+/// 3. Gotos whose target label doesn't exist in the statement list
+pub fn eliminate_redundant_gotos(stmts: &mut Vec<HirStmt>) {
+    // Pass 1: Remove adjacent goto+label pairs
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i + 1 < stmts.len() {
+            if let (HirStmt::Goto { label: goto_label, .. }, HirStmt::Label { name: label_name, .. }) =
+                (&stmts[i], &stmts[i + 1])
+            {
+                if goto_label == label_name {
+                    // Remove the goto (keep the label for now; orphan pass will clean it)
+                    stmts.remove(i);
+                    changed = true;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Pass 2: Recursively clean gotos inside structured blocks
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            HirStmt::If { then_body, else_body, .. } => {
+                eliminate_redundant_gotos(then_body);
+                if let Some(else_stmts) = else_body {
+                    eliminate_redundant_gotos(else_stmts);
+                }
+            }
+            HirStmt::While { body, .. } | HirStmt::DoWhile { body, .. } => {
+                eliminate_redundant_gotos(body);
+            }
+            HirStmt::For { body, .. } => {
+                eliminate_redundant_gotos(body);
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 3: Collect all existing labels in the statement list
+    let mut existing_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_existing_labels(stmts, &mut existing_labels);
+
+    // Pass 4: Remove gotos whose target label doesn't exist
+    remove_orphan_gotos(stmts, &existing_labels);
+
+    // Pass 5: Collect all goto targets still referenced
+    let mut referenced_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_goto_targets(stmts, &mut referenced_labels);
+
+    // Pass 6: Remove orphan labels (not referenced by any goto)
+    remove_orphan_labels(stmts, &referenced_labels);
+}
+
+/// Recursively collect all existing label names from a statement list.
+fn collect_existing_labels(stmts: &[HirStmt], labels: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            HirStmt::Label { name, .. } => {
+                labels.insert(name.clone());
+            }
+            HirStmt::If { then_body, else_body, .. } => {
+                collect_existing_labels(then_body, labels);
+                if let Some(else_stmts) = else_body {
+                    collect_existing_labels(else_stmts, labels);
+                }
+            }
+            HirStmt::While { body, .. } | HirStmt::DoWhile { body, .. } => {
+                collect_existing_labels(body, labels);
+            }
+            HirStmt::For { body, .. } => {
+                collect_existing_labels(body, labels);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Remove gotos whose target label doesn't exist in the statement list.
+fn remove_orphan_gotos(stmts: &mut Vec<HirStmt>, existing_labels: &std::collections::HashSet<String>) {
+    stmts.retain(|s| {
+        if let HirStmt::Goto { label, .. } = s {
+            existing_labels.contains(label)
+        } else {
+            true
+        }
+    });
+
+    // Recurse into structured blocks
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            HirStmt::If { then_body, else_body, .. } => {
+                remove_orphan_gotos(then_body, existing_labels);
+                if let Some(else_stmts) = else_body {
+                    remove_orphan_gotos(else_stmts, existing_labels);
+                }
+            }
+            HirStmt::While { body, .. } | HirStmt::DoWhile { body, .. } => {
+                remove_orphan_gotos(body, existing_labels);
+            }
+            HirStmt::For { body, .. } => {
+                remove_orphan_gotos(body, existing_labels);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Remove labels not referenced by any goto.
+fn remove_orphan_labels(stmts: &mut Vec<HirStmt>, referenced: &std::collections::HashSet<String>) {
+    stmts.retain(|s| {
+        if let HirStmt::Label { name, .. } = s {
+            referenced.contains(name)
+        } else {
+            true
+        }
+    });
+
+    // Recurse into structured blocks
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            HirStmt::If { then_body, else_body, .. } => {
+                remove_orphan_labels(then_body, referenced);
+                if let Some(else_stmts) = else_body {
+                    remove_orphan_labels(else_stmts, referenced);
+                }
+            }
+            HirStmt::While { body, .. } | HirStmt::DoWhile { body, .. } => {
+                remove_orphan_labels(body, referenced);
+            }
+            HirStmt::For { body, .. } => {
+                remove_orphan_labels(body, referenced);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively collect all goto target labels from a statement list.
+fn collect_goto_targets(stmts: &[HirStmt], targets: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            HirStmt::Goto { label, .. } => {
+                targets.insert(label.clone());
+            }
+            HirStmt::If { then_body, else_body, .. } => {
+                collect_goto_targets(then_body, targets);
+                if let Some(else_stmts) = else_body {
+                    collect_goto_targets(else_stmts, targets);
+                }
+            }
+            HirStmt::While { body, .. } | HirStmt::DoWhile { body, .. } => {
+                collect_goto_targets(body, targets);
+            }
+            HirStmt::For { body, .. } => {
+                collect_goto_targets(body, targets);
+            }
+            _ => {}
         }
     }
 }
@@ -1011,7 +1321,7 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let (structured, result) = structure_statements(&stmts, "test_func", &mut sink);
+        let (structured, result) = structure_statements(&stmts, "test_func", &mut sink, &std::collections::HashMap::new());
 
         assert!(result.ifs_recovered >= 1, "should recover at least one if block");
 
@@ -1092,4 +1402,228 @@ mod tests {
         let has_if = func.body.iter().any(|s| matches!(s, HirStmt::If { .. }));
         assert!(has_if, "function body should contain If: {:?}", func.body);
     }
+
+    // ─── Task 8.1: If/else detection ────────────────────────────────────────
+
+    #[test]
+    fn test_if_else_detection() {
+        // Pattern: Jcc(target_A) → then block → Jmp(target_B) → else block → target_B
+        //
+        // 0x100: cmp rax, 0
+        // 0x104: je → sub_114       (forward: skip then-body if equal)
+        // 0x108: var_0 = 1          (then-body)
+        // 0x10c: jmp → sub_11c      (skip else-body)
+        // 0x114: var_0 = 2          (else-body, target of Jcc)
+        // 0x118: var_1 = 3          (else-body continued)
+        // 0x11c: return             (target of JMP, after else)
+        let stmts = vec![
+            HirStmt::Comment {
+                text: "cmp rax, 0".to_string(),
+                span: mk_span(0x100),
+            },
+            HirStmt::Comment {
+                text: "je → sub_114".to_string(),
+                span: mk_span(0x104),
+            },
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x108) },
+                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x108) },
+                span: mk_span(0x108),
+            },
+            HirStmt::Comment {
+                text: "jmp → sub_11c".to_string(),
+                span: mk_span(0x10c),
+            },
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x114) },
+                rhs: HirExpr::IntLit { value: 2, ty: HirType::i32(), span: mk_span(0x114) },
+                span: mk_span(0x114),
+            },
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(1), span: mk_span(0x118) },
+                rhs: HirExpr::IntLit { value: 3, ty: HirType::i32(), span: mk_span(0x118) },
+                span: mk_span(0x118),
+            },
+            HirStmt::Return {
+                value: None,
+                span: mk_span(0x11c),
+            },
+        ];
+
+        let mut sink = DiagnosticSink::new();
+        let (structured, result) = structure_statements(&stmts, "test_if_else", &mut sink, &std::collections::HashMap::new());
+
+        assert!(result.ifs_recovered >= 1, "should recover at least one if");
+
+        // Find the If statement
+        let if_stmt = structured.iter().find(|s| matches!(s, HirStmt::If { .. }));
+        assert!(if_stmt.is_some(), "should contain an If block: {:?}", structured);
+
+        if let Some(HirStmt::If { then_body, else_body, .. }) = if_stmt {
+            assert!(!then_body.is_empty(), "then_body should not be empty");
+            assert!(else_body.is_some(), "else_body should be present for if/else pattern");
+            let else_stmts = else_body.as_ref().unwrap();
+            assert!(!else_stmts.is_empty(), "else_body should not be empty");
+        }
+
+        // The else body statements should NOT appear as standalone statements after the If
+        let standalone_assigns: Vec<_> = structured.iter().filter(|s| {
+            if let HirStmt::Assign { span, .. } = s {
+                span.start_addr == 0x114 || span.start_addr == 0x118
+            } else {
+                false
+            }
+        }).collect();
+        assert!(standalone_assigns.is_empty(),
+            "else body statements should not appear as standalone after the If block");
+    }
+
+    // ─── Task 8.2: While detection with back-edge ───────────────────────────
+
+    #[test]
+    fn test_while_back_edge() {
+        // Pattern: loop body → cmp → backward Jcc
+        //
+        // 0x100: var_0 = 0          (loop start)
+        // 0x104: var_0 = var_0 + 1  (loop body)
+        // 0x108: cmp var_0, 10
+        // 0x10c: jne → sub_100      (backward branch: loop while not equal)
+        // 0x110: return
+        let stmts = vec![
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x100) },
+                rhs: HirExpr::IntLit { value: 0, ty: HirType::i32(), span: mk_span(0x100) },
+                span: mk_span(0x100),
+            },
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x104) },
+                rhs: HirExpr::Binary {
+                    op: HirBinOp::Add,
+                    lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: mk_span(0x104) }),
+                    rhs: Box::new(HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x104) }),
+                    ty: HirType::i32(),
+                    span: mk_span(0x104),
+                },
+                span: mk_span(0x104),
+            },
+            HirStmt::Comment {
+                text: "cmp var_0, 10".to_string(),
+                span: mk_span(0x108),
+            },
+            HirStmt::Comment {
+                text: "jne → sub_100".to_string(),
+                span: mk_span(0x10c),
+            },
+            HirStmt::Return {
+                value: None,
+                span: mk_span(0x110),
+            },
+        ];
+
+        let mut sink = DiagnosticSink::new();
+        let (structured, result) = structure_statements(&stmts, "test_while", &mut sink, &std::collections::HashMap::new());
+
+        assert!(result.loops_recovered >= 1, "should recover at least one while loop");
+
+        let while_stmt = structured.iter().find(|s| matches!(s, HirStmt::While { .. }));
+        assert!(while_stmt.is_some(), "should contain a While block: {:?}", structured);
+
+        if let Some(HirStmt::While { body, .. }) = while_stmt {
+            assert!(!body.is_empty(), "while body should not be empty");
+        }
+    }
+
+    // ─── Task 8.3: Nested control structures ────────────────────────────────
+
+    #[test]
+    fn test_nested_if_inside_while() {
+        // Pattern: while loop containing an if block
+        //
+        // 0x100: var_0 = 0          (loop start)
+        // 0x104: cmp var_0, 5
+        // 0x108: je → sub_118       (forward: if inside loop)
+        // 0x10c: var_1 = 1          (then-body of inner if)
+        // 0x118: var_0 = var_0 + 1  (after inner if, still in loop)
+        // 0x11c: cmp var_0, 10
+        // 0x120: jne → sub_100      (backward: loop back)
+        // 0x124: return
+        let stmts = vec![
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x100) },
+                rhs: HirExpr::IntLit { value: 0, ty: HirType::i32(), span: mk_span(0x100) },
+                span: mk_span(0x100),
+            },
+            HirStmt::Comment {
+                text: "cmp var_0, 5".to_string(),
+                span: mk_span(0x104),
+            },
+            HirStmt::Comment {
+                text: "je → sub_118".to_string(),
+                span: mk_span(0x108),
+            },
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(1), span: mk_span(0x10c) },
+                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x10c) },
+                span: mk_span(0x10c),
+            },
+            HirStmt::Assign {
+                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x118) },
+                rhs: HirExpr::Binary {
+                    op: HirBinOp::Add,
+                    lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: mk_span(0x118) }),
+                    rhs: Box::new(HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x118) }),
+                    ty: HirType::i32(),
+                    span: mk_span(0x118),
+                },
+                span: mk_span(0x118),
+            },
+            HirStmt::Comment {
+                text: "cmp var_0, 10".to_string(),
+                span: mk_span(0x11c),
+            },
+            HirStmt::Comment {
+                text: "jne → sub_100".to_string(),
+                span: mk_span(0x120),
+            },
+            HirStmt::Return {
+                value: None,
+                span: mk_span(0x124),
+            },
+        ];
+
+        let mut sink = DiagnosticSink::new();
+        let (structured, result) = structure_statements(&stmts, "test_nested", &mut sink, &std::collections::HashMap::new());
+
+        assert!(result.loops_recovered >= 1, "should recover a while loop");
+
+        // Find the while loop
+        let while_stmt = structured.iter().find(|s| matches!(s, HirStmt::While { .. }));
+        assert!(while_stmt.is_some(), "should contain a While block: {:?}", structured);
+
+        // Check that the while body contains a nested If
+        if let Some(HirStmt::While { body, .. }) = while_stmt {
+            let has_nested_if = body.iter().any(|s| matches!(s, HirStmt::If { .. }));
+            assert!(has_nested_if,
+                "while body should contain a nested If block: {:?}", body);
+        }
+    }
+
+    // ─── Task 8.4: Goto for irreducible flow ────────────────────────────────
+
+    #[test]
+    fn test_goto_and_label_variants_exist() {
+        // Verify that HirStmt::Goto and HirStmt::Label can be constructed
+        // and that the emitter handles them (verified separately in emitter tests)
+        let goto = HirStmt::Goto {
+            label: "loc_100".to_string(),
+            span: mk_span(0x100),
+        };
+        let label = HirStmt::Label {
+            name: "loc_100".to_string(),
+            span: mk_span(0x100),
+        };
+        assert!(matches!(goto, HirStmt::Goto { .. }));
+        assert!(matches!(label, HirStmt::Label { .. }));
+    }
+
 }

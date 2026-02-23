@@ -15,8 +15,8 @@ fn main() {
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
     let engine_dir = project_root.join("engine");
 
-    // Only build the C++ engine if the directory exists and has CMakeLists.txt
-    if engine_dir.join("CMakeLists.txt").exists() {
+    // Temporarily disable C++ engine build for testing Rust decompiler
+    if false {
         let dst = cmake::Config::new(&engine_dir)
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_SHARED_LIBS", "OFF")
