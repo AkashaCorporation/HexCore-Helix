@@ -70,6 +70,40 @@ int helix_engine_decompile(
     ));
 }
 
+int helix_engine_decompile_ir(
+    HelixEngineHandle* handle,
+    const char* ir_text,
+    size_t ir_len,
+    uint8_t* out_buf,
+    size_t* out_len)
+{
+    if (!handle) {
+        return HELIX_ERROR_ENGINE_NOT_READY;
+    }
+
+    auto* engine = to_engine(handle);
+    return static_cast<int>(engine->decompileIR(
+        ir_text, ir_len, out_buf, out_len
+    ));
+}
+
+int helix_engine_decompile_ir_text(
+    HelixEngineHandle* handle,
+    const char* ir_text,
+    size_t ir_len,
+    char* out_buf,
+    size_t* out_len)
+{
+    if (!handle) {
+        return HELIX_ERROR_ENGINE_NOT_READY;
+    }
+
+    auto* engine = to_engine(handle);
+    return static_cast<int>(engine->decompileIRText(
+        ir_text, ir_len, out_buf, out_len
+    ));
+}
+
 const char* helix_engine_last_error(HelixEngineHandle* handle) {
     if (!handle) {
         return nullptr;

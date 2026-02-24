@@ -3,6 +3,7 @@
 /// @brief The Helix decompilation engine — C++ core with C API export.
 
 #include "helix/Types.h"
+#include "helix/Pipeline.h"
 #include <string>
 #include <memory>
 #include <vector>
@@ -17,8 +18,9 @@ namespace helix {
 
 /// The core decompilation engine.
 ///
-/// In Phase 1, this is a stub that validates inputs and returns status codes.
-/// In Phase 2+, this will hold the MLIR context, dialect registry, and pass pipeline.
+/// Manages the MLIR context, dialect registry, and pass pipeline.
+/// Provides both binary decompilation (Phase 1 API) and IR decompilation
+/// (Phase 2 MLIR pipeline).
 class Engine {
 public:
     explicit Engine(HelixArch arch);
@@ -27,8 +29,8 @@ public:
     // No copy, move only
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
-    Engine(Engine&&) noexcept = default;
-    Engine& operator=(Engine&&) noexcept = default;
+    Engine(Engine&&) noexcept;
+    Engine& operator=(Engine&&) noexcept;
 
     /// Get the engine version string.
     static const char* version() noexcept;
@@ -54,6 +56,40 @@ public:
         size_t* out_len
     );
 
+    /// Decompile LLVM IR text through the full MLIR pipeline.
+    ///
+    /// This is the Phase 2 entry point. Takes LLVM IR text (e.g., from Remill)
+    /// and produces a FlatBuffer-serialized AST.
+    ///
+    /// @param ir_text  LLVM IR assembly text (.ll file content)
+    /// @param ir_len   Length of IR text in bytes
+    /// @param out_buf  Output buffer for FlatBuffer result
+    /// @param out_len  In: capacity. Out: bytes written.
+    /// @return Status code
+    HelixStatus decompileIR(
+        const char* ir_text,
+        size_t ir_len,
+        uint8_t* out_buf,
+        size_t* out_len
+    );
+
+    /// Decompile LLVM IR text and return pseudo-C source code directly.
+    ///
+    /// Same pipeline as decompileIR(), but returns the pseudo-C text output
+    /// instead of FlatBuffer. This is what the CLI tool and direct callers use.
+    ///
+    /// @param ir_text  LLVM IR assembly text (.ll file content)
+    /// @param ir_len   Length of IR text in bytes
+    /// @param out_buf  Output buffer for pseudo-C text (null-terminated)
+    /// @param out_len  In: capacity. Out: bytes written (including null).
+    /// @return Status code
+    HelixStatus decompileIRText(
+        const char* ir_text,
+        size_t ir_len,
+        char* out_buf,
+        size_t* out_len
+    );
+
     /// Get the last error message. Returns nullptr if no error.
     [[nodiscard]] const char* lastError() const noexcept;
 
@@ -63,7 +99,7 @@ private:
 
     // Phase 2: MLIR context and pipeline
     std::unique_ptr<mlir::MLIRContext> mlir_context_;
-    std::unique_ptr<mlir::PassManager> pass_manager_;
+    std::unique_ptr<Pipeline> pipeline_;
 };
 
 } // namespace helix
@@ -91,6 +127,38 @@ int helix_engine_decompile(
     uint64_t base_addr,
     uint64_t entry_addr,
     uint8_t* out_buf,
+    size_t* out_len
+);
+
+/// Decompile LLVM IR text through the MLIR pipeline.
+///
+/// @param engine   Engine handle
+/// @param ir_text  LLVM IR assembly text
+/// @param ir_len   Length of IR text
+/// @param out_buf  Output buffer for FlatBuffer result
+/// @param out_len  In: capacity. Out: bytes written.
+/// @return Status code (0 = success)
+int helix_engine_decompile_ir(
+    HelixEngineHandle* engine,
+    const char* ir_text,
+    size_t ir_len,
+    uint8_t* out_buf,
+    size_t* out_len
+);
+
+/// Decompile LLVM IR text and return pseudo-C source code directly.
+///
+/// @param engine   Engine handle
+/// @param ir_text  LLVM IR assembly text
+/// @param ir_len   Length of IR text
+/// @param out_buf  Output buffer for null-terminated pseudo-C text
+/// @param out_len  In: capacity. Out: bytes written (including null).
+/// @return Status code (0 = success)
+int helix_engine_decompile_ir_text(
+    HelixEngineHandle* engine,
+    const char* ir_text,
+    size_t ir_len,
+    char* out_buf,
     size_t* out_len
 );
 
