@@ -12,7 +12,42 @@ fn main() {
 
     // ─── Paths ─────────────────────────────────────────────────────────
     let engine_build_dir = project_root.join("engine").join("build");
-    let llvm_build = PathBuf::from(r"C:\Users\Mazum\Desktop\caps\llvm-build\build-mlir");
+
+    // LLVM/MLIR build directory — configurable via environment variables.
+    // Priority: MLIR_DIR > LLVM_BUILD_DIR > llvm-config --prefix > fallback
+    let llvm_build = if let Ok(dir) = env::var("MLIR_DIR") {
+        // MLIR_DIR typically points to lib/cmake/mlir; we want the build root.
+        let mlir_path = PathBuf::from(&dir);
+        mlir_path.parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(dir))
+    } else if let Ok(dir) = env::var("LLVM_BUILD_DIR") {
+        PathBuf::from(dir)
+    } else if let Ok(output) = std::process::Command::new("llvm-config")
+        .arg("--prefix")
+        .output()
+    {
+        let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !prefix.is_empty() {
+            PathBuf::from(prefix)
+        } else {
+            panic!(
+                "Could not determine LLVM/MLIR build directory.\n\
+                 Set one of these environment variables:\n\
+                 - MLIR_DIR: path to MLIR CMake config (e.g., /usr/lib/cmake/mlir)\n\
+                 - LLVM_BUILD_DIR: path to the LLVM/MLIR build root"
+            );
+        }
+    } else {
+        panic!(
+            "Could not determine LLVM/MLIR build directory.\n\
+             Set one of these environment variables:\n\
+             - MLIR_DIR: path to MLIR CMake config (e.g., /usr/lib/cmake/mlir)\n\
+             - LLVM_BUILD_DIR: path to the LLVM/MLIR build root"
+        );
+    };
     let llvm_lib_dir = llvm_build.join("lib");
 
     // ─── Link the Helix engine static library ──────────────────────────
@@ -199,7 +234,14 @@ fn main() {
     }
 
     // ─── Re-run triggers ───────────────────────────────────────────────
-    println!("cargo:rerun-if-changed={}", engine_build_dir.join("helix_engine.lib").display());
+    println!("cargo:rerun-if-env-changed=MLIR_DIR");
+    println!("cargo:rerun-if-env-changed=LLVM_BUILD_DIR");
+    let engine_lib_name = if cfg!(target_os = "windows") {
+        "helix_engine.lib"
+    } else {
+        "libhelix_engine.a"
+    };
+    println!("cargo:rerun-if-changed={}", engine_build_dir.join(engine_lib_name).display());
 
     let schemas_dir = project_root.join("schemas");
     if schemas_dir.exists() {

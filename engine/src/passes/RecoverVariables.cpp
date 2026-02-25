@@ -36,6 +36,7 @@
 #include "helix/dialects/HelixHighOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -467,6 +468,8 @@ struct RecoverVariablesPass
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
         registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<mlir::arith::ArithDialect>();
+        registry.insert<mlir::ub::UBDialect>();
     }
 
     void runOnOperation() override {
