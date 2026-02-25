@@ -26,6 +26,19 @@ endif()
 option(HELIX_USE_LLVM "Link against LLVM/MLIR libraries" ON)
 
 if(HELIX_USE_LLVM)
+    # Hint: set LLVM_DIR and MLIR_DIR to point to the CMake config directories,
+    # e.g.:  cmake -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
+    #              -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir ..
+    # Or via environment variables:
+    #   export LLVM_DIR=/path/to/llvm/lib/cmake/llvm
+    #   export MLIR_DIR=/path/to/llvm/lib/cmake/mlir
+    if(NOT DEFINED LLVM_DIR AND DEFINED ENV{LLVM_DIR})
+        set(LLVM_DIR $ENV{LLVM_DIR})
+    endif()
+    if(NOT DEFINED MLIR_DIR AND DEFINED ENV{MLIR_DIR})
+        set(MLIR_DIR $ENV{MLIR_DIR})
+    endif()
+
     find_package(LLVM REQUIRED CONFIG)
     find_package(MLIR REQUIRED CONFIG)
 
@@ -328,8 +341,17 @@ if(HELIX_USE_LLVM)
         # Arith Dialect (arith::ConstantOp, ShRUIOp, etc. in RecoverVariables)
         MLIRArithDialect
 
+        # UB Dialect (dependency of ArithDialect in MLIR 18+ — PoisonOp/PoisonAttr)
+        MLIRUBDialect
+
+        # Func Dialect (required by LLVM IR translation infrastructure)
+        MLIRFuncDialect
+
         # Control Flow Dialect (cf::BranchOp in StructureControlFlow)
         MLIRControlFlowDialect
+
+        # SCF Dialect (structured control flow)
+        MLIRSCFDialect
 
         # DLTI Dialect (required by translateLLVMIRToModule for data layout)
         MLIRDLTIDialect

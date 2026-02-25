@@ -13,6 +13,9 @@
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/PassManager.h"
 
 #include <cstring>
@@ -31,11 +34,14 @@ Engine::Engine(HelixArch arch)
     // Register required dialects.
     // LLVMDialect + DLTIDialect: required by translateLLVMIRToModule()
     // HelixLow + HelixHigh: Helix pass pipeline dialects
-    // cf, arith: used by StructureControlFlow and other passes
+    // cf, arith, ub, func, scf: used by passes and translation infrastructure
     mlir_context_->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
     mlir_context_->getOrLoadDialect<mlir::DLTIDialect>();
     mlir_context_->getOrLoadDialect<mlir::cf::ControlFlowDialect>();
     mlir_context_->getOrLoadDialect<mlir::arith::ArithDialect>();
+    mlir_context_->getOrLoadDialect<mlir::ub::UBDialect>();
+    mlir_context_->getOrLoadDialect<mlir::func::FuncDialect>();
+    mlir_context_->getOrLoadDialect<mlir::scf::SCFDialect>();
     mlir_context_->getOrLoadDialect<helix::low::HelixLowDialect>();
     mlir_context_->getOrLoadDialect<helix::high::HelixHighDialect>();
 
