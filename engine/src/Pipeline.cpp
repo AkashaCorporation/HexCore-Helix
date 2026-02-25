@@ -18,8 +18,10 @@
 #include "mlir/Target/LLVMIR/Import.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
 
 // LLVM includes
@@ -132,14 +134,29 @@ Pipeline::Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch)
     }
 
     // Ensure the LLVM dialect translation infrastructure is registered so
-    // that translateModuleFromLLVMIR() can map LLVM IR constructs to the
-    // mlir::LLVM dialect.
-    mlir::registerAllFromLLVMIRTranslations(*mlir_ctx_);
+    // that translateLLVMIRToModule() can map LLVM IR constructs to the
+    // mlir::LLVM dialect. In MLIR 18.x the registration takes a DialectRegistry.
+    //
+    // IMPORTANT: translateLLVMIRToModule() asserts that both LLVMDialect and
+    // DLTIDialect are in getAvailableDialects() BEFORE it calls
+    // loadAllAvailableDialects().  We must explicitly insert DLTI into the
+    // registry since registerAllFromLLVMIRTranslations() may not do so.
+    {
+        mlir::DialectRegistry registry;
+        mlir::registerAllFromLLVMIRTranslations(registry);
+        registry.insert<mlir::DLTIDialect>();
+        mlir_ctx_->appendDialectRegistry(registry);
+    }
+
+    // Pre-load ALL registered dialects.  The LLVM IR importer creates ops
+    // from multiple dialects (LLVM, cf, arith, func, etc.) and asserts they
+    // are available in the context at import time.
+    mlir_ctx_->loadAllAvailableDialects();
 
     // Load the Helix dialects so the pass pipeline can create their ops.
     mlir_ctx_->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
-    mlir_ctx_->getOrLoadDialect<helix_low::HelixLowDialect>();
-    mlir_ctx_->getOrLoadDialect<helix_high::HelixHighDialect>();
+    mlir_ctx_->getOrLoadDialect<helix::low::HelixLowDialect>();
+    mlir_ctx_->getOrLoadDialect<helix::high::HelixHighDialect>();
 }
 
 Pipeline::~Pipeline() = default;
@@ -199,7 +216,7 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
     // occur during translation (e.g., unsupported LLVM IR constructs).
     DiagnosticCapture capture(mlir_ctx_);
 
-    auto mlir_module = mlir::translateModuleFromLLVMIR(
+    auto mlir_module = mlir::translateLLVMIRToModule(
         std::move(llvm_module),
         mlir_ctx_
     );
@@ -299,13 +316,9 @@ void Pipeline::ensurePipelineBuilt() {
     );
 #endif
 
-    // Enable verification after every pass in debug mode to catch issues
-    // as early as possible.
-#ifndef NDEBUG
+    // Enable verification after every pass to catch which pass produces
+    // invalid IR (e.g., "operation destroyed but still has uses").
     pass_manager_->enableVerifier(/*verifyPasses=*/true);
-#else
-    pass_manager_->enableVerifier(/*verifyPasses=*/false);
-#endif
 
     buildPassPipeline(*pass_manager_);
     pipeline_built_ = true;

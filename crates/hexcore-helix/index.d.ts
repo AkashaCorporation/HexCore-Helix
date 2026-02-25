@@ -8,8 +8,8 @@
  * import { HelixEngine, Architecture } from '@hexcore/helix';
  *
  * const engine = new HelixEngine(Architecture.X86_64);
- * const result = engine.decompile(binaryBuffer, 0x400000n, 0x401000n);
- * console.log(result.source);
+ * const result = engine.decompileIr(irText);
+ * console.log(result.source);  // pseudo-C from MLIR pipeline
  * engine.dispose();
  * ```
  */
@@ -28,17 +28,30 @@ export declare class HelixEngine {
    * - `entry_address`: Entry point address to start decompilation (BigInt)
    */
   decompile(data: Buffer, baseAddress: bigint, entryAddress: bigint): DecompileResult
-  /** Release engine resources. The engine cannot be used after this call. */
-  dispose(): void
   /**
-   * Decompile Remill LLVM IR text into pseudo-C source code.
+   * Decompile Remill LLVM IR text using the **C++ MLIR pipeline**.
    *
-   * This method takes the raw IR text output from HexCore's Remill lifter
-   * and transforms it into human-readable decompiled code.
+   * This is the **primary integration path** for the HexCore IDE.
+   * Routes through: LLVM IR → MLIR translation → HelixLow → HelixHigh → Pseudo-C
    *
-   * - `ir_text`: The LLVM IR text from `hexcore-remill`
+   * Falls back to the Rust pipeline if the MLIR engine is unavailable.
    */
   decompileIr(irText: string): DecompileResult
+  /**
+   * Decompile using the **pure Rust pipeline** (no C++ engine required).
+   *
+   * This is the fallback path and can be called directly for comparison.
+   */
+  decompileIrRust(irText: string): DecompileResult
+  /**
+   * Decompile Remill LLVM IR and return metrics alongside the result.
+   *
+   * Same as `decompile_ir` but also returns pipeline performance data.
+   * Note: Metrics are currently from the Rust pipeline only.
+   */
+  decompileIrWithMetrics(irText: string): [DecompileResult, PipelineMetricsResult]
+  /** Release engine resources. The engine cannot be used after this call. */
+  dispose(): void
   /** Check if the engine has been disposed. */
   get isDisposed(): boolean
 }
@@ -75,6 +88,22 @@ export interface DecompileResult {
   cfgBuffer?: Buffer
   /** Raw FlatBuffer data for the AST (for AST View zero-copy rendering). */
   astBuffer?: Buffer
+  /** Which pipeline was used: "mlir" or "rust" */
+  pipeline: string
+}
+
+/** Pipeline metrics exposed to JavaScript. */
+export interface PipelineMetricsResult {
+  /** Total pipeline duration in milliseconds. */
+  totalMs: number
+  /** Instructions decoded. */
+  instructionsDecoded: number
+  /** Functions recovered. */
+  functionsRecovered: number
+  /** Throughput in instructions per millisecond. */
+  throughput: number
+  /** Number of warnings. */
+  warningCount: number
 }
 
 /**
@@ -87,15 +116,13 @@ export declare function readCfgFunctionName(buffer: Buffer): string | null
 /**
  * Serialize a decompiled AST into a FlatBuffer for the AST View.
  *
- * In Phase 1, this is a no-op returning an empty buffer.
- * In Phase 3+, this will use the `schemas/ast.fbs` generated code.
+ * Takes a JSON string with AST data and returns a FlatBuffer binary.
  */
 export declare function serializeAst(astJson: string): Buffer
 
 /**
  * Serialize a control flow graph into a FlatBuffer for the Graph View.
  *
- * In Phase 1, this is a no-op returning an empty buffer.
- * In Phase 3+, this will use the `schemas/cfg.fbs` generated code.
+ * Takes a JSON string with CFG data and returns a FlatBuffer binary.
  */
 export declare function serializeCfg(cfgJson: string): Buffer

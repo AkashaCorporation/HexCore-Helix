@@ -9,13 +9,14 @@
 #define HELIX_HIGH_OPS_TD
 
 include "mlir/IR/OpBase.td"
+include "mlir/IR/EnumAttr.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
-include "engine/dialects/HelixHighDialect.td"
-include "engine/dialects/HelixHighTypes.td"
+include "dialects/HelixHighDialect.td"
+include "dialects/HelixHighTypes.td"
 
 // ─── Base Class ──────────────────────────────────────────────────────────────
 
@@ -243,7 +244,7 @@ def HelixHigh_FieldAccessOp : HelixHigh_Op<"field", [Pure]> {
     AnyType:$base,
     StrAttr:$field_name,
     UI64Attr:$field_offset,
-    BoolAttr:$is_pointer,
+    UnitAttr:$is_pointer,
     OptionalAttr<UI64Attr>:$address
   );
   let results = (outs AnyType:$result);
@@ -271,7 +272,7 @@ def HelixHigh_TernaryOp : HelixHigh_Op<"ternary", [Pure]> {
 
   let assemblyFormat = [{
     $cond `?` $true_val `:` $false_val (`at` $address^)? attr-dict
-    `:` type($true_val)
+    `:` type($true_val) `,` type($false_val) `->` type($result)
   }];
 }
 
@@ -333,7 +334,7 @@ def HelixHigh_ExprStmtOp : HelixHigh_Op<"expr.stmt", []> {
 // Control Flow Operations (region-based)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-def HelixHigh_IfOp : HelixHigh_Op<"if", [RecursiveSideEffects, NoRegionArguments]> {
+def HelixHigh_IfOp : HelixHigh_Op<"if", [RecursiveMemoryEffects, NoRegionArguments]> {
   let summary = "If-else statement with region-based bodies";
   let description = [{
     Structured if-else statement. The `thenRegion` is always present.
@@ -346,37 +347,38 @@ def HelixHigh_IfOp : HelixHigh_Op<"if", [RecursiveSideEffects, NoRegionArguments
     OptionalAttr<UI64Attr>:$address
   );
   let regions = (region
-    SizedRegion<1>:$thenRegion,
+    AnyRegion:$thenRegion,
     AnyRegion:$elseRegion
   );
 
   let assemblyFormat = [{
-    $condition (`at` $address^)? attr-dict $thenRegion
+    $condition (`at` $address^)? attr-dict-with-keyword $thenRegion
     (`else` $elseRegion^)?
   }];
 }
 
-def HelixHigh_WhileOp : HelixHigh_Op<"while", [RecursiveSideEffects]> {
-  let summary = "While loop with condition region and body region";
+def HelixHigh_WhileOp : HelixHigh_Op<"while", [RecursiveMemoryEffects]> {
+  let summary = "While loop with condition value and body region";
   let description = [{
-    Structured while loop. The `condRegion` computes the loop condition
-    (yields an i1 value). The `bodyRegion` contains the loop body.
+    Structured while loop. The `condition` is an i1 value computed before
+    entering the loop. The `bodyRegion` contains the loop body (may have
+    multiple basic blocks for complex loops).
   }];
 
   let arguments = (ins
+    I1:$condition,
     OptionalAttr<UI64Attr>:$address
   );
   let regions = (region
-    SizedRegion<1>:$condRegion,
-    SizedRegion<1>:$bodyRegion
+    AnyRegion:$bodyRegion
   );
 
   let assemblyFormat = [{
-    (`at` $address^)? attr-dict `cond` $condRegion `body` $bodyRegion
+    $condition (`at` $address^)? attr-dict-with-keyword $bodyRegion
   }];
 }
 
-def HelixHigh_DoWhileOp : HelixHigh_Op<"do_while", [RecursiveSideEffects]> {
+def HelixHigh_DoWhileOp : HelixHigh_Op<"do_while", [RecursiveMemoryEffects]> {
   let summary = "Do-while loop (body executes at least once)";
 
   let arguments = (ins
@@ -388,11 +390,11 @@ def HelixHigh_DoWhileOp : HelixHigh_Op<"do_while", [RecursiveSideEffects]> {
   );
 
   let assemblyFormat = [{
-    (`at` $address^)? attr-dict `body` $bodyRegion `cond` $condRegion
+    (`at` $address^)? attr-dict-with-keyword `body` $bodyRegion `cond` $condRegion
   }];
 }
 
-def HelixHigh_ForOp : HelixHigh_Op<"for", [RecursiveSideEffects]> {
+def HelixHigh_ForOp : HelixHigh_Op<"for", [RecursiveMemoryEffects]> {
   let summary = "For loop with init, condition, step, and body regions";
 
   let arguments = (ins
@@ -406,12 +408,12 @@ def HelixHigh_ForOp : HelixHigh_Op<"for", [RecursiveSideEffects]> {
   );
 
   let assemblyFormat = [{
-    (`at` $address^)? attr-dict
+    (`at` $address^)? attr-dict-with-keyword
     `init` $initRegion `cond` $condRegion `step` $stepRegion `body` $bodyRegion
   }];
 }
 
-def HelixHigh_SwitchOp : HelixHigh_Op<"switch", [RecursiveSideEffects]> {
+def HelixHigh_SwitchOp : HelixHigh_Op<"switch", [RecursiveMemoryEffects]> {
   let summary = "Switch statement with case regions";
 
   let arguments = (ins
@@ -424,7 +426,7 @@ def HelixHigh_SwitchOp : HelixHigh_Op<"switch", [RecursiveSideEffects]> {
   );
 
   let assemblyFormat = [{
-    $selector `cases` $case_values (`at` $address^)? attr-dict
+    $selector `cases` $case_values (`at` $address^)? attr-dict-with-keyword
     `:` type($selector) $caseRegions
   }];
 }

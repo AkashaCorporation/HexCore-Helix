@@ -5,7 +5,7 @@
 #define HELIX_LOW_TYPES_TD
 
 include "mlir/IR/AttrTypeBase.td"
-include "engine/dialects/HelixLowDialect.td"
+include "dialects/HelixLowDialect.td"
 
 class HelixLow_Type<string name, string typeMnemonic, list<Trait> traits = []>
     : TypeDef<HelixLow_Dialect, name, traits> {

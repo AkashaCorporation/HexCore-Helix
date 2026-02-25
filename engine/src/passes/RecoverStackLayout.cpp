@@ -148,7 +148,7 @@ private:
                 builder.getStringAttr(slot.var_name),
                 helix::high::StorageKindAttr::get(
                     builder.getContext(), storageKind),
-                builder.getSI64IntegerAttr(slot.offset),
+                builder.getI64IntegerAttr(slot.offset),
                 /*init=*/Value{},
                 /*address=*/IntegerAttr{});
         }

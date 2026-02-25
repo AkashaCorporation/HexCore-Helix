@@ -16,8 +16,12 @@
 #include "helix/dialects/HelixHighDialect.h"
 #include "helix/dialects/HelixHighTypes.h"
 
-// Include the auto-generated enum declarations
+// Include the auto-generated enum declarations (guarded: may already be
+// included transitively through HelixHighTypes.h)
+#ifndef HELIX_HIGH_ENUMS_INCLUDED
+#define HELIX_HIGH_ENUMS_INCLUDED
 #include "helix/dialects/HelixHighEnums.h.inc"
+#endif
 
 // Include the auto-generated op declarations
 #define GET_OP_CLASSES

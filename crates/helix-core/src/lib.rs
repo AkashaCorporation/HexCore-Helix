@@ -25,7 +25,7 @@ pub mod ast;
 pub mod decompile;
 pub mod diagnostics;
 pub mod error;
-// pub mod ffi;
+pub mod ffi;
 pub mod flatbuf;
 pub mod ir;
 pub mod metrics;

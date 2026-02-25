@@ -9,12 +9,13 @@
 #define HELIX_LOW_OPS_TD
 
 include "mlir/IR/OpBase.td"
+include "mlir/IR/EnumAttr.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
-include "engine/dialects/HelixLowDialect.td"
-include "engine/dialects/HelixLowTypes.td"
+include "dialects/HelixLowDialect.td"
+include "dialects/HelixLowTypes.td"
 
 // ─── Base Class ──────────────────────────────────────────────────────────────
 
@@ -166,7 +167,7 @@ def HelixLow_BinOp : HelixLow_Op<"binop", [Pure]> {
 
   let assemblyFormat = [{
     $kind $lhs `,` $rhs (`at` $address^)? attr-dict
-    `:` type($lhs) `->` type($result)
+    `:` type($lhs) `,` type($rhs) `->` type($result)
   }];
 }
 
@@ -216,7 +217,7 @@ def HelixLow_CmpOp : HelixLow_Op<"cmp", []> {
   );
 
   let assemblyFormat = [{
-    $lhs `,` $rhs (`at` $address^)? attr-dict `:` type($lhs)
+    $lhs `,` $rhs (`at` $address^)? attr-dict `:` type($lhs) `,` type($rhs)
   }];
 }
 
@@ -239,7 +240,7 @@ def HelixLow_TestOp : HelixLow_Op<"test", []> {
   );
 
   let assemblyFormat = [{
-    $lhs `,` $rhs (`at` $address^)? attr-dict `:` type($lhs)
+    $lhs `,` $rhs (`at` $address^)? attr-dict `:` type($lhs) `,` type($rhs)
   }];
 }
 
@@ -419,7 +420,8 @@ def HelixLow_CMovOp : HelixLow_Op<"cmov", [Pure]> {
 
   let assemblyFormat = [{
     $condition $flag_value `,` $true_val `,` $false_val
-    (`at` $address^)? attr-dict `:` type($result)
+    (`at` $address^)? attr-dict
+    `:` type($true_val) `,` type($false_val) `->` type($result)
   }];
 }
 
@@ -463,7 +465,8 @@ def HelixLow_LeaOp : HelixLow_Op<"lea", [Pure]> {
 
   let assemblyFormat = [{
     $base `,` $index `,` $scale `,` $displacement
-    (`at` $address^)? attr-dict `:` type($result)
+    (`at` $address^)? attr-dict
+    `:` type($base) `,` type($index) `->` type($result)
   }];
 }
 
@@ -486,7 +489,8 @@ def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", []> {
 
   let assemblyFormat = [{
     $dst `,` $src `,` $count `,` $element_width
-    (`at` $address^)? attr-dict `:` type($dst)
+    (`at` $address^)? attr-dict
+    `:` type($dst) `,` type($src) `,` type($count)
   }];
 }
 
@@ -507,7 +511,8 @@ def HelixLow_RepStosOp : HelixLow_Op<"rep.stos", []> {
 
   let assemblyFormat = [{
     $dst `,` $value `,` $count `,` $element_width
-    (`at` $address^)? attr-dict `:` type($dst)
+    (`at` $address^)? attr-dict
+    `:` type($dst) `,` type($value) `,` type($count)
   }];
 }
 
@@ -554,7 +559,7 @@ def HelixLow_FuncOp : HelixLow_Op<"func", [
     UI64Attr:$entry_address,
     OptionalAttr<StrAttr>:$original_name
   );
-  let regions = (region SizedRegion<1>:$body);
+  let regions = (region AnyRegion:$body);
 
   let assemblyFormat = [{
     $sym_name `entry` $entry_address (`original_name` $original_name^)?

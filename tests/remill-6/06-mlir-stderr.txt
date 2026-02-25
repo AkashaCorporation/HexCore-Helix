@@ -1,0 +1,823 @@
+error: decompilation failed for "01-name-writing.ll": decompile: stage 3 (passes) failed: runPasses: MLIR pass pipeline failed: block with no terminator, has 
+"helix_high.if"(%116) ({
+}, {
+  %155 = "arith.constant"() <{value = true}> : () -> i1
+  "helix_high.while"(%155) ({
+    "llvm.store"(%164, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %162 = "llvm.call"(%161, %0, %47) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_16DoINT3EP6MemoryR5State3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.int3"() : () -> ()
+    "llvm.store"(%162, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %163 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%163, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%163) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %164 = "llvm.add"(%163, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%164, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %165 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %166 = "llvm.call"(%165, %0, %47) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_16DoINT3EP6MemoryR5State3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.int3"() : () -> ()
+    "llvm.store"(%166, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %167 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%167, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%167) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %168 = "llvm.add"(%167, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%168, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %169 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %170 = "llvm.call"(%169, %0, %47) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_16DoINT3EP6MemoryR5State3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.int3"() : () -> ()
+    "llvm.store"(%170, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %171 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%171, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%171) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %172 = "llvm.add"(%171, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%172, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %173 = "llvm.load"(%70) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %174 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %175 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %176 = "llvm.call"(%175, %0, %173) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14PUSHI2InImEEEP6MemoryS4_R5StateT_, callee_type = !llvm.func<ptr (ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.push"(%173) : (i64) -> ()
+    "llvm.store"(%176, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %177 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%177, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%177) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %178 = "llvm.add"(%177, %20) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%178, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %179 = "llvm.load"(%57) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %180 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RSP"}> {inferred_type = "uint64_t"} : () -> i64
+    %181 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %182 = "llvm.call"(%181, %0, %57, %179, %39) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13SUBI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %183 = "llvm.ptrtoint"(%57) : (!llvm.ptr) -> i64
+    %184:5 = "helix_low.binop"(%183, %179) <{kind = 1 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%182, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %185 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%185, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%185) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %186 = "llvm.add"(%185, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%186, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %187 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %188 = "llvm.add"(%187, %52) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %189 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %190 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %191 = "llvm.call"(%190, %0, %188, %76, %189, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%188) : (i64) -> ()
+    "llvm.store"(%191, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %192 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%192, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%192) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %193 = "llvm.add"(%192, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%193, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %194 = "llvm.load"(%66) <{alignment = 2 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i16
+    %195 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %196 = "llvm.zext"(%194) : (i16) -> i64
+    %197 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %198 = "llvm.call"(%197, %0, %70, %196) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_15MOVZXI3RnWImE2RnItLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    %199 = "llvm.ptrtoint"(%70) : (!llvm.ptr) -> i64
+    %200 = "helix_low.movzx"(%199) <{dst_width = 64 : ui32}> {inferred_type = "uint64_t"} : (i64) -> i64
+    "llvm.store"(%198, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %201 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%201, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%201) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %202 = "llvm.add"(%201, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%202, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %203 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %204 = "llvm.add"(%203, %53) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %205 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %206 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %207 = "llvm.call"(%206, %0, %204, %76, %205, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%204) : (i64) -> ()
+    "llvm.store"(%207, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %208 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%208, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%208) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %209 = "llvm.add"(%208, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%209, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %210 = "llvm.load"(%69) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %211 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %212 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %213 = "llvm.call"(%212, %0, %65, %210) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%210) <{bit_width = 64 : ui32, reg_name = "R8"}> : (i64) -> ()
+    "llvm.store"(%213, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %214 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%214, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%214) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %215 = "llvm.add"(%214, %28) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%215, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %216 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %217 = "llvm.sub"(%216, %54) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %218 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %219 = "llvm.call"(%218, %0, %68, %217) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13LEAI3RnWImE2MnIhEmEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    %220 = "llvm.mlir.constant"() <{value = 0 : i64}> : () -> i64
+    %221 = "llvm.ptrtoint"(%68) : (!llvm.ptr) -> i64
+    %222 = "helix_low.lea"(%221, %217) <{displacement = 0 : si64, scale = 1 : ui32}> {inferred_type = "void*"} : (i64, i64) -> i64
+    "llvm.store"(%219, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %223 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%223, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%223) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %224 = "llvm.add"(%223, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%224, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %225 = "llvm.load"(%63) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %226 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %227 = "llvm.zext"(%225) : (i32) -> i64
+    %228 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %229 = "llvm.call"(%228, %0, %64, %227) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%227) <{bit_width = 64 : ui32, reg_name = "R9"}> : (i64) -> ()
+    "llvm.store"(%229, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %230 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%230, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%230) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %231 = "llvm.add"(%230, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%231, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %232 = "llvm.load"(%62) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %233 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDX"}> {inferred_type = "uint64_t"} : () -> i64
+    %234 = "llvm.load"(%61) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %235 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDX"}> {inferred_type = "uint64_t"} : () -> i64
+    %236 = "llvm.zext"(%234) : (i32) -> i64
+    %237 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %238 = "llvm.call"(%237, %0, %62, %232, %236) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13XORI3RnWImE2RnIjLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %239 = "llvm.ptrtoint"(%62) : (!llvm.ptr) -> i64
+    %240:5 = "helix_low.binop"(%239, %232) <{kind = 8 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%238, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %241 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%241, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%241) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %242 = "llvm.add"(%241, %20) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%242, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %243 = "llvm.load"(%57) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %244 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RSP"}> {inferred_type = "uint64_t"} : () -> i64
+    %245 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %246 = "llvm.call"(%245, %0, %57, %243, %39) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13ADDI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %247 = "llvm.ptrtoint"(%57) : (!llvm.ptr) -> i64
+    %248:5 = "helix_low.binop"(%247, %243) <{kind = 0 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%246, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %249 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%249, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%249) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %250 = "llvm.add"(%249, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%250, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %251 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %252 = "llvm.call"(%251, %0, %70) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13POPI3RnWImEEEP6MemoryS4_R5StateT_, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    %253 = "helix_low.pop"() {inferred_type = "uint64_t"} : () -> i64
+    "llvm.store"(%252, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %254 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%254, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%254) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %255 = "llvm.add"(%254, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%255, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %256 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %257 = "llvm.sub"(%256, %55) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %258 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %259 = "llvm.call"(%258, %0, %257, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  %156 = "arith.constant"() <{value = true}> : () -> i1
+  "helix_high.while"(%156) ({
+    "llvm.store"(%268, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %162 = "llvm.add"(%161, %51) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %163 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %164 = "llvm.call"(%163, %0, %162, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  %157 = "arith.constant"() <{value = true}> : () -> i1
+  "helix_high.while"(%157) ({
+    "llvm.store"(%154, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %162 = "llvm.call"(%161, %0, %68, %28) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2InIjEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%28) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%162, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %163 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%163, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%163) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %164 = "llvm.add"(%163, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%164, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %165 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %166 = "llvm.add"(%165, %43) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %167 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %168 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %169 = "llvm.call"(%168, %0, %166, %76, %167, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%166) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%169, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %170 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%170, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%170) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %171 = "llvm.add"(%170, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%171, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %172 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %173 = "llvm.call"(%172, %0) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_18NOP_IMPLIJEEEP6MemoryS2_R5StateDpT_, callee_type = !llvm.func<ptr (ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.nop"() : () -> ()
+    "llvm.store"(%173, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %174 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%174, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%174) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %175 = "llvm.add"(%174, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%175, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %176 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %177 = "llvm.call"(%176, %0, %68, %28) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2InIjEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%28) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%177, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %178 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%178, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%178) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %179 = "llvm.add"(%178, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%179, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %180 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %181 = "llvm.add"(%180, %44) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %182 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %183 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %184 = "llvm.call"(%183, %0, %181, %76, %182, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%181) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%184, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %185 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%185, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%185) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %186 = "llvm.add"(%185, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%186, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %187 = "llvm.load"(%63) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %188 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %189 = "llvm.zext"(%187) : (i32) -> i64
+    %190 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %191 = "llvm.call"(%190, %0, %68, %189) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%189) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%191, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %192 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%192, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%192) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %193 = "llvm.add"(%192, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%193, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %194 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %195 = "llvm.add"(%194, %45) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %196 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %197 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %198 = "llvm.call"(%197, %0, %195, %76, %196, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%195) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%198, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %199 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%199, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%199) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %200 = "llvm.add"(%199, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%200, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %201 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %202 = "llvm.call"(%201, %0) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_18NOP_IMPLIJEEEP6MemoryS2_R5StateDpT_, callee_type = !llvm.func<ptr (ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.nop"() : () -> ()
+    "llvm.store"(%202, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %203 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%203, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%203) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %204 = "llvm.add"(%203, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%204, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %205 = "llvm.load"(%63) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %206 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %207 = "llvm.zext"(%205) : (i32) -> i64
+    %208 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %209 = "llvm.call"(%208, %0, %68, %207) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%207) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%209, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %210 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%210, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%210) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %211 = "llvm.add"(%210, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%211, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %212 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %213 = "llvm.add"(%212, %46) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %214 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %215 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %216 = "llvm.call"(%215, %0, %213, %76, %214, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%213) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%216, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %217 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%217, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%217) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %218 = "llvm.add"(%217, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%218, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %219 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %220 = "llvm.call"(%219, %0) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_18NOP_IMPLIJEEEP6MemoryS2_R5StateDpT_, callee_type = !llvm.func<ptr (ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.nop"() : () -> ()
+    "llvm.store"(%220, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %221 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%221, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%221) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %222 = "llvm.add"(%221, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%222, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %223 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %224 = "llvm.call"(%223, %0, %47) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_16DoINT3EP6MemoryR5State3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.int3"() : () -> ()
+    "llvm.store"(%224, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %225 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%225, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%225) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %226 = "llvm.add"(%225, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%226, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %227 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %228 = "llvm.call"(%227, %0, %47) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_16DoINT3EP6MemoryR5State3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.int3"() : () -> ()
+    "llvm.store"(%228, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %229 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%229, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%229) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %230 = "llvm.add"(%229, %34) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%230, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %231 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %232 = "llvm.call"(%231, %0, %47) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_16DoINT3EP6MemoryR5State3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr
+    "helix_low.int3"() : () -> ()
+    "llvm.store"(%232, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %233 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%233, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%233) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %234 = "llvm.add"(%233, %20) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%234, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %235 = "llvm.load"(%57) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %236 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RSP"}> {inferred_type = "uint64_t"} : () -> i64
+    %237 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %238 = "llvm.call"(%237, %0, %57, %235, %48) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13SUBI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %239 = "llvm.ptrtoint"(%57) : (!llvm.ptr) -> i64
+    %240:5 = "helix_low.binop"(%239, %235) <{kind = 1 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%238, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %241 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%241, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%241) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %242 = "llvm.add"(%241, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%242, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %243 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %244 = "llvm.add"(%243, %49) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %245 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %246 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %247 = "llvm.call"(%246, %0, %244, %76, %245, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%244) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%247, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %248 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%248, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%248) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %249 = "llvm.add"(%248, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%249, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %250 = "llvm.load"(%60) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %251 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %252 = "llvm.zext"(%250) : (i32) -> i64
+    %253 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %254 = "llvm.call"(%253, %0, %68, %252) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%252) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%254, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %255 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%255, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%255) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %256 = "llvm.add"(%255, %20) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%256, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %257 = "llvm.load"(%57) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %258 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RSP"}> {inferred_type = "uint64_t"} : () -> i64
+    %259 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %260 = "llvm.call"(%259, %0, %57, %257, %48) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13ADDI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %261 = "llvm.ptrtoint"(%57) : (!llvm.ptr) -> i64
+    %262:5 = "helix_low.binop"(%261, %257) <{kind = 0 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%260, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %263 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%263, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%263) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %264 = "llvm.add"(%263, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%264, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %265 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %266 = "llvm.add"(%265, %50) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %267 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %268 = "llvm.call"(%267, %0, %266, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%174) ({
+    "llvm.store"(%190, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%57) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %162 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RSP"}> {inferred_type = "uint64_t"} : () -> i64
+    %163 = "llvm.add"(%161, %39) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %164 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %165 = "llvm.call"(%164, %0, %163, %13) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13CMPI2MnIhE2InIhEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %166:4 = "helix_low.cmp"(%163, %13) {inferred_type = "bool"} : (i64, i64) -> (i1, i1, i1, i1)
+    "llvm.store"(%165, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %167 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%167, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%167) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %168 = "llvm.add"(%167, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%168, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %169 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %170 = "llvm.add"(%169, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %171 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %172 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %173 = "llvm.call"(%172, %0, %71, %170, %171, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13JNZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, !llvm.ptr) -> !llvm.ptr
+    %174 = "llvm.mlir.constant"() <{value = true}> : () -> i1
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%174) ({
+  }) : (i1) -> ()
+  "helix_high.while"(%191) ({
+    "llvm.store"(%200, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%60) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %162 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %163 = "llvm.zext"(%161) : (i32) -> i64
+    %164 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %165 = "llvm.call"(%164, %0, %70, %163) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%163) <{bit_width = 64 : ui32, reg_name = "RBX"}> : (i64) -> ()
+    "llvm.store"(%165, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %166 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%166, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%166) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %167 = "llvm.add"(%166, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%167, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %168 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %169 = "llvm.add"(%168, %37) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %170 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %171 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %172 = "llvm.call"(%171, %0, %169, %76, %170, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%169) : (i64) -> ()
+    "llvm.store"(%172, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %173 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%173, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%173) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %174 = "llvm.add"(%173, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%174, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %175 = "llvm.load"(%67) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %176 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %177 = "llvm.zext"(%175) : (i8) -> i64
+    %178 = "llvm.load"(%67) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %179 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %180 = "llvm.zext"(%178) : (i8) -> i64
+    %181 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %182 = "llvm.call"(%181, %0, %177, %180) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14TESTI2RnIhLb1EES2_EEP6MemoryS4_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %183:2 = "helix_low.test"(%177, %180) {inferred_type = "bool"} : (i64, i64) -> (i1, i1)
+    "llvm.store"(%182, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %184 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%184, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%184) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %185 = "llvm.add"(%184, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%185, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %186 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %187 = "llvm.add"(%186, %38) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %188 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %189 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %190 = "llvm.call"(%189, %0, %71, %187, %188, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_12JZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, !llvm.ptr) -> !llvm.ptr
+    %191 = "llvm.mlir.constant"() <{value = true}> : () -> i1
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%191) ({
+  }) : (i1) -> ()
+  %158 = "arith.constant"() <{value = true}> : () -> i1
+  "helix_high.while"(%158) ({
+    "llvm.store"(%176, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %162 = "llvm.add"(%161, %33) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %163 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %164 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %165 = "llvm.call"(%164, %0, %162, %76, %163, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%162) : (i64) -> ()
+    "llvm.store"(%165, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %166 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%166, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%166) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %167 = "llvm.add"(%166, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%167, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %168 = "llvm.load"(%62) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %169 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDX"}> {inferred_type = "uint64_t"} : () -> i64
+    %170 = "llvm.load"(%61) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %171 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDX"}> {inferred_type = "uint64_t"} : () -> i64
+    %172 = "llvm.zext"(%170) : (i32) -> i64
+    %173 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %174 = "llvm.call"(%173, %0, %62, %168, %172) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13XORI3RnWImE2RnIjLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %175 = "llvm.ptrtoint"(%62) : (!llvm.ptr) -> i64
+    %176:5 = "helix_low.binop"(%175, %168) <{kind = 8 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%174, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %177 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%177, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%177) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %178 = "llvm.add"(%177, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%178, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %179 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %180 = "llvm.call"(%179, %0, %58, %34) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWIhE2InIhEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%34) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%180, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %181 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%181, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%181) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %182 = "llvm.add"(%181, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%182, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %183 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %184 = "llvm.sub"(%183, %35) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %185 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %186 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %187 = "llvm.call"(%186, %0, %184, %76, %185, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%184) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%187, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %188 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%188, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%188) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %189 = "llvm.add"(%188, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%189, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %190 = "llvm.load"(%63) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %191 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %192 = "llvm.zext"(%190) : (i32) -> i64
+    %193 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %194 = "llvm.call"(%193, %0, %69, %192) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%192) <{bit_width = 64 : ui32, reg_name = "RAX"}> : (i64) -> ()
+    "llvm.store"(%194, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %195 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%195, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%195) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %196 = "llvm.add"(%195, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%196, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %197 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %198 = "llvm.add"(%197, %36) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %199 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %200 = "llvm.call"(%199, %0, %198, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%177) ({
+    "llvm.store"(%266, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%59) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %162 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDI"}> {inferred_type = "uint64_t"} : () -> i64
+    %163 = "llvm.zext"(%161) : (i8) -> i64
+    %164 = "llvm.load"(%59) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %165 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDI"}> {inferred_type = "uint64_t"} : () -> i64
+    %166 = "llvm.zext"(%164) : (i8) -> i64
+    %167 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %168 = "llvm.call"(%167, %0, %163, %166) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14TESTI2RnIhLb1EES2_EEP6MemoryS4_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %169:2 = "helix_low.test"(%163, %166) {inferred_type = "bool"} : (i64, i64) -> (i1, i1)
+    "llvm.store"(%168, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %170 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%170, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%170) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %171 = "llvm.add"(%170, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%171, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %172 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %173 = "llvm.add"(%172, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %174 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %175 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %176 = "llvm.call"(%175, %0, %71, %173, %174, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13JNZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, !llvm.ptr) -> !llvm.ptr
+    %177 = "llvm.mlir.constant"() <{value = true}> : () -> i1
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%177) ({
+  }) : (i1) -> ()
+  "helix_high.while"(%267) ({
+    "llvm.store"(%189, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%70) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %162 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %163 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %164 = "llvm.call"(%163, %0, %68, %161) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2MnImEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%161) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%164, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %165 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%165, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%165) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %166 = "llvm.add"(%165, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%166, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %167 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %168 = "llvm.add"(%167, %25) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %169 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %170 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %171 = "llvm.call"(%170, %0, %168, %76, %169, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%168) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%171, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %172 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%172, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%172) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %173 = "llvm.add"(%172, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%173, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %174 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %175 = "llvm.add"(%174, %26) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %176 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %177 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %178 = "llvm.call"(%177, %0, %175, %76, %176, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%175) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%178, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %179 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%179, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%179) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %180 = "llvm.add"(%179, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%180, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %181 = "llvm.load"(%66) <{alignment = 2 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i16
+    %182 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %183 = "llvm.zext"(%181) : (i16) -> i64
+    %184 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %185 = "llvm.call"(%184, %0, %70, %183) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_15MOVZXI3RnWImE2RnItLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    %186 = "llvm.ptrtoint"(%70) : (!llvm.ptr) -> i64
+    %187 = "helix_low.movzx"(%186) <{dst_width = 64 : ui32}> {inferred_type = "uint64_t"} : (i64) -> i64
+    "llvm.store"(%185, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %188 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%188, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%188) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %189 = "llvm.add"(%188, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%189, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %190 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %191 = "llvm.add"(%190, %27) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %192 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %193 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %194 = "llvm.call"(%193, %0, %191, %76, %192, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%191) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%194, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %195 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%195, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%195) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %196 = "llvm.add"(%195, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%196, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %197 = "llvm.load"(%69) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %198 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %199 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %200 = "llvm.call"(%199, %0, %65, %197) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%197) <{bit_width = 64 : ui32, reg_name = "R8"}> : (i64) -> ()
+    "llvm.store"(%200, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %201 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%201, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%201) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %202 = "llvm.add"(%201, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%202, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %203 = "llvm.load"(%63) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %204 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RBX"}> {inferred_type = "uint64_t"} : () -> i64
+    %205 = "llvm.zext"(%203) : (i32) -> i64
+    %206 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %207 = "llvm.call"(%206, %0, %64, %205) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%205) <{bit_width = 64 : ui32, reg_name = "R9"}> : (i64) -> ()
+    "llvm.store"(%207, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %208 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%208, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%208) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %209 = "llvm.add"(%208, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%209, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %210 = "llvm.load"(%62) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %211 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDX"}> {inferred_type = "uint64_t"} : () -> i64
+    %212 = "llvm.load"(%61) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %213 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RDX"}> {inferred_type = "uint64_t"} : () -> i64
+    %214 = "llvm.zext"(%212) : (i32) -> i64
+    %215 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %216 = "llvm.call"(%215, %0, %62, %210, %214) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13XORI3RnWImE2RnIjLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %217 = "llvm.ptrtoint"(%62) : (!llvm.ptr) -> i64
+    %218:5 = "helix_low.binop"(%217, %210) <{kind = 8 : i32}> {inferred_type = "bool"} : (i64, i64) -> (i64, i1, i1, i1, i1)
+    "llvm.store"(%216, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %219 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%219, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%219) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %220 = "llvm.add"(%219, %28) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%220, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %221 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %222 = "llvm.sub"(%221, %29) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %223 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %224 = "llvm.call"(%223, %0, %68, %222) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13LEAI3RnWImE2MnIhEmEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    %225 = "llvm.mlir.constant"() <{value = 0 : i64}> : () -> i64
+    %226 = "llvm.ptrtoint"(%68) : (!llvm.ptr) -> i64
+    %227 = "helix_low.lea"(%226, %222) <{displacement = 0 : si64, scale = 1 : ui32}> {inferred_type = "void*"} : (i64, i64) -> i64
+    "llvm.store"(%224, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %228 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%228, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%228) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %229 = "llvm.add"(%228, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%229, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %230 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %231 = "llvm.sub"(%230, %30) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %232 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %233 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %234 = "llvm.call"(%233, %0, %231, %76, %232, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%231) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%234, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %235 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%235, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%235) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %236 = "llvm.add"(%235, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%236, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %237 = "llvm.load"(%60) <{alignment = 4 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i32
+    %238 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %239 = "llvm.zext"(%237) : (i32) -> i64
+    %240 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %241 = "llvm.call"(%240, %0, %70, %239) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%239) <{bit_width = 64 : ui32, reg_name = "RBX"}> : (i64) -> ()
+    "llvm.store"(%241, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %242 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%242, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%242) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %243 = "llvm.add"(%242, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%243, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %244 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %245 = "llvm.add"(%244, %31) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %246 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %247 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %248 = "llvm.call"(%247, %0, %245, %76, %246, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%245) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%248, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %249 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%249, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%249) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %250 = "llvm.add"(%249, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%250, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %251 = "llvm.load"(%67) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %252 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %253 = "llvm.zext"(%251) : (i8) -> i64
+    %254 = "llvm.load"(%67) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %255 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %256 = "llvm.zext"(%254) : (i8) -> i64
+    %257 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %258 = "llvm.call"(%257, %0, %253, %256) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14TESTI2RnIhLb1EES2_EEP6MemoryS4_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %259:2 = "helix_low.test"(%253, %256) {inferred_type = "bool"} : (i64, i64) -> (i1, i1)
+    "llvm.store"(%258, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %260 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%260, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%260) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %261 = "llvm.add"(%260, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%261, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %262 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %263 = "llvm.add"(%262, %32) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %264 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %265 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %266 = "llvm.call"(%265, %0, %71, %263, %264, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_12JZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, !llvm.ptr) -> !llvm.ptr
+    %267 = "llvm.mlir.constant"() <{value = true}> : () -> i1
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%267) ({
+  }) : (i1) -> ()
+  "helix_high.while"(%190) ({
+    "llvm.store"(%115, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %159 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%159, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%159) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %160 = "llvm.add"(%159, %19) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%160, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %161 = "llvm.load"(%69) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %162 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %163 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %164 = "llvm.call"(%163, %0, %68, %161) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_13MOVI3RnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> !llvm.ptr
+    "helix_low.reg.write"(%161) <{bit_width = 64 : ui32, reg_name = "RCX"}> : (i64) -> ()
+    "llvm.store"(%164, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %165 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%165, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%165) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %166 = "llvm.add"(%165, %17) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%166, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %167 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %168 = "llvm.sub"(%167, %23) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %169 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %170 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %171 = "llvm.call"(%170, %0, %168, %76, %169, %72) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_, callee_type = !llvm.func<ptr (ptr, ptr, i64, ptr, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+    "helix_low.call"(%168) {arg_count = 1 : i32} : (i64) -> ()
+    "llvm.store"(%171, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %172 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%172, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%172) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %173 = "llvm.add"(%172, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%173, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %174 = "llvm.load"(%67) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %175 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %176 = "llvm.zext"(%174) : (i8) -> i64
+    %177 = "llvm.load"(%67) <{alignment = 1 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i8
+    %178 = "helix_low.reg.read"() <{bit_width = 64 : ui32, reg_name = "RAX"}> {inferred_type = "uint64_t"} : () -> i64
+    %179 = "llvm.zext"(%177) : (i8) -> i64
+    %180 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %181 = "llvm.call"(%180, %0, %176, %179) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_14TESTI2RnIhLb1EES2_EEP6MemoryS4_R5StateT_T0_, callee_type = !llvm.func<ptr (ptr, ptr, i64, i64)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, i64, i64) -> !llvm.ptr
+    %182:2 = "helix_low.test"(%176, %179) {inferred_type = "bool"} : (i64, i64) -> (i1, i1)
+    "llvm.store"(%181, %75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr, !llvm.ptr) -> ()
+    %183 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    "llvm.store"(%183, %77) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    "helix_low.reg.write"(%183) <{bit_width = 64 : ui32, reg_name = "RIP"}> : (i64) -> ()
+    %184 = "llvm.add"(%183, %21) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    "llvm.store"(%184, %76) <{alignment = 8 : i64, ordering = 0 : i64}> : (i64, !llvm.ptr) -> ()
+    %185 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %186 = "llvm.add"(%185, %24) <{overflowFlags = #llvm.overflow<none>}> : (i64, i64) -> i64
+    %187 = "llvm.load"(%76) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> i64
+    %188 = "llvm.load"(%75) <{alignment = 8 : i64, ordering = 0 : i64}> : (!llvm.ptr) -> !llvm.ptr
+    %189 = "llvm.call"(%188, %0, %71, %186, %187, %76) <{CConv = #llvm.cconv<ccc>, callee = @_ZN12_GLOBAL__N_12JZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE, callee_type = !llvm.func<ptr (ptr, ptr, ptr, i64, i64, ptr)>, fastmathFlags = #llvm.fastmath<none>}> : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, !llvm.ptr) -> !llvm.ptr
+    %190 = "llvm.mlir.constant"() <{value = true}> : () -> i1
+    "helix_high.continue"() : () -> ()
+  }) : (i1) -> ()
+  "helix_high.while"(%190) ({
+  }) : (i1) -> ()
+  "helix_low.ret"() : () -> ()
+}) : (i1) -> ()

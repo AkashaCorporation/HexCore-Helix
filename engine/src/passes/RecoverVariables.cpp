@@ -35,6 +35,7 @@
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -220,6 +221,9 @@ struct VariableTracker {
     /// Counter for generating unique temporary variable names.
     unsigned tempCounter = 0;
 
+    /// Counter for generating unique variable IDs within the function.
+    uint32_t varIdCounter = 0;
+
     /// Declare a register-backed variable if it hasn't been declared yet.
     ///
     /// @param canonicalReg  The canonical 64-bit register name (e.g., "RAX").
@@ -233,13 +237,15 @@ struct VariableTracker {
             return it->second;
 
         std::string varName = regToVarName(canonicalReg);
-        auto i64Ty = builder.getIntegerType(64);
 
         auto declOp = builder.create<helix::high::VarDeclOp>(
             loc,
-            builder.getStringAttr(varName),
-            TypeAttr::get(i64Ty),
-            /*initializer=*/Value{});
+            /*var_id=*/varIdCounter++,
+            /*var_name=*/varName,
+            /*storage=*/helix::high::StorageKind::Register,
+            /*stack_offset=*/IntegerAttr{},
+            /*init=*/Value{},
+            /*address=*/IntegerAttr{});
 
         regToDecl[canonicalReg] = declOp;
         ++NumRegVarsCreated;
@@ -270,13 +276,14 @@ struct VariableTracker {
             offset < 0 ? -offset : offset);
         std::string varName = std::format("var_{:x}", absOffset);
 
-        auto intTy = builder.getIntegerType(width);
-
         auto declOp = builder.create<helix::high::VarDeclOp>(
             loc,
-            builder.getStringAttr(varName),
-            TypeAttr::get(intTy),
-            /*initializer=*/Value{});
+            /*var_id=*/varIdCounter++,
+            /*var_name=*/varName,
+            /*storage=*/helix::high::StorageKind::Stack,
+            /*stack_offset=*/builder.getI64IntegerAttr(offset),
+            /*init=*/Value{},
+            /*address=*/IntegerAttr{});
 
         stackOffsetToDecl[offset] = declOp;
         ++NumStackVarsCreated;
@@ -295,13 +302,17 @@ struct VariableTracker {
     /// @param loc      Source location.
     /// @return         The var.decl operation.
     Operation* declareTemp(Type type, OpBuilder& builder, Location loc) {
+        (void)type;  // type is implicit from init/usage in the new API
         std::string varName = std::format("v{}", tempCounter++);
 
         auto declOp = builder.create<helix::high::VarDeclOp>(
             loc,
-            builder.getStringAttr(varName),
-            TypeAttr::get(type),
-            /*initializer=*/Value{});
+            /*var_id=*/varIdCounter++,
+            /*var_name=*/varName,
+            /*storage=*/helix::high::StorageKind::Temporary,
+            /*stack_offset=*/IntegerAttr{},
+            /*init=*/Value{},
+            /*address=*/IntegerAttr{});
 
         ++NumTempsCreated;
 
@@ -335,8 +346,7 @@ static Value emitTruncation(Value fullValue, unsigned targetWidth,
         return fullValue;
 
     return builder.create<helix::high::CastOp>(
-        loc, targetTy, fullValue,
-        builder.getStringAttr("trunc"));
+        loc, targetTy, fullValue);
 }
 
 /// Emit a right-shift + truncation for high-byte registers (AH, BH, CH, DH).
@@ -391,9 +401,7 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
     if (info.width == 32 && info.bitOffset == 0) {
         // x86-64: writing a 32-bit register zero-extends to 64 bits.
         // This is a simple zero-extension cast.
-        return builder.create<helix::high::CastOp>(
-            loc, i64Ty, newValue,
-            builder.getStringAttr("zext"));
+        return builder.create<helix::high::CastOp>(loc, i64Ty, newValue);
     }
 
     // For 16-bit and 8-bit writes, we need a read-modify-write pattern:
@@ -411,9 +419,7 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
     // Zero-extend the new value to 64 bits.
     Value extendedNew;
     if (newValue.getType() != i64Ty) {
-        extendedNew = builder.create<helix::high::CastOp>(
-            loc, i64Ty, newValue,
-            builder.getStringAttr("zext"));
+        extendedNew = builder.create<helix::high::CastOp>(loc, i64Ty, newValue);
     } else {
         extendedNew = newValue;
     }
@@ -532,10 +538,13 @@ private:
                 builder.setInsertionPoint(readOp);
                 auto* tempDecl = tracker.declareTemp(
                     readOp.getResult().getType(), declBuilder, funcLoc);
+                auto tempTyped = llvm::cast<helix::high::VarDeclOp>(tempDecl);
                 auto varRef = builder.create<helix::high::VarRefOp>(
                     readOp.getLoc(),
                     readOp.getResult().getType(),
-                    tempDecl->getAttrOfType<StringAttr>("name"));
+                    tempTyped.getVarId(),
+                    tempTyped.getVarName(),
+                    mlir::IntegerAttr{});
                 readOp.getResult().replaceAllUsesWith(varRef.getResult());
                 readOp.erase();
                 ++NumReadsReplaced;
@@ -552,10 +561,13 @@ private:
 
             // Read the full-width variable.
             auto i64Ty = builder.getIntegerType(64);
+            auto varDeclTyped = llvm::cast<helix::high::VarDeclOp>(varDecl);
             auto varRef = builder.create<helix::high::VarRefOp>(
                 readOp.getLoc(),
                 i64Ty,
-                varDecl->getAttrOfType<StringAttr>("name"));
+                varDeclTyped.getVarId(),
+                varDeclTyped.getVarName(),
+                mlir::IntegerAttr{});
 
             Value result;
             if (subReg.width == 64 && subReg.bitOffset == 0) {
@@ -598,10 +610,18 @@ private:
                 builder.setInsertionPoint(writeOp);
                 auto* tempDecl = tracker.declareTemp(
                     writeOp.getValue().getType(), declBuilder, funcLoc);
+                auto tempTyped2 = llvm::cast<helix::high::VarDeclOp>(tempDecl);
+                auto tempRef = builder.create<helix::high::VarRefOp>(
+                    writeOp.getLoc(),
+                    writeOp.getValue().getType(),
+                    tempTyped2.getVarId(),
+                    tempTyped2.getVarName(),
+                    mlir::IntegerAttr{});
                 builder.create<helix::high::AssignOp>(
                     writeOp.getLoc(),
-                    tempDecl->getAttrOfType<StringAttr>("name"),
-                    writeOp.getValue());
+                    tempRef.getResult(),
+                    writeOp.getValue(),
+                    mlir::IntegerAttr{});
                 writeOp.erase();
                 ++NumWritesReplaced;
                 continue;
@@ -622,10 +642,13 @@ private:
             } else {
                 // Sub-register write — read-modify-write pattern.
                 auto i64Ty = builder.getIntegerType(64);
+                auto varDeclTyped2 = llvm::cast<helix::high::VarDeclOp>(varDecl);
                 auto currentVar = builder.create<helix::high::VarRefOp>(
                     writeOp.getLoc(),
                     i64Ty,
-                    varDecl->getAttrOfType<StringAttr>("name"));
+                    varDeclTyped2.getVarId(),
+                    varDeclTyped2.getVarName(),
+                    mlir::IntegerAttr{});
 
                 valueToStore = emitSubRegInsert(
                     currentVar.getResult(), writeOp.getValue(),
@@ -634,10 +657,18 @@ private:
             }
 
             // Emit the assignment to the canonical variable.
+            auto varDeclTyped3 = llvm::cast<helix::high::VarDeclOp>(varDecl);
+            auto targetRef = builder.create<helix::high::VarRefOp>(
+                writeOp.getLoc(),
+                valueToStore.getType(),
+                varDeclTyped3.getVarId(),
+                varDeclTyped3.getVarName(),
+                mlir::IntegerAttr{});
             builder.create<helix::high::AssignOp>(
                 writeOp.getLoc(),
-                varDecl->getAttrOfType<StringAttr>("name"),
-                valueToStore);
+                targetRef.getResult(),
+                valueToStore,
+                mlir::IntegerAttr{});
 
             writeOp.erase();
             ++NumWritesReplaced;

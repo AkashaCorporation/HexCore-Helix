@@ -10,6 +10,9 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Pass/PassManager.h"
 
 #include <cstring>
@@ -25,8 +28,14 @@ Engine::Engine(HelixArch arch)
     // Initialize MLIR context with all required dialects.
     mlir_context_ = std::make_unique<mlir::MLIRContext>();
 
-    // Register Helix dialects.
+    // Register required dialects.
+    // LLVMDialect + DLTIDialect: required by translateLLVMIRToModule()
+    // HelixLow + HelixHigh: Helix pass pipeline dialects
+    // cf, arith: used by StructureControlFlow and other passes
     mlir_context_->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    mlir_context_->getOrLoadDialect<mlir::DLTIDialect>();
+    mlir_context_->getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+    mlir_context_->getOrLoadDialect<mlir::arith::ArithDialect>();
     mlir_context_->getOrLoadDialect<helix::low::HelixLowDialect>();
     mlir_context_->getOrLoadDialect<helix::high::HelixHighDialect>();
 
@@ -84,8 +93,6 @@ HelixStatus Engine::decompile(
     }
 
     // Phase 2 stub for binary input: needs Remill lifter integration.
-    // For now, inform the caller that binary decompilation requires
-    // LLVM IR input through decompileIR().
     last_error_ = "Binary decompilation requires Remill lifter. Use decompileIR() with LLVM IR text.";
     return HELIX_ERROR_INTERNAL;
 }
@@ -108,6 +115,12 @@ HelixStatus Engine::decompileIR(
     }
 
     // Run the full MLIR decompilation pipeline.
+    //
+    // NOTE: MLIR can recurse deeply on large IR inputs (400+ SSA values
+    // in a single basic block).  Callers MUST ensure adequate stack space:
+    //   - helix_tool.exe: /STACK:16777216 set in CMakeLists.txt
+    //   - Rust FFI: caller spawns a thread with 16 MB stack via
+    //     std::thread::Builder::stack_size()
     llvm::StringRef irStr(ir_text, ir_len);
     auto result = pipeline_->decompile(irStr);
 
@@ -153,6 +166,7 @@ HelixStatus Engine::decompileIRText(
     }
 
     // Run the full MLIR decompilation pipeline.
+    // Stack requirements documented in decompileIR().
     llvm::StringRef irStr(ir_text, ir_len);
     auto result = pipeline_->decompile(irStr);
 

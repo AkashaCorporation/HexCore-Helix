@@ -15,11 +15,6 @@ using namespace helix::low;
 
 #include "helix/dialects/HelixLowEnums.cpp.inc"
 
-// ─── Type definitions ────────────────────────────────────────────────────────
-
-#define GET_TYPEDEF_CLASSES
-#include "helix/dialects/HelixLowTypes.cpp.inc"
-
 // ─── Op definitions ──────────────────────────────────────────────────────────
 
 #define GET_OP_CLASSES

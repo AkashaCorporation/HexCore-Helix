@@ -54,11 +54,12 @@ if(HELIX_USE_LLVM)
     else()
         message(STATUS "Found mlir-tblgen: ${MLIR_TBLGEN_EXE}")
 
-        # TableGen include paths
-        set(TBLGEN_INCLUDES
-            -I${MLIR_INCLUDE_DIRS}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-        )
+        # TableGen include paths — MLIR_INCLUDE_DIRS may have multiple entries
+        set(TBLGEN_INCLUDES "")
+        foreach(inc_dir ${MLIR_INCLUDE_DIRS})
+            list(APPEND TBLGEN_INCLUDES "-I${inc_dir}")
+        endforeach()
+        list(APPEND TBLGEN_INCLUDES "-I${CMAKE_CURRENT_SOURCE_DIR}")
 
         # ── HelixLow Dialect TableGen ────────────────────────────────────
         set(HELIX_LOW_TD ${HELIX_TABLEGEN_DIR}/HelixLowOps.td)
@@ -229,6 +230,7 @@ set(HELIX_SOURCES
     src/analysis/SignatureDb.cpp
 
     # Passes
+    src/passes/Passes.cpp
     src/passes/RemillToHelixLow.cpp
     src/passes/RecoverStackLayout.cpp
     src/passes/RecoverCallingConvention.cpp
@@ -311,6 +313,8 @@ if(HELIX_USE_LLVM)
         MLIRLLVMDialect
         MLIRLLVMCommonConversion
         MLIRTargetLLVMIRImport
+        MLIRLLVMIRToLLVMTranslation
+        MLIRLLVMIRToNVVMTranslation
 
         # Built-in passes
         MLIRTransformUtils
@@ -320,6 +324,15 @@ if(HELIX_USE_LLVM)
         MLIRControlFlowInterfaces
         MLIRFunctionInterfaces
         MLIRInferTypeOpInterface
+
+        # Arith Dialect (arith::ConstantOp, ShRUIOp, etc. in RecoverVariables)
+        MLIRArithDialect
+
+        # Control Flow Dialect (cf::BranchOp in StructureControlFlow)
+        MLIRControlFlowDialect
+
+        # DLTI Dialect (required by translateLLVMIRToModule for data layout)
+        MLIRDLTIDialect
     )
 endif()
 
@@ -342,6 +355,15 @@ if(HELIX_BUILD_TOOLS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_BINARY_DIR}/include
     )
+
+    # MLIR's internal recursion can blow the default 1 MB stack on large IR
+    # inputs.  Set the PE default stack reserve to 16 MB so that both the
+    # main thread and any std::thread spawned by the engine get enough room.
+    if(MSVC)
+        target_link_options(helix_tool PRIVATE /STACK:67108864)
+    else()
+        # On Linux/macOS, control via ulimit or pthread_attr; linker flags vary.
+    endif()
 
     install(TARGETS helix_tool RUNTIME DESTINATION bin)
 endif()

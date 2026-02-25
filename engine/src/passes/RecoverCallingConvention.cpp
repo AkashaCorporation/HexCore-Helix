@@ -99,7 +99,7 @@ private:
                 // If this register is read before any write, it's a parameter
                 if (!writtenRegs.contains(name)) {
                     for (auto argReg : argRegs) {
-                        if (name == argReg) {
+                        if (name == llvm::StringRef(argReg)) {
                             // Only add once
                             bool found = false;
                             for (auto& p : paramRegs) {

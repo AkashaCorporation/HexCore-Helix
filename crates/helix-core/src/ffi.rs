@@ -44,16 +44,6 @@ extern "C" {
     pub fn helix_engine_version() -> *const c_char;
 
     /// Decompile a function at the given address from the provided binary data.
-    ///
-    /// - `engine`: Valid engine handle
-    /// - `data`: Pointer to binary data
-    /// - `data_len`: Length of binary data in bytes
-    /// - `base_addr`: Base virtual address of the data
-    /// - `entry_addr`: Entry point address to decompile
-    /// - `out_buf`: Output buffer for the decompiled result (FlatBuffer)
-    /// - `out_len`: On input, capacity of `out_buf`. On output, bytes written.
-    ///
-    /// Returns a `HelixStatus` code.
     pub fn helix_engine_decompile(
         engine: *mut HelixEngineHandle,
         data: *const u8,
@@ -61,6 +51,24 @@ extern "C" {
         base_addr: u64,
         entry_addr: u64,
         out_buf: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
+
+    /// Decompile LLVM IR text through the MLIR pipeline, returning FlatBuffer output.
+    pub fn helix_engine_decompile_ir(
+        engine: *mut HelixEngineHandle,
+        ir_text: *const c_char,
+        ir_len: usize,
+        out_buf: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
+
+    /// Decompile LLVM IR text and return pseudo-C source code directly.
+    pub fn helix_engine_decompile_ir_text(
+        engine: *mut HelixEngineHandle,
+        ir_text: *const c_char,
+        ir_len: usize,
+        out_buf: *mut c_char,
         out_len: *mut usize,
     ) -> c_int;
 
@@ -142,6 +150,128 @@ impl EngineHandle {
                     });
                 }
 
+                out_buf.truncate(out_len);
+                return Ok(out_buf);
+            }
+
+            if status == HelixStatus::ErrorOutOfMemory {
+                let requested = if out_len > out_buf.len() {
+                    out_len
+                } else {
+                    out_buf.len().saturating_mul(2)
+                };
+
+                if requested > out_buf.len() && requested <= MAX_OUTPUT_CAPACITY {
+                    out_buf.resize(requested, 0);
+                    continue;
+                }
+            }
+
+            let msg = self.last_error().unwrap_or_else(|| status.to_string());
+            return Err(HelixError::Ffi {
+                status_code: status as i32,
+                message: msg,
+            });
+        }
+
+        Err(HelixError::Ffi {
+            status_code: HelixStatus::ErrorOutOfMemory as i32,
+            message: format!(
+                "Engine output exceeded configured buffer growth policy (max {} bytes)",
+                MAX_OUTPUT_CAPACITY
+            ),
+        })
+    }
+
+    /// Decompile LLVM IR text through the MLIR pipeline, returning pseudo-C source code.
+    ///
+    /// This is the **primary integration path** for the HexCore IDE.
+    /// Takes Remill-lifted LLVM IR and produces decompiled C-like source.
+    pub fn decompile_ir_text(&mut self, ir_text: &str) -> HelixResult<String> {
+        let mut out_buf: Vec<u8> = vec![0u8; INITIAL_OUTPUT_CAPACITY];
+
+        for _ in 0..MAX_REALLOC_ATTEMPTS {
+            let mut out_len = out_buf.len();
+
+            let status = unsafe {
+                helix_engine_decompile_ir_text(
+                    self.handle,
+                    ir_text.as_ptr() as *const c_char,
+                    ir_text.len(),
+                    out_buf.as_mut_ptr() as *mut c_char,
+                    &mut out_len,
+                )
+            };
+
+            let status = HelixStatus::from(status);
+            if status == HelixStatus::Ok {
+                // out_len includes the null terminator; strip it
+                let text_len = if out_len > 0 { out_len - 1 } else { 0 };
+                out_buf.truncate(text_len);
+                return String::from_utf8(out_buf).map_err(|e| HelixError::Ffi {
+                    status_code: HelixStatus::ErrorInternal as i32,
+                    message: format!("Engine returned invalid UTF-8: {}", e),
+                });
+            }
+
+            if status == HelixStatus::ErrorOutOfMemory {
+                let requested = if out_len > out_buf.len() {
+                    out_len
+                } else {
+                    out_buf.len().saturating_mul(2)
+                };
+
+                if requested > out_buf.len() && requested <= MAX_OUTPUT_CAPACITY {
+                    out_buf.resize(requested, 0);
+                    continue;
+                }
+            }
+
+            let msg = self.last_error().unwrap_or_else(|| status.to_string());
+            return Err(HelixError::Ffi {
+                status_code: status as i32,
+                message: msg,
+            });
+        }
+
+        Err(HelixError::Ffi {
+            status_code: HelixStatus::ErrorOutOfMemory as i32,
+            message: format!(
+                "Engine output exceeded configured buffer growth policy (max {} bytes)",
+                MAX_OUTPUT_CAPACITY
+            ),
+        })
+    }
+
+    /// Decompile LLVM IR text through the MLIR pipeline, returning FlatBuffer bytes.
+    pub fn decompile_ir(&mut self, ir_text: &str) -> HelixResult<Vec<u8>> {
+        let mut out_buf: Vec<u8> = vec![0u8; INITIAL_OUTPUT_CAPACITY];
+
+        for _ in 0..MAX_REALLOC_ATTEMPTS {
+            let mut out_len = out_buf.len();
+
+            let status = unsafe {
+                helix_engine_decompile_ir(
+                    self.handle,
+                    ir_text.as_ptr() as *const c_char,
+                    ir_text.len(),
+                    out_buf.as_mut_ptr(),
+                    &mut out_len,
+                )
+            };
+
+            let status = HelixStatus::from(status);
+            if status == HelixStatus::Ok {
+                if out_len > out_buf.len() {
+                    return Err(HelixError::Ffi {
+                        status_code: HelixStatus::ErrorInternal as i32,
+                        message: format!(
+                            "Engine returned an invalid output length ({}) for capacity {}",
+                            out_len,
+                            out_buf.len()
+                        ),
+                    });
+                }
                 out_buf.truncate(out_len);
                 return Ok(out_buf);
             }

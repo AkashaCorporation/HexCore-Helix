@@ -34,7 +34,9 @@
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 
-#include "mlir/Analysis/Dominance.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -393,9 +395,10 @@ static unsigned convertCmovsToTernary(Region& region, OpBuilder& builder) {
         auto ternary = builder.create<helix::high::TernaryOp>(
             cmov.getLoc(),
             cmov.getResult().getType(),
-            cmov.getFlag(),           // i1 condition
-            cmov.getTrueVal(),        // value when condition is true
-            cmov.getFalseVal());      // value when condition is false
+            cmov.getFlagValue(),       // i1 condition
+            cmov.getTrueVal(),         // value when condition is true
+            cmov.getFalseVal(),        // value when condition is false
+            IntegerAttr{});            // address (none)
 
         // Replace all uses of the CMOV result with the ternary result.
         cmov.getResult().replaceAllUsesWith(ternary.getResult());
@@ -430,6 +433,8 @@ struct StructureControlFlowPass
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
         registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<mlir::arith::ArithDialect>();
+        registry.insert<mlir::cf::ControlFlowDialect>();
     }
 
     void runOnOperation() override {
@@ -623,18 +628,18 @@ private:
 
         // Create the helix_high.while operation.
         //
-        // The WhileOp takes a condition and has a body region.  In the MLIR
-        // model, the condition is evaluated each iteration; if false, control
-        // exits the while.
+        // The WhileOp takes a condition operand (i1) and has a body region.
+        // The condition is the loop entry guard; the body executes while true.
         auto whileOp = builder.create<helix::high::WhileOp>(
-            loc, condValue);
+            loc, condValue, IntegerAttr{});
 
         // Move loop body blocks into the while's body region.
-        Region& bodyRegion = whileOp.getBody();
+        Region& bodyRegion = whileOp.getBodyRegion();
         for (Block* block : loop.body) {
             if (block == loop.header)
                 continue;  // Header stays outside; its condition feeds the while
-            block->moveBefore(&bodyRegion, bodyRegion.end());
+            bodyRegion.getBlocks().splice(bodyRegion.end(),
+                block->getParent()->getBlocks(), block->getIterator());
         }
 
         // If the body region is empty (single-block loop), move the header's
@@ -655,8 +660,11 @@ private:
             Block& latchBlock = bodyRegion.back();
             if (auto* term = latchBlock.getTerminator()) {
                 builder.setInsertionPoint(term);
-                builder.create<helix::high::ContinueOp>(term->getLoc());
+                builder.create<helix::high::ContinueOp>(term->getLoc(), IntegerAttr{});
                 term->erase();
+            } else {
+                builder.setInsertionPointToEnd(&latchBlock);
+                builder.create<helix::high::ContinueOp>(loc, IntegerAttr{});
             }
         }
 
@@ -772,12 +780,13 @@ private:
 
         // Create the helix_high.if operation.
         auto ifOp = builder.create<helix::high::IfOp>(
-            loc, ifRegion.condition, ifRegion.hasElse);
+            loc, ifRegion.condition, IntegerAttr{});
 
         // Move then-blocks into the IfOp's then-region.
         Region& thenRegion = ifOp.getThenRegion();
         for (Block* block : ifRegion.thenBlocks) {
-            block->moveBefore(&thenRegion, thenRegion.end());
+            thenRegion.getBlocks().splice(thenRegion.end(),
+                block->getParent()->getBlocks(), block->getIterator());
         }
 
         // Ensure the then-region has a yield/terminator.
@@ -786,7 +795,7 @@ private:
             if (lastThen.empty() ||
                 !lastThen.back().hasTrait<OpTrait::IsTerminator>()) {
                 builder.setInsertionPointToEnd(&lastThen);
-                builder.create<helix::high::YieldOp>(loc);
+                builder.create<helix::high::YieldOp>(loc, mlir::Value{});
             }
         }
 
@@ -794,7 +803,8 @@ private:
         if (ifRegion.hasElse) {
             Region& elseRegion = ifOp.getElseRegion();
             for (Block* block : ifRegion.elseBlocks) {
-                block->moveBefore(&elseRegion, elseRegion.end());
+                elseRegion.getBlocks().splice(elseRegion.end(),
+                    block->getParent()->getBlocks(), block->getIterator());
             }
 
             // Ensure the else-region has a yield/terminator.
@@ -803,16 +813,20 @@ private:
                 if (lastElse.empty() ||
                     !lastElse.back().hasTrait<OpTrait::IsTerminator>()) {
                     builder.setInsertionPointToEnd(&lastElse);
-                    builder.create<helix::high::YieldOp>(loc);
+                    builder.create<helix::high::YieldOp>(loc, mlir::Value{});
                 }
             }
         }
 
         // Replace the original conditional branch with a fallthrough to the
         // merge block (if it exists).
+        builder.setInsertionPoint(terminator);
         if (ifRegion.mergeBlock) {
-            builder.setInsertionPoint(terminator);
             builder.create<cf::BranchOp>(loc, ifRegion.mergeBlock);
+        } else {
+            // If there's no merge block, both paths diverge (e.g. return).
+            // We must still terminate the block containing the IfOp.
+            builder.create<helix::low::RetOp>(loc, IntegerAttr{});
         }
         terminator->erase();
 
@@ -859,7 +873,8 @@ private:
         builder.setInsertionPointToStart(edge.target);
         builder.create<helix::high::LabelOp>(
             edge.target->front().getLoc(),
-            builder.getStringAttr(labelName));
+            builder.getStringAttr(labelName),
+            IntegerAttr{});
 
         // Replace the source block's branch to the target with a goto.
         auto* terminator = edge.source->getTerminator();
@@ -867,7 +882,8 @@ private:
             builder.setInsertionPoint(terminator);
             builder.create<helix::high::GotoOp>(
                 terminator->getLoc(),
-                builder.getStringAttr(labelName));
+                builder.getStringAttr(labelName),
+                IntegerAttr{});
 
             // Note: we do NOT erase the terminator here because it may have
             // other successors (e.g., the other branch of a cond_br) that

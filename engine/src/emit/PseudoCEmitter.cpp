@@ -10,6 +10,7 @@
 
 #include "helix/emit/PseudoCEmitter.h"
 #include "helix/dialects/HelixHighOps.h"
+#include "helix/dialects/HelixLowOps.h"
 
 #include "mlir/IR/BuiltinOps.h"
 

@@ -399,7 +399,7 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
     bool foundRead = false;
     bool foundOverwrite = false;
 
-    for (auto it = std::next(Operation::Iterator(writeOp));
+    for (auto it = std::next(writeOp->getIterator());
          it != block->end(); ++it) {
         Operation& op = *it;
 
@@ -428,7 +428,7 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
             };
             bool isVolatile = std::any_of(
                 std::begin(kVolatile), std::end(kVolatile),
-                [&](std::string_view v) { return v == regName; });
+                [&](std::string_view v) { return v == std::string_view(regName); });
 
             if (isVolatile) {
                 foundOverwrite = true;

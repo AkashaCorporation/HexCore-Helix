@@ -15,11 +15,6 @@ using namespace helix::high;
 
 #include "helix/dialects/HelixHighEnums.cpp.inc"
 
-// ─── Type definitions ────────────────────────────────────────────────────────
-
-#define GET_TYPEDEF_CLASSES
-#include "helix/dialects/HelixHighTypes.cpp.inc"
-
 // ─── Op definitions ──────────────────────────────────────────────────────────
 
 #define GET_OP_CLASSES

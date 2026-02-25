@@ -29,7 +29,7 @@ def HelixLow_Dialect : Dialect {
   }];
 
   let useDefaultTypePrinterParser = 1;
-  let useDefaultAttributePrinterParser = 1;
+  let useDefaultAttributePrinterParser = 0;
 }
 
 #endif // HELIX_LOW_DIALECT_TD

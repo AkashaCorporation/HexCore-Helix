@@ -5,7 +5,8 @@
 #define HELIX_HIGH_TYPES_TD
 
 include "mlir/IR/AttrTypeBase.td"
-include "engine/dialects/HelixHighDialect.td"
+include "mlir/IR/EnumAttr.td"
+include "dialects/HelixHighDialect.td"
 
 class HelixHigh_Type<string name, string typeMnemonic, list<Trait> traits = []>
     : TypeDef<HelixHigh_Dialect, name, traits> {
@@ -50,7 +51,7 @@ def HelixHigh_CType : HelixHigh_Type<"CType", "ctype"> {
   }];
 
   let parameters = (ins
-    HelixHigh_TypeKind:$kind,
+    EnumParameter<HelixHigh_TypeKind>:$kind,
     DefaultValuedParameter<"bool", "true">:$is_signed,
     DefaultValuedParameter<"unsigned", "0">:$bit_width,
     OptionalParameter<"mlir::StringAttr">:$struct_name

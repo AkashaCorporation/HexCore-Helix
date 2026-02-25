@@ -277,40 +277,85 @@ private:
         auto helixFunc = builder.create<helix::low::FuncOp>(
             llvmFunc.getLoc(),
             builder.getStringAttr(funcName),
-            builder.getUI64IntegerAttr(entryAddr),
+            IntegerAttr::get(
+                IntegerType::get(builder.getContext(), 64,
+                                 IntegerType::Unsigned),
+                entryAddr),
             /*original_name=*/StringAttr{});
 
         // Create the entry block in the HelixLow function.
         auto* entryBlock = new Block();
         helixFunc.getBody().push_back(entryBlock);
+
+        // Create a dummy block for unresolved branches.
+        auto* dummyBlock = new Block();
+        helixFunc.getBody().push_back(dummyBlock);
+        
+        // The dummy block needs a terminator to be valid.
+        builder.setInsertionPointToStart(dummyBlock);
+        builder.create<helix::low::RetOp>(llvmFunc.getLoc(), IntegerAttr{});
+
+        // Set insertion point to start of entry block
         builder.setInsertionPointToStart(entryBlock);
 
-        // Walk the original function's operations and convert them.
-        PCTracker pcTracker;
-        auto& llvmBody = llvmFunc.getBody();
-
-        for (auto& block : llvmBody) {
-            for (auto& op : block.getOperations()) {
-                // Track PC updates.
-                if (auto store = dyn_cast<LLVM::StoreOp>(&op)) {
-                    pcTracker.trackStore(store, regs);
-                }
-
-                convertOperation(&op, builder, regs, pcTracker);
+        // Replace all block arguments across the entire llvmFunc with UndefOps
+        // to prevent moved operations from referencing out-of-region arguments.
+        for (auto& block : llvmFunc.getBody()) {
+            for (auto arg : block.getArguments()) {
+                Value undef = builder.create<LLVM::UndefOp>(llvmFunc.getLoc(), arg.getType());
+                arg.replaceAllUsesWith(undef);
             }
         }
 
-        // Add a terminator if the block doesn't have one.
-        if (entryBlock->empty() ||
-            !entryBlock->back().hasTrait<OpTrait::IsTerminator>()) {
-            auto addr = pcTracker.has_pc
-                ? builder.getUI64IntegerAttr(pcTracker.current_pc)
-                : IntegerAttr{};
-            builder.create<helix::low::RetOp>(
-                llvmFunc.getLoc(), addr);
+        // Walk the original function's operations and convert them.
+        PCTracker pcTracker;
+        for (auto& block : llvmFunc.getBody()) {
+            for (auto it = block.begin(), e = block.end(); it != e; ) {
+                Operation* op = &*it;
+                it++;
+
+                // Move all non-terminator operations to the new HelixLow function.
+                // This guarantees that any value produced by the LLVM operation and used
+                // by newly created HelixLow ops resides in the same region.
+                bool isTerminator = op->hasTrait<OpTrait::IsTerminator>();
+                if (!isTerminator) {
+                    op->moveBefore(builder.getBlock(), builder.getInsertionPoint());
+                }
+
+                // Track PC updates.
+                if (auto store = dyn_cast<LLVM::StoreOp>(op)) {
+                    pcTracker.trackStore(store, regs);
+                }
+
+                convertOperation(op, builder, regs, pcTracker, dummyBlock);
+            }
         }
 
-        // Remove the original LLVM function.
+        // Clean up blocks: ensure all have terminators, remove empty trailing blocks.
+        for (auto it = helixFunc.getBody().begin(), e = helixFunc.getBody().end(); it != e; ) {
+            auto& blk = *it;
+            if (blk.empty() && &blk != &helixFunc.getBody().front()) {
+                // Remove empty blocks (except the entry block).
+                Block* blockToErase = &blk;
+                it++;
+                blockToErase->erase();
+                continue;
+            }
+            if (blk.empty() || !blk.back().hasTrait<OpTrait::IsTerminator>()) {
+                builder.setInsertionPointToEnd(&blk);
+                auto addr = pcTracker.has_pc
+                    ? IntegerAttr::get(
+                          IntegerType::get(builder.getContext(), 64,
+                                           IntegerType::Unsigned),
+                          pcTracker.current_pc)
+                    : IntegerAttr{};
+                builder.create<helix::low::RetOp>(llvmFunc.getLoc(), addr);
+            }
+            ++it;
+        }
+
+        // We can now safely erase the original LLVM function, because all the operations
+        // producing values that HelixLow operations consume have been MOVED to helixFunc.
         llvmFunc.erase();
 
         return success();
@@ -319,10 +364,16 @@ private:
     /// Convert a single LLVM Dialect operation to HelixLow.
     void convertOperation(Operation* op, OpBuilder& builder,
                           const RegisterTracker& regs,
-                          PCTracker& pcTracker) {
+                          PCTracker& pcTracker,
+                          Block* dummyBlock) {
         auto loc = op->getLoc();
+        // Build address attribute as UI64 (unsigned 64-bit int) to satisfy
+        // OptionalAttr<UI64Attr> constraints in HelixLowOps.td.
         auto addrAttr = pcTracker.has_pc
-            ? builder.getUI64IntegerAttr(pcTracker.current_pc)
+            ? IntegerAttr::get(
+                  IntegerType::get(builder.getContext(), 64,
+                                   IntegerType::Unsigned),
+                  pcTracker.current_pc)
             : IntegerAttr{};
 
         // ─── Pattern: Load from register pointer ─────────────────────────
@@ -425,7 +476,7 @@ private:
             if (semInfo->is_helper)
                 return;
 
-            convertSemantic(call, builder, regs, *semInfo, addrAttr, loc);
+            convertSemantic(call, builder, regs, *semInfo, addrAttr, loc, dummyBlock);
             return;
         }
 
@@ -440,6 +491,10 @@ private:
         // ─── Pattern: Return — emit HelixLow ret ────────────────────────
         if (isa<LLVM::ReturnOp>(op)) {
             builder.create<helix::low::RetOp>(loc, addrAttr);
+            // Terminators must be at the end of the block.
+            auto* nextBlock = new Block();
+            builder.getBlock()->getParent()->push_back(nextBlock);
+            builder.setInsertionPointToStart(nextBlock);
             return;
         }
 
@@ -452,11 +507,21 @@ private:
         // Other LLVM ops are currently ignored (will be handled as passes mature).
     }
 
+    /// Helper to cast pointers to i64 for arithmetic/logic operations
+    Value ensureInt64(Value val, OpBuilder& builder, Location loc) {
+        if (isa<LLVM::LLVMPointerType>(val.getType())) {
+            return builder.create<LLVM::PtrToIntOp>(
+                loc, builder.getI64Type(), val);
+        }
+        return val;
+    }
+
     /// Convert a recognized Remill semantic function call to HelixLow ops.
     void convertSemantic(LLVM::CallOp call, OpBuilder& builder,
                          const RegisterTracker& regs,
                          const RemillSemanticInfo& semInfo,
-                         IntegerAttr addrAttr, Location loc) {
+                         IntegerAttr addrAttr, Location loc,
+                         Block* dummyBlock) {
         auto semantic = semInfo.semantic;
 
         // Determine the working integer type (default 64-bit for x86_64).
@@ -493,9 +558,9 @@ private:
                     /*zero_flag=*/i1Ty,
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
-                    builder.getI32IntegerAttr(static_cast<int32_t>(*kind)),
-                    call.getOperand(2),   // lhs (often reg value)
-                    call.getOperand(3),   // rhs (src/imm)
+                    *kind,
+                    ensureInt64(call.getOperand(2), builder, loc),   // lhs (often reg value)
+                    ensureInt64(call.getOperand(3), builder, loc),   // rhs (src/imm)
                     addrAttr);
             }
             break;
@@ -510,8 +575,8 @@ private:
                     /*zero_flag=*/i1Ty,
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
-                    call.getOperand(2),
-                    call.getOperand(3),
+                    ensureInt64(call.getOperand(2), builder, loc),
+                    ensureInt64(call.getOperand(3), builder, loc),
                     addrAttr);
             }
             break;
@@ -523,8 +588,8 @@ private:
                     loc,
                     /*zero_flag=*/i1Ty,
                     /*sign_flag=*/i1Ty,
-                    call.getOperand(2),
-                    call.getOperand(3),
+                    ensureInt64(call.getOperand(2), builder, loc),
+                    ensureInt64(call.getOperand(3), builder, loc),
                     addrAttr);
             }
             break;
@@ -544,17 +609,27 @@ private:
                 auto regName = regs.getRegName(destRegPtr);
                 if (regName) {
                     unsigned width = RegisterTracker::inferRegWidth(*regName);
+                    auto intTy = builder.getIntegerType(width);
+                    Value finalVal = srcValue;
+                    if (isa<LLVM::LLVMPointerType>(finalVal.getType())) {
+                        finalVal = builder.create<LLVM::PtrToIntOp>(loc, intTy, finalVal);
+                    }
                     builder.create<helix::low::RegWriteOp>(
                         loc,
-                        srcValue,
+                        finalVal,
                         builder.getStringAttr(*regName),
                         builder.getUI32IntegerAttr(width),
                         addrAttr);
                 } else {
+                    Value finalVal = srcValue;
+                    if (isa<LLVM::LLVMPointerType>(finalVal.getType())) {
+                        finalVal = builder.create<LLVM::PtrToIntOp>(
+                            loc, builder.getI64Type(), finalVal);
+                    }
                     // Unknown destination — emit as a generic 64-bit reg.write.
                     builder.create<helix::low::RegWriteOp>(
                         loc,
-                        srcValue,
+                        finalVal,
                         builder.getStringAttr("unknown"),
                         builder.getUI32IntegerAttr(64),
                         addrAttr);
@@ -565,10 +640,15 @@ private:
 
         case RemillSemantic::MOVZX: {
             if (call.getNumOperands() >= 3) {
+                Value operand = call.getOperand(2);
+                if (isa<LLVM::LLVMPointerType>(operand.getType())) {
+                    operand = builder.create<LLVM::PtrToIntOp>(
+                        loc, builder.getI64Type(), operand);
+                }
                 builder.create<helix::low::MovZxOp>(
                     loc,
                     i64Ty,
-                    call.getOperand(2),
+                    operand,
                     builder.getUI32IntegerAttr(64),
                     addrAttr);
             }
@@ -582,7 +662,7 @@ private:
                 builder.create<helix::low::MovSxOp>(
                     loc,
                     i64Ty,
-                    call.getOperand(2),
+                    ensureInt64(call.getOperand(2), builder, loc),
                     builder.getUI32IntegerAttr(64),
                     addrAttr);
             }
@@ -622,6 +702,10 @@ private:
 
         case RemillSemantic::RET: {
             builder.create<helix::low::RetOp>(loc, addrAttr);
+            // Terminators must be at the end of the block.
+            auto* nextBlock = new Block();
+            builder.getBlock()->getParent()->push_back(nextBlock);
+            builder.setInsertionPointToStart(nextBlock);
             break;
         }
 
@@ -632,8 +716,13 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::JmpOp>(
                     loc,
-                    call.getOperand(2),  // target address
-                    addrAttr);
+                    /*target_addr=*/IntegerAttr{},
+                    /*address=*/addrAttr,
+                    /*dest=*/dummyBlock);
+                // Terminators must be at the end of the block.
+                auto* nextBlock = new Block();
+                builder.getBlock()->getParent()->push_back(nextBlock);
+                builder.setInsertionPointToStart(nextBlock);
             }
             break;
         }
@@ -666,11 +755,15 @@ private:
 
                 builder.create<helix::low::JccOp>(
                     loc,
-                    builder.getStringAttr(*condStr),
-                    flagVal,
-                    call.getOperand(3),  // taken target address
-                    call.getOperand(4),  // fallthrough address
-                    addrAttr);
+                    *condStr,             // condition
+                    flagVal,              // flag_value
+                    addrAttr,             // address
+                    dummyBlock,           // trueDest (placeholder)
+                    dummyBlock);          // falseDest (placeholder)
+                // Terminators must be at the end of the block.
+                auto* nextBlock = new Block();
+                builder.getBlock()->getParent()->push_back(nextBlock);
+                builder.setInsertionPointToStart(nextBlock);
             }
             break;
         }
@@ -712,8 +805,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Bsf)),
+                    helix::low::UnaryOpKind::Bsf,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -724,8 +816,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Bsr)),
+                    helix::low::UnaryOpKind::Bsr,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -736,8 +827,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Bswap)),
+                    helix::low::UnaryOpKind::Bswap,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -748,8 +838,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Neg)),
+                    helix::low::UnaryOpKind::Neg,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -760,8 +849,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Not)),
+                    helix::low::UnaryOpKind::Not,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -772,8 +860,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Inc)),
+                    helix::low::UnaryOpKind::Inc,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -784,8 +871,7 @@ private:
             if (call.getNumOperands() >= 3) {
                 builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    builder.getI32IntegerAttr(
-                        static_cast<int32_t>(helix::low::UnaryOpKind::Dec)),
+                    helix::low::UnaryOpKind::Dec,
                     call.getOperand(2),
                     addrAttr);
             }
@@ -826,12 +912,13 @@ private:
             if (call.getNumOperands() >= 4) {
                 auto zero = builder.create<LLVM::ConstantOp>(
                     loc, i64Ty, builder.getI64IntegerAttr(0));
+                auto signedI64Ty = IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
                 builder.create<helix::low::LeaOp>(
                     loc, i64Ty,
-                    call.getOperand(2),   // base
-                    call.getOperand(3),   // index
+                    ensureInt64(call.getOperand(2), builder, loc),   // base
+                    ensureInt64(call.getOperand(3), builder, loc),   // index
                     builder.getUI32IntegerAttr(1),  // scale
-                    builder.getSI64IntegerAttr(0),   // displacement
+                    IntegerAttr::get(signedI64Ty, 0), // displacement
                     addrAttr);
             }
             break;

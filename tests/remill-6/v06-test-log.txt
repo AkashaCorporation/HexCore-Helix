@@ -1,0 +1,41 @@
+   Compiling cfg-if v1.0.4
+   Compiling getrandom v0.3.4
+   Compiling zerocopy v0.8.39
+   Compiling getrandom v0.4.1
+   Compiling autocfg v1.5.0
+   Compiling windows-sys v0.61.2
+   Compiling once_cell v1.21.3
+   Compiling fastrand v2.3.0
+   Compiling fnv v1.0.7
+   Compiling serde v1.0.228
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling num-traits v0.2.19
+   Compiling serde_derive v1.0.228
+   Compiling bit-set v0.8.0
+   Compiling unarray v0.1.4
+   Compiling rand_core v0.9.5
+   Compiling tempfile v3.26.0
+   Compiling regex-syntax v0.8.10
+   Compiling rand_xorshift v0.4.0
+   Compiling rusty-fork v0.3.1
+   Compiling rand v0.9.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.10.0
+   Compiling helix-core v0.1.0 (C:\Users\Mazum\Desktop\HexCore-Helix-Original\HexCore-Helix\crates\helix-core)
+    Finished `release` profile [optimized] target(s) in 42.46s
+     Running `target\release\examples\test_mlir_v06.exe tests/remill-6/01-name-writing.ll`
+ÔòöÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòù
+Ôòæ  HexCore Helix v06 Test ÔÇö MLIR vs Rust Pipeline Comparison  Ôòæ
+ÔòÜÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòØ
+
+  Input: tests/remill-6/01-name-writing.ll
+  IR size: 49532 bytes (915 lines)
+
+ÔöüÔöüÔöü Test 1: C++ MLIR Engine ÔöüÔöüÔöü
+  Engine version: 0.2.0-mlir
+  Creating engine took: 2.6054ms
+Assertion failed: llvm::is_contained(context->getAvailableDialects(), DLTIDialect::getDialectNamespace()), file C:\Users\Mazum\Desktop\caps\llvm-build\llvm-project-18.1.8.src\mlir\lib\Target\LLVMIR\ModuleImport.cpp, line 2043
+error: process didn't exit successfully: `target\release\examples\test_mlir_v06.exe tests/remill-6/01-name-writing.ll` (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)

@@ -28,7 +28,7 @@ def HelixHigh_Dialect : Dialect {
   }];
 
   let useDefaultTypePrinterParser = 1;
-  let useDefaultAttributePrinterParser = 1;
+  let useDefaultAttributePrinterParser = 0;
 }
 
 #endif // HELIX_HIGH_DIALECT_TD
