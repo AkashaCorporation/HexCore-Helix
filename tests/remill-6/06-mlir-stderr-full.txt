@@ -1,1 +1,0 @@
-error: decompilation failed for "01-name-writing.ll": decompile: stage 3 (passes) failed: runPasses: MLIR pass pipeline failed: 'helix_low.func' op attribute 'entry_address' failed to satisfy constraint: 64-bit unsigned integer attribute

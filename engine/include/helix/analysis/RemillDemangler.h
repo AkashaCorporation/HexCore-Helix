@@ -42,10 +42,23 @@ enum class RemillSemantic {
     NOP, INT3, SYSCALL, CPUID,
     // x87 FPU (future)
     FLD, FST, FSTP, FADD, FSUB, FMUL, FDIV,
-    // SSE/AVX (future)
+    // SSE/AVX scalar
     MOVSS, MOVSD, MOVAPS, MOVUPS, ADDSS, ADDSD,
     MULSS, MULSD, SUBSS, SUBSD, DIVSS, DIVSD,
     XORPS, XORPD, PXOR,
+    // SSE/AVX packed & misc
+    MOVxPS, MOVSS_MEM, SHUFPS, SUBPS, ADDPS, MULPS,
+    COMISS, UNPCKHPS,
+    // SETcc (conditional byte set)
+    SETcc,
+    // CMPXCHG
+    CMPXCHG,
+    // PREFETCH (hint, no semantic effect)
+    PREFETCH,
+    // CDQ/CDQE variants with explicit register suffix
+    CDQ_EAX, CDQE_EAX,
+    // HandleUnsupported (Remill catch-all for unlifted instructions)
+    HANDLE_UNSUPPORTED,
     // Unrecognized
     Unknown,
 };

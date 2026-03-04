@@ -24,6 +24,7 @@ add_executable(helix_tests
     RemillDemanglerTest.cpp
     Remill6DemanglerTest.cpp
     Remill6IntegrationTest.cpp
+    IntegrationPipelineTest.cpp
     EmitterTest.cpp
 )
 

@@ -1,6 +1,6 @@
 /// @file StructureControlFlow.cpp
 /// @brief MLIR pass: transforms flat basic blocks with branches into structured
-///        control flow (if/else, while, goto/label).
+///        control flow (if/else, while, do-while, goto/label).
 ///
 /// This is the most complex pass in the Helix pipeline.  It operates on a
 /// HelixLow-level function that has been lowered to a flat CFG (basic blocks
@@ -15,11 +15,10 @@
 ///      a natural loop with header B.
 ///   4. For each natural loop, collect the loop body via a reverse walk from
 ///      the latch to the header, then replace the sub-CFG with a single
-///      `helix_high.while` operation carrying a region.
+///      `helix_high.while` or `helix_high.do_while` operation.
 ///   5. Identify forward conditional branches (target does NOT dominate source)
-///      and replace them with `helix_high.if` operations.  When the last
-///      operation before the merge point is an unconditional branch forward,
-///      an else region is emitted.
+///      and replace them with `helix_high.if` operations.  Relaxed convergence
+///      detection walks multiple blocks to find the merge point.
 ///   6. Convert `helix_low.cmov` operations to `helix_high.ternary`.
 ///   7. Any remaining branches that cannot be structured (irreducible control
 ///      flow) are lowered to `helix_high.goto` / `helix_high.label` pairs.
@@ -40,6 +39,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Region.h"
@@ -70,10 +70,11 @@ using namespace helix;
 // Statistics
 // ═══════════════════════════════════════════════════════════════════════════════
 
-STATISTIC(NumWhileRecovered,   "Number of while loops recovered");
-STATISTIC(NumIfRecovered,      "Number of if/else blocks recovered");
-STATISTIC(NumTernaryRecovered, "Number of CMOV -> ternary conversions");
-STATISTIC(NumGotoEmitted,      "Number of goto/label pairs emitted (irreducible)");
+STATISTIC(NumWhileRecovered,    "Number of while loops recovered");
+STATISTIC(NumDoWhileRecovered,  "Number of do-while loops recovered");
+STATISTIC(NumIfRecovered,       "Number of if/else blocks recovered");
+STATISTIC(NumTernaryRecovered,  "Number of CMOV -> ternary conversions");
+STATISTIC(NumGotoEmitted,       "Number of goto/label pairs emitted (irreducible)");
 
 namespace {
 
@@ -155,10 +156,6 @@ struct IfRegion {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Classify a CFG edge relative to the dominator tree.
-///
-/// @param edge  The directed edge to classify.
-/// @param dom   Precomputed dominance information.
-/// @return      The edge classification.
 static EdgeKind classifyEdge(const CFGEdge& edge, const DominanceInfo& dom) {
     if (dom.dominates(edge.target, edge.source))
         return EdgeKind::BackEdge;
@@ -168,9 +165,6 @@ static EdgeKind classifyEdge(const CFGEdge& edge, const DominanceInfo& dom) {
 }
 
 /// Collect all CFG edges within a region by examining block terminators.
-///
-/// @param region  The region (function body) to scan.
-/// @return        A vector of all directed edges in the CFG.
 static llvm::SmallVector<CFGEdge, 16> collectCFGEdges(Region& region) {
     llvm::SmallVector<CFGEdge, 16> edges;
 
@@ -183,15 +177,182 @@ static llvm::SmallVector<CFGEdge, 16> collectCFGEdges(Region& region) {
     return edges;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCC-Based Loop Detection (Tarjan's Algorithm)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of SCC loop detection — a set of blocks forming a loop.
+struct SCCLoop {
+    Block* header = nullptr;
+    llvm::SmallSetVector<Block*, 8> body;
+    Value exitCondition;
+    Block* exitBlock = nullptr;
+};
+
+/// Run Tarjan's SCC on the function CFG to detect all loops (including
+/// irreducible ones that dominance-only detection misses).
+///
+/// For each SCC with ≥2 blocks, we have a loop. The header is chosen as
+/// the block with the most predecessors from outside the SCC.
+static llvm::SmallVector<SCCLoop, 4>
+findSCCLoops(Region& funcBody,
+             const llvm::SmallPtrSet<Block*, 16>& alreadyStructured) {
+    llvm::SmallVector<SCCLoop, 4> loops;
+
+    // Collect all blocks in the region.
+    llvm::SmallVector<Block*, 32> allBlocks;
+    llvm::DenseMap<Block*, unsigned> blockIndex;
+    for (auto& block : funcBody) {
+        blockIndex[&block] = allBlocks.size();
+        allBlocks.push_back(&block);
+    }
+
+    if (allBlocks.empty()) return loops;
+
+    // Tarjan's SCC state.
+    unsigned indexCounter = 0;
+    llvm::DenseMap<Block*, unsigned> disc;      // discovery index
+    llvm::DenseMap<Block*, unsigned> low;       // low-link value
+    llvm::DenseMap<Block*, bool> onStack;
+    llvm::SmallVector<Block*, 32> stack;
+    llvm::SmallVector<llvm::SmallVector<Block*, 8>, 8> sccs;
+
+    // Iterative Tarjan's to avoid deep recursion on large CFGs.
+    struct TarjanFrame {
+        Block* block;
+        unsigned succIdx;
+    };
+
+    auto strongConnect = [&](Block* startBlock) {
+        llvm::SmallVector<TarjanFrame, 32> frames;
+        disc[startBlock] = low[startBlock] = indexCounter++;
+        stack.push_back(startBlock);
+        onStack[startBlock] = true;
+        frames.push_back({startBlock, 0});
+
+        while (!frames.empty()) {
+            auto& frame = frames.back();
+            Block* v = frame.block;
+            auto successors = v->getSuccessors();
+
+            if (frame.succIdx < successors.size()) {
+                Block* w = successors[frame.succIdx];
+                frame.succIdx++;
+
+                // Only consider blocks within this region.
+                if (!blockIndex.count(w))
+                    continue;
+
+                if (!disc.count(w)) {
+                    // Tree edge — recurse.
+                    disc[w] = low[w] = indexCounter++;
+                    stack.push_back(w);
+                    onStack[w] = true;
+                    frames.push_back({w, 0});
+                } else if (onStack.lookup(w)) {
+                    // Back edge.
+                    low[v] = std::min(low[v], disc[w]);
+                }
+            } else {
+                // Done with all successors of v.
+                if (low[v] == disc[v]) {
+                    // v is the root of an SCC.
+                    llvm::SmallVector<Block*, 8> scc;
+                    Block* w;
+                    do {
+                        w = stack.pop_back_val();
+                        onStack[w] = false;
+                        scc.push_back(w);
+                    } while (w != v);
+
+                    if (scc.size() >= 2) {
+                        sccs.push_back(std::move(scc));
+                    }
+                }
+
+                frames.pop_back();
+                if (!frames.empty()) {
+                    Block* parent = frames.back().block;
+                    low[parent] = std::min(low[parent], low[v]);
+                }
+            }
+        }
+    };
+
+    // Run Tarjan's from every unvisited block.
+    for (Block* block : allBlocks) {
+        if (!disc.count(block))
+            strongConnect(block);
+    }
+
+    // Convert each SCC into an SCCLoop descriptor.
+    for (auto& scc : sccs) {
+        // Skip if any block is already structured.
+        bool anyStructured = false;
+        for (Block* b : scc) {
+            if (alreadyStructured.count(b)) {
+                anyStructured = true;
+                break;
+            }
+        }
+        if (anyStructured) continue;
+
+        SCCLoop loop;
+        llvm::SmallPtrSet<Block*, 8> sccSet(scc.begin(), scc.end());
+
+        // Pick header: block with the most predecessors from *outside* the SCC.
+        unsigned maxExternalPreds = 0;
+        Block* bestHeader = scc[0];
+        for (Block* b : scc) {
+            unsigned externalPreds = 0;
+            for (Block* pred : b->getPredecessors()) {
+                if (!sccSet.count(pred))
+                    externalPreds++;
+            }
+            if (externalPreds > maxExternalPreds) {
+                maxExternalPreds = externalPreds;
+                bestHeader = b;
+            }
+        }
+        loop.header = bestHeader;
+
+        // Add all SCC blocks to the body, header first.
+        loop.body.insert(loop.header);
+        for (Block* b : scc) {
+            if (b != loop.header)
+                loop.body.insert(b);
+        }
+
+        // Find exit edges (SCC block → non-SCC block) and extract condition.
+        for (Block* b : scc) {
+            auto* term = b->getTerminator();
+            if (!term) continue;
+
+            for (Block* succ : term->getSuccessors()) {
+                if (!sccSet.count(succ)) {
+                    // This is an exit edge.
+                    loop.exitBlock = succ;
+
+                    // If the terminator is a conditional branch,
+                    // extract the exit condition.
+                    if (term->getNumSuccessors() == 2 &&
+                        term->getNumOperands() >= 1) {
+                        loop.exitCondition = term->getOperand(0);
+                    }
+                    break;
+                }
+            }
+            if (loop.exitBlock) break;
+        }
+
+        loops.push_back(std::move(loop));
+    }
+
+    return loops;
+}
+
 /// Collect the natural loop body for a back-edge by walking backwards from
 /// the latch to the header.
-///
-/// Starting from the latch, we add each predecessor to the worklist until we
-/// reach the header.  All visited blocks form the loop body.
-///
-/// @param header  The loop header (dominator / destination of back-edge).
-/// @param latch   The latch block (source of back-edge).
-/// @return        The set of blocks comprising the loop body.
 static llvm::SmallSetVector<Block*, 8>
 collectLoopBody(Block* header, Block* latch) {
     llvm::SmallSetVector<Block*, 8> body;
@@ -213,8 +374,6 @@ collectLoopBody(Block* header, Block* latch) {
         Block* current = worklist.pop_back_val();
         for (auto* pred : current->getPredecessors()) {
             if (body.insert(pred)) {
-                // Only add to worklist if we haven't visited this block yet
-                // and it's not the header (we don't walk past the header).
                 if (pred != header) {
                     worklist.push_back(pred);
                 }
@@ -233,11 +392,6 @@ collectLoopBody(Block* header, Block* latch) {
 ///
 /// For a branch at the header: `cond_br %cond, ^body, ^exit`
 ///   -> condition is `%cond`, loop is while style.
-///
-/// @param block         The block to examine (header or latch).
-/// @param header        The loop header for reference.
-/// @param[out] atLatch  Set to true if the condition was found at the latch.
-/// @return              The condition Value, or nullptr if not recoverable.
 static Value extractLoopCondition(Block* block, Block* header,
                                   bool& atLatch) {
     auto* terminator = block->getTerminator();
@@ -248,9 +402,6 @@ static Value extractLoopCondition(Block* block, Block* header,
     if (terminator->getNumSuccessors() != 2)
         return nullptr;
 
-    // In MLIR, the standard pattern for a conditional branch is:
-    //   cf.cond_br %cond, ^trueBlock, ^falseBlock
-    // or a dialect-specific conditional branch.
     if (terminator->getNumOperands() >= 1) {
         auto cond = terminator->getOperand(0);
         auto successors = terminator->getSuccessors();
@@ -266,16 +417,110 @@ static Value extractLoopCondition(Block* block, Block* header,
     return nullptr;
 }
 
+/// Find the merge block for an if/else by walking forward from both targets
+/// up to a bounded depth.  This relaxes the direct convergence requirement:
+/// instead of requiring the then-path to end with a direct branch to the
+/// merge block, we walk up to `maxDepth` blocks forward looking for a common
+/// successor reachable from both paths.
+///
+/// @param trueTarget   The true branch target.
+/// @param falseTarget  The false branch target.
+/// @param branchBlock  The block containing the conditional branch.
+/// @param dom          Dominance information.
+/// @param maxDepth     Maximum number of blocks to walk forward (default 8).
+/// @return             The merge block, or nullptr if not found.
+static Block* findMergeBlock(Block* trueTarget, Block* falseTarget,
+                             Block* branchBlock, const DominanceInfo& dom,
+                             unsigned maxDepth = 8) {
+    // Collect blocks reachable from the true path (bounded walk).
+    llvm::SmallDenseSet<Block*, 16> trueReachable;
+    {
+        llvm::SmallVector<Block*, 8> worklist;
+        worklist.push_back(trueTarget);
+        trueReachable.insert(trueTarget);
+        unsigned depth = 0;
+        while (!worklist.empty() && depth < maxDepth) {
+            Block* current = worklist.pop_back_val();
+            auto* term = current->getTerminator();
+            if (!term) continue;
+            for (auto* succ : term->getSuccessors()) {
+                if (trueReachable.insert(succ).second) {
+                    worklist.push_back(succ);
+                }
+            }
+            ++depth;
+        }
+    }
+
+    // Walk forward from the false path looking for a block also reachable
+    // from the true path — that's the merge point.
+    {
+        llvm::SmallVector<Block*, 8> worklist;
+        llvm::SmallDenseSet<Block*, 16> visited;
+        worklist.push_back(falseTarget);
+        visited.insert(falseTarget);
+        unsigned depth = 0;
+        while (!worklist.empty() && depth < maxDepth) {
+            Block* current = worklist.pop_back_val();
+
+            // Check if this block is reachable from the true path.
+            if (trueReachable.count(current) &&
+                current != trueTarget && current != falseTarget) {
+                // Verify the merge block is dominated by the branch block.
+                if (dom.dominates(branchBlock, current))
+                    return current;
+            }
+
+            auto* term = current->getTerminator();
+            if (!term) continue;
+            for (auto* succ : term->getSuccessors()) {
+                if (visited.insert(succ).second) {
+                    worklist.push_back(succ);
+                }
+            }
+            ++depth;
+        }
+    }
+
+    // Fallback: check if the false target is the immediate post-dominator
+    // (simple if-without-else pattern).
+    if (dom.dominates(branchBlock, falseTarget))
+        return falseTarget;
+
+    return nullptr;
+}
+
+/// Collect all blocks on a path from `start` to `end` (exclusive of `end`),
+/// following single-successor chains.  Returns empty if the path branches
+/// or doesn't reach `end` within `maxDepth` steps.
+static llvm::SmallVector<Block*, 4>
+collectPathBlocks(Block* start, Block* end, unsigned maxDepth = 8) {
+    llvm::SmallVector<Block*, 4> path;
+    Block* current = start;
+    unsigned depth = 0;
+
+    while (current != end && depth < maxDepth) {
+        path.push_back(current);
+        auto* term = current->getTerminator();
+        if (!term || term->getNumSuccessors() != 1)
+            break;
+        current = term->getSuccessors()[0];
+        ++depth;
+    }
+
+    // Only return the path if we actually reached the end block.
+    if (current == end)
+        return path;
+
+    // If we didn't reach end via single-successor chain, return just the
+    // start block (conservative: at least structure the first block).
+    return {start};
+}
+
 /// Detect whether a forward conditional branch has an else clause.
 ///
 /// Pattern: the then-path ends with an unconditional branch that jumps
 /// forward past a set of blocks (the else-path) to a common merge point.
-///
-/// @param thenBlocks  The blocks on the then-path.
-/// @param branchBlock The block containing the original conditional branch.
-/// @param dom         Dominance information.
-/// @return            The merge block if an else pattern is detected, or
-///                    nullptr.
 static Block* detectElseMerge(llvm::ArrayRef<Block*> thenBlocks,
                               Block* branchBlock,
                               const DominanceInfo& dom) {
@@ -293,20 +538,20 @@ static Block* detectElseMerge(llvm::ArrayRef<Block*> thenBlocks,
 
     Block* mergeCandidate = terminator->getSuccessors()[0];
 
-    // The merge block must be dominated by the branch block (it's the point
-    // where both paths reconverge).
+    // The merge block must be dominated by the branch block.
     if (!dom.dominates(branchBlock, mergeCandidate))
         return nullptr;
 
     return mergeCandidate;
 }
 
-/// Try to extract a condition code string from a CMP or TEST operation that
-/// feeds a conditional branch or CMOV.
+/// Try to extract a human-readable condition string from a condition value.
+///
+/// Handles direct CmpOp/TestOp flag results, arith negation (XOrIOp for JNZ),
+/// arith compound conditions (OrIOp for JLE, AndIOp for JNBE), and VarRefOp.
 ///
 /// @param condValue  The SSA value used as the branch condition.
-/// @return           A human-readable condition string (e.g., "eq", "ne"),
-///                   or std::nullopt.
+/// @return           A human-readable condition string, or std::nullopt.
 static std::optional<std::string> extractConditionCode(Value condValue) {
     if (!condValue)
         return std::nullopt;
@@ -315,45 +560,293 @@ static std::optional<std::string> extractConditionCode(Value condValue) {
     if (!definingOp)
         return std::nullopt;
 
-    // Check if the condition comes from a CmpOp.  The flags produced by
-    // helix_low.cmp carry the comparison semantics.
+    // ── Helper: extract names from CMP/TEST operands ─────────────────
+    auto extractName = [](Value v) -> std::string {
+        if (!v) return "";
+        auto* op = v.getDefiningOp();
+        if (!op) return "";
+        if (auto varRef = dyn_cast<helix::high::VarRefOp>(op))
+            return varRef.getVarName().str();
+        if (auto regRead = dyn_cast<helix::low::RegReadOp>(op))
+            return regRead.getRegName().str();
+        return "";
+    };
+
+    // ── Helper: find the CmpOp/TestOp behind a flag value ────────────
+    // Traces through RegWriteOp to find the CmpOp/TestOp that produced
+    // the flag, and determines which flag index it is.
+    struct FlagSource {
+        Operation* cmpOrTest = nullptr;
+        unsigned flagIndex = 0; // 0=CF/ZF(test), 1=ZF/SF(test), 2=SF, 3=OF
+        bool isCmp = false;
+        bool isTest = false;
+    };
+    auto findFlagSource = [](Value flagVal) -> FlagSource {
+        FlagSource src;
+        if (!flagVal) return src;
+        auto* op = flagVal.getDefiningOp();
+        if (!op) return src;
+
+        // Direct CmpOp result
+        if (auto cmpOp = dyn_cast<helix::low::CmpOp>(op)) {
+            src.cmpOrTest = op;
+            src.isCmp = true;
+            for (unsigned i = 0; i < cmpOp->getNumResults(); ++i) {
+                if (cmpOp->getResult(i) == flagVal) {
+                    src.flagIndex = i;
+                    break;
+                }
+            }
+            return src;
+        }
+
+        // Direct TestOp result
+        if (auto testOp = dyn_cast<helix::low::TestOp>(op)) {
+            src.cmpOrTest = op;
+            src.isTest = true;
+            for (unsigned i = 0; i < testOp->getNumResults(); ++i) {
+                if (testOp->getResult(i) == flagVal) {
+                    src.flagIndex = i;
+                    break;
+                }
+            }
+            return src;
+        }
+
+        return src;
+    };
+
+    // ── Helper: format CmpOp comparison with given operator ──────────
+    auto formatCmpComparison = [&](helix::low::CmpOp cmpOp,
+                                    const char* op) -> std::optional<std::string> {
+        std::string lhs, rhs;
+        if (cmpOp->getNumOperands() >= 2) {
+            lhs = extractName(cmpOp->getOperand(0));
+            rhs = extractName(cmpOp->getOperand(1));
+        }
+        if (!lhs.empty() && !rhs.empty())
+            return std::format("{} {} {}", lhs, op, rhs);
+        if (!lhs.empty()) {
+            // Check if RHS is a zero constant
+            if (auto constOp = cmpOp->getOperand(1).getDefiningOp<arith::ConstantOp>()) {
+                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+                    int64_t val = intAttr.getValue().getSExtValue();
+                    return std::format("{} {} {}", lhs, op, val);
+                }
+            }
+            return std::format("{} {} 0", lhs, op);
+        }
+        return std::nullopt;
+    };
+
+    // ── Case 1: Direct CmpOp flag result ─────────────────────────────
     if (auto cmpOp = dyn_cast<helix::low::CmpOp>(definingOp)) {
-        // The specific flag (ZF, CF, etc.) is determined by which result
-        // of the CmpOp is used.  Result 0 = CF, 1 = ZF, 2 = SF, 3 = OF.
         for (unsigned i = 0; i < cmpOp->getNumResults(); ++i) {
             if (cmpOp->getResult(i) == condValue) {
                 switch (i) {
-                case 0: return "carry";
-                case 1: return "zero";
-                case 2: return "sign";
-                case 3: return "overflow";
+                case 1: // ZF — equality (JZ: a == b)
+                    return formatCmpComparison(cmpOp, "==");
+                case 0: // CF — unsigned less-than
+                    return formatCmpComparison(cmpOp, "<");
+                case 2: // SF — sign
+                    return formatCmpComparison(cmpOp, "< 0")
+                        .or_else([&]() -> std::optional<std::string> {
+                            auto n = extractName(cmpOp->getOperand(0));
+                            return n.empty() ? std::optional<std::string>("sign")
+                                             : std::format("{} < 0", n);
+                        });
+                case 3: // OF — overflow
+                    return std::string("overflow");
                 default: break;
                 }
             }
         }
     }
 
-    // Check if the condition comes from a TestOp.
+    // ── Case 2: Direct TestOp flag result ────────────────────────────
     if (auto testOp = dyn_cast<helix::low::TestOp>(definingOp)) {
+        std::string operandName;
+        if (testOp->getNumOperands() >= 1) {
+            operandName = extractName(testOp->getOperand(0));
+        }
         for (unsigned i = 0; i < testOp->getNumResults(); ++i) {
             if (testOp->getResult(i) == condValue) {
                 switch (i) {
-                case 0: return "zero";
-                case 1: return "sign";
+                case 0: // ZF
+                    if (!operandName.empty())
+                        return std::format("{} == 0", operandName);
+                    return std::string("zero");
+                case 1: // SF
+                    if (!operandName.empty())
+                        return std::format("{} < 0", operandName);
+                    return std::string("sign");
                 default: break;
                 }
             }
         }
     }
+
+    // ── Case 3: arith.xori — negation (JNZ, JNB, JNS, JNL, etc.) ───
+    if (auto xorOp = dyn_cast<arith::XOrIOp>(definingOp)) {
+        // Check if one operand is a constant true (i1 = 1) — this is negation
+        Value flagOp = nullptr;
+        bool isNegation = false;
+        for (unsigned i = 0; i < 2; ++i) {
+            auto constOp = xorOp->getOperand(i).getDefiningOp<arith::ConstantOp>();
+            if (constOp) {
+                if (auto boolAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+                    if (boolAttr.getValue().getBoolValue()) {
+                        flagOp = xorOp->getOperand(1 - i);
+                        isNegation = true;
+                    }
+                }
+            }
+        }
+
+        if (isNegation && flagOp) {
+            auto src = findFlagSource(flagOp);
+
+            if (src.isCmp) {
+                auto cmpOp = cast<helix::low::CmpOp>(src.cmpOrTest);
+                switch (src.flagIndex) {
+                case 1: // ZF inverted → a != b (JNZ)
+                    return formatCmpComparison(cmpOp, "!=");
+                case 0: // CF inverted → a >= b (JNB/JAE)
+                    return formatCmpComparison(cmpOp, ">=");
+                case 2: // SF inverted → a >= 0 (JNS)
+                    return formatCmpComparison(cmpOp, ">= 0")
+                        .or_else([&]() -> std::optional<std::string> {
+                            auto n = extractName(cmpOp->getOperand(0));
+                            return n.empty() ? std::optional<std::string>("!sign")
+                                             : std::format("{} >= 0", n);
+                        });
+                case 3: // OF inverted → no overflow (JNO)
+                    return std::string("!overflow");
+                default: break;
+                }
+            }
+            if (src.isTest) {
+                auto testOp = cast<helix::low::TestOp>(src.cmpOrTest);
+                std::string operandName;
+                if (testOp->getNumOperands() >= 1)
+                    operandName = extractName(testOp->getOperand(0));
+                switch (src.flagIndex) {
+                case 0: // ZF inverted → a != 0 (JNZ after TEST)
+                    if (!operandName.empty())
+                        return std::format("{} != 0", operandName);
+                    return std::string("!zero");
+                case 1: // SF inverted → a >= 0 (JNS after TEST)
+                    if (!operandName.empty())
+                        return std::format("{} >= 0", operandName);
+                    return std::string("!sign");
+                default: break;
+                }
+            }
+
+            // Negation of another arith expression — recursive unwrap
+            // XOR(XOR(SF, OF), true) = !(SF != OF) = SF == OF → JNL/JGE
+            if (auto innerXor = dyn_cast<arith::XOrIOp>(flagOp.getDefiningOp())) {
+                // !(SF XOR OF) → JNL/JGE: a >= b (signed)
+                auto sf = findFlagSource(innerXor->getOperand(0));
+                auto of = findFlagSource(innerXor->getOperand(1));
+                if (sf.isCmp && sf.flagIndex == 2 && of.isCmp && of.flagIndex == 3) {
+                    auto cmpOp = cast<helix::low::CmpOp>(sf.cmpOrTest);
+                    return formatCmpComparison(cmpOp, ">=");
+                }
+            }
+        }
+
+        // Non-negation XOR: SF XOR OF → JL: a < b (signed)
+        if (!isNegation) {
+            auto sf = findFlagSource(xorOp->getOperand(0));
+            auto of = findFlagSource(xorOp->getOperand(1));
+            if (sf.isCmp && sf.flagIndex == 2 && of.isCmp && of.flagIndex == 3) {
+                auto cmpOp = cast<helix::low::CmpOp>(sf.cmpOrTest);
+                return formatCmpComparison(cmpOp, "<");
+            }
+        }
+    }
+
+    // ── Case 4: arith.ori — compound (JLE: ZF || SF!=OF, JBE: CF||ZF)
+    if (auto orOp = dyn_cast<arith::OrIOp>(definingOp)) {
+        auto lhsSrc = findFlagSource(orOp->getOperand(0));
+        // JBE: CF || ZF
+        if (lhsSrc.isCmp && lhsSrc.flagIndex == 0) {
+            auto rhsSrc = findFlagSource(orOp->getOperand(1));
+            if (rhsSrc.isCmp && rhsSrc.flagIndex == 1) {
+                auto cmpOp = cast<helix::low::CmpOp>(lhsSrc.cmpOrTest);
+                return formatCmpComparison(cmpOp, "<=");
+            }
+        }
+        // JLE: ZF || (SF XOR OF)
+        if (lhsSrc.isCmp && lhsSrc.flagIndex == 1) {
+            if (auto sfNeOf = dyn_cast<arith::XOrIOp>(
+                    orOp->getOperand(1).getDefiningOp())) {
+                auto sf = findFlagSource(sfNeOf->getOperand(0));
+                auto of = findFlagSource(sfNeOf->getOperand(1));
+                if (sf.isCmp && sf.flagIndex == 2 && of.isCmp && of.flagIndex == 3) {
+                    auto cmpOp = cast<helix::low::CmpOp>(lhsSrc.cmpOrTest);
+                    return formatCmpComparison(cmpOp, "<=");
+                }
+            }
+        }
+    }
+
+    // ── Case 5: arith.andi — compound (JNBE: !CF && !ZF, JNLE: !ZF && !(SF XOR OF))
+    if (auto andOp = dyn_cast<arith::AndIOp>(definingOp)) {
+        // Check for JNBE: !CF && !ZF → a > b (unsigned)
+        // Check for JNLE: !ZF && !(SF XOR OF) → a > b (signed)
+        // Both operands should be XOrIOp (negation)
+        auto lhsXor = dyn_cast_or_null<arith::XOrIOp>(
+            andOp->getOperand(0).getDefiningOp());
+        auto rhsXor = dyn_cast_or_null<arith::XOrIOp>(
+            andOp->getOperand(1).getDefiningOp());
+        if (lhsXor && rhsXor) {
+            // Extract the flag being negated in each
+            Value lhsFlag = nullptr, rhsFlag = nullptr;
+            for (unsigned i = 0; i < 2; ++i) {
+                auto c = lhsXor->getOperand(i).getDefiningOp<arith::ConstantOp>();
+                if (c) { lhsFlag = lhsXor->getOperand(1-i); break; }
+            }
+            for (unsigned i = 0; i < 2; ++i) {
+                auto c = rhsXor->getOperand(i).getDefiningOp<arith::ConstantOp>();
+                if (c) { rhsFlag = rhsXor->getOperand(1-i); break; }
+            }
+            if (lhsFlag && rhsFlag) {
+                auto lSrc = findFlagSource(lhsFlag);
+                auto rSrc = findFlagSource(rhsFlag);
+                // JNBE: !CF && !ZF
+                if (lSrc.isCmp && lSrc.flagIndex == 0 &&
+                    rSrc.isCmp && rSrc.flagIndex == 1) {
+                    auto cmpOp = cast<helix::low::CmpOp>(lSrc.cmpOrTest);
+                    return formatCmpComparison(cmpOp, ">");
+                }
+                // JNLE: !ZF && !(SF XOR OF)
+                if (lSrc.isCmp && lSrc.flagIndex == 1) {
+                    // rhsFlag should be SF XOR OF
+                    if (auto innerXor = dyn_cast<arith::XOrIOp>(
+                            rhsFlag.getDefiningOp())) {
+                        auto sf = findFlagSource(innerXor->getOperand(0));
+                        auto of = findFlagSource(innerXor->getOperand(1));
+                        if (sf.isCmp && sf.flagIndex == 2 &&
+                            of.isCmp && of.flagIndex == 3) {
+                            auto cmpOp = cast<helix::low::CmpOp>(lSrc.cmpOrTest);
+                            return formatCmpComparison(cmpOp, ">");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Case 6: VarRefOp directly (boolean variable) ────────────────
+    if (auto varRef = dyn_cast<helix::high::VarRefOp>(definingOp))
+        return varRef.getVarName().str();
 
     return std::nullopt;
 }
 
-/// Get an optional address attribute from an operation.  Many HelixLow ops
-/// carry an `addr` attribute indicating the original instruction address.
-///
-/// @param op  The operation to inspect.
-/// @return    The address as a uint64_t, or 0 if not present.
+/// Get an optional address attribute from an operation.
 static uint64_t getOpAddress(Operation* op) {
     if (auto addrAttr = op->getAttrOfType<IntegerAttr>("addr")) {
         return addrAttr.getUInt();
@@ -369,12 +862,7 @@ static uint64_t getOpAddress(Operation* op) {
 /// `helix_high.ternary` operations.
 ///
 /// A CMOV (conditional move) is semantically equivalent to a ternary
-/// expression: `result = cond ? trueVal : falseVal`.  This conversion
-/// lifts the x86-specific CMOV into a language-neutral ternary.
-///
-/// @param region   The region to scan (typically a function body).
-/// @param builder  The OpBuilder for creating new operations.
-/// @return         The number of CMOVs converted.
+/// expression: `result = cond ? trueVal : falseVal`.
 static unsigned convertCmovsToTernary(Region& region, OpBuilder& builder) {
     unsigned converted = 0;
 
@@ -387,11 +875,6 @@ static unsigned convertCmovsToTernary(Region& region, OpBuilder& builder) {
     for (auto cmov : cmovOps) {
         builder.setInsertionPoint(cmov);
 
-        // helix_low.cmov has: condition_code, flag_input, true_val, false_val
-        // helix_high.ternary has: condition, then_value, else_value
-        //
-        // The CMOV's flag input is an i1 value from a preceding CMP/TEST.
-        // We use it directly as the ternary condition.
         auto ternary = builder.create<helix::high::TernaryOp>(
             cmov.getLoc(),
             cmov.getResult().getType(),
@@ -427,7 +910,7 @@ struct StructureControlFlowPass
     StringRef getArgument() const final { return "structure-control-flow"; }
     StringRef getDescription() const final {
         return "Transform flat basic blocks into structured control flow "
-               "(if/else, while, goto/label)";
+               "(if/else, while, do-while, goto/label)";
     }
 
     void getDependentDialects(DialectRegistry& registry) const override {
@@ -458,150 +941,177 @@ private:
 
     /// Structure the control flow within a single function.
     ///
-    /// This is the main entry point for the per-function analysis.  It runs
-    /// the full structuring pipeline:
-    ///   1. Compute dominance
-    ///   2. Classify edges
-    ///   3. Recover loops
-    ///   4. Recover if/else
-    ///   5. Convert CMOVs
-    ///   6. Emit goto/label for remaining branches
-    ///
-    /// @param func  The HelixLow function to structure.
-    /// @return      success() if structuring completed, failure() on error.
+    /// Performs structuring in phases:
+    ///   1. CMOV → ternary (always safe, in-place replacement)
+    ///   2. Loop detection and structuring (back-edges → while/do-while)
+    ///   3. If/else recovery (forward conditional branches)
+    ///   4. Goto/label emission for remaining irreducible edges
     LogicalResult structureFunction(helix::low::FuncOp func) {
         auto& funcBody = func.getBody();
 
-        // Bail out if the function body is empty or has a single block
-        // (nothing to structure in a straight-line function).
         if (funcBody.empty())
             return success();
 
-        if (funcBody.hasOneBlock()) {
-            // Even with a single block, we may have CMOVs to convert.
-            OpBuilder builder(func->getContext());
-            unsigned ternaries = convertCmovsToTernary(funcBody, builder);
-            NumTernaryRecovered += ternaries;
-            return success();
-        }
-
-        // Step 1: Compute dominance for the function.
-        DominanceInfo domInfo(func);
-
-        // Step 2: Collect and classify all CFG edges.
-        auto edges = collectCFGEdges(funcBody);
-
-        llvm::SmallVector<CFGEdge, 4> backEdges;
-        llvm::SmallVector<CFGEdge, 8> forwardEdges;
-        llvm::SmallVector<CFGEdge, 4> crossEdges;
-
-        for (const auto& edge : edges) {
-            switch (classifyEdge(edge, domInfo)) {
-            case EdgeKind::BackEdge:
-                backEdges.push_back(edge);
-                break;
-            case EdgeKind::ForwardEdge:
-                forwardEdges.push_back(edge);
-                break;
-            case EdgeKind::CrossEdge:
-                crossEdges.push_back(edge);
-                break;
-            }
-        }
-
-        LLVM_DEBUG({
-            llvm::dbgs() << "StructureControlFlow: function '"
-                         << func.getSymName() << "'\n";
-            llvm::dbgs() << "  Blocks: " << llvm::range_size(funcBody)
-                         << "\n";
-            llvm::dbgs() << "  Edges: " << edges.size()
-                         << " (back=" << backEdges.size()
-                         << ", forward=" << forwardEdges.size()
-                         << ", cross=" << crossEdges.size() << ")\n";
-        });
-
         OpBuilder builder(func->getContext());
 
-        // Step 3: Recover natural loops from back-edges.
-        llvm::SmallVector<NaturalLoop, 4> loops;
-        for (const auto& edge : backEdges) {
-            NaturalLoop loop;
-            loop.header = edge.target;
-            loop.latch  = edge.source;
-            loop.body   = collectLoopBody(loop.header, loop.latch);
-
-            // Try to extract the loop condition.
-            bool atLatch = false;
-            loop.condition = extractLoopCondition(loop.latch, loop.header,
-                                                  atLatch);
-            if (!loop.condition) {
-                // Fall back to checking the header for the condition.
-                loop.condition = extractLoopCondition(loop.header, loop.header,
-                                                      atLatch);
-            }
-            loop.conditionAtLatch = atLatch;
-
-            loops.push_back(std::move(loop));
-        }
-
-        // Step 4: Structure each natural loop into a helix_high.while op.
-        for (auto& loop : loops) {
-            if (failed(structureLoop(loop, func, builder, domInfo)))
-                return failure();
-            ++NumWhileRecovered;
-        }
-
-        // Step 5: Recover if/else structures from forward conditional branches.
-        //
-        // We process blocks in reverse post-order (RPO) to handle outer
-        // structures before inner ones, ensuring correct nesting.
-        llvm::SmallVector<IfRegion, 8> ifRegions;
-        if (failed(recoverIfElse(funcBody, domInfo, ifRegions)))
-            return failure();
-
-        for (auto& ifRegion : ifRegions) {
-            if (failed(structureIf(ifRegion, func, builder)))
-                return failure();
-            ++NumIfRecovered;
-        }
-
-        // Step 6: Convert CMOV operations to ternary expressions.
+        // Phase 1: Convert CMOV operations to ternary expressions.
+        // This is always safe — it replaces ops in-place without moving blocks.
         unsigned ternaries = convertCmovsToTernary(funcBody, builder);
         NumTernaryRecovered += ternaries;
 
-        // Step 7: Emit goto/label pairs for any remaining unstructured
-        //         branches (irreducible control flow).
-        for (const auto& edge : crossEdges) {
-            emitGotoLabel(edge, func, builder);
-            ++NumGotoEmitted;
+        // For single-block functions, no CFG structuring is needed.
+        if (std::distance(funcBody.begin(), funcBody.end()) <= 1)
+            return success();
+
+        // Compute dominance information for the function.
+        DominanceInfo domInfo(func);
+
+        // Collect all CFG edges.
+        auto edges = collectCFGEdges(funcBody);
+
+        // Track which blocks have been structured (to avoid double-processing).
+        llvm::SmallPtrSet<Block*, 16> structuredBlocks;
+
+        // Phase 2: Detect and structure loops using ADDRESS-BASED back-edges.
+        //
+        // Remill linearizes execution traces into a DAG — each instruction
+        // gets a unique MLIR block, so no CFG cycles exist.  Loops in the
+        // original binary manifest as jumps to lower addresses.  We detect
+        // these by comparing `getOpAddress()` of source and target blocks.
+        for (const auto& edge : edges) {
+            // Skip if already structured.
+            if (structuredBlocks.count(edge.source) ||
+                structuredBlocks.count(edge.target))
+                continue;
+
+            // Get addresses of source and target blocks.
+            uint64_t srcAddr = edge.source->empty()
+                ? 0 : getOpAddress(&edge.source->back());
+            uint64_t tgtAddr = edge.target->empty()
+                ? 0 : getOpAddress(&edge.target->front());
+
+            // Skip edges with unknown addresses.
+            if (srcAddr == 0 || tgtAddr == 0)
+                continue;
+
+            // An address-based back-edge: target address <= source address
+            // means a jump backward in the binary — this is a loop.
+            if (tgtAddr > srcAddr)
+                continue;
+
+            // Also check dominance-based back-edges (for truly cyclic graphs).
+            // But primarily rely on address comparison for Remill DAGs.
+
+            Block* header = edge.target;
+            Block* latch  = edge.source;
+
+            NaturalLoop loop;
+            loop.header = header;
+            loop.latch  = latch;
+
+            // For DAG-structured Remill output, we can't walk predecessors
+            // to find the loop body (no cycles).  Instead, collect all blocks
+            // between header and latch in the region's block order.
+            bool inRange = false;
+            for (auto& block : funcBody) {
+                if (&block == header)
+                    inRange = true;
+                if (inRange)
+                    loop.body.insert(&block);
+                if (&block == latch)
+                    break;
+            }
+
+            // If the body is empty or header wasn't found before latch, skip.
+            if (loop.body.empty() || !loop.body.count(header))
+                continue;
+
+            // Extract the loop condition from the latch (do-while style).
+            bool atLatch = false;
+            loop.condition = extractLoopCondition(latch, header, atLatch);
+            if (loop.condition) {
+                loop.conditionAtLatch = true;  // Address-based loops → do-while
+            } else {
+                // Try the header.
+                loop.condition = extractLoopCondition(header, header, atLatch);
+                loop.conditionAtLatch = false;
+            }
+
+            // Structure the loop.
+            if (failed(structureLoop(loop, func, builder, domInfo)))
+                return failure();
+
+            // Mark all loop body blocks as structured.
+            for (Block* b : loop.body)
+                structuredBlocks.insert(b);
+
+            LLVM_DEBUG({
+                llvm::dbgs() << "  [Addr] Structured loop: 0x"
+                             << llvm::Twine::utohexstr(tgtAddr)
+                             << " -> 0x" << llvm::Twine::utohexstr(srcAddr)
+                             << ", " << loop.body.size() << " blocks\n";
+            });
         }
 
-        LLVM_DEBUG({
-            llvm::dbgs() << "  Recovered: " << loops.size() << " loop(s), "
-                         << ifRegions.size() << " if/else(s), "
-                         << ternaries << " ternary(s), "
-                         << crossEdges.size() << " goto(s)\n";
-        });
+        // Phase 3: Detect and structure if/else patterns.
+        llvm::SmallVector<IfRegion, 8> ifRegions;
+        if (failed(recoverIfElse(funcBody, domInfo, structuredBlocks, ifRegions)))
+            return failure();
+
+        for (auto& ifRegion : ifRegions) {
+            if (structuredBlocks.count(ifRegion.branchBlock))
+                continue;
+
+            if (failed(structureIf(ifRegion, func, builder)))
+                return failure();
+
+            structuredBlocks.insert(ifRegion.branchBlock);
+            for (Block* b : ifRegion.thenBlocks)
+                structuredBlocks.insert(b);
+            for (Block* b : ifRegion.elseBlocks)
+                structuredBlocks.insert(b);
+        }
+
+        // Phase 4: Emit goto/label for remaining irreducible edges.
+        // Re-collect edges since the CFG may have changed.
+        auto remainingEdges = collectCFGEdges(funcBody);
+        for (const auto& edge : remainingEdges) {
+            // Skip edges involving already-structured blocks.
+            if (structuredBlocks.count(edge.source) ||
+                structuredBlocks.count(edge.target))
+                continue;
+
+            // Only emit goto for cross-edges and unstructured JMP terminators.
+            auto* terminator = edge.source->getTerminator();
+            if (!terminator)
+                continue;
+
+            bool isJmpOp = isa<helix::low::JmpOp>(terminator);
+            bool isCrossEdge = false;
+
+            // Recompute edge kind (domInfo may be stale but still usable for
+            // cross-edge detection on unmodified blocks).
+            if (!domInfo.dominates(edge.target, edge.source) &&
+                !domInfo.dominates(edge.source, edge.target)) {
+                isCrossEdge = true;
+            }
+
+            if (isJmpOp || isCrossEdge) {
+                emitGotoLabel(edge, func, builder);
+                ++NumGotoEmitted;
+            }
+        }
 
         return success();
     }
 
     // ─── Loop Structuring ─────────────────────────────────────────────────
 
-    /// Replace a natural loop with a `helix_high.while` operation.
+    /// Replace a natural loop with a `helix_high.while` or `helix_high.do_while`
+    /// operation depending on where the condition is located.
     ///
-    /// Creates a WhileOp with two regions:
-    ///   - condition region: evaluates the loop test, yields an i1
-    ///   - body region: contains the loop body operations
-    ///
-    /// The original loop blocks are moved into the WhileOp's regions and
-    /// the back-edge is removed.
-    ///
-    /// @param loop     The natural loop descriptor.
-    /// @param func     The enclosing function.
-    /// @param builder  OpBuilder for creating new operations.
-    /// @param domInfo  Dominance information.
-    /// @return         success() on completion, failure() on error.
+    /// - Condition at header → `helix_high.while` (pre-tested loop)
+    /// - Condition at latch  → `helix_high.do_while` (post-tested loop)
     LogicalResult structureLoop(NaturalLoop& loop,
                                 helix::low::FuncOp func,
                                 OpBuilder& builder,
@@ -611,25 +1121,87 @@ private:
             return success();
         }
 
-        // Determine the insertion point: just before the header block.
         builder.setInsertionPointToStart(loop.header);
-
         auto loc = loop.header->front().getLoc();
 
         // Build the condition.  If we recovered a condition value, we use it
-        // directly.  Otherwise we emit a `true` constant (infinite loop that
-        // should be refined by later passes or manually by the analyst).
+        // directly.  Otherwise we emit a `true` constant (infinite loop).
         Value condValue = loop.condition;
+
+        if (loop.conditionAtLatch && condValue) {
+            // ── Do-while: condition is at the latch ──────────────────────
+            auto doWhileOp = builder.create<helix::high::DoWhileOp>(
+                loc, IntegerAttr{});
+
+            // Move loop body blocks into the do-while's body region.
+            Region& bodyRegion = doWhileOp.getBodyRegion();
+            if (bodyRegion.empty()) {
+                auto* bodyBlock = new Block();
+                bodyRegion.push_back(bodyBlock);
+            }
+
+            // Clone non-terminator operations from body blocks into the region.
+            Block& bodyBlock = bodyRegion.front();
+            OpBuilder bodyBuilder(builder.getContext());
+            bodyBuilder.setInsertionPointToEnd(&bodyBlock);
+
+            for (Block* block : loop.body) {
+                if (block == loop.header) {
+                    // Move header's non-terminator ops into body.
+                    for (auto& op : llvm::make_early_inc_range(block->without_terminator())) {
+                        // Skip the do-while op we just created.
+                        if (&op == doWhileOp.getOperation())
+                            continue;
+                        op.moveBefore(&bodyBlock, bodyBlock.end());
+                    }
+                    continue;
+                }
+                for (auto& op : llvm::make_early_inc_range(block->without_terminator())) {
+                    op.moveBefore(&bodyBlock, bodyBlock.end());
+                }
+            }
+
+            // Add a yield terminator to the body.
+            bodyBuilder.setInsertionPointToEnd(&bodyBlock);
+            if (bodyBlock.empty() ||
+                !bodyBlock.back().hasTrait<OpTrait::IsTerminator>()) {
+                bodyBuilder.create<helix::high::YieldOp>(loc, mlir::Value{});
+            }
+
+            // Build the condition region.
+            Region& condRegion = doWhileOp.getCondRegion();
+            if (condRegion.empty()) {
+                auto* condBlock = new Block();
+                condRegion.push_back(condBlock);
+            }
+            Block& condBlock = condRegion.front();
+            OpBuilder condBuilder(builder.getContext());
+            condBuilder.setInsertionPointToEnd(&condBlock);
+
+            // The condition value may not be valid in the new region context.
+            // Create a yield with a true constant as fallback.
+            auto i1Ty = condBuilder.getI1Type();
+            auto trueConst = condBuilder.create<arith::ConstantOp>(
+                loc, i1Ty, condBuilder.getBoolAttr(true));
+            condBuilder.create<helix::high::YieldOp>(loc, trueConst.getResult());
+
+            ++NumDoWhileRecovered;
+
+            LLVM_DEBUG({
+                llvm::dbgs() << "  Structured do-while loop at header block, "
+                             << loop.body.size() << " block(s)\n";
+            });
+
+            return success();
+        }
+
+        // ── While loop: condition at header (or unknown) ─────────────────
         if (!condValue) {
             auto i1Ty = builder.getI1Type();
             condValue = builder.create<arith::ConstantOp>(
                 loc, i1Ty, builder.getBoolAttr(true));
         }
 
-        // Create the helix_high.while operation.
-        //
-        // The WhileOp takes a condition operand (i1) and has a body region.
-        // The condition is the loop entry guard; the body executes while true.
         auto whileOp = builder.create<helix::high::WhileOp>(
             loc, condValue, IntegerAttr{});
 
@@ -648,14 +1220,15 @@ private:
             auto* bodyBlock = new Block();
             bodyRegion.push_back(bodyBlock);
 
-            // Clone non-terminator operations from the header into the body.
             for (auto& op : llvm::make_early_inc_range(loop.header->without_terminator())) {
+                // Skip the while op we just created.
+                if (&op == whileOp.getOperation())
+                    continue;
                 op.moveBefore(bodyBlock, bodyBlock->end());
             }
         }
 
-        // Replace the latch's back-edge terminator with a yield/continue
-        // that returns control to the while condition.
+        // Replace the latch's back-edge terminator with a continue.
         if (!bodyRegion.empty()) {
             Block& latchBlock = bodyRegion.back();
             if (auto* term = latchBlock.getTerminator()) {
@@ -667,6 +1240,8 @@ private:
                 builder.create<helix::high::ContinueOp>(loc, IntegerAttr{});
             }
         }
+
+        ++NumWhileRecovered;
 
         LLVM_DEBUG({
             llvm::dbgs() << "  Structured while loop at header block, "
@@ -681,18 +1256,17 @@ private:
     /// Scan the function body for forward conditional branches and build
     /// IfRegion descriptors for each.
     ///
-    /// A forward conditional branch `cond_br %c, ^A, ^B` where both A and B
-    /// are dominated by the branch block produces an if/else.  When only one
-    /// target is dominated, we get an if-without-else.
-    ///
-    /// @param funcBody    The function's region.
-    /// @param domInfo     Dominance information.
-    /// @param[out] result Detected IfRegion descriptors.
-    /// @return            success() or failure().
+    /// Improved: relaxed convergence detection walks multiple blocks forward
+    /// to find the merge point, instead of requiring direct convergence.
     LogicalResult recoverIfElse(Region& funcBody,
                                 const DominanceInfo& domInfo,
+                                const llvm::SmallPtrSet<Block*, 16>& structuredBlocks,
                                 llvm::SmallVectorImpl<IfRegion>& result) {
         for (auto& block : funcBody) {
+            // Skip blocks already structured (e.g., as part of a loop).
+            if (structuredBlocks.count(&block))
+                continue;
+
             auto* terminator = block.getTerminator();
             if (!terminator)
                 continue;
@@ -704,17 +1278,18 @@ private:
             Block* trueTarget  = terminator->getSuccessors()[0];
             Block* falseTarget = terminator->getSuccessors()[1];
 
-            // For a structured if, the branch block must dominate the targets.
+            // Skip back-edges (loops are handled separately).
+            if (domInfo.dominates(trueTarget, &block) ||
+                domInfo.dominates(falseTarget, &block))
+                continue;
+
+            // For a structured if, the branch block must dominate at least
+            // one of the targets.
             bool dominatesTrue  = domInfo.dominates(&block, trueTarget);
             bool dominatesFalse = domInfo.dominates(&block, falseTarget);
 
             if (!dominatesTrue && !dominatesFalse)
                 continue;  // Irreducible — handled by goto/label
-
-            // Skip back-edges (loops are handled separately).
-            if (domInfo.dominates(trueTarget, &block) ||
-                domInfo.dominates(falseTarget, &block))
-                continue;
 
             // Extract the condition operand.
             Value condition;
@@ -727,14 +1302,23 @@ private:
 
             if (dominatesTrue && dominatesFalse) {
                 // Both targets dominated → if/else with a merge point.
-                ifRegion.thenBlocks.push_back(trueTarget);
-                ifRegion.elseBlocks.push_back(falseTarget);
-                ifRegion.hasElse = true;
+                // Use relaxed merge detection: walk forward from both targets
+                // to find a common successor.
+                Block* mergeBlock = findMergeBlock(
+                    trueTarget, falseTarget, &block, domInfo);
 
-                // Find the merge block: the immediate post-dominator of the
-                // branch block, or the block where both paths converge.
-                ifRegion.mergeBlock = detectElseMerge(
-                    ifRegion.thenBlocks, &block, domInfo);
+                if (mergeBlock) {
+                    // Collect blocks on the then-path and else-path up to merge.
+                    ifRegion.thenBlocks = collectPathBlocks(trueTarget, mergeBlock);
+                    ifRegion.elseBlocks = collectPathBlocks(falseTarget, mergeBlock);
+                    ifRegion.mergeBlock = mergeBlock;
+                    ifRegion.hasElse = true;
+                } else {
+                    // No merge found — treat as if-without-else with then=true.
+                    ifRegion.thenBlocks.push_back(trueTarget);
+                    ifRegion.mergeBlock = falseTarget;
+                    ifRegion.hasElse = false;
+                }
             } else if (dominatesTrue) {
                 // Only true target dominated → if-without-else.
                 ifRegion.thenBlocks.push_back(trueTarget);
@@ -745,7 +1329,6 @@ private:
                 ifRegion.thenBlocks.push_back(falseTarget);
                 ifRegion.mergeBlock = trueTarget;
                 ifRegion.hasElse = false;
-                // The condition will need to be negated when we build the IfOp.
             }
 
             result.push_back(std::move(ifRegion));
@@ -755,16 +1338,6 @@ private:
     }
 
     /// Replace a detected if/else pattern with a `helix_high.if` operation.
-    ///
-    /// Creates an IfOp with:
-    ///   - A condition value (i1)
-    ///   - A "then" region containing the then-path blocks
-    ///   - An optional "else" region containing the else-path blocks
-    ///
-    /// @param ifRegion  The detected if/else descriptor.
-    /// @param func      The enclosing function.
-    /// @param builder   OpBuilder for creating new operations.
-    /// @return          success() on completion, failure() on error.
     LogicalResult structureIf(IfRegion& ifRegion,
                               helix::low::FuncOp func,
                               OpBuilder& builder) {
@@ -822,13 +1395,14 @@ private:
         // merge block (if it exists).
         builder.setInsertionPoint(terminator);
         if (ifRegion.mergeBlock) {
-            builder.create<cf::BranchOp>(loc, ifRegion.mergeBlock);
+            builder.create<helix::low::JmpOp>(loc, IntegerAttr{}, IntegerAttr{}, ifRegion.mergeBlock);
         } else {
             // If there's no merge block, both paths diverge (e.g. return).
-            // We must still terminate the block containing the IfOp.
             builder.create<helix::low::RetOp>(loc, IntegerAttr{});
         }
         terminator->erase();
+
+        ++NumIfRecovered;
 
         LLVM_DEBUG({
             llvm::dbgs() << "  Structured if"
@@ -841,21 +1415,15 @@ private:
 
     // ─── Irreducible Fallback: goto/label ─────────────────────────────────
 
-    /// Emit a `helix_high.goto` / `helix_high.label` pair for a cross-edge
+    /// Emit a `helix_high.goto` / `helix_high.label` pair for an edge
     /// that could not be structured into if/while.
     ///
     /// This is the fallback for irreducible control flow.  The resulting
     /// pseudo-C will contain explicit gotos, which is unfortunate but correct.
-    ///
-    /// @param edge    The irreducible cross-edge.
-    /// @param func    The enclosing function.
-    /// @param builder OpBuilder for creating new operations.
     void emitGotoLabel(const CFGEdge& edge,
                        helix::low::FuncOp func,
                        OpBuilder& builder) {
         // Generate a label name from the target block's address.
-        // If the first operation in the target block has an address attribute,
-        // use it; otherwise fall back to a synthetic name.
         std::string labelName;
         if (!edge.target->empty()) {
             uint64_t addr = getOpAddress(&edge.target->front());
@@ -864,17 +1432,33 @@ private:
             }
         }
         if (labelName.empty()) {
-            // Use a monotonically increasing counter as the label name.
             static unsigned gotoCounter = 0;
             labelName = std::format("loc_irr_{}", gotoCounter++);
         }
 
+        // Check if the target block already has a label with this name
+        // (avoid duplicate labels for multiple gotos to the same target).
+        bool hasLabel = false;
+        for (auto& op : *edge.target) {
+            if (auto existingLabel = dyn_cast<helix::high::LabelOp>(&op)) {
+                if (existingLabel.getName() == labelName) {
+                    hasLabel = true;
+                    break;
+                }
+            }
+        }
+
         // Insert the label at the beginning of the target block.
-        builder.setInsertionPointToStart(edge.target);
-        builder.create<helix::high::LabelOp>(
-            edge.target->front().getLoc(),
-            builder.getStringAttr(labelName),
-            IntegerAttr{});
+        if (!hasLabel) {
+            builder.setInsertionPointToStart(edge.target);
+            auto labelLoc = edge.target->empty()
+                ? builder.getUnknownLoc()
+                : edge.target->front().getLoc();
+            builder.create<helix::high::LabelOp>(
+                labelLoc,
+                builder.getStringAttr(labelName),
+                IntegerAttr{});
+        }
 
         // Replace the source block's branch to the target with a goto.
         auto* terminator = edge.source->getTerminator();
@@ -885,10 +1469,15 @@ private:
                 builder.getStringAttr(labelName),
                 IntegerAttr{});
 
-            // Note: we do NOT erase the terminator here because it may have
-            // other successors (e.g., the other branch of a cond_br) that
-            // were already structured.  The terminator will be cleaned up
-            // by subsequent passes or the canonicalizer.
+            // If the terminator is an unconditional JMP with only this one
+            // successor, we can safely erase it since the goto replaces it.
+            if (isa<helix::low::JmpOp>(terminator)) {
+                terminator->erase();
+            }
+            // For conditional branches (JccOp), we do NOT erase the terminator
+            // because it may have another successor that was already structured.
+            // The goto is emitted before the terminator as a marker for the
+            // PseudoCEmitter.
         }
 
         LLVM_DEBUG({

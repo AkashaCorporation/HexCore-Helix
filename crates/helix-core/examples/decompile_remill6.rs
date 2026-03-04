@@ -4,7 +4,7 @@ use helix_core::decompile::decompile_ir_via_hir;
 
 fn main() {
     let ir_path = "tests/remill-6/01-name-writing.ll";
-    let out_path = "tests/remill-6/04-helix.c";
+    let out_path = "tests/remill-6/07-helix-optimized.c";
 
     let ir = std::fs::read_to_string(ir_path)
         .unwrap_or_else(|e| panic!("Falha ao ler {}: {}", ir_path, e));

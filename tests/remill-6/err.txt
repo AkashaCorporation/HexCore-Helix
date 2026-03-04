@@ -1,1 +1,0 @@
-error: decompilation failed for "01-name-writing.ll": decompile: stage 3 (passes) failed: runPasses: MLIR pass pipeline failed: operand #0 does not dominate this use

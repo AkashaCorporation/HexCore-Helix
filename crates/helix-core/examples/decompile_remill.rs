@@ -11,6 +11,7 @@ fn main() {
         ("Remill-3", "01-swarm-serialization.ll", "04-swarm-serialization.helix.c"),
         ("Remill-4", "01-swarm-write.ll", "04-swarm-write.helix.c"),
         ("Remill-5", "01-name-writing.ll", "04-name-writing.helix.c"),
+        ("remill-7", "bone_pos_calc.ll", "bone_pos_calc.helix.c"),
     ];
 
     for (dir, ll_file, out_file) in &cases {

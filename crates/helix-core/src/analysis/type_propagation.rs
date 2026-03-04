@@ -148,12 +148,50 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
         } => {
             let expr_ty = infer_expr_type(env, expr, signatures);
             changed |= env.set(*var_id, expr_ty);
+
+            // MOVZX/MOVSX: propagate signedness to source variable.
+            if let HirExpr::Cast { expr: inner, to_ty, .. } = expr {
+                if let HirType::Int { signed, .. } = to_ty {
+                    if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
+                        let src_ty = env.get(*src_id);
+                        if let HirType::Int { bits: src_bits, .. } = src_ty {
+                            let refined = HirType::Int { signed: *signed, bits: *src_bits };
+                            changed |= env.set(*src_id, refined);
+                        }
+                    }
+                }
+            }
         }
 
         HirStmt::Assign { lhs, rhs, .. } => {
             let rhs_ty = infer_expr_type(env, rhs, signatures);
             if let HirExpr::Var { id, .. } = lhs {
                 changed |= env.set(*id, rhs_ty);
+            }
+
+            // MOVZX/MOVSX: propagate signedness back to the source variable.
+            // In the HIR, MOVZX/MOVSX are represented as Cast expressions.
+            // The cast target type carries the signedness info that should
+            // also be applied to the source operand at its original width.
+            if let HirExpr::Cast { expr: inner, to_ty, .. } = rhs {
+                if let HirType::Int { signed, .. } = to_ty {
+                    // Propagate signedness to the source variable at its width
+                    if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
+                        let src_ty = env.get(*src_id);
+                        if let HirType::Int { bits: src_bits, .. } = src_ty {
+                            let refined = HirType::Int { signed: *signed, bits: *src_bits };
+                            changed |= env.set(*src_id, refined);
+                        }
+                    }
+                }
+            }
+
+            // LEA: address computation results are pointers.
+            // In the HIR, LEA is represented as AddressOf unary expressions.
+            if let HirExpr::Unary { op: crate::ir::hir::HirUnaryOp::AddressOf, .. } = rhs {
+                if let HirExpr::Var { id, .. } = lhs {
+                    changed |= env.set(*id, HirType::void_ptr());
+                }
             }
         }
 
@@ -213,7 +251,7 @@ fn infer_expr_type(env: &TypeEnv, expr: &HirExpr, signatures: &SignatureDb) -> H
 
         HirExpr::Binary { op, lhs, rhs, .. } => {
             let lhs_ty = infer_expr_type(env, lhs, signatures);
-            let _rhs_ty = infer_expr_type(env, rhs, signatures);
+            let rhs_ty = infer_expr_type(env, rhs, signatures);
             match op {
                 // Comparison operators always return bool
                 HirBinOp::Eq
@@ -224,8 +262,26 @@ fn infer_expr_type(env: &TypeEnv, expr: &HirExpr, signatures: &SignatureDb) -> H
                 | HirBinOp::Ge
                 | HirBinOp::LogAnd
                 | HirBinOp::LogOr => HirType::Bool,
-                // Arithmetic: use the wider type
-                _ => lhs_ty,
+                // Pointer arithmetic: pointer + integer → pointer
+                HirBinOp::Add | HirBinOp::Sub => {
+                    if matches!(lhs_ty, HirType::Pointer(_)) {
+                        lhs_ty
+                    } else if matches!(rhs_ty, HirType::Pointer(_)) {
+                        rhs_ty
+                    } else if lhs_ty.is_resolved() {
+                        lhs_ty
+                    } else {
+                        rhs_ty
+                    }
+                }
+                // Other arithmetic: use the wider/resolved type
+                _ => {
+                    if lhs_ty.is_resolved() {
+                        lhs_ty
+                    } else {
+                        rhs_ty
+                    }
+                }
             }
         }
 

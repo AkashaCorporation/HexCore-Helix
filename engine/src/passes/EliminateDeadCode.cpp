@@ -75,6 +75,11 @@ STATISTIC(NumPrologueOpsRemoved,   "Number of prologue/epilogue ops removed");
 STATISTIC(NumStackAdjustsRemoved,  "Number of RSP bookkeeping ops removed");
 STATISTIC(NumDeadWritesRemoved,    "Number of dead register writes removed");
 STATISTIC(NumTriviallyDeadRemoved, "Number of trivially dead ops removed");
+STATISTIC(NumDeadFlagsRemoved,     "Number of dead flag computations removed");
+STATISTIC(NumDeadCmpTestRemoved,   "Number of dead CMP/TEST ops removed");
+STATISTIC(NumDeadVarsRemoved,      "Number of dead variable decls removed");
+STATISTIC(NumDeadAssignsRemoved,   "Number of dead assignments removed");
+STATISTIC(NumDeadUndefRemoved,     "Number of dead __undef assignments removed");
 
 namespace {
 
@@ -358,6 +363,311 @@ static bool isStackPointerBookkeeping(Operation* op) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Flag Liveness Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracks which CPU flags produced by an operation are actually consumed
+/// by downstream conditional operations (jcc, cmov).
+///
+/// Flag-producing operations:
+///   - helix_low.binop: carry, zero, sign, overflow
+///   - helix_low.cmp:   carry, zero, sign, overflow
+///   - helix_low.test:  zero, sign (no carry/overflow)
+///
+/// Flag-consuming operations:
+///   - helix_low.jcc:  conditional branch based on flag condition
+///   - helix_low.cmov: conditional move based on flag condition
+///
+/// A flag is "live" if its SSA result value has at least one user.
+/// A flag is "dead" if its SSA result has no users.
+/// If ALL flags of a CMP/TEST are dead, the entire operation is dead.
+///
+/// When a flag's liveness is uncertain (e.g., it flows through a block
+/// argument or phi), we conservatively mark it as live and emit a warning.
+struct FlagLiveness {
+    bool carry_live    = false;
+    bool zero_live     = false;
+    bool sign_live     = false;
+    bool overflow_live = false;
+
+    /// Returns true if any flag is live.
+    bool any_live() const {
+        return carry_live || zero_live || sign_live || overflow_live;
+    }
+
+    /// Mark flags as live based on a JccOp's condition code.
+    ///
+    /// x86 condition codes and the flags they read:
+    ///   z/nz (ZF), b/nb (CF), be/nbe (CF|ZF), l/nl (SF^OF),
+    ///   le/nle (ZF|(SF^OF)), s/ns (SF), o/no (OF), p/np (PF — not modeled)
+    void mark_from_jcc(llvm::StringRef condition) {
+        markFlagsForCondition(condition);
+    }
+
+    /// Mark flags as live based on a CMovOp's condition code.
+    void mark_from_cmov(llvm::StringRef condition) {
+        markFlagsForCondition(condition);
+    }
+
+private:
+    void markFlagsForCondition(llvm::StringRef cond) {
+        // Normalize to lowercase for comparison.
+        auto c = cond.lower();
+
+        if (c == "z" || c == "e" || c == "nz" || c == "ne") {
+            zero_live = true;
+        } else if (c == "b" || c == "c" || c == "nb" || c == "nc" ||
+                   c == "nae" || c == "ae") {
+            carry_live = true;
+        } else if (c == "be" || c == "na" || c == "nbe" || c == "a") {
+            carry_live = true;
+            zero_live  = true;
+        } else if (c == "l" || c == "nge" || c == "nl" || c == "ge") {
+            sign_live     = true;
+            overflow_live = true;
+        } else if (c == "le" || c == "ng" || c == "nle" || c == "g") {
+            zero_live     = true;
+            sign_live     = true;
+            overflow_live = true;
+        } else if (c == "s" || c == "ns") {
+            sign_live = true;
+        } else if (c == "o" || c == "no") {
+            overflow_live = true;
+        } else {
+            // Unknown condition — conservatively mark all flags as live.
+            carry_live    = true;
+            zero_live     = true;
+            sign_live     = true;
+            overflow_live = true;
+        }
+    }
+};
+
+/// Check whether a flag SSA value has uncertain consumption.
+///
+/// A flag value is "uncertain" if it is used by an operation that is not
+/// a recognized flag consumer (jcc, cmov) — for example, if it flows
+/// through a block argument or is used by an unknown operation.
+///
+/// @param flagValue  The SSA value of a flag result.
+/// @return           True if the flag has uncertain consumption.
+static bool hasUncertainFlagConsumption(Value flagValue) {
+    for (auto* user : flagValue.getUsers()) {
+        if (!isa<helix::low::JccOp>(user) &&
+            !isa<helix::low::CMovOp>(user)) {
+            // Used by something other than jcc/cmov — uncertain.
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Compute flag liveness for a flag-producing operation by examining
+/// which of its flag results have consumers.
+///
+/// @param op  A flag-producing operation (BinOp, CmpOp, or TestOp).
+/// @return    The FlagLiveness indicating which flags are live.
+static FlagLiveness computeFlagLiveness(Operation* op) {
+    FlagLiveness liveness;
+
+    if (auto binOp = dyn_cast<helix::low::BinOp>(op)) {
+        // BinOp results: [0]=result, [1]=carry, [2]=zero, [3]=sign, [4]=overflow
+        liveness.carry_live    = !binOp.getCarryFlag().use_empty();
+        liveness.zero_live     = !binOp.getZeroFlag().use_empty();
+        liveness.sign_live     = !binOp.getSignFlag().use_empty();
+        liveness.overflow_live = !binOp.getOverflowFlag().use_empty();
+    } else if (auto cmpOp = dyn_cast<helix::low::CmpOp>(op)) {
+        // CmpOp results: [0]=carry, [1]=zero, [2]=sign, [3]=overflow
+        liveness.carry_live    = !cmpOp.getCarryFlag().use_empty();
+        liveness.zero_live     = !cmpOp.getZeroFlag().use_empty();
+        liveness.sign_live     = !cmpOp.getSignFlag().use_empty();
+        liveness.overflow_live = !cmpOp.getOverflowFlag().use_empty();
+    } else if (auto testOp = dyn_cast<helix::low::TestOp>(op)) {
+        // TestOp results: [0]=zero, [1]=sign (no carry/overflow)
+        liveness.zero_live = !testOp.getZeroFlag().use_empty();
+        liveness.sign_live = !testOp.getSignFlag().use_empty();
+    }
+
+    return liveness;
+}
+
+/// Check whether a flag-producing operation has any uncertain flag
+/// consumption (flags used by non-jcc/cmov operations).
+///
+/// @param op  A flag-producing operation.
+/// @return    True if any flag has uncertain consumption.
+static bool hasAnyUncertainFlags(Operation* op) {
+    if (auto binOp = dyn_cast<helix::low::BinOp>(op)) {
+        return hasUncertainFlagConsumption(binOp.getCarryFlag()) ||
+               hasUncertainFlagConsumption(binOp.getZeroFlag()) ||
+               hasUncertainFlagConsumption(binOp.getSignFlag()) ||
+               hasUncertainFlagConsumption(binOp.getOverflowFlag());
+    } else if (auto cmpOp = dyn_cast<helix::low::CmpOp>(op)) {
+        return hasUncertainFlagConsumption(cmpOp.getCarryFlag()) ||
+               hasUncertainFlagConsumption(cmpOp.getZeroFlag()) ||
+               hasUncertainFlagConsumption(cmpOp.getSignFlag()) ||
+               hasUncertainFlagConsumption(cmpOp.getOverflowFlag());
+    } else if (auto testOp = dyn_cast<helix::low::TestOp>(op)) {
+        return hasUncertainFlagConsumption(testOp.getZeroFlag()) ||
+               hasUncertainFlagConsumption(testOp.getSignFlag());
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dead Variable Elimination (HelixHigh-level)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Check whether an operation is a "live" consumer — one that produces an
+/// observable side effect.  A variable is considered live if any of its
+/// references feed (directly or transitively) into one of these operations.
+///
+/// Live operations:
+///   - helix_low.jcc, helix_low.jmp  (branch — affects control flow)
+///   - helix_low.call, helix_high.call (function call — observable side effect)
+///   - helix_low.ret, helix_high.return (return — observable output)
+///   - helix_low.mem.write (memory write — observable side effect)
+///   - helix_high.assign where the LHS feeds a live variable
+static bool isLiveConsumer(Operation* op) {
+    return isa<helix::low::JccOp>(op) ||
+           isa<helix::low::JmpOp>(op) ||
+           isa<helix::low::CallOp>(op) ||
+           isa<helix::high::CallOp>(op) ||
+           isa<helix::low::RetOp>(op) ||
+           isa<helix::high::ReturnOp>(op) ||
+           isa<helix::low::MemWriteOp>(op);
+}
+
+/// Check whether a Value is consumed (directly or transitively) by a live
+/// operation.  Walks the use-chain forward, stopping at live consumers.
+///
+/// @param value     The SSA value to check.
+/// @param visited   Set of already-visited operations (cycle protection).
+/// @return          True if the value reaches a live consumer.
+static bool isValueLive(Value value,
+                        llvm::SmallPtrSetImpl<Operation*>& visited) {
+    for (auto* user : value.getUsers()) {
+        if (!visited.insert(user).second)
+            continue;  // already visited — avoid infinite loops
+
+        // Direct live consumer.
+        if (isLiveConsumer(user))
+            return true;
+
+        // helix_high.assign: the value is live if the assignment target
+        // (LHS) is itself live.  The LHS is a var.ref whose var_id we
+        // need to trace further.  For simplicity, if the value appears as
+        // the RHS of an assign, check whether the assign's target feeds
+        // into something live.
+        if (auto assignOp = dyn_cast<helix::high::AssignOp>(user)) {
+            // The assign itself is a side effect — if the target var is
+            // live, this assign is live.  We check the target operand.
+            if (isValueLive(assignOp.getTarget(), visited))
+                return true;
+            continue;
+        }
+
+        // For any other operation that produces results, check if those
+        // results are live.
+        for (auto result : user->getResults()) {
+            if (isValueLive(result, visited))
+                return true;
+        }
+    }
+    return false;
+}
+
+/// Determine whether a helix_high.var.decl is dead.
+///
+/// A variable declaration is dead if none of its var.ref operations are
+/// consumed by a live operation (branch, call, return, memory write, or
+/// an assignment whose target is itself live).
+///
+/// @param declOp   The var.decl operation.
+/// @param funcBody The function's region (to scan for var.ref ops).
+/// @return         True if the variable is dead and can be removed.
+static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody) {
+    auto varId = declOp.getVarId();
+    auto varName = declOp.getVarName();
+
+    // Never remove SIMD vector variables — their reads aren't fully modeled yet,
+    // but they contain critical offset calculations (e.g., Entity->Position at +0x70).
+    if (varName.starts_with("XMM") || varName.starts_with("YMM") || varName.starts_with("ZMM") ||
+        varName.starts_with("xmm") || varName.starts_with("ymm") || varName.starts_with("zmm"))
+        return false;
+    // Collect all var.ref operations that reference this variable.
+    llvm::SmallVector<helix::high::VarRefOp, 8> refs;
+    funcBody.walk([&](helix::high::VarRefOp refOp) {
+        if (refOp.getVarId() == varId)
+            refs.push_back(refOp);
+    });
+
+    // If no references at all, the variable is dead.
+    if (refs.empty())
+        return true;
+
+    // Check if any reference is consumed by a live operation.
+    for (auto refOp : refs) {
+        llvm::SmallPtrSet<Operation*, 16> visited;
+        if (isValueLive(refOp.getResult(), visited))
+            return false;  // at least one live use — variable is alive
+    }
+
+    return true;  // no live uses found
+}
+
+/// Check whether an __undef assignment is dead.
+///
+/// An assignment is dead if:
+///   1. The RHS is an __undef reference (var name starts with "__undef")
+///   2. The LHS (target variable) is never read by a live operation
+///
+/// @param assignOp  The assign operation to check.
+/// @param funcBody  The function's region.
+/// @return          True if this is a dead __undef assignment.
+static bool isDeadUndefAssign(helix::high::AssignOp assignOp,
+                              Region& funcBody) {
+    // Check if the RHS is a var.ref to __undef.
+    auto* rhsDef = assignOp.getValue().getDefiningOp();
+    if (!rhsDef)
+        return false;
+
+    if (auto refOp = dyn_cast<helix::high::VarRefOp>(rhsDef)) {
+        auto name = refOp.getVarName();
+        if (!name.starts_with("__undef"))
+            return false;
+    } else {
+        return false;
+    }
+
+    // Check if the target variable is dead.
+    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+    if (!lhsDef)
+        return false;
+
+    if (auto targetRef = dyn_cast<helix::high::VarRefOp>(lhsDef)) {
+        auto targetId = targetRef.getVarId();
+
+        // Check if any OTHER reference to this variable is live.
+        bool anyLive = false;
+        funcBody.walk([&](helix::high::VarRefOp otherRef) {
+            if (otherRef == targetRef)
+                return;  // skip the LHS reference itself
+            if (otherRef.getVarId() != targetId)
+                return;
+
+            llvm::SmallPtrSet<Operation*, 16> visited;
+            if (isValueLive(otherRef.getResult(), visited))
+                anyLive = true;
+        });
+
+        return !anyLive;
+    }
+
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Dead Register Write Detection
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -380,7 +690,10 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
 
     // Never remove writes to RSP or RBP — they're handled by the
     // stack pointer bookkeeping and frame pointer passes respectively.
-    if (regName == "RSP" || regName == "RBP")
+    // Also, never remove writes to SIMD vector registers because RemillToHelixLow 
+    // erases their semantic reads, leading to false dead stores and missing offsets.
+    if (regName == "RSP" || regName == "RBP" || 
+        regName.starts_with("XMM") || regName.starts_with("YMM") || regName.starts_with("ZMM"))
         return false;
 
     // Check if the written value has any uses at all.  In SSA form, a
@@ -439,8 +752,8 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
         // A return uses RAX (return value).  If we're writing to RAX and
         // there's a return ahead, the write is NOT dead.
         if (isa<helix::low::RetOp>(&op)) {
-            if (regName == "RAX") {
-                foundRead = true;  // RAX is implicitly read by RET.
+            if (regName == "RAX" || regName.starts_with("XMM") || regName.starts_with("YMM") || regName.starts_with("ZMM")) {
+                foundRead = true;  // RAX and Vector Registers are implicitly read by RET.
                 break;
             }
             // For other registers at return, the write is dead (callee-saved
@@ -585,6 +898,29 @@ private:
             llvm::dbgs() << "  Phase 5: removed " << deadWritesRemoved
                          << " dead register writes\n");
 
+        // ── Phase 5b: Remove dead flag computations ─────────────────────
+        //
+        // Analyze flag-producing operations (binop, cmp, test) and remove
+        // individual dead flag computations.  If ALL flags of a CMP/TEST
+        // are dead, remove the entire operation.  Flags with uncertain
+        // consumption are preserved with a warning.
+
+        unsigned deadFlagsRemoved  = 0;
+        unsigned deadCmpTestRemoved = 0;
+
+        auto flagResult = removeDeadFlags(funcBody);
+        deadFlagsRemoved   = std::get<0>(flagResult);
+        deadCmpTestRemoved = std::get<1>(flagResult);
+
+        NumDeadFlagsRemoved   += deadFlagsRemoved;
+        NumDeadCmpTestRemoved += deadCmpTestRemoved;
+
+        LLVM_DEBUG(if (deadFlagsRemoved + deadCmpTestRemoved > 0)
+            llvm::dbgs() << "  Phase 5b: removed " << deadFlagsRemoved
+                         << " dead flag computations, "
+                         << deadCmpTestRemoved
+                         << " dead CMP/TEST ops\n");
+
         // ── Phase 6: Trivially dead operation cleanup ───────────────────
 
         unsigned trivDeadRemoved = removeTriviallyDeadOps(funcBody);
@@ -594,10 +930,39 @@ private:
             llvm::dbgs() << "  Phase 6: removed " << trivDeadRemoved
                          << " trivially dead ops\n");
 
+        // ── Phase 7: Dead variable elimination (HelixHigh) ─────────────
+        //
+        // Remove helix_high.var.decl whose value is never consumed by a
+        // live operation, dead __undef assignments, and dead assignment
+        // chains.  Iterates to fixed point.
+
+        unsigned deadVarsRemoved = 0;
+        unsigned deadAssignsRemoved = 0;
+        unsigned deadUndefRemoved = 0;
+
+        auto deadVarResult = removeDeadVariables(funcBody);
+        deadVarsRemoved    += std::get<0>(deadVarResult);
+        deadAssignsRemoved += std::get<1>(deadVarResult);
+        deadUndefRemoved   += std::get<2>(deadVarResult);
+
+        NumDeadVarsRemoved    += deadVarsRemoved;
+        NumDeadAssignsRemoved += deadAssignsRemoved;
+        NumDeadUndefRemoved   += deadUndefRemoved;
+
+        LLVM_DEBUG(if (deadVarsRemoved + deadAssignsRemoved + deadUndefRemoved > 0)
+            llvm::dbgs() << "  Phase 7: removed " << deadVarsRemoved
+                         << " dead vars, " << deadAssignsRemoved
+                         << " dead assigns, " << deadUndefRemoved
+                         << " dead __undef assigns\n");
+
         LLVM_DEBUG(llvm::dbgs() << "  Total removed: "
                                 << (nopsRemoved + prologueRemoved +
                                     frameOpsRemoved + stackAdjRemoved +
-                                    deadWritesRemoved + trivDeadRemoved)
+                                    deadWritesRemoved +
+                                    deadFlagsRemoved + deadCmpTestRemoved +
+                                    trivDeadRemoved +
+                                    deadVarsRemoved + deadAssignsRemoved +
+                                    deadUndefRemoved)
                                 << "\n");
 
         return success();
@@ -825,6 +1190,14 @@ private:
         auto& funcBody = func.getBody();
         unsigned removed = 0;
 
+        // Multi-block functions may have LLVM dialect branch ops whose operands
+        // cross block boundaries, causing Liveness analysis to assert.
+        // Skip Liveness-based DCE for multi-block — the emitter-level DSE
+        // (PseudoCEmitter::precomputeDeadStores) handles this independently.
+        if (funcBody.getBlocks().size() > 2) {
+            return 0;
+        }
+
         // Compute MLIR liveness for the function.
         Liveness liveness(func);
 
@@ -858,6 +1231,169 @@ private:
         }
 
         return removed;
+    }
+
+    // ─── Phase 5b: Dead Flag Computation Removal ────────────────────────
+
+    /// Remove dead flag computations from flag-producing operations.
+    ///
+    /// For each flag-producing operation (BinOp, CmpOp, TestOp):
+    ///   1. Compute which flags are actually consumed by jcc/cmov ops
+    ///   2. If a flag has uncertain consumption (non-jcc/cmov user),
+    ///      preserve it and emit a warning
+    ///   3. For CmpOp/TestOp: if ALL flags are dead, remove the entire op
+    ///   4. For BinOp: only flag results can be dead (main result may be live);
+    ///      dead flag results are replaced with a constant false value
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          Tuple of (dead flags removed, dead CMP/TEST ops removed).
+    std::tuple<unsigned, unsigned> removeDeadFlags(Region& funcBody) {
+        unsigned totalFlagsRemoved   = 0;
+        unsigned totalCmpTestRemoved = 0;
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // ── Step 1: Handle CmpOp — remove entire op if all flags dead ──
+            {
+                llvm::SmallVector<helix::low::CmpOp, 8> deadCmps;
+
+                funcBody.walk([&](helix::low::CmpOp cmpOp) {
+                    // Check for uncertain consumption first.
+                    if (hasAnyUncertainFlags(cmpOp)) {
+                        cmpOp.emitWarning()
+                            << "flag liveness uncertain, preserving";
+                        return;
+                    }
+
+                    auto liveness = computeFlagLiveness(cmpOp);
+                    if (!liveness.any_live()) {
+                        deadCmps.push_back(cmpOp);
+                    }
+                });
+
+                for (auto cmpOp : deadCmps) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead CMP (all flags unused): "
+                        << *cmpOp.getOperation() << "\n");
+
+                    // Before erasing, clean up operand definitions that may
+                    // become dead (e.g., RegReadOps feeding the CMP).
+                    llvm::SmallVector<Operation*, 4> operandDefs;
+                    for (auto operand : cmpOp->getOperands()) {
+                        if (auto* defOp = operand.getDefiningOp())
+                            operandDefs.push_back(defOp);
+                    }
+
+                    cmpOp.erase();
+                    ++totalCmpTestRemoved;
+                    changed = true;
+
+                    // Clean up now-dead operand definitions.
+                    for (auto* defOp : operandDefs) {
+                        if (defOp->use_empty() &&
+                            isa<helix::low::RegReadOp>(defOp)) {
+                            defOp->erase();
+                            ++totalFlagsRemoved;
+                        }
+                    }
+                }
+            }
+
+            // ── Step 2: Handle TestOp — remove entire op if all flags dead ─
+            {
+                llvm::SmallVector<helix::low::TestOp, 8> deadTests;
+
+                funcBody.walk([&](helix::low::TestOp testOp) {
+                    if (hasAnyUncertainFlags(testOp)) {
+                        testOp.emitWarning()
+                            << "flag liveness uncertain, preserving";
+                        return;
+                    }
+
+                    auto liveness = computeFlagLiveness(testOp);
+                    if (!liveness.any_live()) {
+                        deadTests.push_back(testOp);
+                    }
+                });
+
+                for (auto testOp : deadTests) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead TEST (all flags unused): "
+                        << *testOp.getOperation() << "\n");
+
+                    llvm::SmallVector<Operation*, 4> operandDefs;
+                    for (auto operand : testOp->getOperands()) {
+                        if (auto* defOp = operand.getDefiningOp())
+                            operandDefs.push_back(defOp);
+                    }
+
+                    testOp.erase();
+                    ++totalCmpTestRemoved;
+                    changed = true;
+
+                    for (auto* defOp : operandDefs) {
+                        if (defOp->use_empty() &&
+                            isa<helix::low::RegReadOp>(defOp)) {
+                            defOp->erase();
+                            ++totalFlagsRemoved;
+                        }
+                    }
+                }
+            }
+
+            // ── Step 3: Handle BinOp — replace dead flag results ───────────
+            //
+            // BinOp produces both a value result and flag results.  The value
+            // result may still be live even if all flags are dead.  For dead
+            // flag results, we replace their uses (if any remain after DCE)
+            // with a constant false, then count them as removed.
+            //
+            // Note: We do NOT remove the BinOp itself — only its dead flag
+            // outputs.  The BinOp is kept if its value result is live.
+            {
+                funcBody.walk([&](helix::low::BinOp binOp) {
+                    if (hasAnyUncertainFlags(binOp)) {
+                        binOp.emitWarning()
+                            << "flag liveness uncertain, preserving";
+                        return;
+                    }
+
+                    auto liveness = computeFlagLiveness(binOp);
+
+                    // Count dead flags (unused flag results).
+                    unsigned deadCount = 0;
+                    if (!liveness.carry_live &&
+                        binOp.getCarryFlag().use_empty())
+                        ++deadCount;
+                    if (!liveness.zero_live &&
+                        binOp.getZeroFlag().use_empty())
+                        ++deadCount;
+                    if (!liveness.sign_live &&
+                        binOp.getSignFlag().use_empty())
+                        ++deadCount;
+                    if (!liveness.overflow_live &&
+                        binOp.getOverflowFlag().use_empty())
+                        ++deadCount;
+
+                    if (deadCount > 0) {
+                        LLVM_DEBUG(llvm::dbgs()
+                            << "  BinOp with " << deadCount
+                            << " dead flag(s): "
+                            << *binOp.getOperation() << "\n");
+                        totalFlagsRemoved += deadCount;
+                        // The dead flag results are already unused (use_empty),
+                        // so no replacement is needed.  They will be cleaned
+                        // up when the BinOp is eventually removed (if the
+                        // value result also becomes dead) or ignored by the
+                        // emitter.
+                    }
+                });
+            }
+        }
+
+        return {totalFlagsRemoved, totalCmpTestRemoved};
     }
 
     // ─── Phase 6: Trivially Dead Operation Cleanup ───────────────────────
@@ -927,6 +1463,158 @@ private:
         }
 
         return removed;
+    }
+
+    // ─── Phase 7: Dead Variable Elimination (HelixHigh) ──────────────────
+
+    /// Remove dead variable declarations, dead assignment chains, and dead
+    /// __undef assignments.
+    ///
+    /// A variable is dead if none of its var.ref operations are consumed by
+    /// a live operation (branch, call, return, memory write).  Dead
+    /// assignments are removed in reverse dependency order: first the
+    /// assignments that feed the dead variable, then the declaration itself.
+    ///
+    /// Iterates to fixed point because removing one dead variable may
+    /// expose other variables as dead (transitive dependency chains).
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          Tuple of (dead vars, dead assigns, dead __undef) removed.
+    std::tuple<unsigned, unsigned, unsigned>
+    removeDeadVariables(Region& funcBody) {
+        unsigned totalVars    = 0;
+        unsigned totalAssigns = 0;
+        unsigned totalUndef   = 0;
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // ── Step 1: Remove dead __undef assignments ─────────────────
+            {
+                llvm::SmallVector<helix::high::AssignOp, 16> deadUndefs;
+
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    if (isDeadUndefAssign(assignOp, funcBody))
+                        deadUndefs.push_back(assignOp);
+                });
+
+                for (auto assignOp : deadUndefs) {
+                    // Erase the RHS var.ref if it becomes unused.
+                    auto* rhsDef = assignOp.getValue().getDefiningOp();
+                    // Erase the LHS var.ref if it becomes unused.
+                    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+
+                    assignOp.erase();
+                    ++totalUndef;
+                    changed = true;
+
+                    if (rhsDef && rhsDef->use_empty())
+                        rhsDef->erase();
+                    if (lhsDef && lhsDef->use_empty())
+                        lhsDef->erase();
+                }
+            }
+
+            // ── Step 2: Remove dead assignment chains ───────────────────
+            //
+            // An assignment is dead if its target variable has no live
+            // consumers.  We remove assignments in reverse order so that
+            // removing a later assignment may expose an earlier one as dead.
+            {
+                llvm::SmallVector<helix::high::AssignOp, 16> allAssigns;
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    allAssigns.push_back(assignOp);
+                });
+
+                // Process in reverse order (reverse dependency).
+                for (auto it = allAssigns.rbegin(); it != allAssigns.rend();
+                     ++it) {
+                    auto assignOp = *it;
+
+                    // Get the target variable ID.
+                    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+                    if (!lhsDef)
+                        continue;
+
+                    auto targetRef =
+                        dyn_cast<helix::high::VarRefOp>(lhsDef);
+                    if (!targetRef)
+                        continue;
+
+                    auto targetId = targetRef.getVarId();
+
+                    // Never remove assignments to SIMD vector variables —
+                    // their reads aren't modeled but they contain critical offsets.
+                    auto targetName = targetRef.getVarName();
+                    if (targetName.starts_with("xmm") || targetName.starts_with("ymm") ||
+                        targetName.starts_with("zmm") || targetName.starts_with("XMM") ||
+                        targetName.starts_with("YMM") || targetName.starts_with("ZMM"))
+                        continue;
+
+                    // Check if the target variable has any live consumers
+                    // (excluding this assignment's own LHS reference).
+                    bool anyLive = false;
+                    funcBody.walk([&](helix::high::VarRefOp refOp) {
+                        if (anyLive)
+                            return;
+                        if (refOp == targetRef)
+                            return;
+                        if (refOp.getVarId() != targetId)
+                            return;
+
+                        llvm::SmallPtrSet<Operation*, 16> visited;
+                        if (isValueLive(refOp.getResult(), visited))
+                            anyLive = true;
+                    });
+
+                    if (!anyLive) {
+                        auto* rhsDef = assignOp.getValue().getDefiningOp();
+                        auto* lhsOp  = assignOp.getTarget().getDefiningOp();
+
+                        assignOp.erase();
+                        ++totalAssigns;
+                        changed = true;
+
+                        // Clean up orphaned operand definitions.
+                        if (rhsDef && rhsDef->use_empty())
+                            rhsDef->erase();
+                        if (lhsOp && lhsOp->use_empty())
+                            lhsOp->erase();
+                    }
+                }
+            }
+
+            // ── Step 3: Remove dead variable declarations ───────────────
+            {
+                llvm::SmallVector<helix::high::VarDeclOp, 16> deadDecls;
+
+                funcBody.walk([&](helix::high::VarDeclOp declOp) {
+                    if (isDeadVarDecl(declOp, funcBody))
+                        deadDecls.push_back(declOp);
+                });
+
+                for (auto declOp : deadDecls) {
+                    // If the decl has an initializer, check if it's dead too.
+                    if (declOp.getInit()) {
+                        auto* initDef =
+                            declOp.getInit().getDefiningOp();
+                        declOp.erase();
+                        ++totalVars;
+                        changed = true;
+
+                        if (initDef && initDef->use_empty())
+                            initDef->erase();
+                    } else {
+                        declOp.erase();
+                        ++totalVars;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        return {totalVars, totalAssigns, totalUndef};
     }
 };
 

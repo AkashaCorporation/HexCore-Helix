@@ -257,9 +257,251 @@ pub fn decode_operand_classes(mangled: &str) -> Vec<OpClass> {
     classes
 }
 
+/// HelixLow dialect operation that a Remill semantic maps to.
+///
+/// Mirrors the C++ `convertSemantic` logic in `RemillToHelixLow.cpp`.
+/// Each variant corresponds to a `helix_low.*` MLIR operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelixLowOp {
+    /// `helix_low.binop` — binary arithmetic/logic with flags.
+    BinOp(BinOpKind),
+    /// `helix_low.cmp` — comparison (sets flags, no result).
+    Cmp,
+    /// `helix_low.test` — logical test (AND without result, sets flags).
+    Test,
+    /// `helix_low.reg.write` — register write (MOV semantic).
+    RegWrite,
+    /// `helix_low.movzx` — zero-extend move.
+    MovZx,
+    /// `helix_low.movsx` — sign-extend move.
+    MovSx,
+    /// `helix_low.lea` — load effective address (pure computation).
+    Lea,
+    /// `helix_low.push` — push onto stack.
+    Push,
+    /// `helix_low.pop` — pop from stack.
+    Pop,
+    /// `helix_low.call` — function call.
+    Call,
+    /// `helix_low.ret` — function return.
+    Ret,
+    /// `helix_low.jmp` — unconditional jump.
+    Jmp,
+    /// `helix_low.jcc` — conditional jump with condition code.
+    Jcc(String),
+    /// `helix_low.cmov` — conditional move.
+    CMov(String),
+    /// `helix_low.nop` — no operation (removed by DCE).
+    Nop,
+    /// `helix_low.int3` — breakpoint marker.
+    Int3,
+    /// `helix_low.unaryop` — unary operation (NEG, NOT, INC, DEC, etc.).
+    UnaryOp(UnaryOpKind),
+    /// `helix_low.xchg` — exchange registers.
+    Xchg,
+    /// `helix_low.rep.movs` — REP MOVS string copy.
+    RepMovs,
+    /// `helix_low.rep.stos` — REP STOS string fill.
+    RepStos,
+}
+
+/// Binary operation kind, mirrors `helix_low::BinOpKind` in C++.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOpKind {
+    Add,
+    Sub,
+    Mul,
+    IMul,
+    Div,
+    IDiv,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Sar,
+    Rol,
+    Ror,
+}
+
+/// Unary operation kind, mirrors `helix_low::UnaryOpKind` in C++.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOpKind {
+    Neg,
+    Not,
+    Inc,
+    Dec,
+    Bswap,
+    Bsf,
+    Bsr,
+}
+
+/// Map a decoded `Semantic` to the corresponding `HelixLowOp`.
+///
+/// This is the Rust equivalent of the C++ `RemillToHelixLowPass::convertSemantic`
+/// method. Returns `None` for semantics that don't have a direct HelixLow mapping
+/// (e.g., `Unknown`, FPU, SSE/AVX).
+pub fn semantic_to_helix_low(semantic: &Semantic) -> Option<HelixLowOp> {
+    match semantic {
+        // Arithmetic/logic → helix_low.binop
+        Semantic::Add => Some(HelixLowOp::BinOp(BinOpKind::Add)),
+        Semantic::Sub => Some(HelixLowOp::BinOp(BinOpKind::Sub)),
+        Semantic::Mul => Some(HelixLowOp::BinOp(BinOpKind::Mul)),
+        Semantic::IMul => Some(HelixLowOp::BinOp(BinOpKind::IMul)),
+        Semantic::Div => Some(HelixLowOp::BinOp(BinOpKind::Div)),
+        Semantic::IDiv => Some(HelixLowOp::BinOp(BinOpKind::IDiv)),
+        Semantic::And => Some(HelixLowOp::BinOp(BinOpKind::And)),
+        Semantic::Or => Some(HelixLowOp::BinOp(BinOpKind::Or)),
+        Semantic::Xor => Some(HelixLowOp::BinOp(BinOpKind::Xor)),
+        Semantic::Shl => Some(HelixLowOp::BinOp(BinOpKind::Shl)),
+        Semantic::Shr => Some(HelixLowOp::BinOp(BinOpKind::Shr)),
+        Semantic::Sar => Some(HelixLowOp::BinOp(BinOpKind::Sar)),
+
+        // Comparison → helix_low.cmp / helix_low.test
+        Semantic::Cmp => Some(HelixLowOp::Cmp),
+        Semantic::Test => Some(HelixLowOp::Test),
+
+        // Data movement → helix_low.reg.write / movzx / movsx / lea
+        Semantic::Mov => Some(HelixLowOp::RegWrite),
+        Semantic::MovZx => Some(HelixLowOp::MovZx),
+        Semantic::MovSx | Semantic::Cdqe => Some(HelixLowOp::MovSx),
+        Semantic::Lea => Some(HelixLowOp::Lea),
+
+        // Stack → helix_low.push / pop
+        Semantic::Push => Some(HelixLowOp::Push),
+        Semantic::Pop => Some(HelixLowOp::Pop),
+
+        // Control flow → helix_low.call / ret / jmp / jcc
+        Semantic::Call => Some(HelixLowOp::Call),
+        Semantic::Ret => Some(HelixLowOp::Ret),
+        Semantic::Jmp => Some(HelixLowOp::Jmp),
+        Semantic::Jcc(cc) => Some(HelixLowOp::Jcc(cc.clone())),
+        Semantic::CMov(cc) => Some(HelixLowOp::CMov(cc.clone())),
+
+        // Unary → helix_low.unaryop
+        Semantic::Neg => Some(HelixLowOp::UnaryOp(UnaryOpKind::Neg)),
+        Semantic::Not => Some(HelixLowOp::UnaryOp(UnaryOpKind::Not)),
+        Semantic::Inc => Some(HelixLowOp::UnaryOp(UnaryOpKind::Inc)),
+        Semantic::Dec => Some(HelixLowOp::UnaryOp(UnaryOpKind::Dec)),
+        Semantic::Bswap => Some(HelixLowOp::UnaryOp(UnaryOpKind::Bswap)),
+        Semantic::Bsf => Some(HelixLowOp::UnaryOp(UnaryOpKind::Bsf)),
+        Semantic::Bsr => Some(HelixLowOp::UnaryOp(UnaryOpKind::Bsr)),
+
+        // Exchange → helix_low.xchg
+        Semantic::Xchg => Some(HelixLowOp::Xchg),
+
+        // Special → helix_low.nop / int3
+        Semantic::Nop => Some(HelixLowOp::Nop),
+        Semantic::Int3 => Some(HelixLowOp::Int3),
+
+        // String ops → helix_low.rep.*
+        Semantic::RepMovs => Some(HelixLowOp::RepMovs),
+        Semantic::RepStos => Some(HelixLowOp::RepStos),
+
+        // No direct HelixLow mapping (BT, XAdd, FPU, SSE, Unknown, etc.)
+        _ => None,
+    }
+}
+
+/// Get the Jcc condition string for a conditional jump semantic.
+///
+/// Mirrors the C++ `getJccCondition()` in `RemillDemangler.cpp`.
+pub fn jcc_condition(semantic: &Semantic) -> Option<&'static str> {
+    match semantic {
+        Semantic::Jcc(cc) => {
+            match cc.as_str() {
+                "JZ" | "JE" => Some("z"),
+                "JNZ" | "JNE" => Some("nz"),
+                "JB" | "JC" | "JNAE" => Some("b"),
+                "JNB" | "JNC" | "JAE" => Some("nb"),
+                "JBE" | "JNA" => Some("be"),
+                "JNBE" | "JA" => Some("nbe"),
+                "JL" | "JNGE" => Some("l"),
+                "JNL" | "JGE" => Some("nl"),
+                "JLE" | "JNG" => Some("le"),
+                "JNLE" | "JG" => Some("nle"),
+                "JS" => Some("s"),
+                "JNS" => Some("ns"),
+                "JO" => Some("o"),
+                "JNO" => Some("no"),
+                "JP" | "JPE" => Some("p"),
+                "JNP" | "JPO" => Some("np"),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn split_numeric_prefix(s: &str) -> (&str, &str) {
     let pos = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     (&s[..pos], &s[pos..])
+}
+
+// ─── Idiom Pattern Detection ────────────────────────────────────────────────
+
+/// Result of idiom pattern analysis on a HelixLow operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdiomPattern {
+    /// `XOR reg, reg` — both operands are the same register.
+    /// Should be converted to `int.lit 0` (zero assignment).
+    SelfXor,
+    /// `TEST reg, reg` — both operands are the same register.
+    /// Should be converted to `helix_low.cmp reg, 0`.
+    TestSelfToCompareZero,
+    /// `MOV reg, reg` — source and destination are the same register.
+    /// Should be eliminated entirely (no-op).
+    MovSelfEliminated,
+}
+
+/// Detect idiom patterns for a binary operation with two register operands.
+///
+/// Given a semantic and two register names (source operands), returns the
+/// applicable idiom pattern if both operands reference the same register.
+///
+/// This is the Rust equivalent of the C++ `isSameRegisterOperand` check
+/// in `RemillToHelixLow.cpp`.
+pub fn detect_self_operand_idiom(
+    semantic: &Semantic,
+    reg_a: &str,
+    reg_b: &str,
+) -> Option<IdiomPattern> {
+    if reg_a != reg_b {
+        return None;
+    }
+
+    match semantic {
+        Semantic::Xor => Some(IdiomPattern::SelfXor),
+        Semantic::Test => Some(IdiomPattern::TestSelfToCompareZero),
+        Semantic::Mov => Some(IdiomPattern::MovSelfEliminated),
+        _ => None,
+    }
+}
+
+/// Apply idiom transformation to a HelixLow operation.
+///
+/// Returns the transformed operation, or `None` if the operation should be
+/// eliminated (e.g., MOV reg, reg).
+pub fn apply_idiom(
+    op: &HelixLowOp,
+    idiom: &IdiomPattern,
+) -> Option<HelixLowOp> {
+    match idiom {
+        IdiomPattern::SelfXor => {
+            // XOR reg, reg → still emitted as BinOp(Xor) but with is_self_xor
+            // flag. The DCE pass will later convert this to `int.lit 0`.
+            // We keep the original op; the flag is tracked externally.
+            Some(op.clone())
+        }
+        IdiomPattern::TestSelfToCompareZero => {
+            // TEST reg, reg → CMP reg, 0
+            Some(HelixLowOp::Cmp)
+        }
+        IdiomPattern::MovSelfEliminated => {
+            // MOV reg, reg → eliminated (no operation generated)
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +629,98 @@ mod tests {
         assert_eq!(classes, vec![OpClass::MemWrite, OpClass::MemRead, OpClass::RegRead]);
     }
 
+    // ── semantic_to_helix_low tests ──────────────────────────────────────
+
+    #[test]
+    fn test_arithmetic_semantics_map_to_binop() {
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Add),
+            Some(HelixLowOp::BinOp(BinOpKind::Add))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Sub),
+            Some(HelixLowOp::BinOp(BinOpKind::Sub))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Xor),
+            Some(HelixLowOp::BinOp(BinOpKind::Xor))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::And),
+            Some(HelixLowOp::BinOp(BinOpKind::And))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Or),
+            Some(HelixLowOp::BinOp(BinOpKind::Or))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Shl),
+            Some(HelixLowOp::BinOp(BinOpKind::Shl))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Shr),
+            Some(HelixLowOp::BinOp(BinOpKind::Shr))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Sar),
+            Some(HelixLowOp::BinOp(BinOpKind::Sar))
+        );
+    }
+
+    #[test]
+    fn test_cmp_test_map_correctly() {
+        assert_eq!(semantic_to_helix_low(&Semantic::Cmp), Some(HelixLowOp::Cmp));
+        assert_eq!(semantic_to_helix_low(&Semantic::Test), Some(HelixLowOp::Test));
+    }
+
+    #[test]
+    fn test_control_flow_maps() {
+        assert_eq!(semantic_to_helix_low(&Semantic::Call), Some(HelixLowOp::Call));
+        assert_eq!(semantic_to_helix_low(&Semantic::Ret), Some(HelixLowOp::Ret));
+        assert_eq!(semantic_to_helix_low(&Semantic::Jmp), Some(HelixLowOp::Jmp));
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Jcc("JZ".into())),
+            Some(HelixLowOp::Jcc("JZ".into()))
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Jcc("JNZ".into())),
+            Some(HelixLowOp::Jcc("JNZ".into()))
+        );
+    }
+
+    #[test]
+    fn test_nop_int3_maps() {
+        assert_eq!(semantic_to_helix_low(&Semantic::Nop), Some(HelixLowOp::Nop));
+        assert_eq!(semantic_to_helix_low(&Semantic::Int3), Some(HelixLowOp::Int3));
+    }
+
+    #[test]
+    fn test_data_movement_maps() {
+        assert_eq!(semantic_to_helix_low(&Semantic::Mov), Some(HelixLowOp::RegWrite));
+        assert_eq!(semantic_to_helix_low(&Semantic::MovZx), Some(HelixLowOp::MovZx));
+        assert_eq!(semantic_to_helix_low(&Semantic::MovSx), Some(HelixLowOp::MovSx));
+        assert_eq!(semantic_to_helix_low(&Semantic::Lea), Some(HelixLowOp::Lea));
+        assert_eq!(semantic_to_helix_low(&Semantic::Push), Some(HelixLowOp::Push));
+        assert_eq!(semantic_to_helix_low(&Semantic::Pop), Some(HelixLowOp::Pop));
+    }
+
+    #[test]
+    fn test_unknown_returns_none() {
+        assert_eq!(semantic_to_helix_low(&Semantic::Unknown("FOO".into())), None);
+    }
+
+    #[test]
+    fn test_jcc_condition_mapping() {
+        assert_eq!(jcc_condition(&Semantic::Jcc("JZ".into())), Some("z"));
+        assert_eq!(jcc_condition(&Semantic::Jcc("JE".into())), Some("z"));
+        assert_eq!(jcc_condition(&Semantic::Jcc("JNZ".into())), Some("nz"));
+        assert_eq!(jcc_condition(&Semantic::Jcc("JNE".into())), Some("nz"));
+        assert_eq!(jcc_condition(&Semantic::Jcc("JB".into())), Some("b"));
+        assert_eq!(jcc_condition(&Semantic::Jcc("JL".into())), Some("l"));
+        assert_eq!(jcc_condition(&Semantic::Jcc("JNLE".into())), Some("nle"));
+        assert_eq!(jcc_condition(&Semantic::Add), None);
+    }
+
     #[test]
     fn test_all_remill_test_files_no_unknown_semantics() {
         let test_files = [
@@ -445,5 +779,71 @@ mod tests {
         if files_found == 0 {
             eprintln!("SKIP: no Remill test files found (test data absent)");
         }
+    }
+
+    // ── Idiom pattern detection tests ────────────────────────────────────
+
+    #[test]
+    fn test_xor_self_detected() {
+        let result = detect_self_operand_idiom(&Semantic::Xor, "RAX", "RAX");
+        assert_eq!(result, Some(IdiomPattern::SelfXor));
+    }
+
+    #[test]
+    fn test_xor_different_regs_no_idiom() {
+        let result = detect_self_operand_idiom(&Semantic::Xor, "RAX", "RBX");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_test_self_detected() {
+        let result = detect_self_operand_idiom(&Semantic::Test, "RCX", "RCX");
+        assert_eq!(result, Some(IdiomPattern::TestSelfToCompareZero));
+    }
+
+    #[test]
+    fn test_test_different_regs_no_idiom() {
+        let result = detect_self_operand_idiom(&Semantic::Test, "RCX", "RDX");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_mov_self_detected() {
+        let result = detect_self_operand_idiom(&Semantic::Mov, "RBP", "RBP");
+        assert_eq!(result, Some(IdiomPattern::MovSelfEliminated));
+    }
+
+    #[test]
+    fn test_mov_different_regs_no_idiom() {
+        let result = detect_self_operand_idiom(&Semantic::Mov, "RSP", "RBP");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_add_self_no_idiom() {
+        // ADD reg, reg is NOT an idiom — it doubles the value.
+        let result = detect_self_operand_idiom(&Semantic::Add, "RAX", "RAX");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_apply_idiom_self_xor_keeps_op() {
+        let op = HelixLowOp::BinOp(BinOpKind::Xor);
+        let result = apply_idiom(&op, &IdiomPattern::SelfXor);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_apply_idiom_test_self_converts_to_cmp() {
+        let op = HelixLowOp::Test;
+        let result = apply_idiom(&op, &IdiomPattern::TestSelfToCompareZero);
+        assert_eq!(result, Some(HelixLowOp::Cmp));
+    }
+
+    #[test]
+    fn test_apply_idiom_mov_self_eliminated() {
+        let op = HelixLowOp::RegWrite;
+        let result = apply_idiom(&op, &IdiomPattern::MovSelfEliminated);
+        assert_eq!(result, None);
     }
 }

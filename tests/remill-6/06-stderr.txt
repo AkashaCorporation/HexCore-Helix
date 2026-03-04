@@ -1,4 +1,0 @@
---- Stats ---
-Functions: 1
-Instructions: 69
-  [diag] sub_141f7939d: frame=32B, locals=2

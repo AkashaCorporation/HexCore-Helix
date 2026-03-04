@@ -10,6 +10,7 @@
 #define HELIX_ANALYSIS_SIGNATURE_DB_H
 
 #include "llvm/ADT/StringRef.h"
+#include "mlir/IR/BuiltinOps.h"
 #include <optional>
 #include <string>
 #include <vector>
@@ -42,6 +43,17 @@ bool isCrtFunction(llvm::StringRef name);
 
 /// Check if a function name is a known Win32 API function.
 bool isWin32Function(llvm::StringRef name);
+
+/// Resolve CALL target addresses to function names within a module.
+///
+/// Walks all helix_low.FuncOp operations to build an address→name map,
+/// then updates every helix_low.CallOp whose target address matches a
+/// known function entry point by setting its target_name attribute.
+/// For addresses matching a known CRT/Win32 signature, the canonical
+/// signature name is used instead.
+///
+/// @param module  The top-level MLIR ModuleOp containing HelixLow functions.
+void resolveCallTargets(mlir::ModuleOp module);
 
 } // namespace helix
 

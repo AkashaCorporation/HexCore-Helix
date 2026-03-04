@@ -110,7 +110,7 @@ static std::string decompileFile(const fs::path& input_path) {
     }
 
     helix_engine_destroy(handle);
-    return std::string(out_buf.data());  // null-terminated
+    return std::string(out_buf.data(), out_len - 1);  // use explicit length
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -193,14 +193,18 @@ int main(int argc, char* argv[]) {
 
     // Output to file or stdout
     if (argc >= 3) {
-        fs::path out_path = argv[2];
+        fs::path out_path;
+        if (std::string(argv[2]) == "-o" && argc >= 4) {
+            out_path = argv[3];
+        } else {
+            out_path = argv[2];
+        }
         std::ofstream ofs(out_path);
         if (!ofs) {
             std::cerr << "error: cannot write to: " << out_path << "\n";
             return 1;
         }
         ofs << result;
-        std::cerr << "Output: " << out_path << "\n";
     } else {
         std::cout << result;
     }

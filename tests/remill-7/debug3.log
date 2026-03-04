@@ -1,0 +1,100 @@
+[Helix] OK: Synthesized condition for nz
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for nz
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for s
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for nl
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for nz
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for s
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for nl
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for nz
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[Helix] OK: Synthesized condition for z
+[Helix] Terminator is llvm.cond_br with 2 successors
+[SCC] Found 0 SCC loop(s), 49 blocks in function, 65 edges
+  Block term: helix_low.jcc succs=2
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.jmp succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jmp succs=1
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.jcc succs=2
+  Block term: llvm.br succs=1
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.jmp succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jmp succs=1
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.jcc succs=2
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.jcc succs=2
+  Block term: llvm.br succs=1
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: llvm.br succs=1
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.jcc succs=2
+  Block term: helix_low.ret succs=0
+  Block term: llvm.br succs=1
+  Block term: helix_low.ret succs=0
+  Block term: helix_low.ret succs=0

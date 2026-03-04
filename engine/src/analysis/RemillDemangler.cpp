@@ -174,6 +174,32 @@ RemillSemantic classifySemantic(std::string_view name) {
     if (name == "XORPD"  || name == "XORPDI")  return RemillSemantic::XORPD;
     if (name == "PXOR"   || name == "PXORI")   return RemillSemantic::PXOR;
 
+    // ---- SSE/AVX packed & misc ------------------------------------------
+    if (name == "MOVxPS")                       return RemillSemantic::MOVxPS;
+    if (name == "MOVSS_MEM")                    return RemillSemantic::MOVSS_MEM;
+    if (name == "SHUFPS" || name == "SHUFPSI")  return RemillSemantic::SHUFPS;
+    if (name == "SUBPS"  || name == "SUBPSI")   return RemillSemantic::SUBPS;
+    if (name == "ADDPS"  || name == "ADDPSI")   return RemillSemantic::ADDPS;
+    if (name == "MULPS"  || name == "MULPSI")   return RemillSemantic::MULPS;
+    if (name == "COMISS" || name == "COMISSI")  return RemillSemantic::COMISS;
+    if (name == "UNPCKHPS")                     return RemillSemantic::UNPCKHPS;
+
+    // ---- PREFETCH (hint, no semantic effect) ----------------------------
+    if (name == "PREFETCH" || name == "PREFETCHI") return RemillSemantic::PREFETCH;
+
+    // ---- CMPXCHG variants ----------------------------------------------
+    if (name.starts_with("CMPXCHG"))            return RemillSemantic::CMPXCHG;
+
+    // ---- SETcc (conditional byte set) ----------------------------------
+    if (name.starts_with("SET"))                return RemillSemantic::SETcc;
+
+    // ---- CDQ/CDQE with register suffix ---------------------------------
+    if (name == "CDQ_EAX")                      return RemillSemantic::CDQ_EAX;
+    if (name == "CDQE_EAX")                     return RemillSemantic::CDQE_EAX;
+
+    // ---- HandleUnsupported (Remill catch-all) ---------------------------
+    if (name == "HandleUnsupported")            return RemillSemantic::HANDLE_UNSUPPORTED;
+
     // ---- Fallback: conditional jumps (J<cc>), conditional moves (CMOV<cc>),
     //       and REP-prefixed string instructions ----------------------------
 
@@ -429,6 +455,32 @@ llvm::StringRef semanticToString(RemillSemantic semantic) {
     case RemillSemantic::XORPS:  return "XORPS";
     case RemillSemantic::XORPD:  return "XORPD";
     case RemillSemantic::PXOR:   return "PXOR";
+
+    // SSE/AVX packed & misc
+    case RemillSemantic::MOVxPS:      return "MOVxPS";
+    case RemillSemantic::MOVSS_MEM:   return "MOVSS_MEM";
+    case RemillSemantic::SHUFPS:      return "SHUFPS";
+    case RemillSemantic::SUBPS:       return "SUBPS";
+    case RemillSemantic::ADDPS:       return "ADDPS";
+    case RemillSemantic::MULPS:       return "MULPS";
+    case RemillSemantic::COMISS:      return "COMISS";
+    case RemillSemantic::UNPCKHPS:    return "UNPCKHPS";
+
+    // SETcc
+    case RemillSemantic::SETcc:       return "SETcc";
+
+    // CMPXCHG
+    case RemillSemantic::CMPXCHG:     return "CMPXCHG";
+
+    // PREFETCH
+    case RemillSemantic::PREFETCH:    return "PREFETCH";
+
+    // CDQ/CDQE variants
+    case RemillSemantic::CDQ_EAX:     return "CDQ_EAX";
+    case RemillSemantic::CDQE_EAX:    return "CDQE_EAX";
+
+    // HandleUnsupported
+    case RemillSemantic::HANDLE_UNSUPPORTED: return "HandleUnsupported";
 
     // Unrecognized
     case RemillSemantic::Unknown: return "Unknown";

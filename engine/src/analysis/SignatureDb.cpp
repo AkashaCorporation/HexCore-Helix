@@ -6,10 +6,16 @@
 /// type information from known function signatures.
 
 #include "helix/analysis/SignatureDb.h"
+#include "helix/dialects/HelixLowOps.h"
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <format>
 #include <string>
 
 using namespace helix;
@@ -152,4 +158,76 @@ bool helix::isWin32Function(llvm::StringRef name) {
 
     const auto& db = getDb().db;
     return db.count(name) > 0 && !isCrtFunction(name);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Call Target Resolution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void helix::resolveCallTargets(mlir::ModuleOp module) {
+    // Phase 1: Build address → function name map from all FuncOps in the module.
+    llvm::DenseMap<uint64_t, llvm::StringRef> addrToName;
+
+    module.walk([&](helix::low::FuncOp func) {
+        uint64_t addr = func.getEntryAddress();
+        auto symName = func.getSymName();
+        addrToName[addr] = symName;
+    });
+
+    // Phase 2: Walk all CallOps and resolve target addresses.
+    module.walk([&](helix::low::CallOp call) {
+        // Skip if already resolved.
+        if (call.getTargetName())
+            return;
+
+        // Try to extract a constant address from the target_addr operand.
+        auto targetVal = call.getTargetAddr();
+        auto* defOp = targetVal.getDefiningOp();
+        if (!defOp)
+            return;
+
+        // Handle LLVM constant integer (the common case from Remill lifting).
+        uint64_t targetAddr = 0;
+        bool resolved = false;
+
+        if (auto constOp = mlir::dyn_cast<mlir::LLVM::ConstantOp>(defOp)) {
+            if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+                targetAddr = intAttr.getValue().getZExtValue();
+                resolved = true;
+            }
+        }
+        // Also handle arith.constant if present.
+        if (!resolved) {
+            if (auto intAttr = defOp->getAttrOfType<mlir::IntegerAttr>("value")) {
+                targetAddr = intAttr.getValue().getZExtValue();
+                resolved = true;
+            }
+        }
+
+        if (!resolved)
+            return;
+
+        // Look up the address in the module's function table.
+        auto it = addrToName.find(targetAddr);
+        if (it != addrToName.end()) {
+            auto funcName = it->second;
+
+            // If the function name matches a known signature, prefer the
+            // canonical signature name (handles cases where the binary's
+            // symbol table has a decorated name but we know the real API).
+            auto sig = lookupSignature(funcName);
+            if (sig) {
+                call.setTargetNameAttr(
+                    mlir::StringAttr::get(call->getContext(), sig->name));
+            } else {
+                call.setTargetNameAttr(
+                    mlir::StringAttr::get(call->getContext(), funcName));
+            }
+        } else {
+            // Address not in module's function table — format as sub_<hex>.
+            auto name = std::format("sub_{:x}", targetAddr);
+            call.setTargetNameAttr(
+                mlir::StringAttr::get(call->getContext(), name));
+        }
+    });
 }

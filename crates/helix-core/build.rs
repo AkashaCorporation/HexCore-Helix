@@ -156,6 +156,15 @@ fn main() {
         "MLIRFuncDialect",
         // Control Flow Dialect
         "MLIRControlFlowDialect",
+        "MLIRSCFDialect",
+        "MLIRTensorDialect",
+        "MLIRAffineDialect",
+        "MLIRComplexDialect",
+        "MLIRMemRefDialect",
+        "MLIRArithUtils",
+        "MLIRTensorUtils",
+        "MLIRMemRefUtils",
+        "MLIRSCFUtils",
         // Additional dependencies pulled in transitively
         "MLIRParser",
         "MLIRAsmParser",

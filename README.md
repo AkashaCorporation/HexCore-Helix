@@ -1,6 +1,8 @@
 # HexCore Helix
 
-> **Next-generation decompilation engine** — Rust + C++23/MLIR + FlatBuffers
+> **Next-generation decompilation engine** — C++23/MLIR + Rust + FlatBuffers
+>
+> Turns machine code into readable pseudo-C, powered by custom MLIR dialects and real flag/condition recovery.
 
 [![CI](https://github.com/LXrdKnowkill/HexCore-Helix/actions/workflows/build.yml/badge.svg)](https://github.com/LXrdKnowkill/HexCore-Helix/actions/workflows/build.yml)
 
@@ -51,20 +53,32 @@ graph TB
 | **Safety Bridge** | Rust + NAPI-RS | Memory-safe bridge to Node.js/VS Code |
 | **Transport** | FlatBuffers | Zero-copy IPC between engine and UI |
 
-## What's Working (Feb 2026)
+## What's Working (March 2026)
+
+### MLIR Decompilation Engine (Phase 2) ✅
+
+The C++23 engine with custom MLIR dialects is now the **primary decompilation backend**:
+
+- **7-pass MLIR pipeline** — RemillToHelixLow → RecoverStackLayout → RecoverCallingConvention → PropagateTypes → StructureControlFlow → RecoverVariables → EliminateDeadCode
+- **170+ x86-64 semantics** — MOV, LEA, CMP, TEST, ADD, SUB, AND, OR, XOR, CMOV, XCHG, and more
+- **Flag recovery** — `if (nz)` → `if (x != 0)`, flag synthesis from CMP/TEST results
+- **Control flow structuring** — `if/else`, `while`, `do-while`, `goto/label`, ternary from CMOV
+- **Argument recovery** — Tracks RCX, RDX, R8, R9 before `CALL` to populate function arguments
+- **Vtable call naming** — `rax->vfunc_0x18()` from indirect call offsets
+- **Standalone CLI** — `helix_tool.exe input.ll` produces clean pseudo-C
+- **PseudoCEmitter** — 2300+ lines of expression formatting, dead store suppression, confidence scoring
+- Real-world testing on **Saber Interactive** (World War Z) and **Crystal Dynamics** (ROTTR) game binaries
 
 ### HIR Pipeline (Phase 1.5) ✅
 
-The Rust-based HIR (High-level IR) pipeline is fully operational and serves as the primary decompilation path:
+The Rust-based HIR pipeline serves as the secondary decompilation path for simpler functions:
 
-- **HIR Builder & Emitter** — Lowering from Remill IR to pseudo-C with named variables, types, and indentation
-- **Calling Convention Recovery** — Win64 argument folding, result naming, register elimination
+- **HIR Builder & Emitter** — Lowering from Remill IR to pseudo-C with named variables
+- **Calling Convention Recovery** — Win64 argument folding, result naming
 - **Type Propagation** — Iterative refinement of `Unknown` types to fixed-point
-- **Control Flow Structuring** — Recovery of `if/else` and `while` loops from CMP/TEST + Jcc patterns
-- **Expanded Semantics** — CMOV, XCHG, MOVZX/MOVSX, BSF/BSR, BSWAP, REP MOVS/STOS, CDQE
+- **Control Flow Structuring** — Recovery of `if/else` and `while` from CMP/TEST + Jcc
 - **Data Flow Analysis** — Liveness, reaching definitions, dead code elimination
-- **Structured Diagnostics** — Typed diagnostic system (Error/Warning/Info/Hint)
-- **104 unit tests passing**, throughput **>95 instr/ms** on real game binaries
+- **104 unit tests passing**, throughput **>95 instr/ms**
 
 ### FlatBuffers Transport (Phase 3) ✅
 
@@ -74,18 +88,16 @@ Zero-copy binary transport between the engine and the VS Code UI:
 - **Rust serialization** — Manual FlatBuffer builder with roundtrip tests
 - **NAPI zero-copy** — `Buffer` objects passed directly to TypeScript without copying
 
-## Test Data — Helix vs Rellic
+## Test Data
 
-The `tests/` directory contains real-world decompilation outputs from **Rise of the Tomb Raider** (`ROTTR.exe`) and **World War Z** (`wwzRetailEgs.exe`), comparing the HexCore Helix output against the HexCore Rellic (experimental) output:
+The `tests/` directory contains real-world decompilation outputs from **Rise of the Tomb Raider** (`ROTTR.exe`) and **World War Z** (`wwzRetailEgs.exe`):
 
 ```
 tests/
-├── Remill-1/          # camera-init (wwz)
-├── Remill-2/          # aim-assist-init (wwz)
-├── Remill-3/          # swarm-serialization (wwz)
-├── Remill-4/          # swarm-write (wwz)
-├── Remill-5/          # name-writing (wwz)
-├── remill-6/          # name-writing alternative
+├── remill-7/          # Saber Interactive engine (multi-block, 49 blocks)
+│   ├── bone_pos_calc3.ll       # Bone position calculation (complex)
+│   ├── bone_pos_calc3.helix.c  # Helix decompiled output
+│   └── projectile_constructor.ll
 └── reports/
     ├── latest.md             # Current benchmark results
     ├── helix-vs-rellic.md    # Side-by-side comparison metrics
@@ -94,8 +106,7 @@ tests/
 
 Each test case contains:
 - `*.ll` — Remill-lifted LLVM IR
-- `*.c` — Rellic decompiled output (verbose, ~62 lines with temporaries)
-- `*.helix.c` — Helix decompiled output (clean, ~12 lines)
+- `*.helix.c` — Helix decompiled output
 
 ### Benchmark Highlights (ROTTR.exe)
 
@@ -109,43 +120,38 @@ Each test case contains:
 
 ```
 HexCore-Helix/
-├── Cargo.toml                 # Rust workspace root
-├── package.json               # NPM package (@hexcore/helix)
-├── index.js                   # Native binary auto-loader
-├── index.d.ts                 # TypeScript declarations
-├── crates/
-│   ├── helix-core/            # Pure Rust library (types, traits, FFI)
-│   │   └── src/
-│   │       ├── lib.rs         # Module root
-│   │       ├── types.rs       # Address, Instruction, CFG, etc.
-│   │       ├── ir/            # HIR pipeline (parser, builder, emitter)
-│   │       ├── analysis/      # Data flow, control flow, calling convention
-│   │       ├── flatbuf/       # FlatBuffer serialization (CFG, AST)
-│   │       ├── pipeline.rs    # Lifter/TransformPass/Emitter traits
-│   │       ├── ffi.rs         # C++ FFI boundary
-│   │       └── error.rs       # Error types
-│   └── hexcore-helix/         # NAPI-RS bridge (Node.js ↔ Rust)
-│       └── src/
-│           ├── lib.rs         # Module root
-│           ├── engine.rs      # HelixEngine JS class
-│           └── transport.rs   # FlatBuffer zero-copy transport
-├── engine/                    # C++23 engine (Phase 2 — WIP)
-│   ├── CMakeLists.txt         # CMake build (C++23, LLVM/MLIR)
+├── Cargo.toml                    # Rust workspace root
+├── CHANGELOG.md                  # Version history
+├── engine/                       # C++23 MLIR Engine (Phase 2)
+│   ├── CMakeLists.txt            # CMake build (C++23, LLVM 18, MLIR)
+│   ├── dialects/
+│   │   ├── HelixLowOps.td        # HelixLow dialect (TableGen)
+│   │   └── HelixHighOps.td       # HelixHigh dialect (TableGen)
 │   ├── include/helix/
-│   │   ├── Engine.h           # Engine class + C API
-│   │   └── Types.h            # FFI-safe types
-│   └── src/
-│       ├── Engine.cpp         # Engine implementation
-│       └── CApi.cpp           # C API bridge
-├── schemas/                   # FlatBuffers schemas
-│   ├── common.fbs             # Shared types (Address, Instruction, Arch)
-│   ├── cfg.fbs                # Control Flow Graph
-│   └── ast.fbs                # Abstract Syntax Tree
-├── tests/                     # Real-world test cases (ROTTR, WWZ)
-│   ├── Remill-*/              # IR + Rellic + Helix outputs
-│   └── reports/               # Benchmark and comparison reports
+│   │   ├── Engine.h              # Engine class + C API
+│   │   ├── passes/Passes.h       # Pass registration
+│   │   └── emit/PseudoCEmitter.h # Emitter header
+│   ├── src/
+│   │   ├── Pipeline.cpp          # 7-pass MLIR pipeline orchestration
+│   │   ├── passes/
+│   │   │   ├── RemillToHelixLow.cpp       # Remill IR → HelixLow
+│   │   │   ├── StructureControlFlow.cpp   # CFG → if/while/goto
+│   │   │   ├── RecoverVariables.cpp       # Register → variable
+│   │   │   ├── EliminateDeadCode.cpp      # Dead store elimination
+│   │   │   ├── PropagateTypes.cpp         # Type inference
+│   │   │   └── RecoverStackLayout.cpp     # Stack frame analysis
+│   │   └── emit/
+│   │       └── PseudoCEmitter.cpp         # MLIR → pseudo-C (2300 lines)
+│   └── tools/
+│       └── helix_tool.cpp        # Standalone CLI decompiler
+├── crates/
+│   ├── helix-core/               # Rust library (HIR pipeline, Phase 1.5)
+│   └── hexcore-helix/            # NAPI-RS bridge (Node.js ↔ Rust)
+├── schemas/                      # FlatBuffers schemas (CFG, AST)
+├── tests/                        # Real-world test cases
+│   └── remill-7/                 # Saber Interactive engine samples
 └── .github/workflows/
-    └── build.yml              # CI/CD pipeline
+    └── build.yml                 # CI/CD pipeline
 ```
 
 ## Quick Start
@@ -167,22 +173,19 @@ HexCore-Helix/
 ### Build
 
 ```bash
-# Install npm dependencies
-npm install
-
-# Build C++ engine (optional — Phase 2 WIP)
+# Build C++ MLIR engine
 cmake -B engine/build -S engine -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build --config Release
 
-# Build NAPI-RS native module
-npm run build
+# Decompile a single file
+./engine/build/helix_tool.exe tests/remill-7/bone_pos_calc3.ll
 
-# Run Rust tests
+# Batch decompile a folder
+./engine/build/helix_tool.exe --dir tests/remill-7/
+
+# Build Rust components (optional)
+cargo build --workspace
 cargo test --workspace
-
-# Verify Rust code
-cargo check --workspace
-cargo clippy --workspace
 ```
 
 ### Optional: Signature DB (CRT/Win32 naming)
@@ -220,10 +223,11 @@ engine.dispose();
 
 - [x] **Phase 1**: Foundation & Safety Bridge (Rust + NAPI-RS + C++ scaffold)
 - [x] **Phase 1.5**: HIR Pipeline & Robustness (104 tests, >95 instr/ms)
-- [ ] **Phase 2**: MLIR Engine (Custom Helix dialect, Remill ingestion, transform passes)
+- [x] **Phase 2**: MLIR Engine — Custom dialects, 7-pass pipeline, PseudoCEmitter, CLI tool
 - [x] **Phase 3**: FlatBuffers Transport (Zero-copy CFG/AST schemas + serialization)
-- [ ] **Phase 4**: HexCore IDE Integration
-- [ ] **Phase 5**: Stabilization & Audit
+- [ ] **Phase 4**: Loop rerolling + expression folding
+- [ ] **Phase 5**: HexCore IDE Integration
+- [ ] **Phase 6**: Stabilization & Audit
 
 ## License
 

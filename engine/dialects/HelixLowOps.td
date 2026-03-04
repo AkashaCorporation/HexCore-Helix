@@ -155,7 +155,8 @@ def HelixLow_BinOp : HelixLow_Op<"binop", [Pure]> {
     HelixLow_BinOpKind:$kind,
     AnyInteger:$lhs,
     AnyInteger:$rhs,
-    OptionalAttr<UI64Attr>:$address
+    OptionalAttr<UI64Attr>:$address,
+    OptionalAttr<UnitAttr>:$is_self_xor
   );
   let results = (outs
     AnyInteger:$result,
@@ -166,7 +167,7 @@ def HelixLow_BinOp : HelixLow_Op<"binop", [Pure]> {
   );
 
   let assemblyFormat = [{
-    $kind $lhs `,` $rhs (`at` $address^)? attr-dict
+    $kind $lhs `,` $rhs (`at` $address^)? (`self_xor` $is_self_xor^)? attr-dict
     `:` type($lhs) `,` type($rhs) `->` type($result)
   }];
 }
@@ -257,12 +258,13 @@ def HelixLow_CallOp : HelixLow_Op<"call", []> {
 
   let arguments = (ins
     AnyInteger:$target_addr,
+    Variadic<AnyType>:$args,
     OptionalAttr<StrAttr>:$target_name,
     OptionalAttr<UI64Attr>:$address
   );
 
   let assemblyFormat = [{
-    $target_addr (`name` $target_name^)? (`at` $address^)? attr-dict `:` type($target_addr)
+    $target_addr (`name` $target_name^)? `(` $args `)` (`at` $address^)? attr-dict `:` type($target_addr) (`,` type($args)^)?
   }];
 }
 
