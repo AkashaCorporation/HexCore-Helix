@@ -1123,6 +1123,11 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
 
     // Helper: resolve a block to a label name, even if it's outside this region.
     auto resolveBlockLabel = [&](Block* dest) -> std::string {
+        // Prefer LabelOp name if the block has one (emitted by StructureControlFlow).
+        for (auto& op : *dest) {
+            if (auto labelOp = dyn_cast<helix::high::LabelOp>(&op))
+                return labelOp.getName().str();
+        }
         if (blockLabels_.count(dest))
             return blockLabels_[dest];
         return "";

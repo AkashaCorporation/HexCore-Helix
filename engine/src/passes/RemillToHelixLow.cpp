@@ -1025,9 +1025,30 @@ private:
                     unsigned width = RegisterTracker::inferRegWidth(*destRegName);
                     auto intTy = builder.getIntegerType(width);
                     Value finalVal = srcValue;
-                    if (isa<LLVM::LLVMPointerType>(finalVal.getType())) {
+
+                    // ─── Memory source: MOV reg, [mem] ──────────────────
+                    // When the source is a memory operand (Mn), srcValue is
+                    // an ADDRESS.  Emit MemReadOp to load the actual value.
+                    if (semInfo.has_memory_src) {
+                        unsigned readWidth = semInfo.src_width;
+                        auto readTy = builder.getIntegerType(readWidth);
+                        auto memRead = builder.create<helix::low::MemReadOp>(
+                            loc,
+                            readTy,
+                            ensureInt64(srcValue, builder, loc),
+                            builder.getUI32IntegerAttr(readWidth),
+                            addrAttr);
+                        finalVal = memRead.getResult();
+                        // Extend to register width if needed (e.g., 32→64 for MOV EAX, [mem]).
+                        if (readWidth < width) {
+                            finalVal = builder.create<LLVM::ZExtOp>(loc, intTy, finalVal);
+                        } else if (readWidth > width) {
+                            finalVal = builder.create<LLVM::TruncOp>(loc, intTy, finalVal);
+                        }
+                    } else if (isa<LLVM::LLVMPointerType>(finalVal.getType())) {
                         finalVal = builder.create<LLVM::PtrToIntOp>(loc, intTy, finalVal);
                     }
+
                     builder.create<helix::low::RegWriteOp>(
                         loc,
                         finalVal,
@@ -1035,16 +1056,18 @@ private:
                         builder.getUI32IntegerAttr(width),
                         addrAttr);
                 } else {
+                    // Destination is a memory address (e.g., MOV [rcx+0x14], eax).
+                    // Emit as MemWriteOp — this is a side-effecting store that
+                    // must be preserved (not a dead register write).
                     Value finalVal = srcValue;
                     if (isa<LLVM::LLVMPointerType>(finalVal.getType())) {
                         finalVal = builder.create<LLVM::PtrToIntOp>(
                             loc, builder.getI64Type(), finalVal);
                     }
-                    // Unknown destination — emit as a generic 64-bit reg.write.
-                    builder.create<helix::low::RegWriteOp>(
+                    builder.create<helix::low::MemWriteOp>(
                         loc,
-                        finalVal,
-                        builder.getStringAttr("unknown"),
+                        ensureInt64(destRegPtr, builder, loc),
+                        ensureInt64(finalVal, builder, loc),
                         builder.getUI32IntegerAttr(64),
                         addrAttr);
                 }

@@ -267,7 +267,53 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
 
         RemillSemantic sem = classifySemantic(semantic_name);
 
-        return RemillSemanticInfo{sem, std::move(raw), /*is_helper=*/false};
+        // Analyze the operand suffix for memory operand types.
+        // Pattern: After the semantic name, the mangled suffix contains
+        // template arguments like:
+        //   I3MnWIjE...  → first operand is MnW (memory write dest), j=uint32
+        //   I3RnWImE2MnIjE...  → first is RnW (register dest), second is MnI (memory source), j=uint32
+        //   I3MnWImE2RnImLb1EE... → MnW dest (memory write), Rn src (register)
+        std::string_view suffix = after_digits.substr(name_len);
+        bool has_mem_src = false;
+        bool has_mem_dst = false;
+        unsigned src_w = 64;
+
+        // Find the first operand type (destination):
+        // "3MnW" = memory write destination
+        // "3RnW" = register write destination
+        if (suffix.find("MnW") != std::string_view::npos) {
+            has_mem_dst = true;
+        }
+
+        // Find if there's a memory source operand (Mn without W following it).
+        // We look for "Mn" that is NOT part of "MnW".
+        // Pattern: "2MnI" = memory read source.
+        {
+            auto pos = suffix.find("MnI");
+            // MnW also has Mn, so check it's not MnW
+            if (pos != std::string_view::npos) {
+                // Check that this Mn is NOT preceded by a context that makes it MnW.
+                // If "MnW" exists, the "MnI" we found might be a second one (the source).
+                // Just check: if the "MnI" is at a different position than where "MnW" starts.
+                auto mnw_pos = suffix.find("MnW");
+                if (mnw_pos == std::string_view::npos || pos != mnw_pos) {
+                    has_mem_src = true;
+                    // Infer width from the type char after "MnI":
+                    // IjE = uint32 (32-bit), ImE = uint64 (64-bit),
+                    // IhE = uint8 (8-bit), ItE = uint16 (16-bit)
+                    if (pos + 3 < suffix.size()) {
+                        char typeChar = suffix[pos + 3];
+                        if (typeChar == 'j') src_w = 32;
+                        else if (typeChar == 'm') src_w = 64;
+                        else if (typeChar == 'h') src_w = 8;
+                        else if (typeChar == 't') src_w = 16;
+                    }
+                }
+            }
+        }
+
+        return RemillSemanticInfo{sem, std::move(raw), /*is_helper=*/false,
+                                  has_mem_src, has_mem_dst, src_w};
     }
 
     // ---- Pattern 2: __remill_{read,write}_memory_<N> intrinsics -------------

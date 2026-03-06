@@ -1076,9 +1076,11 @@ private:
         // Re-collect edges since the CFG may have changed.
         auto remainingEdges = collectCFGEdges(funcBody);
         for (const auto& edge : remainingEdges) {
-            // Skip edges involving already-structured blocks.
-            if (structuredBlocks.count(edge.source) ||
-                structuredBlocks.count(edge.target))
+            // Skip edges where the SOURCE was already structured (its branch
+            // has been consumed into a while/if body).  But do NOT skip edges
+            // where only the TARGET was structured — those still need labels
+            // because unstructured JccOp branches may reference them.
+            if (structuredBlocks.count(edge.source))
                 continue;
 
             // Only emit goto for cross-edges and unstructured JMP terminators.
@@ -1087,6 +1089,7 @@ private:
                 continue;
 
             bool isJmpOp = isa<helix::low::JmpOp>(terminator);
+            bool isJccOp = isa<helix::low::JccOp>(terminator);
             bool isCrossEdge = false;
 
             // Recompute edge kind (domInfo may be stale but still usable for
@@ -1096,11 +1099,59 @@ private:
                 isCrossEdge = true;
             }
 
-            if (isJmpOp || isCrossEdge) {
+            // Also emit goto/label for JccOp branches that target blocks
+            // which were consumed into structured regions (IfOp bodies).
+            // Without this, PseudoCEmitter generates dangling `goto block_N`
+            // that have no corresponding label in the output.
+            bool targetsStructuredBlock =
+                isJccOp && structuredBlocks.count(edge.target);
+
+            if (isJmpOp || isCrossEdge || targetsStructuredBlock) {
                 emitGotoLabel(edge, func, builder);
                 ++NumGotoEmitted;
             }
         }
+
+        // Phase 4.5: Ensure ALL JccOp/JmpOp targets anywhere in the function
+        // have corresponding LabelOp labels.  Phase 4 only processes edges
+        // from the parent function body, but IfOp/WhileOp bodies may contain
+        // JccOp ops whose successor blocks are in the parent region or in
+        // other nested regions.  Without labels, PseudoCEmitter emits
+        // dangling "goto block_N" with no matching label.
+        llvm::DenseSet<Block*> labeledBlocks;
+        // Collect blocks that already have a LabelOp.
+        func.walk([&](helix::high::LabelOp labelOp) {
+            labeledBlocks.insert(labelOp->getBlock());
+        });
+
+        // Walk all JccOp/JmpOp ops and label their targets.
+        func.walk([&](Operation* op) {
+            for (unsigned i = 0; i < op->getNumSuccessors(); ++i) {
+                Block* succ = op->getSuccessor(i);
+                if (labeledBlocks.count(succ))
+                    continue;  // Already has a label.
+                // Emit a LabelOp at the start of the target block.
+                std::string labelName;
+                if (!succ->empty()) {
+                    uint64_t addr = getOpAddress(&succ->front());
+                    if (addr != 0)
+                        labelName = std::format("loc_{:x}", addr);
+                }
+                if (labelName.empty()) {
+                    static unsigned globalLabelCounter = 100;
+                    labelName = std::format("loc_irr_{}", globalLabelCounter++);
+                }
+                builder.setInsertionPointToStart(succ);
+                auto labelLoc = succ->empty()
+                    ? builder.getUnknownLoc()
+                    : succ->front().getLoc();
+                builder.create<helix::high::LabelOp>(
+                    labelLoc,
+                    builder.getStringAttr(labelName),
+                    IntegerAttr{});
+                labeledBlocks.insert(succ);
+            }
+        });
 
         return success();
     }

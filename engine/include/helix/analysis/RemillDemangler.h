@@ -71,6 +71,15 @@ struct RemillSemanticInfo {
     std::string raw_name;
     /// Whether this is a helper/intrinsic rather than a semantic.
     bool is_helper = false;
+    /// Whether the source operand is a memory reference (Mn).
+    /// When true, the source value is an ADDRESS and must be MemRead'd.
+    bool has_memory_src = false;
+    /// Whether the destination operand is a memory reference (MnW).
+    /// When true, the dest value is an ADDRESS and must be MemWrite'd.
+    bool has_memory_dst = false;
+    /// Width of the source operand in bits (inferred from type suffix).
+    /// e.g., MnIjE → 32-bit (j=uint32), MnImE → 64-bit (m=uint64).
+    unsigned src_width = 64;
 };
 
 /// Attempt to demangle a Remill semantic function name.
