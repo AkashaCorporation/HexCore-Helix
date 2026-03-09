@@ -24,15 +24,563 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <format>
+#include <functional>
+#include <map>
+#include <optional>
 #include <regex>
+#include <set>
 #include <string>
+#include <string_view>
+#include <vector>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 
 using namespace mlir;
 using namespace helix;
 
 #define DEBUG_TYPE "pseudoc-emitter"
+
+namespace {
+
+static std::optional<unsigned> parseParamIndex(std::string_view name) {
+    constexpr std::string_view prefix = "param_";
+    if (!name.starts_with(prefix) || name.size() == prefix.size())
+        return std::nullopt;
+
+    unsigned value = 0;
+    for (char ch : name.substr(prefix.size())) {
+        if (ch < '0' || ch > '9')
+            return std::nullopt;
+        value = (value * 10) + static_cast<unsigned>(ch - '0');
+    }
+
+    if (value == 0)
+        return std::nullopt;
+    return value;
+}
+
+static std::string toLowerCopy(std::string_view value) {
+    std::string result(value);
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return result;
+}
+
+static bool isSyntheticTemporaryName(std::string_view name) {
+    return name.starts_with("var_") || name.starts_with("spill_");
+}
+
+static bool isSyntheticValueName(std::string_view name) {
+    if (isSyntheticTemporaryName(name))
+        return true;
+    if (!name.starts_with('v') || name.size() < 2)
+        return false;
+    return std::all_of(name.begin() + 1, name.end(), [](unsigned char ch) {
+        return std::isdigit(ch);
+    });
+}
+
+static bool containsSyntheticValueIdentifier(std::string_view text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != 'v')
+            continue;
+        if (i > 0) {
+            unsigned char prev = static_cast<unsigned char>(text[i - 1]);
+            if (std::isalnum(prev) || prev == '_')
+                continue;
+        }
+
+        size_t j = i + 1;
+        if (j >= text.size() || !std::isdigit(static_cast<unsigned char>(text[j])))
+            continue;
+        while (j < text.size() &&
+               std::isdigit(static_cast<unsigned char>(text[j]))) {
+            ++j;
+        }
+
+        if (j < text.size()) {
+            unsigned char next = static_cast<unsigned char>(text[j]);
+            if (std::isalnum(next) || next == '_')
+                continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+static std::optional<int64_t> parseFormattedIntegerLiteral(std::string_view text) {
+    if (text.empty())
+        return std::nullopt;
+
+    bool negative = false;
+    if (text.front() == '-') {
+        negative = true;
+        text.remove_prefix(1);
+    }
+
+    if (text.empty())
+        return std::nullopt;
+
+    int base = 10;
+    if (text.starts_with("0x") || text.starts_with("0X")) {
+        base = 16;
+        text.remove_prefix(2);
+    }
+
+    if (text.empty())
+        return std::nullopt;
+
+    try {
+        auto value = static_cast<int64_t>(std::stoll(std::string(text), nullptr, base));
+        return negative ? -value : value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static std::optional<uint64_t> parseSubroutineAddressName(std::string_view text) {
+    constexpr std::string_view prefix = "sub_";
+    if (!text.starts_with(prefix) || text.size() == prefix.size())
+        return std::nullopt;
+
+    text.remove_prefix(prefix.size());
+    try {
+        return std::stoull(std::string(text), nullptr, 16);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+struct RelativeCallPattern {
+    std::string baseVar;
+    int64_t smallConstSum = 0;
+    int64_t largeConstSum = 0;
+    unsigned largeConstCount = 0;
+    bool valid = true;
+};
+
+static std::optional<int64_t> tryExtractIntegerLiteralFromValue(Value value) {
+    if (!value)
+        return std::nullopt;
+
+    auto* defOp = value.getDefiningOp();
+    if (!defOp)
+        return std::nullopt;
+
+    if (auto intLit = dyn_cast<helix::high::IntLitOp>(defOp))
+        return intLit.getValue();
+
+    if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+            return intAttr.getValue().getSExtValue();
+    }
+
+    if (auto constOp = dyn_cast<arith::ConstantOp>(defOp)) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+            return intAttr.getValue().getSExtValue();
+    }
+
+    if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value"))
+        return intAttr.getValue().getSExtValue();
+
+    return std::nullopt;
+}
+
+static void collectRelativeCallPattern(Value value, int64_t sign,
+                                       RelativeCallPattern& pattern) {
+    if (!pattern.valid || !value)
+        return;
+
+    if (auto literal = tryExtractIntegerLiteralFromValue(value)) {
+        int64_t signedValue = sign * *literal;
+        if (std::llabs(signedValue) >= 0x100) {
+            pattern.largeConstSum += signedValue;
+            ++pattern.largeConstCount;
+        } else {
+            pattern.smallConstSum += signedValue;
+        }
+        return;
+    }
+
+    if (auto varRef = value.getDefiningOp<helix::high::VarRefOp>()) {
+        auto name = varRef.getVarName().str();
+        if (sign != 1 || !isSyntheticValueName(name)) {
+            pattern.valid = false;
+            return;
+        }
+        if (pattern.baseVar.empty()) {
+            pattern.baseVar = name;
+            return;
+        }
+        if (pattern.baseVar != name)
+            pattern.valid = false;
+        return;
+    }
+
+    if (auto add = value.getDefiningOp<LLVM::AddOp>()) {
+        collectRelativeCallPattern(add.getLhs(), sign, pattern);
+        collectRelativeCallPattern(add.getRhs(), sign, pattern);
+        return;
+    }
+
+    if (auto sub = value.getDefiningOp<LLVM::SubOp>()) {
+        collectRelativeCallPattern(sub.getLhs(), sign, pattern);
+        collectRelativeCallPattern(sub.getRhs(), -sign, pattern);
+        return;
+    }
+
+    if (auto zext = value.getDefiningOp<LLVM::ZExtOp>()) {
+        collectRelativeCallPattern(zext.getArg(), sign, pattern);
+        return;
+    }
+
+    if (auto sext = value.getDefiningOp<LLVM::SExtOp>()) {
+        collectRelativeCallPattern(sext.getArg(), sign, pattern);
+        return;
+    }
+
+    if (auto trunc = value.getDefiningOp<LLVM::TruncOp>()) {
+        collectRelativeCallPattern(trunc.getArg(), sign, pattern);
+        return;
+    }
+
+    if (auto ptrToInt = value.getDefiningOp<LLVM::PtrToIntOp>()) {
+        collectRelativeCallPattern(ptrToInt.getArg(), sign, pattern);
+        return;
+    }
+
+    if (auto intToPtr = value.getDefiningOp<LLVM::IntToPtrOp>()) {
+        collectRelativeCallPattern(intToPtr.getArg(), sign, pattern);
+        return;
+    }
+
+    if (auto castOp = value.getDefiningOp<helix::high::CastOp>()) {
+        collectRelativeCallPattern(castOp.getInput(), sign, pattern);
+        return;
+    }
+
+    pattern.valid = false;
+}
+
+static void addRelativeCallConstant(RelativeCallPattern& pattern, int64_t value) {
+    if (std::llabs(value) >= 0x100) {
+        pattern.largeConstSum += value;
+        ++pattern.largeConstCount;
+    } else {
+        pattern.smallConstSum += value;
+    }
+}
+
+static std::optional<RelativeCallPattern>
+collectRelativeCallPatternFromString(std::string_view expr) {
+    RelativeCallPattern pattern;
+    bool sawSyntheticBase = false;
+
+    for (size_t i = 0; i < expr.size(); ++i) {
+        char ch = expr[i];
+
+        if (ch == 'v') {
+            size_t j = i + 1;
+            if (j >= expr.size() ||
+                !std::isdigit(static_cast<unsigned char>(expr[j]))) {
+                continue;
+            }
+            while (j < expr.size() &&
+                   std::isdigit(static_cast<unsigned char>(expr[j]))) {
+                ++j;
+            }
+
+            if (i > 0) {
+                unsigned char prev = static_cast<unsigned char>(expr[i - 1]);
+                if (std::isalnum(prev) || prev == '_')
+                    continue;
+            }
+            if (j < expr.size()) {
+                unsigned char next = static_cast<unsigned char>(expr[j]);
+                if (std::isalnum(next) || next == '_')
+                    continue;
+            }
+
+            std::string name(expr.substr(i, j - i));
+            if (pattern.baseVar.empty()) {
+                pattern.baseVar = name;
+            } else if (pattern.baseVar != name) {
+                pattern.valid = false;
+                return std::nullopt;
+            }
+            sawSyntheticBase = true;
+            i = j - 1;
+            continue;
+        }
+
+        constexpr std::string_view fieldPrefix = "field_0x";
+        if (expr.substr(i).starts_with(fieldPrefix)) {
+            size_t start = i + fieldPrefix.size();
+            size_t j = start;
+            while (j < expr.size() &&
+                   std::isxdigit(static_cast<unsigned char>(expr[j]))) {
+                ++j;
+            }
+            if (j == start) {
+                pattern.valid = false;
+                return std::nullopt;
+            }
+
+            try {
+                auto value = static_cast<int64_t>(
+                    std::stoll(std::string(expr.substr(start, j - start)), nullptr, 16));
+                addRelativeCallConstant(pattern, value);
+            } catch (...) {
+                pattern.valid = false;
+                return std::nullopt;
+            }
+
+            i = j - 1;
+            continue;
+        }
+
+        if (ch != '+' && ch != '-')
+            continue;
+
+        int64_t sign = (ch == '-') ? -1 : 1;
+        size_t j = i + 1;
+        while (j < expr.size() &&
+               std::isspace(static_cast<unsigned char>(expr[j]))) {
+            ++j;
+        }
+        if (j >= expr.size())
+            break;
+
+        if (!(std::isdigit(static_cast<unsigned char>(expr[j])) ||
+              (expr[j] == '0' && j + 1 < expr.size() &&
+               (expr[j + 1] == 'x' || expr[j + 1] == 'X')))) {
+            continue;
+        }
+
+        size_t start = j;
+        int base = 10;
+        if (expr[j] == '0' && j + 1 < expr.size() &&
+            (expr[j + 1] == 'x' || expr[j + 1] == 'X')) {
+            base = 16;
+            j += 2;
+            while (j < expr.size() &&
+                   std::isxdigit(static_cast<unsigned char>(expr[j]))) {
+                ++j;
+            }
+        } else {
+            while (j < expr.size() &&
+                   std::isdigit(static_cast<unsigned char>(expr[j]))) {
+                ++j;
+            }
+        }
+
+        try {
+            auto value = static_cast<int64_t>(
+                std::stoll(std::string(expr.substr(start, j - start)), nullptr, base));
+            addRelativeCallConstant(pattern, sign * value);
+        } catch (...) {
+            pattern.valid = false;
+            return std::nullopt;
+        }
+
+        i = j - 1;
+    }
+
+    if (!pattern.valid || !sawSyntheticBase || pattern.largeConstCount != 1)
+        return std::nullopt;
+    return pattern;
+}
+
+static std::string normalizeAddressExpression(std::string_view expr) {
+    std::string normalized;
+    normalized.reserve(expr.size());
+    for (char ch : expr) {
+        if (ch != '(' && ch != ')' && ch != ' ' && ch != '\t')
+            normalized.push_back(static_cast<char>(std::tolower(
+                static_cast<unsigned char>(ch))));
+    }
+    return normalized;
+}
+
+static bool isStackSlotExpression(std::string_view expr) {
+    return expr.find("rsp + ") != std::string_view::npos ||
+           expr.find("rsp - ") != std::string_view::npos ||
+           expr.find("rbp + ") != std::string_view::npos ||
+           expr.find("rbp - ") != std::string_view::npos;
+}
+
+static bool isBoundaryRelevantOp(Operation& op) {
+    return isa<helix::high::AssignOp,
+               helix::high::ExprStmtOp,
+               helix::high::IfOp,
+               helix::high::WhileOp,
+               helix::high::DoWhileOp,
+               helix::high::ForOp,
+               helix::high::LabelOp,
+               helix::high::ReturnOp,
+               helix::low::MemReadOp,
+               helix::low::MemWriteOp,
+               helix::low::RegWriteOp,
+               helix::low::CallOp,
+               helix::low::RetOp,
+               helix::low::JmpOp,
+               helix::low::JccOp,
+               helix::low::PushOp,
+               helix::low::PopOp,
+               LLVM::LoadOp,
+               LLVM::StoreOp>(op);
+}
+
+static std::optional<unsigned>
+inferDenseObservedStackParamLimit(const std::set<unsigned>& observedStackParams) {
+    if (observedStackParams.empty())
+        return std::nullopt;
+
+    const bool hasEarlyAnchor =
+        observedStackParams.contains(5) || observedStackParams.contains(6);
+    if (!hasEarlyAnchor)
+        return std::nullopt;
+
+    std::optional<unsigned> bestLimit;
+    for (unsigned upperBound : observedStackParams) {
+        if (upperBound < 5)
+            continue;
+
+        unsigned windowSize = upperBound - 4;
+        unsigned observedCount = 0;
+        for (unsigned index : observedStackParams) {
+            if (index >= 5 && index <= upperBound)
+                ++observedCount;
+        }
+
+        if (observedCount == 0)
+            continue;
+
+        double density =
+            static_cast<double>(observedCount) / static_cast<double>(windowSize);
+        bool strongEnough =
+            (upperBound == 5 && observedStackParams.contains(5)) ||
+            observedCount >= 2 ||
+            observedStackParams.contains(5);
+        if (!strongEnough || density < 0.60)
+            continue;
+
+        bestLimit = upperBound;
+    }
+
+    return bestLimit;
+}
+
+static std::optional<std::string>
+extractDereferencedAddressExpression(std::string_view expr) {
+    auto derefPos = expr.find("*(");
+    if (derefPos == std::string_view::npos)
+        return std::nullopt;
+
+    auto openPos = derefPos + 1;
+    int depth = 0;
+    for (size_t i = openPos; i < expr.size(); ++i) {
+        if (expr[i] == '(') {
+            ++depth;
+        } else if (expr[i] == ')') {
+            --depth;
+            if (depth == 0)
+                return std::string(expr.substr(openPos, i - openPos + 1));
+        }
+    }
+
+    return std::nullopt;
+}
+
+static bool isLikelyReturnTarget(Value value) {
+    auto ref = value.getDefiningOp<helix::high::VarRefOp>();
+    if (!ref)
+        return false;
+
+    auto name = ref.getVarName();
+    return name == "result" || name == "rax";
+}
+
+static bool blockHasLikelyReturnWrite(Block* block, Block::iterator endIt) {
+    if (!block)
+        return false;
+
+    for (auto it = endIt; it != block->begin();) {
+        --it;
+
+        if (auto assign = dyn_cast<helix::high::AssignOp>(&*it)) {
+            if (isLikelyReturnTarget(assign.getTarget()))
+                return true;
+        }
+
+        if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(&*it)) {
+            if (regWrite.getRegName() == "RAX" || regWrite.getRegName() == "EAX" ||
+                regWrite.getRegName() == "XMM0")
+                return true;
+        }
+
+        if (isa<helix::low::CallOp>(&*it))
+            return false;
+    }
+
+    return false;
+}
+
+static bool inferLikelyReturnValue(helix::low::FuncOp func) {
+    bool hasRet = false;
+    bool foundReturnWrite = false;
+
+    func.walk([&](helix::low::RetOp ret) {
+        if (foundReturnWrite)
+            return;
+        hasRet = true;
+
+        auto* block = ret->getBlock();
+        if (!block)
+            return;
+
+        if (blockHasLikelyReturnWrite(block, Block::iterator(ret))) {
+            foundReturnWrite = true;
+            return;
+        }
+
+        std::vector<std::pair<Block*, unsigned>> worklist;
+        std::unordered_set<Block*> visited;
+        for (Block* pred : block->getPredecessors())
+            worklist.push_back({pred, 0u});
+
+        while (!worklist.empty()) {
+            auto [candidate, depth] = worklist.back();
+            worklist.pop_back();
+            if (!candidate || !visited.insert(candidate).second)
+                continue;
+
+            if (blockHasLikelyReturnWrite(candidate, candidate->end())) {
+                foundReturnWrite = true;
+                return;
+            }
+
+            if (depth >= 1)
+                continue;
+
+            for (Block* pred : candidate->getPredecessors())
+                worklist.push_back({pred, depth + 1});
+        }
+    });
+
+    if (!hasRet)
+        return false;
+
+    func.walk([&](helix::high::AssignOp assign) {
+        if (!foundReturnWrite && isLikelyReturnTarget(assign.getTarget()))
+            foundReturnWrite = true;
+    });
+
+    return foundReturnWrite;
+}
+
+} // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public API
@@ -62,6 +610,224 @@ void PseudoCEmitter::emit(ModuleOp module, llvm::raw_ostream& os) {
     });
 }
 
+std::optional<unsigned>
+PseudoCEmitter::inferWin64StackParamIndexFromAddressString(
+    std::string_view expr, int64_t rbpStackParamBaseOffset) {
+    auto normalized = normalizeAddressExpression(expr);
+
+    constexpr std::string_view rspPrefix = "rsp+";
+    constexpr std::string_view rbpPrefix = "rbp+";
+    int64_t stackParamBaseOffset = 0x28;
+    std::string_view offsetStr;
+    std::string_view normalizedView(normalized);
+    if (normalizedView.starts_with(rspPrefix)) {
+        offsetStr = normalizedView.substr(rspPrefix.size());
+    } else if (normalizedView.starts_with(rbpPrefix)) {
+        offsetStr = normalizedView.substr(rbpPrefix.size());
+        stackParamBaseOffset = rbpStackParamBaseOffset;
+    } else {
+        return std::nullopt;
+    }
+
+    if (offsetStr.empty())
+        return std::nullopt;
+
+    uint64_t offset = 0;
+    try {
+        if (offsetStr.starts_with("0x"))
+            offset = std::stoull(std::string(offsetStr.substr(2)), nullptr, 16);
+        else
+            offset = std::stoull(std::string(offsetStr), nullptr, 10);
+    } catch (...) {
+        return std::nullopt;
+    }
+
+    // Win64 stack-passed arguments start at [rsp+0x28]. For frame-based
+    // functions we use the pass-recovered `rbp` base when available.
+    if (offset < static_cast<uint64_t>(stackParamBaseOffset) ||
+        ((offset - static_cast<uint64_t>(stackParamBaseOffset)) % 8) != 0)
+        return std::nullopt;
+
+    return 5u + static_cast<unsigned>(
+        (offset - static_cast<uint64_t>(stackParamBaseOffset)) / 8);
+}
+
+bool PseudoCEmitter::looksLikeStructBaseIdentifier(std::string_view name) {
+    if (name.empty() || name == "rsp" || name == "rbp")
+        return false;
+    if (isSyntheticValueName(name))
+        return false;
+    if (name == "this" || name == "self")
+        return true;
+    if (name.starts_with("param_") || name.starts_with("arg"))
+        return true;
+
+    return name.size() <= 3 &&
+           std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+               return std::isalnum(ch) || ch == '_';
+           });
+}
+
+bool PseudoCEmitter::isCalleeSavedRegisterName(std::string_view name) {
+    auto lower = toLowerCopy(name);
+    return lower == "rbx" || lower == "rbp" || lower == "rdi" ||
+           lower == "rsi" || lower == "r12" || lower == "r13" ||
+           lower == "r14" || lower == "r15";
+}
+
+std::optional<uint64_t>
+PseudoCEmitter::tryResolveSyntheticRelativeCallTarget(helix::low::CallOp call) {
+    auto addr = call.getAddress();
+    if (!addr)
+        return std::nullopt;
+
+    RelativeCallPattern pattern;
+    collectRelativeCallPattern(call.getTargetAddr(), /*sign=*/1, pattern);
+    if (!pattern.valid || pattern.largeConstCount != 1) {
+        if (auto fallback =
+                collectRelativeCallPatternFromString(
+                    formatExpression(call.getTargetAddr()))) {
+            pattern = *fallback;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    int64_t base = static_cast<int64_t>(*addr) + 5;
+    if (!pattern.baseVar.empty()) {
+        auto it = syntheticCallBaseAddrs_.find(pattern.baseVar);
+        if (it == syntheticCallBaseAddrs_.end()) {
+            base = static_cast<int64_t>(*addr) + 5 - pattern.smallConstSum;
+            syntheticCallBaseAddrs_.emplace(pattern.baseVar, base);
+        } else {
+            base = it->second;
+        }
+    }
+
+    return static_cast<uint64_t>(base + pattern.smallConstSum +
+                                 pattern.largeConstSum);
+}
+
+std::optional<uint64_t>
+PseudoCEmitter::tryResolveSyntheticRelativeAddress(Value value) {
+    RelativeCallPattern pattern;
+    collectRelativeCallPattern(value, /*sign=*/1, pattern);
+    if (!pattern.valid || pattern.largeConstCount != 1 ||
+        pattern.baseVar.empty()) {
+        return std::nullopt;
+    }
+
+    auto it = syntheticCallBaseAddrs_.find(pattern.baseVar);
+    if (it == syntheticCallBaseAddrs_.end())
+        return std::nullopt;
+
+    return static_cast<uint64_t>(it->second + pattern.smallConstSum +
+                                 pattern.largeConstSum);
+}
+
+std::string PseudoCEmitter::applyNameAliases(std::string name) const {
+    auto it = nameAliases_.find(name);
+    if (it != nameAliases_.end())
+        return it->second;
+    return name;
+}
+
+std::optional<unsigned>
+PseudoCEmitter::inferWin64StackParamIndex(Operation* contextOp, Value addr) {
+    if (!currentFunctionIsWin64_)
+        return std::nullopt;
+
+    auto addrExpr = formatExpression(addr);
+    auto paramIndex = inferWin64StackParamIndexFromAddressString(
+        addrExpr, currentWin64RbpStackParamBaseOffset_);
+    if (!paramIndex)
+        return std::nullopt;
+
+    auto normalized = normalizeAddressExpression(addrExpr);
+    if (normalized.starts_with("rsp+") && hasStackPointerWriteBefore(contextOp))
+        return std::nullopt;
+
+    return paramIndex;
+}
+
+bool PseudoCEmitter::hasStackPointerWriteBefore(Operation* op) {
+    auto* block = op ? op->getBlock() : nullptr;
+    if (!block)
+        return true;
+
+    for (Operation& candidate : *block) {
+        if (&candidate == op)
+            break;
+
+        if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(&candidate)) {
+            auto regName = toLowerCopy(regWrite.getRegName().str());
+            if (regName == "rsp" || regName == "esp")
+                return true;
+        }
+
+        if (auto assign = dyn_cast<helix::high::AssignOp>(&candidate)) {
+            if (formatExpression(assign.getTarget()) == "rsp")
+                return true;
+        }
+
+        if (auto store = dyn_cast<LLVM::StoreOp>(&candidate)) {
+            if (formatExpression(store.getAddr()) == "rsp")
+                return true;
+        }
+    }
+
+    return false;
+}
+
+bool PseudoCEmitter::isNearBlockBoundary(Operation* op, unsigned budget) {
+    auto* block = op ? op->getBlock() : nullptr;
+    if (!block)
+        return false;
+
+    unsigned fromStart = 0;
+    for (auto it = block->begin(); it != block->end(); ++it) {
+        if (&*it == op)
+            break;
+        if (!isBoundaryRelevantOp(*it))
+            continue;
+        ++fromStart;
+        if (fromStart >= budget)
+            break;
+    }
+    if (fromStart < budget)
+        return true;
+
+    unsigned fromEnd = 0;
+    for (auto it = block->rbegin(); it != block->rend(); ++it) {
+        if (&*it == op)
+            break;
+        if (!isBoundaryRelevantOp(*it))
+            continue;
+        ++fromEnd;
+        if (fromEnd >= budget)
+            break;
+    }
+    return fromEnd < budget;
+}
+
+bool PseudoCEmitter::isNearBlockStart(Operation* op, unsigned budget) {
+    auto* block = op ? op->getBlock() : nullptr;
+    if (!block)
+        return false;
+
+    unsigned fromStart = 0;
+    for (auto it = block->begin(); it != block->end(); ++it) {
+        if (&*it == op)
+            return fromStart < budget;
+        if (!isBoundaryRelevantOp(*it))
+            continue;
+        ++fromStart;
+        if (fromStart >= budget)
+            return false;
+    }
+    return false;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Private Implementation
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -75,13 +841,15 @@ void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
 PseudoCEmitter::FunctionStats PseudoCEmitter::analyzeFunction(Operation* op) {
     FunctionStats stats;
     auto func = cast<helix::low::FuncOp>(op);
+    syntheticCallBaseAddrs_.clear();
 
     func.walk([&](Operation* inst) {
         stats.instructionCount++;
 
         // Check for bad patterns
         if (auto call = dyn_cast<helix::low::CallOp>(inst)) {
-            if (!call.getTargetName()) {
+            if (!call.getTargetName() &&
+                !tryResolveSyntheticRelativeCallTarget(call)) {
                 // Indirect call or unresolved target
                 stats.badPatterns++;
                 stats.issues.push_back("Unresolved call target");
@@ -142,6 +910,17 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
     auto entryAddr = func.getEntryAddress();
 
     lastRegValue.clear(); // Reset copy propagation state for new function
+    nameAliases_.clear();
+    syntheticCallBaseAddrs_.clear();
+    referencedBlocks_.clear();
+    referencedLabelNames_.clear();
+    currentFunctionName_ = funcName.str();
+    currentFunctionEntryAddr_ = entryAddr;
+    currentReturnValueName_.clear();
+    currentFunctionHasReturnValue_ = func->hasAttr("has_return_value");
+    currentFunctionIsWin64_ = true;
+    if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention"))
+        currentFunctionIsWin64_ = (ccAttr.getValue() == "win64");
 
     // Initialize block labels for the entire function
     globalBlockCounter_ = 1;
@@ -158,6 +937,99 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
         else
             blockLabels_[block] = std::format("block_{}", globalBlockCounter_++);
     });
+
+    auto collectEmittedLabelReferences =
+        [&](auto&& self, Region& region) -> void {
+            auto nextBlockInRegion = [&](Block* block) -> Block* {
+                if (!block)
+                    return nullptr;
+                auto it = block->getIterator();
+                ++it;
+                if (it == region.end())
+                    return nullptr;
+                return &*it;
+            };
+
+            auto getNonLabelOps = [&](Block* block) {
+                llvm::SmallVector<Operation*, 4> ops;
+                if (!block)
+                    return ops;
+                for (auto& nested : *block) {
+                    if (isa<helix::high::LabelOp>(&nested))
+                        continue;
+                    ops.push_back(&nested);
+                }
+                return ops;
+            };
+
+            auto resolveJumpOnlyBlock = [&](Block* block) -> Block* {
+                llvm::SmallPtrSet<Block*, 8> visited;
+                Block* current = block;
+                unsigned depthBudget = 6;
+                while (current && depthBudget-- > 0 &&
+                       visited.insert(current).second) {
+                    auto ops = getNonLabelOps(current);
+                    if (ops.size() != 1)
+                        break;
+                    if (auto jmp = dyn_cast<helix::low::JmpOp>(ops.front())) {
+                        current = jmp.getDest();
+                        continue;
+                    }
+                    break;
+                }
+                return current;
+            };
+
+            auto getTrivialReturnOp = [&](Block* block) -> Operation* {
+                Block* resolved = resolveJumpOnlyBlock(block);
+                auto ops = getNonLabelOps(resolved);
+                if (ops.size() != 1)
+                    return nullptr;
+                if (isa<helix::low::RetOp>(ops.front()) ||
+                    isa<helix::high::ReturnOp>(ops.front())) {
+                    return ops.front();
+                }
+                return nullptr;
+            };
+
+            for (auto& block : region) {
+                for (auto& nestedOp : block.getOperations()) {
+                    if (auto gotoOp = dyn_cast<helix::high::GotoOp>(&nestedOp)) {
+                        referencedLabelNames_.insert(gotoOp.getLabel().str());
+                    } else if (auto jmp = dyn_cast<helix::low::JmpOp>(&nestedOp)) {
+                        Block* dest = resolveJumpOnlyBlock(jmp.getDest());
+                        if (dest != nextBlockInRegion(&block) &&
+                            !getTrivialReturnOp(dest)) {
+                            referencedBlocks_.insert(dest);
+                        }
+                    } else if (auto jcc = dyn_cast<helix::low::JccOp>(&nestedOp)) {
+                        Block* trueDest = resolveJumpOnlyBlock(jcc.getTrueDest());
+                        Block* falseDest = resolveJumpOnlyBlock(jcc.getFalseDest());
+                        Block* nextBlock = nextBlockInRegion(&block);
+
+                        if (getTrivialReturnOp(trueDest) &&
+                            getTrivialReturnOp(falseDest)) {
+                            continue;
+                        }
+                        if (trueDest == nextBlock &&
+                            getTrivialReturnOp(falseDest)) {
+                            continue;
+                        }
+                        if (falseDest == nextBlock &&
+                            getTrivialReturnOp(trueDest)) {
+                            continue;
+                        }
+                        if (trueDest)
+                            referencedBlocks_.insert(trueDest);
+                    }
+
+                    for (Region& nestedRegion : nestedOp.getRegions())
+                        self(self, nestedRegion);
+                }
+            }
+        };
+    for (Region& region : func->getRegions())
+        collectEmittedLabelReferences(collectEmittedLabelReferences, region);
 
     // Analyze function quality
     FunctionStats stats = analyzeFunction(op);
@@ -184,57 +1056,221 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
     os << "// -----------------------------------------------------------------------------\n";
 
     // Return type (default to int64_t for now, refined by type propagation)
-    bool hasReturnValue = func->hasAttr("has_return_value");
+    bool hasReturnValue =
+        func->hasAttr("has_return_value") || inferLikelyReturnValue(func);
+    currentFunctionHasReturnValue_ = hasReturnValue;
+    currentReturnValueName_.clear();
+    currentFunctionIsWin64_ = true;
+    currentWin64RbpStackParamBaseOffset_ = 0x28;
+    currentWin64StackParamLimit_ = 4;
+    if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention"))
+        currentFunctionIsWin64_ = (ccAttr.getValue() == "win64");
+    if (auto rbpBaseAttr =
+            func->getAttrOfType<IntegerAttr>("win64_rbp_param_base_offset")) {
+        currentWin64RbpStackParamBaseOffset_ =
+            rbpBaseAttr.getValue().getSExtValue();
+    }
+    nameAliases_.clear();
+
     std::string returnType = hasReturnValue ? "int64_t" : "void";
 
-    // Collect parameters from var.decl ops with Parameter storage
-    llvm::SmallVector<std::string> params;
+    struct ParamInfo {
+        std::string typeStr;
+        std::string rawName;
+    };
+
+    std::map<unsigned, ParamInfo> paramInfoByIndex;
+    llvm::SmallVector<std::string> syntheticLocalNames;
+    llvm::SmallVector<std::string> extraNamedParams;
+    auto recordParam = [&](unsigned index, const std::string& typeStr,
+                           const std::string& rawName) {
+        auto [it, inserted] = paramInfoByIndex.try_emplace(index, ParamInfo{typeStr, rawName});
+        if (!inserted) {
+            if (it->second.typeStr == "int64_t" && typeStr != "int64_t")
+                it->second.typeStr = typeStr;
+            if (it->second.rawName.empty())
+                it->second.rawName = rawName;
+        }
+    };
+
     func.walk([&](helix::high::VarDeclOp decl) {
-        if (decl.getStorage() == helix::high::StorageKind::Parameter) {
-            std::string paramType = "int64_t";
-            if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type"))
-                paramType = inferredType.getValue().str();
-            params.push_back(std::format("{} {}", paramType,
-                decl.getVarName().str()));
+        if (decl.getStorage() != helix::high::StorageKind::Parameter)
+            return;
+
+        std::string paramType = "int64_t";
+        if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type"))
+            paramType = inferredType.getValue().str();
+
+        std::string rawName = decl.getVarName().str();
+        if (auto index = parseParamIndex(rawName))
+            recordParam(*index, paramType, rawName);
+        else
+            extraNamedParams.push_back(std::format("{} {}", paramType, rawName));
+    });
+
+    func.walk([&](helix::high::VarRefOp ref) {
+        if (auto index = parseParamIndex(ref.getVarName().str())) {
+            recordParam(*index, "int64_t", ref.getVarName().str());
         }
     });
 
-    // ─── Win64 calling convention: inject virtual arguments ─────────
-    // If no Parameter VarDecls were generated, emit RCX/RDX/R8/R9 as args.
-    if (params.empty()) {
-        // Scan for any RegReadOp that reads a Win64 argument register.
-        // If found, we know this function takes arguments.
+    std::set<unsigned> observedStackParams;
+    func.walk([&](helix::low::MemReadOp memRead) {
+        auto addrExpr = formatExpression(memRead.getAddr());
+        auto normalized = normalizeAddressExpression(addrExpr);
+        if (auto index = inferWin64StackParamIndex(memRead.getOperation(),
+                                                   memRead.getAddr())) {
+            if (normalized.starts_with("rbp+") ||
+                isNearBlockStart(memRead.getOperation(), 48)) {
+                observedStackParams.insert(*index);
+            }
+        }
+    });
+    func.walk([&](LLVM::LoadOp load) {
+        auto addrExpr = formatExpression(load.getAddr());
+        auto normalized = normalizeAddressExpression(addrExpr);
+        if (auto index = inferWin64StackParamIndex(load.getOperation(),
+                                                   load.getAddr())) {
+            if (normalized.starts_with("rbp+") ||
+                isNearBlockStart(load.getOperation(), 48)) {
+                observedStackParams.insert(*index);
+            }
+        }
+    });
+    func.walk([&](helix::high::AssignOp assign) {
+        auto valueExpr = formatExpression(assign.getValue());
+        auto addrExpr = extractDereferencedAddressExpression(valueExpr);
+        if (!addrExpr) {
+            return;
+        }
+
+        if (auto index = inferWin64StackParamIndexFromAddressString(
+                *addrExpr, currentWin64RbpStackParamBaseOffset_)) {
+            observedStackParams.insert(*index);
+        }
+    });
+    for (const auto& [index, _] : paramInfoByIndex) {
+        if (index > 4)
+            observedStackParams.insert(index);
+    }
+    std::set<unsigned> recoveredStackParamIndices;
+    for (const auto& [index, _] : paramInfoByIndex) {
+        if (index > 4)
+            recoveredStackParamIndices.insert(index);
+    }
+
+    auto inferredStackParamLimit =
+        inferDenseObservedStackParamLimit(observedStackParams);
+    currentWin64StackParamLimit_ = inferredStackParamLimit.value_or(4);
+    if (currentWin64StackParamLimit_ == 4 &&
+        recoveredStackParamIndices.contains(5)) {
+        currentWin64StackParamLimit_ = 5;
+    }
+    if (currentWin64StackParamLimit_ == 4) {
+        unsigned denseRunEnd = 0;
+        for (unsigned index = 6; recoveredStackParamIndices.contains(index); ++index)
+            denseRunEnd = index;
+        if (denseRunEnd >= 7)
+            currentWin64StackParamLimit_ = denseRunEnd;
+    }
+    if (currentWin64StackParamLimit_ >= 5) {
+        for (unsigned index = 5; index <= currentWin64StackParamLimit_; ++index)
+            recordParam(index, "int64_t", std::format("param_{}", index));
+    }
+
+    for (auto it = paramInfoByIndex.begin(); it != paramInfoByIndex.end();) {
+        if (it->first > 4 && it->first > currentWin64StackParamLimit_) {
+            std::string originalName = it->second.rawName.empty()
+                ? std::format("param_{}", it->first)
+                : it->second.rawName;
+            std::string syntheticName = std::format("spill_{}", it->first);
+            nameAliases_[originalName] = syntheticName;
+            syntheticLocalNames.push_back(syntheticName);
+            it = paramInfoByIndex.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
+    // Fall back to ABI register parameters when recovery did not materialize
+    // explicit parameter declarations.
+    if (paramInfoByIndex.empty() && extraNamedParams.empty()) {
         llvm::StringMap<bool> usedArgRegs;
-        static const std::pair<const char*, const char*> kWin64Args[] = {
-            {"RCX", "arg0"}, {"RDX", "arg1"}, {"R8", "arg2"}, {"R9", "arg3"}
+        static const std::pair<const char*, unsigned> kWin64Args[] = {
+            {"RCX", 1}, {"RDX", 2}, {"R8", 3}, {"R9", 4}
         };
         func.walk([&](helix::low::RegReadOp regRead) {
             auto name = regRead.getRegName();
-            for (auto [reg, argName] : kWin64Args) {
-                if (name == reg || name == llvm::StringRef(reg).lower()) {
+            for (auto [reg, index] : kWin64Args) {
+                if (name == reg || name == llvm::StringRef(reg).lower())
                     usedArgRegs[reg] = true;
-                }
             }
-        });
-        // Also check for ECX, EDX (32-bit aliases)
-        func.walk([&](helix::low::RegReadOp regRead) {
-            auto name = regRead.getRegName();
             if (name == "ECX") usedArgRegs["RCX"] = true;
             if (name == "EDX") usedArgRegs["RDX"] = true;
             if (name == "R8D") usedArgRegs["R8"] = true;
             if (name == "R9D") usedArgRegs["R9"] = true;
         });
-        // Emit args in order: arg0 (RCX), arg1 (RDX), arg2 (R8), arg3 (R9)
-        // but only up to the highest used arg.
+
         int maxArgIdx = -1;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 4; ++i) {
             if (usedArgRegs.count(kWin64Args[i].first))
                 maxArgIdx = i;
         }
-        for (int i = 0; i <= maxArgIdx; i++) {
-            params.push_back(std::format("int64_t {}", kWin64Args[i].second));
+        for (int i = 0; i <= maxArgIdx; ++i) {
+            unsigned index = kWin64Args[i].second;
+            recordParam(index, "int64_t", std::format("param_{}", index));
         }
     }
+
+    // Heuristic: if param_1 is repeatedly used as the base of field accesses,
+    // emit it as `this` to make methods/constructors read naturally.
+    if (paramInfoByIndex.count(1)) {
+        unsigned objectUseScore = 0;
+        auto bumpIfThisLike = [&](const std::string& expr) {
+            if (expr.find("param_1->field_") != std::string::npos ||
+                expr.find("&param_1->field_") != std::string::npos) {
+                ++objectUseScore;
+            }
+        };
+
+        func.walk([&](helix::low::MemReadOp memRead) {
+            bumpIfThisLike(formatExpression(memRead.getAddr()));
+        });
+        func.walk([&](helix::low::MemWriteOp memWrite) {
+            bumpIfThisLike(formatExpression(memWrite.getAddr()));
+        });
+        func.walk([&](helix::low::CallOp call) {
+            bumpIfThisLike(formatExpression(call.getTargetAddr()));
+            for (auto arg : call.getArgs())
+                bumpIfThisLike(formatExpression(arg));
+        });
+        func.walk([&](helix::high::FieldAccessOp field) {
+            if (formatExpression(field.getBase()) == "param_1")
+                objectUseScore += 2;
+        });
+
+        if (objectUseScore >= 3) {
+            nameAliases_["param_1"] = "this";
+            auto& selfParam = paramInfoByIndex[1];
+            selfParam.rawName = "this";
+            if (selfParam.typeStr == "int64_t")
+                selfParam.typeStr = "void*";
+        }
+    }
+
+    llvm::SmallVector<std::string> params;
+    if (!paramInfoByIndex.empty()) {
+        for (const auto& [index, info] : paramInfoByIndex) {
+            std::string paramType = info.typeStr;
+            std::string paramName = info.rawName.empty()
+                ? std::format("param_{}", index)
+                : info.rawName;
+            paramName = applyNameAliases(paramName);
+            params.push_back(std::format("{} {}", paramType, paramName));
+        }
+    }
+    for (const auto& extra : extraNamedParams)
+        params.push_back(extra);
 
     // Function signature
     os << std::format("{} {}(", returnType, funcName.str());
@@ -262,6 +1298,7 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
         helix::high::StorageKind storage;
     };
     llvm::SmallVector<VarDeclInfo> stackDecls, registerDecls, tempDecls;
+    std::set<std::string> declaredLocalNames;
 
     func.walk([&](helix::high::VarDeclOp decl) {
         if (decl.getStorage() == helix::high::StorageKind::Parameter)
@@ -276,6 +1313,7 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
             typeStr = inferredType.getValue().str();
 
         VarDeclInfo info{typeStr, decl.getVarName().str(), decl.getStorage()};
+        declaredLocalNames.insert(info.name);
 
         switch (decl.getStorage()) {
         case helix::high::StorageKind::Stack:
@@ -293,6 +1331,43 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
             break;
         }
     });
+
+    for (const auto& syntheticName : syntheticLocalNames) {
+        declaredLocalNames.insert(syntheticName);
+        tempDecls.push_back(
+            VarDeclInfo{"int64_t", syntheticName, helix::high::StorageKind::Temporary});
+    }
+
+    func.walk([&](helix::high::VarRefOp ref) {
+        std::string name = applyNameAliases(ref.getVarName().str());
+        if (declaredLocalNames.contains(name))
+            return;
+        if (parseParamIndex(name))
+            return;
+        if (name == "this")
+            return;
+        if (!name.starts_with("var_") && !name.starts_with("spill_"))
+            return;
+
+        declaredLocalNames.insert(name);
+        tempDecls.push_back(
+            VarDeclInfo{"int64_t", name, helix::high::StorageKind::Temporary});
+    });
+
+    if (hasReturnValue) {
+        func.walk([&](helix::high::VarDeclOp decl) {
+            if (!referencedVarIds.contains(decl.getVarId()))
+                return;
+
+            auto name = decl.getVarName().str();
+            if (name == "result") {
+                currentReturnValueName_ = "result";
+                return;
+            }
+            if (currentReturnValueName_.empty() && name == "rax")
+                currentReturnValueName_ = "rax";
+        });
+    }
 
     // Emit grouped declarations: locals → registers → temporaries
     auto emitDeclGroup = [&](const llvm::SmallVector<VarDeclInfo>& decls) {
@@ -345,16 +1420,26 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
 
     // ─── Assignment ─────────────────────────────────────────────────────
     if (auto assign = dyn_cast<helix::high::AssignOp>(op)) {
-        // ─── Skip dead assignments from Memory* chain breaking ────────────
         auto exprStr = formatExpression(assign.getValue());
+        std::string targetStr = formatExpression(assign.getTarget());
+
+        // ─── Skip dead assignments from Memory* chain breaking ────────────
         if (exprStr == "(void*)(0)" ||
             exprStr == "(int64_t)((void*)(0))")
             return;
+
+        // Suppress synthetic null pointer aliases that only exist to thread
+        // Remill bookkeeping pointers through the IR.
+        if (exprStr == "NULL" && isSyntheticTemporaryName(targetStr) &&
+            isa<LLVM::LLVMPointerType>(assign.getValue().getType())) {
+            return;
+        }
 
         // ─── Skip PC-increment bookkeeping ────────────────────────────────
         // Remill emits `NEXT_PC = PC + instr_size` for every instruction.
         // After variable recovery, these appear as assignments like
         // `saved_rbp = (saved_rbp + 3)`. Filter by string pattern.
+        bool suppressEmission = false;
         if (exprStr.size() > 4 && exprStr.front() == '(' && exprStr.back() == ')') {
             auto plusPos = exprStr.rfind("+ ");
             if (plusPos != std::string::npos) {
@@ -364,12 +1449,10 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
                 try {
                     int val = std::stoi(numStr);
                     if (val >= 1 && val <= 15)
-                        return;
+                        suppressEmission = true;
                 } catch (...) {}
             }
         }
-
-        std::string targetStr = formatExpression(assign.getTarget());
 
         // ─── Forward Copy Propagation Peephole ─────────────────────────────
         if (lastRegValue.count(targetStr) && lastRegValue[targetStr] == exprStr) {
@@ -387,6 +1470,9 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
         }
         
         lastRegValue[targetStr] = exprStr;
+
+        if (suppressEmission)
+            return;
 
         indent(os, depth);
         os << targetStr
@@ -411,22 +1497,56 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     // ─── If/else ────────────────────────────────────────────────────────
     if (auto ifOp = dyn_cast<helix::high::IfOp>(op)) {
         lastRegValue.clear(); // Control flow branch invalidates sequence
-        indent(os, depth);
-        {
-            auto condCode = extractConditionCode(ifOp.getCondition(), this);
-            std::string condStr = condCode ? *condCode : formatExpression(ifOp.getCondition());
-            os << "if (" << condStr << ") {\n";
-        }
-        emitRegionBody(ifOp.getThenRegion(), os, depth + 1);
-        indent(os, depth);
-        os << "}";
+        std::function<void(helix::high::IfOp, bool)> emitIfBody;
+        emitIfBody =
+            [&](helix::high::IfOp nestedIf, bool withIndent) {
+                if (withIndent)
+                    indent(os, depth);
+                auto condCode =
+                    extractConditionCode(nestedIf.getCondition(), this);
+                std::string condStr =
+                    condCode ? *condCode : formatExpression(nestedIf.getCondition());
+                os << "if (" << condStr << ") {\n";
+                emitRegionBody(nestedIf.getThenRegion(), os, depth + 1);
+                indent(os, depth);
+                os << "}";
 
-        if (!ifOp.getElseRegion().empty()) {
-            os << " else {\n";
-            emitRegionBody(ifOp.getElseRegion(), os, depth + 1);
-            indent(os, depth);
-            os << "}";
-        }
+                auto singleNestedElseIf =
+                    [&](Region& region) -> helix::high::IfOp {
+                        if (region.empty())
+                            return {};
+                        helix::high::IfOp nested;
+                        for (auto& elseBlock : region) {
+                            for (auto& nestedOp : elseBlock) {
+                                if (isa<helix::high::LabelOp, helix::high::YieldOp>(
+                                        &nestedOp)) {
+                                    continue;
+                                }
+                                if (nested)
+                                    return {};
+                                nested = dyn_cast<helix::high::IfOp>(&nestedOp);
+                                if (!nested)
+                                    return {};
+                            }
+                        }
+                        return nested;
+                    };
+
+                if (!nestedIf.getElseRegion().empty()) {
+                    if (auto nestedElseIf =
+                            singleNestedElseIf(nestedIf.getElseRegion())) {
+                        os << " else ";
+                        emitIfBody(nestedElseIf, /*withIndent=*/false);
+                    } else {
+                        os << " else {\n";
+                        emitRegionBody(nestedIf.getElseRegion(), os, depth + 1);
+                        indent(os, depth);
+                        os << "}";
+                    }
+                }
+            };
+
+        emitIfBody(ifOp, /*withIndent=*/true);
         os << "\n";
         return;
     }
@@ -513,6 +1633,12 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     }
 
     if (auto label = dyn_cast<helix::high::LabelOp>(op)) {
+        auto* block = label->getBlock();
+        const bool referenced =
+            referencedLabelNames_.contains(label.getName().str()) ||
+            referencedBlocks_.contains(block);
+        if (!referenced)
+            return;
         // Labels are unindented by one level
         if (depth > 0)
             indent(os, depth - 1);
@@ -623,7 +1749,49 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     if (auto memWrite = dyn_cast<helix::low::MemWriteOp>(op)) {
         indent(os, depth);
         auto addrStr = formatExpression(memWrite.getAddr());
-        
+        std::string locationExpr;
+        if (addrStr.starts_with("&") && addrStr.find("->") != std::string::npos) {
+            locationExpr = addrStr.substr(1);
+        } else if (addrStr.starts_with("(&") && addrStr.back() == ')' &&
+                   addrStr.find("->") != std::string::npos) {
+            locationExpr = addrStr.substr(2, addrStr.size() - 3);
+        } else {
+            locationExpr = std::format("(*({}))", addrStr);
+        }
+
+        if (auto unary = memWrite.getValue().getDefiningOp<helix::low::UnaryOp>()) {
+            auto kind = unary.getKind();
+            if (kind == helix::low::UnaryOpKind::Inc ||
+                kind == helix::low::UnaryOpKind::Dec) {
+                auto sameAddr = [&]() {
+                    auto operandExpr = formatExpression(unary.getOperand());
+                    if (normalizeAddressExpression(operandExpr) ==
+                        normalizeAddressExpression(addrStr)) {
+                        return true;
+                    }
+
+                    if (auto priorRead =
+                            unary.getOperand().getDefiningOp<helix::low::MemReadOp>()) {
+                        return normalizeAddressExpression(
+                                   formatExpression(priorRead.getAddr())) ==
+                               normalizeAddressExpression(addrStr);
+                    }
+                    return false;
+                };
+
+                if (sameAddr()) {
+                    os << locationExpr
+                       << (kind == helix::low::UnaryOpKind::Inc ? "++" : "--");
+                    if (auto addr = memWrite.getAddress())
+                        os << std::format(";  // 0x{:x}", *addr);
+                    else
+                        os << ";";
+                    os << "\n";
+                    return;
+                }
+            }
+        }
+
         // Clean up *( &param_X->field_Y ) into param_X->field_Y
         if (addrStr.starts_with("&") && addrStr.find("->") != std::string::npos) {
             os << addrStr.substr(1) << " = " << formatExpression(memWrite.getValue());
@@ -656,8 +1824,30 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
 
         indent(os, depth);
         bool isIndirect = false;
+        bool isRecursive = false;
+        auto matchesCurrentFunction =
+            [&](std::string_view targetName,
+                std::optional<uint64_t> targetAddr = std::nullopt) {
+                if (targetAddr && *targetAddr == currentFunctionEntryAddr_)
+                    return true;
+                if (auto parsed = parseSubroutineAddressName(targetName))
+                    return *parsed == currentFunctionEntryAddr_;
+                return targetName == currentFunctionName_;
+            };
         if (auto name = call.getTargetName()) {
             os << name->str();
+            isRecursive = matchesCurrentFunction(name->str());
+        } else if (auto recoveredTarget =
+                       tryResolveSyntheticRelativeCallTarget(call)) {
+            auto addrExpr = std::format("0x{:x}", *recoveredTarget);
+            if (auto sig = helix::lookupSignature(addrExpr)) {
+                os << sig->name;
+                isRecursive = matchesCurrentFunction(sig->name, *recoveredTarget);
+            } else {
+                auto recoveredName = std::format("sub_{:x}", *recoveredTarget);
+                os << recoveredName;
+                isRecursive = matchesCurrentFunction(recoveredName, *recoveredTarget);
+            }
         } else {
             // Try to resolve the target address via SignatureDb
             auto addrExpr = formatExpression(call.getTargetAddr());
@@ -695,6 +1885,11 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
             auto sig = helix::lookupSignature(addrExpr);
             if (sig) {
                 os << sig->name;
+                if (auto parsed = parseFormattedIntegerLiteral(addrExpr))
+                    isRecursive = matchesCurrentFunction(sig->name,
+                                                         static_cast<uint64_t>(*parsed));
+                else
+                    isRecursive = matchesCurrentFunction(sig->name);
             } else {
                 // ─── Vtable / Struct Method Pattern Detection ───────────
                 // Now that pointer arithmetic creates strings like "&rax->field_0x18",
@@ -714,6 +1909,10 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
                 if (!vtableResolved) {
                     // Standard decompiler convention: sub_<hex_address>
                     os << "sub_" << addrExpr;
+                    if (auto parsed = parseFormattedIntegerLiteral(addrExpr))
+                        isRecursive = matchesCurrentFunction(
+                            std::format("sub_{}", addrExpr),
+                            static_cast<uint64_t>(*parsed));
                 }
                 isIndirect = true;
             }
@@ -726,14 +1925,26 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
             os << inferredArgs[i];
         }
         os << ")";
-        
+
+        std::string trailingComment;
+        auto appendComment = [&](std::string_view text) {
+            if (text.empty())
+                return;
+            if (!trailingComment.empty())
+                trailingComment += " | ";
+            trailingComment += text;
+        };
+
         if (auto addr = call.getAddress())
-            os << std::format(";  // 0x{:x}", *addr);
-        else
-            os << ";";
-            
-        if (isIndirect) {
-            os << " // [WARNING] Indirect call";
+            appendComment(std::format("0x{:x}", *addr));
+        if (isRecursive)
+            appendComment("RECURSIVE");
+        if (isIndirect)
+            appendComment("[WARNING] Indirect call");
+
+        os << ";";
+        if (!trailingComment.empty()) {
+            os << "  // " << trailingComment;
         }
         os << "\n";
         return;
@@ -742,6 +1953,8 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     if (auto ret = dyn_cast<helix::low::RetOp>(op)) {
         indent(os, depth);
         os << "return";
+        if (currentFunctionHasReturnValue_ && !currentReturnValueName_.empty())
+            os << " " << applyNameAliases(currentReturnValueName_);
         if (auto addr = ret.getAddress())
             os << std::format(";  // 0x{:x}", *addr);
         else
@@ -777,27 +1990,11 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     }
 
     // ─── HelixLow: Cmp/Test (set flags, no result value emitted) ────────
-    if (auto cmp = dyn_cast<helix::low::CmpOp>(op)) {
-        indent(os, depth);
-        os << "cmp(" << formatExpression(cmp.getLhs())
-           << ", " << formatExpression(cmp.getRhs()) << ")";
-        if (auto addr = cmp.getAddress())
-            os << std::format(";  // 0x{:x}", *addr);
-        else
-            os << ";";
-        os << "\n";
+    if (isa<helix::low::CmpOp>(op)) {
         return;
     }
 
-    if (auto test = dyn_cast<helix::low::TestOp>(op)) {
-        indent(os, depth);
-        os << "test(" << formatExpression(test.getLhs())
-           << ", " << formatExpression(test.getRhs()) << ")";
-        if (auto addr = test.getAddress())
-            os << std::format(";  // 0x{:x}", *addr);
-        else
-            os << ";";
-        os << "\n";
+    if (isa<helix::low::TestOp>(op)) {
         return;
     }
 
@@ -904,9 +2101,9 @@ static std::string extractName(Value v, PseudoCEmitter* emitter = nullptr) {
         return "";
     }
     if (auto varRef = dyn_cast<helix::high::VarRefOp>(op))
-        return varRef.getVarName().str();
+        return emitter ? emitter->formatExpression(v) : varRef.getVarName().str();
     if (auto regRead = dyn_cast<helix::low::RegReadOp>(op))
-        return regRead.getRegName().str();
+        return emitter ? emitter->formatExpression(v) : regRead.getRegName().str();
     // Fallback: use the full expression formatter
     if (emitter) {
         auto expr = emitter->formatExpression(v);
@@ -922,6 +2119,7 @@ struct FlagSource {
     unsigned flagIndex = 0;
     bool isCmp = false;
     bool isTest = false;
+    bool isBinOp = false;
 };
 
 static FlagSource findFlagSource(Value flagVal) {
@@ -939,6 +2137,12 @@ static FlagSource findFlagSource(Value flagVal) {
         src.cmpOrTest = op; src.isTest = true;
         for (unsigned i = 0; i < testOp->getNumResults(); ++i)
             if (testOp->getResult(i) == flagVal) { src.flagIndex = i; break; }
+        return src;
+    }
+    if (auto binOp = dyn_cast<helix::low::BinOp>(op)) {
+        src.cmpOrTest = op; src.isBinOp = true;
+        for (unsigned i = 0; i < binOp->getNumResults(); ++i)
+            if (binOp->getResult(i) == flagVal) { src.flagIndex = i; break; }
         return src;
     }
     return src;
@@ -963,6 +2167,80 @@ static std::optional<std::string> formatCmpStr(helix::low::CmpOp cmpOp,
         }
         return std::format("{} {} 0", lhs, op);
     }
+    return std::nullopt;
+}
+
+static std::optional<std::string> formatBinOpCmpStr(helix::low::BinOp binOp,
+                                                    const char* op,
+                                                    PseudoCEmitter* emitter = nullptr) {
+    std::string lhs, rhs;
+    if (binOp->getNumOperands() >= 2) {
+        lhs = extractName(binOp->getOperand(0), emitter);
+        rhs = extractName(binOp->getOperand(1), emitter);
+    }
+    if (!lhs.empty() && !rhs.empty())
+        return std::format("{} {} {}", lhs, op, rhs);
+    return std::nullopt;
+}
+
+static std::optional<std::string> formatSignedCompareFromFlagSource(
+    const FlagSource& src, const char* op, PseudoCEmitter* emitter = nullptr) {
+    if (src.isCmp)
+        return formatCmpStr(cast<helix::low::CmpOp>(src.cmpOrTest), op, emitter);
+
+    if (src.isBinOp) {
+        auto binOp = cast<helix::low::BinOp>(src.cmpOrTest);
+        if (binOp.getKind() == helix::low::BinOpKind::Sub)
+            return formatBinOpCmpStr(binOp, op, emitter);
+    }
+
+    return std::nullopt;
+}
+
+static bool isLogicalNegationConstant(Value value) {
+    if (!value)
+        return false;
+
+    if (auto constOp = value.getDefiningOp<arith::ConstantOp>()) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+            auto intValue = intAttr.getValue();
+            return intValue.isOne() || intValue.isAllOnes();
+        }
+    }
+
+    if (auto constOp = value.getDefiningOp<LLVM::ConstantOp>()) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+            auto intValue = intAttr.getValue();
+            return intValue.isOne() || intValue.isAllOnes();
+        }
+    }
+
+    return false;
+}
+
+static std::optional<std::string> invertConditionText(std::string_view condition) {
+    static constexpr std::pair<std::string_view, std::string_view> kPairs[] = {
+        {" == ", " != "},
+        {" != ", " == "},
+        {" >= ", " < "},
+        {" <= ", " > "},
+        {" < ", " >= "},
+        {" > ", " <= "},
+    };
+
+    for (const auto& [from, to] : kPairs) {
+        auto pos = condition.find(from);
+        if (pos == std::string_view::npos)
+            continue;
+        std::string result(condition);
+        result.replace(pos, from.size(), to);
+        return result;
+    }
+
+    if (condition == "overflow")
+        return std::string("!overflow");
+    if (condition == "!overflow")
+        return std::string("overflow");
     return std::nullopt;
 }
 
@@ -1009,16 +2287,19 @@ static std::optional<std::string> extractConditionCode(Value condValue,
         Value flagOp = nullptr;
         bool isNeg = false;
         for (unsigned i = 0; i < 2; ++i) {
-            if (auto c = xorOp->getOperand(i).getDefiningOp<arith::ConstantOp>()) {
-                if (auto b = dyn_cast<IntegerAttr>(c.getValue())) {
-                    if (b.getValue().getBoolValue()) {
-                        flagOp = xorOp->getOperand(1 - i);
-                        isNeg = true;
-                    }
-                }
-            }
+            if (!isLogicalNegationConstant(xorOp->getOperand(i)))
+                continue;
+            flagOp = xorOp->getOperand(1 - i);
+            isNeg = true;
+            break;
         }
         if (isNeg && flagOp) {
+            if (auto nested = extractConditionCode(flagOp, emitter)) {
+                if (auto inverted = invertConditionText(*nested))
+                    return inverted;
+                return std::format("!({})", *nested);
+            }
+
             auto src = findFlagSource(flagOp);
             if (src.isCmp) {
                 auto cmpOp = cast<helix::low::CmpOp>(src.cmpOrTest);
@@ -1044,21 +2325,54 @@ static std::optional<std::string> extractConditionCode(Value condValue,
                     return name.empty() ? std::string("!sign")
                                         : std::format("{} >= 0", name);
             }
+            if (src.isBinOp) {
+                auto binOp = cast<helix::low::BinOp>(src.cmpOrTest);
+                if (binOp.getKind() == helix::low::BinOpKind::Sub) {
+                    switch (src.flagIndex) {
+                    case 2: {
+                        auto cmp = formatBinOpCmpStr(binOp, "==", emitter);
+                        if (cmp) return *cmp;
+                        break;
+                    }
+                    case 3: {
+                        auto lhs = extractName(binOp->getOperand(0), emitter);
+                        auto rhs = extractName(binOp->getOperand(1), emitter);
+                        if (!lhs.empty() && !rhs.empty())
+                            return std::format("(({} - {}) < 0)", lhs, rhs);
+                        break;
+                    }
+                    case 4:
+                        return std::string("!overflow");
+                    default:
+                        break;
+                    }
+                }
+            }
             // !(SF XOR OF) → JNL/JGE
             if (auto innerXor = dyn_cast_or_null<arith::XOrIOp>(
                     flagOp.getDefiningOp())) {
                 auto sf = findFlagSource(innerXor->getOperand(0));
                 auto of = findFlagSource(innerXor->getOperand(1));
-                if (sf.isCmp && sf.flagIndex == 2 && of.isCmp && of.flagIndex == 3)
-                    return formatCmpStr(cast<helix::low::CmpOp>(sf.cmpOrTest), ">=", emitter);
+                if (sf.flagIndex == 2 && of.flagIndex == 3 &&
+                    sf.cmpOrTest == of.cmpOrTest) {
+                    if (auto cmp = formatSignedCompareFromFlagSource(
+                            sf, ">=", emitter)) {
+                        return cmp;
+                    }
+                }
             }
         }
         // SF XOR OF → JL
         if (!isNeg) {
             auto sf = findFlagSource(xorOp->getOperand(0));
             auto of = findFlagSource(xorOp->getOperand(1));
-            if (sf.isCmp && sf.flagIndex == 2 && of.isCmp && of.flagIndex == 3)
-                return formatCmpStr(cast<helix::low::CmpOp>(sf.cmpOrTest), "<", emitter);
+            if (sf.flagIndex == 2 && of.flagIndex == 3 &&
+                sf.cmpOrTest == of.cmpOrTest) {
+                if (auto cmp = formatSignedCompareFromFlagSource(
+                        sf, "<", emitter)) {
+                    return cmp;
+                }
+            }
         }
     }
 
@@ -1133,10 +2447,105 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
         return "";
     };
 
+    auto blockHasExplicitLabel = [&](Block* block) {
+        if (!block)
+            return false;
+        for (auto& op : *block) {
+            if (isa<helix::high::LabelOp>(&op))
+                return true;
+        }
+        return false;
+    };
+
+    auto shouldEmitSyntheticBlockLabel = [&](Block* block) {
+        if (!block)
+            return false;
+        if (blockHasExplicitLabel(block))
+            return false;
+        return referencedBlocks_.contains(block);
+    };
+
+    auto nextBlockInRegion = [&](Block* block) -> Block* {
+        if (!block)
+            return nullptr;
+        auto it = block->getIterator();
+        ++it;
+        if (it == region.end())
+            return nullptr;
+        return &*it;
+    };
+
+    auto getNonLabelOps = [&](Block* block) {
+        llvm::SmallVector<Operation*, 4> ops;
+        if (!block)
+            return ops;
+        for (auto& op : *block) {
+            if (isa<helix::high::LabelOp>(&op))
+                continue;
+            ops.push_back(&op);
+        }
+        return ops;
+    };
+
+    auto resolveJumpOnlyBlock = [&](Block* block) -> Block* {
+        llvm::SmallPtrSet<Block*, 8> visited;
+        Block* current = block;
+        unsigned depthBudget = 6;
+        while (current && depthBudget-- > 0 && visited.insert(current).second) {
+            auto ops = getNonLabelOps(current);
+            if (ops.size() != 1)
+                break;
+            if (auto jmp = dyn_cast<helix::low::JmpOp>(ops.front())) {
+                current = jmp.getDest();
+                continue;
+            }
+            break;
+        }
+        return current;
+    };
+
+    auto getTrivialReturnOp = [&](Block* block) -> Operation* {
+        Block* resolved = resolveJumpOnlyBlock(block);
+        auto ops = getNonLabelOps(resolved);
+        if (ops.size() != 1)
+            return nullptr;
+        if (isa<helix::low::RetOp>(ops.front()) ||
+            isa<helix::high::ReturnOp>(ops.front())) {
+            return ops.front();
+        }
+        return nullptr;
+    };
+
+    auto blockStartsWithVisibleLabel = [&](Block* block) {
+        if (!block)
+            return false;
+        for (auto& op : *block) {
+            auto label = dyn_cast<helix::high::LabelOp>(&op);
+            if (!label)
+                return false;
+            const bool referenced =
+                referencedLabelNames_.contains(label.getName().str()) ||
+                referencedBlocks_.contains(label->getBlock());
+            if (referenced)
+                return true;
+        }
+        return false;
+    };
+
     bool firstBlock = true;
+    bool suppressAcrossBlocksUntilLabel = false;
     for (auto& block : region) {
+        if (suppressAcrossBlocksUntilLabel && !blockStartsWithVisibleLabel(&block))
+            continue;
+
+        if (blockStartsWithVisibleLabel(&block))
+            suppressAcrossBlocksUntilLabel = false;
+
+        lastRegValue.clear();
+        bool suppressUntilVisibleLabel = false;
+
         // Emit block label for non-entry blocks in multi-block regions.
-        if (multiBlock && !firstBlock) {
+        if (multiBlock && !firstBlock && shouldEmitSyntheticBlockLabel(&block)) {
             if (depth > 0)
                 indent(os, depth - 1);
             os << blockLabels_[&block] << ":\n";
@@ -1147,22 +2556,47 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
         deadStoreOps = precomputeDeadStores(block);
 
         for (auto& op : block.getOperations()) {
+            if (suppressUntilVisibleLabel) {
+                auto label = dyn_cast<helix::high::LabelOp>(&op);
+                if (!label)
+                    continue;
+
+                const bool referenced =
+                    referencedLabelNames_.contains(label.getName().str()) ||
+                    referencedBlocks_.contains(label->getBlock());
+                if (!referenced)
+                    continue;
+
+                suppressUntilVisibleLabel = false;
+            }
+
             // Handle JmpOp (unconditional jump) — emit as goto.
             if (auto jmp = dyn_cast<helix::low::JmpOp>(&op)) {
-                Block* dest = jmp.getDest();
+                Block* dest = resolveJumpOnlyBlock(jmp.getDest());
+                if (dest == nextBlockInRegion(&block))
+                    continue;
+                if (Operation* retOp = getTrivialReturnOp(dest)) {
+                    emitStatement(retOp, os, depth);
+                    suppressUntilVisibleLabel = true;
+                    suppressAcrossBlocksUntilLabel = true;
+                    continue;
+                }
                 indent(os, depth);
                 auto label = resolveBlockLabel(dest);
                 if (!label.empty())
                     os << "goto " << label << ";\n";
                 else
                     os << "goto /* unresolved */;\n";
+                suppressUntilVisibleLabel = true;
+                suppressAcrossBlocksUntilLabel = true;
                 continue;
             }
 
             // Handle JccOp (conditional jump) — emit as if/goto.
             if (auto jcc = dyn_cast<helix::low::JccOp>(&op)) {
-                Block* trueDest = jcc.getTrueDest();
-                Block* falseDest = jcc.getFalseDest();
+                Block* trueDest = resolveJumpOnlyBlock(jcc.getTrueDest());
+                Block* falseDest = resolveJumpOnlyBlock(jcc.getFalseDest());
+                Block* nextBlock = nextBlockInRegion(&block);
                 indent(os, depth);
 
                 // Use extractConditionCode for a human-readable condition,
@@ -1171,8 +2605,46 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
                 auto condCode = extractConditionCode(jcc.getFlagValue(), this);
                 if (condCode)
                     condStr = *condCode;
-                else
-                    condStr = jcc.getCondition().str();
+                else {
+                    condStr = formatExpression(jcc.getFlagValue());
+                    if (condStr.empty() || condStr == "/* null */" ||
+                        condStr == "/* arg */") {
+                        condStr = jcc.getCondition().str();
+                    }
+                }
+
+                if (Operation* trueRet = getTrivialReturnOp(trueDest)) {
+                    if (Operation* falseRet = getTrivialReturnOp(falseDest)) {
+                        os << "if (" << condStr << ") {\n";
+                        emitStatement(trueRet, os, depth + 1);
+                        indent(os, depth);
+                        os << "} else {\n";
+                        emitStatement(falseRet, os, depth + 1);
+                        indent(os, depth);
+                        os << "}\n";
+                        continue;
+                    }
+                }
+
+                if (trueDest == nextBlock) {
+                    if (Operation* retOp = getTrivialReturnOp(falseDest)) {
+                        os << "if (!(" << condStr << ")) {\n";
+                        emitStatement(retOp, os, depth + 1);
+                        indent(os, depth);
+                        os << "}\n";
+                        continue;
+                    }
+                }
+
+                if (falseDest == nextBlock) {
+                    if (Operation* retOp = getTrivialReturnOp(trueDest)) {
+                        os << "if (" << condStr << ") {\n";
+                        emitStatement(retOp, os, depth + 1);
+                        indent(os, depth);
+                        os << "}\n";
+                        continue;
+                    }
+                }
 
                 os << "if (" << condStr << ") ";
 
@@ -1181,12 +2653,16 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
                     os << "goto " << trueLabel << ";\n";
                 else
                     os << "goto /* unresolved */;\n";
-
-                // Emit explicit goto for false dest if it's not the next block.
                 continue;
             }
 
             emitStatement(&op, os, depth);
+            if (isa<helix::high::GotoOp,
+                    helix::low::RetOp,
+                    helix::high::ReturnOp>(&op)) {
+                suppressUntilVisibleLabel = true;
+                suppressAcrossBlocksUntilLabel = true;
+            }
         }
     }
 }
@@ -1199,6 +2675,9 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     if (!defOp)
         return "/* arg */";
 
+    if (auto resolvedAddr = tryResolveSyntheticRelativeAddress(val))
+        return std::format("0x{:x}", *resolvedAddr);
+
     // ═════════════════════════════════════════════════════════════════════
     // HelixHigh Dialect expressions
     // ═════════════════════════════════════════════════════════════════════
@@ -1210,7 +2689,15 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     // ─── Variable reference ─────────────────────────────────────────────
     if (auto varRef = dyn_cast<helix::high::VarRefOp>(defOp)) {
-        return varRef.getVarName().str();
+        auto name = applyNameAliases(varRef.getVarName().str());
+        if (isSyntheticTemporaryName(name)) {
+            auto it = lastRegValue.find(name);
+            if (it != lastRegValue.end() && it->second != name &&
+                it->second.find(name) == std::string::npos) {
+                return it->second;
+            }
+        }
+        return name;
     }
 
     // ─── Binary expression ──────────────────────────────────────────────
@@ -1241,6 +2728,15 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         auto rhsStr = formatExpression(binary.getRhs());
 
         if (binary.getOp() == helix::high::BinaryOpKind::Add || binary.getOp() == helix::high::BinaryOpKind::Sub) {
+            if (auto lhs = parseFormattedIntegerLiteral(lhsStr)) {
+                if (auto rhs = parseFormattedIntegerLiteral(rhsStr)) {
+                    auto value = binary.getOp() == helix::high::BinaryOpKind::Add
+                        ? (*lhs + *rhs)
+                        : (*lhs - *rhs);
+                    return formatIntLiteral(value);
+                }
+            }
+
             auto hasTlsBase = [](const std::string& s) {
                 return s.find("__readgsqword(0x58)") != std::string::npos || s.find("&__local") != std::string::npos;
             };
@@ -1255,10 +2751,11 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
             
             // ─── Automatic Struct Field Recovery ────────────────────────────
-            if (binary.getOp() == helix::high::BinaryOpKind::Add && 
-                lhsStr.find(' ') == std::string::npos && 
-                lhsStr.find('(') == std::string::npos && 
-                (lhsStr.starts_with("param_") || lhsStr.size() <= 3)) { // e.g. param_2 or rax
+            if (binary.getOp() == helix::high::BinaryOpKind::Add &&
+                lhsStr.find(' ') == std::string::npos &&
+                lhsStr.find('(') == std::string::npos &&
+                !containsSyntheticValueIdentifier(lhsStr) &&
+                looksLikeStructBaseIdentifier(lhsStr)) {
                 if (rhsStr.starts_with("0x") || (rhsStr.find_first_not_of("0123456789") == std::string::npos)) {
                     if (lhsStr != "rsp" && lhsStr != "rbp") { // Don't turn stack pointers into structs
                         std::string hexOffset = rhsStr;
@@ -1344,21 +2841,26 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         // ─── Win64 calling convention: map arg registers to argN ─────
         // Initial reads of RCX/RDX/R8/R9 (or their 32-bit aliases) are
         // function arguments in the Windows x64 ABI.
-        static const std::pair<const char*, const char*> kArgMap[] = {
-            {"RCX", "arg0"}, {"ECX", "arg0"},
-            {"RDX", "arg1"}, {"EDX", "arg1"},
-            {"R8",  "arg2"}, {"R8D", "arg2"},
-            {"R9",  "arg3"}, {"R9D", "arg3"},
+        static const std::pair<const char*, unsigned> kArgMap[] = {
+            {"RCX", 1}, {"ECX", 1},
+            {"RDX", 2}, {"EDX", 2},
+            {"R8",  3}, {"R8D", 3},
+            {"R9",  4}, {"R9D", 4},
         };
-        for (auto [reg, argName] : kArgMap) {
+        for (auto [reg, argIndex] : kArgMap) {
             if (name == reg)
-                return std::string(argName);
+                return applyNameAliases(std::format("param_{}", argIndex));
         }
         for (auto& c : name) c = std::tolower(c);
         return name;
     }
 
     if (auto memRead = dyn_cast<helix::low::MemReadOp>(defOp)) {
+        if (auto paramIndex = inferWin64StackParamIndex(memRead.getOperation(),
+                                                        memRead.getAddr());
+            paramIndex && *paramIndex <= currentWin64StackParamLimit_)
+            return applyNameAliases(std::format("param_{}", *paramIndex));
+
         auto addrStr = formatExpression(memRead.getAddr());
         // Clean up *( &param_X->field_Y ) into param_X->field_Y
         if (addrStr.starts_with("&") && addrStr.find("->") != std::string::npos) {
@@ -1448,10 +2950,11 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
             
             // ─── Automatic Struct Field Recovery ────────────────────────────
-            if (binop.getKind() == helix::low::BinOpKind::Add && 
-                lhsStr.find(' ') == std::string::npos && 
-                lhsStr.find('(') == std::string::npos && 
-                (lhsStr.starts_with("param_") || lhsStr.size() <= 3)) { // e.g. param_2 or rax
+            if (binop.getKind() == helix::low::BinOpKind::Add &&
+                lhsStr.find(' ') == std::string::npos &&
+                lhsStr.find('(') == std::string::npos &&
+                !containsSyntheticValueIdentifier(lhsStr) &&
+                looksLikeStructBaseIdentifier(lhsStr)) {
                 if (rhsStr.starts_with("0x") || (rhsStr.find_first_not_of("0123456789") == std::string::npos)) {
                     if (lhsStr != "rsp" && lhsStr != "rbp") { // Don't turn stack pointers into structs
                         std::string hexOffset = rhsStr;
@@ -1602,6 +3105,11 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     if (auto op = dyn_cast<LLVM::AddOp>(defOp)) {
         auto lhsStr = formatExpression(op.getLhs());
         auto rhsStr = formatExpression(op.getRhs());
+
+        if (auto lhs = parseFormattedIntegerLiteral(lhsStr)) {
+            if (auto rhs = parseFormattedIntegerLiteral(rhsStr))
+                return formatIntLiteral(*lhs + *rhs);
+        }
         
         // ─── Segment Register Awareness ─────────────────────────────────
         if (lhsStr == "*(int64_t)(NULL)" || lhsStr == "*(NULL)") {
@@ -1613,9 +3121,10 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         }
         
         // ─── Automatic Struct Field Recovery ────────────────────────────
-        if (lhsStr.find(' ') == std::string::npos && 
-            lhsStr.find('(') == std::string::npos && 
-            (lhsStr.starts_with("param_") || lhsStr.size() <= 3)) { // e.g. param_2 or rax
+        if (lhsStr.find(' ') == std::string::npos &&
+            lhsStr.find('(') == std::string::npos &&
+            !containsSyntheticValueIdentifier(lhsStr) &&
+            looksLikeStructBaseIdentifier(lhsStr)) {
             if (rhsStr.starts_with("0x") || (rhsStr.find_first_not_of("0123456789") == std::string::npos)) {
                 if (lhsStr != "rsp" && lhsStr != "rbp") { // Don't turn stack pointers into structs
                     std::string hexOffset = rhsStr;
@@ -1629,9 +3138,15 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         return std::format("({} + {})", lhsStr, rhsStr);
     }
 
-    if (auto op = dyn_cast<LLVM::SubOp>(defOp))
-        return std::format("({} - {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::SubOp>(defOp)) {
+        auto lhsStr = formatExpression(op.getLhs());
+        auto rhsStr = formatExpression(op.getRhs());
+        if (auto lhs = parseFormattedIntegerLiteral(lhsStr)) {
+            if (auto rhs = parseFormattedIntegerLiteral(rhsStr))
+                return formatIntLiteral(*lhs - *rhs);
+        }
+        return std::format("({} - {})", lhsStr, rhsStr);
+    }
 
     if (auto op = dyn_cast<LLVM::MulOp>(defOp)) {
         auto lhsStr = formatExpression(op.getLhs());
@@ -1744,8 +3259,13 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     }
 
     // ─── Memory load ────────────────────────────────────────────────────
-    if (auto load = dyn_cast<LLVM::LoadOp>(defOp))
+    if (auto load = dyn_cast<LLVM::LoadOp>(defOp)) {
+        if (auto paramIndex = inferWin64StackParamIndex(load.getOperation(),
+                                                        load.getAddr());
+            paramIndex && *paramIndex <= currentWin64StackParamLimit_)
+            return applyNameAliases(std::format("param_{}", *paramIndex));
         return std::format("*({})", formatExpression(load.getAddr()));
+    }
 
     // ─── Function call (expression context — has return value) ──────────
     if (auto call = dyn_cast<LLVM::CallOp>(defOp)) {
@@ -1821,9 +3341,10 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         // ─── Automatic Struct Field Recovery ────────────────────────────
         if (dynIndices.size() == 1) {
             auto rhsStr = formatExpression(dynIndices[0]);
-            if (base.find(' ') == std::string::npos && 
-                base.find('(') == std::string::npos && 
-                (base.starts_with("param_") || base.size() <= 3)) { // e.g. param_2 or rax
+            if (base.find(' ') == std::string::npos &&
+                base.find('(') == std::string::npos &&
+                !containsSyntheticValueIdentifier(base) &&
+                looksLikeStructBaseIdentifier(base)) {
                 if (rhsStr.starts_with("0x") || (rhsStr.find_first_not_of("0123456789") == std::string::npos)) {
                     if (base != "rsp" && base != "rbp") { // Don't turn stack pointers into structs
                         std::string hexOffset = rhsStr;
@@ -1895,9 +3416,10 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         }
         
         // ─── Automatic Struct Field Recovery ────────────────────────────
-        if (lhsStr.find(' ') == std::string::npos && 
-            lhsStr.find('(') == std::string::npos && 
-            (lhsStr.starts_with("param_") || lhsStr.size() <= 3)) { // e.g. param_2 or rax
+        if (lhsStr.find(' ') == std::string::npos &&
+            lhsStr.find('(') == std::string::npos &&
+            !containsSyntheticValueIdentifier(lhsStr) &&
+            looksLikeStructBaseIdentifier(lhsStr)) {
             if (rhsStr.starts_with("0x") || (rhsStr.find_first_not_of("0123456789") == std::string::npos)) {
                 if (lhsStr != "rsp" && lhsStr != "rbp") { // Don't turn stack pointers into structs
                     std::string hexOffset = rhsStr;
@@ -1974,9 +3496,32 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         return std::format("({} | {})",
             formatExpression(op.getLhs()), formatExpression(op.getRhs()));
 
-    if (auto op = dyn_cast<arith::XOrIOp>(defOp))
+    if (auto op = dyn_cast<arith::XOrIOp>(defOp)) {
+        auto lhsSrc = findFlagSource(op.getLhs());
+        auto rhsSrc = findFlagSource(op.getRhs());
+        if (lhsSrc.flagIndex == 2 && rhsSrc.flagIndex == 3 &&
+            lhsSrc.cmpOrTest == rhsSrc.cmpOrTest) {
+            if (auto cmpStr = formatSignedCompareFromFlagSource(
+                    lhsSrc, "<", this)) {
+                return *cmpStr;
+            }
+        }
+        if (rhsSrc.flagIndex == 2 && lhsSrc.flagIndex == 3 &&
+            lhsSrc.cmpOrTest == rhsSrc.cmpOrTest) {
+            if (auto cmpStr = formatSignedCompareFromFlagSource(
+                    rhsSrc, "<", this)) {
+                return *cmpStr;
+            }
+        }
+
+        if (isLogicalNegationConstant(op.getLhs()))
+            return std::format("!({})", formatExpression(op.getRhs()));
+        if (isLogicalNegationConstant(op.getRhs()))
+            return std::format("!({})", formatExpression(op.getLhs()));
+
         return std::format("({} ^ {})",
             formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    }
 
     if (auto op = dyn_cast<arith::ShLIOp>(defOp))
         return std::format("({} << {})",
@@ -2136,6 +3681,13 @@ bool PseudoCEmitter::isPrologueArtifact(Operation* op) {
         // Frame pointer teardown: rsp = rbp
         if (target == "rsp" && value == "rbp")
             return true;
+
+        if (isNearBlockBoundary(op)) {
+            if (isStackSlotExpression(target) && isCalleeSavedRegisterName(value))
+                return true;
+            if (isCalleeSavedRegisterName(target) && isStackSlotExpression(value))
+                return true;
+        }
     }
 
     // HelixLow RegWriteOp: check for RBP = RSP or RSP = RBP
@@ -2145,6 +3697,30 @@ bool PseudoCEmitter::isPrologueArtifact(Operation* op) {
             auto exprStr = formatExpression(regWrite.getValue());
             if (exprStr == "rsp" || exprStr == "rbp")
                 return true;
+        }
+
+        if (isNearBlockBoundary(op) &&
+            isCalleeSavedRegisterName(regName.str()) &&
+            isStackSlotExpression(formatExpression(regWrite.getValue()))) {
+            return true;
+        }
+    }
+
+    if (auto memWrite = dyn_cast<helix::low::MemWriteOp>(op)) {
+        if (isNearBlockBoundary(op)) {
+            auto addrStr = formatExpression(memWrite.getAddr());
+            auto valueStr = formatExpression(memWrite.getValue());
+            if (isStackSlotExpression(addrStr) &&
+                isCalleeSavedRegisterName(valueStr)) {
+                return true;
+            }
+            auto normalized = normalizeAddressExpression(addrStr);
+            if ((normalized == "rsp+0x10" || normalized == "rsp+0x18" ||
+                 normalized == "rsp+0x20") &&
+                (isCalleeSavedRegisterName(valueStr) ||
+                 valueStr.starts_with("param_"))) {
+                return true;
+            }
         }
     }
 
@@ -2170,6 +3746,7 @@ std::unordered_set<Operation*>
 PseudoCEmitter::precomputeDeadStores(Block& block) {
     std::unordered_set<Operation*> deadOps;
     std::unordered_set<std::string> writtenNotRead;
+    std::unordered_map<std::string, Operation*> pendingTailWrites;
 
     // Collect operation pointers for reverse iteration
     llvm::SmallVector<Operation*, 64> ops;
@@ -2211,10 +3788,12 @@ PseudoCEmitter::precomputeDeadStores(Block& block) {
                     } else {
                         // First (from the bottom) write to this target
                         writtenNotRead.insert(targetStr);
+                        pendingTailWrites[targetStr] = op;
                     }
                 } else {
                     // Side-effecting expression — clear target and keep alive
                     writtenNotRead.erase(targetStr);
+                    pendingTailWrites.erase(targetStr);
                 }
             }
 
@@ -2236,17 +3815,60 @@ PseudoCEmitter::precomputeDeadStores(Block& block) {
             }
             for (auto& r : toRemove)
                 writtenNotRead.erase(r);
+            for (auto& r : toRemove)
+                pendingTailWrites.erase(r);
 
             continue;
         }
 
         // For all other ops, check if they reference any of our tracked variables
         // (calls, memory writes, etc. → they read their operands)
+        if (isa<helix::low::RetOp>(op)) {
+            auto returnName = applyNameAliases(currentReturnValueName_);
+            if (!returnName.empty()) {
+                writtenNotRead.erase(returnName);
+                pendingTailWrites.erase(returnName);
+            } else {
+                writtenNotRead.erase("rax");
+                pendingTailWrites.erase("rax");
+            }
+            continue;
+        }
+
+        if (auto ret = dyn_cast<helix::high::ReturnOp>(op)) {
+            auto valueStr = formatExpression(ret.getValue());
+            std::vector<std::string> toRemove;
+            for (auto& entry : writtenNotRead) {
+                if (valueStr.find(entry) != std::string::npos)
+                    toRemove.push_back(entry);
+            }
+            for (auto& entry : toRemove)
+                writtenNotRead.erase(entry);
+            for (auto& entry : toRemove)
+                pendingTailWrites.erase(entry);
+            continue;
+        }
+
         if (isa<helix::low::CallOp>(op) || isa<helix::high::ExprStmtOp>(op) ||
-            isa<helix::low::MemWriteOp>(op) || isa<helix::low::RetOp>(op) ||
-            isa<helix::high::ReturnOp>(op)) {
+            isa<helix::low::MemWriteOp>(op)) {
             // Conservative: any call/return might read any register → clear all
             writtenNotRead.clear();
+            pendingTailWrites.clear();
+        }
+    }
+
+    auto* terminator = block.empty() ? nullptr : block.getTerminator();
+    bool blockReturns = terminator &&
+        (isa<helix::low::RetOp>(terminator) || isa<helix::high::ReturnOp>(terminator));
+
+    if (blockReturns) {
+        auto returnName = applyNameAliases(currentReturnValueName_);
+        for (auto& [target, writeOp] : pendingTailWrites) {
+            if (!writeOp)
+                continue;
+            if ((!returnName.empty() && target == returnName) || target == "rax")
+                continue;
+            deadOps.insert(writeOp);
         }
     }
 

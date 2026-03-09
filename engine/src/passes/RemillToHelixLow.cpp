@@ -13,6 +13,7 @@
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/RemillDemangler.h"
 #include "helix/analysis/SignatureDb.h"
+#include "helix/analysis/X86RegisterInfo.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -23,9 +24,12 @@
 
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <array>
 #include <format>
 #include <string>
 #include <string_view>
@@ -62,6 +66,34 @@ struct RegisterTracker {
         {25, "R12"}, {27, "R13"}, {29, "R14"}, {31, "R15"},
         {33, "RIP"},
     };
+
+    /// Strip pointer-preserving wrappers so bookkeeping allocas are still
+    /// recognized after import adds bitcasts or no-op GEPs.
+    static Value stripPointerAliases(Value val) {
+        while (val) {
+            if (auto bitcast = val.getDefiningOp<LLVM::BitcastOp>()) {
+                val = bitcast.getArg();
+                continue;
+            }
+            if (auto cast = val.getDefiningOp<LLVM::AddrSpaceCastOp>()) {
+                val = cast.getArg();
+                continue;
+            }
+            if (auto gep = val.getDefiningOp<LLVM::GEPOp>()) {
+                if (auto constIndices = extractConstantGEPIndices(gep)) {
+                    bool allZero = llvm::all_of(*constIndices, [](int idx) {
+                        return idx == 0;
+                    });
+                    if (allZero) {
+                        val = gep.getBase();
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        return val;
+    }
 
     /// Scan a function body and build the register map.
     void scan(LLVM::LLVMFuncOp func) {
@@ -109,9 +141,102 @@ struct RegisterTracker {
             }
         });
 
-        // Also track alloca-based bookkeeping values (for filtering).
+        // Also track alloca-based bookkeeping values (NEXT_PC, RETURN_PC,
+        // BRANCH_TAKEN) by their fixed operand position in Remill semantics.
+        func.walk([&](LLVM::CallOp call) {
+            auto callee = call.getCallee();
+            if (!callee)
+                return;
+
+            auto semInfo = helix::demangleRemillSemantic(*callee);
+            if (!semInfo)
+                return;
+
+            auto bindBookkeepingPtr = [&](Value ptr, llvm::StringRef name) {
+                ptr = stripPointerAliases(ptr);
+                if (!ptr.getDefiningOp<LLVM::AllocaOp>())
+                    return;
+                gep_to_reg.try_emplace(ptr, name.str());
+                reg_widths[name] = inferRegWidth(name);
+            };
+
+            switch (semInfo->semantic) {
+            case RemillSemantic::CALL:
+                if (call.getNumOperands() > 3)
+                    bindBookkeepingPtr(call.getOperand(3), "NEXT_PC");
+                if (call.getNumOperands() > 5)
+                    bindBookkeepingPtr(call.getOperand(5), "RETURN_PC");
+                break;
+            case RemillSemantic::JMP:
+                if (call.getNumOperands() > 3)
+                    bindBookkeepingPtr(call.getOperand(3), "NEXT_PC");
+                break;
+            case RemillSemantic::RET:
+                if (call.getNumOperands() > 2)
+                    bindBookkeepingPtr(call.getOperand(2), "RETURN_PC");
+                break;
+            default:
+                if (!helix::isConditionalJump(semInfo->semantic))
+                    return;
+                if (call.getNumOperands() > 2)
+                    bindBookkeepingPtr(call.getOperand(2), "BRANCH_TAKEN");
+                if (call.getNumOperands() > 5)
+                    bindBookkeepingPtr(call.getOperand(5), "NEXT_PC");
+                break;
+            }
+        });
+
+        // Recover the plain PC alloca structurally. Unlike NEXT_PC and
+        // RETURN_PC, Remill does not pass %PC directly to semantic helpers,
+        // so we infer it from the classic pattern:
+        //   %pc = load i64, ptr %PC
+        //   %next = add i64 %pc, <instr_size>
+        //   store i64 %next, ptr %NEXT_PC
         func.walk([&](LLVM::AllocaOp alloca) {
-            // BRANCH_TAKEN, RETURN_PC, MONITOR, etc. are Remill internals.
+            if (gep_to_reg.count(alloca.getResult()))
+                return;
+
+            bool looksLikePc = false;
+            for (Operation* user : alloca->getUsers()) {
+                auto load = dyn_cast<LLVM::LoadOp>(user);
+                if (!load)
+                    continue;
+
+                for (Operation* loadUser : load.getResult().getUsers()) {
+                    auto add = dyn_cast<LLVM::AddOp>(loadUser);
+                    auto sub = dyn_cast<LLVM::SubOp>(loadUser);
+                    Value candidate;
+                    if (add)
+                        candidate = add.getResult();
+                    else if (sub)
+                        candidate = sub.getResult();
+                    else
+                        continue;
+
+                    for (Operation* arithUser : candidate.getUsers()) {
+                        auto store = dyn_cast<LLVM::StoreOp>(arithUser);
+                        if (!store)
+                            continue;
+                        auto dst = getRegName(store.getAddr());
+                        if (dst && *dst == "NEXT_PC") {
+                            looksLikePc = true;
+                            break;
+                        }
+                    }
+
+                    if (looksLikePc)
+                        break;
+                }
+
+                if (looksLikePc)
+                    break;
+            }
+
+            if (!looksLikePc)
+                return;
+
+            gep_to_reg.try_emplace(alloca.getResult(), "PC");
+            reg_widths["PC"] = inferRegWidth("PC");
         });
     }
 
@@ -165,12 +290,102 @@ struct RegisterTracker {
         return gep_to_reg.count(val) > 0;
     }
 
+    static std::optional<std::string> extractRegisterNameFromValue(Value val) {
+        val = stripPointerAliases(val);
+        auto gep = val.getDefiningOp<LLVM::GEPOp>();
+        if (!gep)
+            return std::nullopt;
+
+        if (auto regAttr = gep->getAttrOfType<StringAttr>("remill_register"))
+            return regAttr.getValue().str();
+
+        if (auto metaDict = gep->getAttrOfType<DictionaryAttr>("llvm.metadata")) {
+            if (auto regAttr = metaDict.getAs<StringAttr>("remill_register"))
+                return regAttr.getValue().str();
+        }
+
+        if (auto constIndices = extractConstantGEPIndices(gep)) {
+            if (constIndices->size() >= 4 &&
+                (*constIndices)[0] == 0 &&
+                (*constIndices)[1] == 0 &&
+                (*constIndices)[2] == 6) {
+                int gprIdx = (*constIndices)[3];
+                for (auto [idx, name] : kGprIndexMap) {
+                    if (idx == gprIdx)
+                        return std::string(name);
+                }
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    static std::optional<std::string> extractBookkeepingNameFromAlloca(Value val) {
+        val = stripPointerAliases(val);
+        auto alloca = val.getDefiningOp<LLVM::AllocaOp>();
+        if (!alloca)
+            return std::nullopt;
+
+        std::optional<std::string> candidate;
+        auto observe = [&](llvm::StringRef name) {
+            if (!candidate) {
+                candidate = name.str();
+                return;
+            }
+            if (*candidate != name)
+                candidate = std::nullopt;
+        };
+
+        for (Operation* user : alloca->getUsers()) {
+            auto call = dyn_cast<LLVM::CallOp>(user);
+            if (!call)
+                continue;
+
+            auto callee = call.getCallee();
+            if (!callee)
+                continue;
+
+            auto semInfo = helix::demangleRemillSemantic(*callee);
+            if (!semInfo)
+                continue;
+
+            auto markIfOperand = [&](unsigned idx, llvm::StringRef name) {
+                if (call.getNumOperands() > idx && call.getOperand(idx) == val)
+                    observe(name);
+            };
+
+            switch (semInfo->semantic) {
+            case RemillSemantic::CALL:
+                markIfOperand(3, "NEXT_PC");
+                markIfOperand(5, "RETURN_PC");
+                break;
+            case RemillSemantic::JMP:
+                markIfOperand(3, "NEXT_PC");
+                break;
+            case RemillSemantic::RET:
+                markIfOperand(2, "RETURN_PC");
+                break;
+            default:
+                if (!helix::isConditionalJump(semInfo->semantic))
+                    break;
+                markIfOperand(2, "BRANCH_TAKEN");
+                markIfOperand(5, "NEXT_PC");
+                break;
+            }
+        }
+
+        return candidate;
+    }
+
     /// Get the register name for a GEP result, if known.
     std::optional<std::string> getRegName(Value val) const {
+        val = stripPointerAliases(val);
         auto it = gep_to_reg.find(val);
         if (it != gep_to_reg.end())
             return it->second;
-        return std::nullopt;
+        if (auto direct = extractRegisterNameFromValue(val))
+            return direct;
+        return extractBookkeepingNameFromAlloca(val);
     }
 };
 
@@ -180,26 +395,127 @@ struct PCTracker {
     uint64_t current_pc = 0;
     /// Whether we have a valid PC.
     bool has_pc = false;
+    /// Last known concrete values for bookkeeping slots such as PC/NEXT_PC.
+    llvm::StringMap<int64_t> trackedValues;
+
+    std::optional<int64_t> tryEvaluate(Value value,
+                                       const RegisterTracker& regs) const {
+        llvm::SmallPtrSet<Operation*, 16> visiting;
+        return tryEvaluate(value, regs, visiting);
+    }
 
     /// Try to extract a PC value from a store to NEXT_PC.
     void trackStore(LLVM::StoreOp store, const RegisterTracker& regs) {
         // Pattern: store i64 %val, ptr %NEXT_PC
         // The stored value is often: add i64 %prev_pc, <instr_size>
         auto destReg = regs.getRegName(store.getAddr());
-        if (destReg && (*destReg == "PC" || *destReg == "NEXT_PC")) {
-            // Try to extract a constant PC value
-            if (auto constOp = store.getValue().getDefiningOp<LLVM::ConstantOp>()) {
-                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-                    current_pc = intAttr.getUInt();
-                    has_pc = true;
-                }
-            }
+        if (!destReg)
+            return;
+
+        auto evaluated = tryEvaluate(store.getValue(), regs);
+        if (evaluated) {
+            trackedValues[*destReg] = *evaluated;
+        } else {
+            trackedValues.erase(*destReg);
+        }
+
+        if (!evaluated)
+            return;
+
+        if (*destReg == "PC") {
+            current_pc = static_cast<uint64_t>(*evaluated);
+            has_pc = true;
+            return;
+        }
+
+        // NEXT_PC is the most useful base for RIP-relative reconstruction.
+        // Keep tracking it as the active address so later arithmetic over
+        // synthetic temporaries can still collapse to concrete targets.
+        if (*destReg == "NEXT_PC") {
+            current_pc = static_cast<uint64_t>(*evaluated);
+            has_pc = true;
         }
     }
 
     /// Get an optional address attribute for the current PC.
     std::optional<uint64_t> getAddress() const {
         return has_pc ? std::optional(current_pc) : std::nullopt;
+    }
+
+private:
+    std::optional<int64_t> tryEvaluate(
+        Value value, const RegisterTracker& regs,
+        llvm::SmallPtrSetImpl<Operation*>& visiting) const {
+        if (!value)
+            return std::nullopt;
+
+        auto* defOp = value.getDefiningOp();
+        if (!defOp)
+            return std::nullopt;
+
+        if (!visiting.insert(defOp).second)
+            return std::nullopt;
+
+        auto eraseOnReturn = llvm::make_scope_exit([&] { visiting.erase(defOp); });
+
+        if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                return intAttr.getValue().getSExtValue();
+        }
+
+        if (auto constOp = dyn_cast<arith::ConstantOp>(defOp)) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                return intAttr.getValue().getSExtValue();
+        }
+
+        if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value"))
+            return intAttr.getValue().getSExtValue();
+
+        if (auto load = dyn_cast<LLVM::LoadOp>(defOp)) {
+            auto srcReg = regs.getRegName(load.getAddr());
+            if (srcReg) {
+                if (auto it = trackedValues.find(*srcReg);
+                    it != trackedValues.end()) {
+                    return it->second;
+                }
+                if ((*srcReg == "PC" || *srcReg == "NEXT_PC") && has_pc)
+                    return static_cast<int64_t>(current_pc);
+            }
+            return std::nullopt;
+        }
+
+        if (auto add = dyn_cast<LLVM::AddOp>(defOp)) {
+            auto lhs = tryEvaluate(add.getLhs(), regs, visiting);
+            auto rhs = tryEvaluate(add.getRhs(), regs, visiting);
+            if (lhs && rhs)
+                return *lhs + *rhs;
+            return std::nullopt;
+        }
+
+        if (auto sub = dyn_cast<LLVM::SubOp>(defOp)) {
+            auto lhs = tryEvaluate(sub.getLhs(), regs, visiting);
+            auto rhs = tryEvaluate(sub.getRhs(), regs, visiting);
+            if (lhs && rhs)
+                return *lhs - *rhs;
+            return std::nullopt;
+        }
+
+        if (auto zext = dyn_cast<LLVM::ZExtOp>(defOp))
+            return tryEvaluate(zext.getArg(), regs, visiting);
+
+        if (auto sext = dyn_cast<LLVM::SExtOp>(defOp))
+            return tryEvaluate(sext.getArg(), regs, visiting);
+
+        if (auto trunc = dyn_cast<LLVM::TruncOp>(defOp))
+            return tryEvaluate(trunc.getArg(), regs, visiting);
+
+        if (auto ptrToInt = dyn_cast<LLVM::PtrToIntOp>(defOp))
+            return tryEvaluate(ptrToInt.getArg(), regs, visiting);
+
+        if (auto intToPtr = dyn_cast<LLVM::IntToPtrOp>(defOp))
+            return tryEvaluate(intToPtr.getArg(), regs, visiting);
+
+        return std::nullopt;
     }
 };
 
@@ -445,6 +761,39 @@ private:
         // ─── Pattern: Load from register pointer ─────────────────────────
         if (auto load = dyn_cast<LLVM::LoadOp>(op)) {
             if (auto regName = regs.getRegName(load.getAddr())) {
+                // Fold tracked bookkeeping slots directly to constants so
+                // they don't become orphan temporaries like v0/v1/v7.
+                if (auto it = pcTracker.trackedValues.find(*regName);
+                    it != pcTracker.trackedValues.end() &&
+                    load.getResult().getType().isSignlessInteger()) {
+                    auto intTy = cast<IntegerType>(load.getResult().getType());
+                    auto constant = builder.create<LLVM::ConstantOp>(
+                        loc,
+                        intTy,
+                        IntegerAttr::get(intTy, it->second));
+                    load.getResult().replaceAllUsesWith(constant.getResult());
+                    opsToErase.push_back(op);
+                    return;
+                }
+
+                if ((*regName == "PC" || *regName == "NEXT_PC" ||
+                     *regName == "RETURN_PC") &&
+                    load.getResult().getType().isSignlessInteger()) {
+                    llvm::DenseSet<Block*> visitingBlocks;
+                    if (auto resolved = resolvePointerValueBefore(
+                            load->getBlock(), Block::iterator(load),
+                            load.getAddr(), /*depth=*/6, visitingBlocks)) {
+                        auto intTy = cast<IntegerType>(load.getResult().getType());
+                        auto constant = builder.create<LLVM::ConstantOp>(
+                            loc,
+                            intTy,
+                            IntegerAttr::get(intTy, *resolved));
+                        load.getResult().replaceAllUsesWith(constant.getResult());
+                        opsToErase.push_back(op);
+                        return;
+                    }
+                }
+
                 unsigned width = RegisterTracker::inferRegWidth(*regName);
                 auto intTy = builder.getIntegerType(width);
 
@@ -471,7 +820,7 @@ private:
                 auto memRead = builder.create<helix::low::MemReadOp>(
                     loc,
                     builder.getIntegerType(width),
-                    ensureInt64(addrVal, builder, loc),
+                    ensureInt64(addrVal, builder, loc, &regs, &pcTracker),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);
                 load.getResult().replaceAllUsesWith(memRead.getResult());
@@ -546,8 +895,8 @@ private:
 
                 builder.create<helix::low::MemWriteOp>(
                     loc,
-                    ensureInt64(addrVal, builder, loc),
-                    ensureInt64(store.getValue(), builder, loc),
+                    ensureInt64(addrVal, builder, loc, &regs, &pcTracker),
+                    ensureInt64(store.getValue(), builder, loc, &regs, &pcTracker),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);
                 opsToErase.push_back(op);
@@ -687,12 +1036,93 @@ private:
     }
 
     /// Helper to cast pointers to i64 for arithmetic/logic operations
-    Value ensureInt64(Value val, OpBuilder& builder, Location loc) {
+    Value ensureInt64(Value val, OpBuilder& builder, Location loc,
+                      const RegisterTracker* regs = nullptr,
+                      const PCTracker* pcTracker = nullptr) {
+        if (regs && pcTracker) {
+            if (auto evaluated = pcTracker->tryEvaluate(val, *regs)) {
+                return builder.create<LLVM::ConstantOp>(
+                    loc,
+                    builder.getI64Type(),
+                    builder.getI64IntegerAttr(*evaluated));
+            }
+        }
         if (isa<LLVM::LLVMPointerType>(val.getType())) {
             return builder.create<LLVM::PtrToIntOp>(
                 loc, builder.getI64Type(), val);
         }
         return val;
+    }
+
+    unsigned inferValueWidth(Value val) {
+        if (auto intTy = dyn_cast<IntegerType>(val.getType()))
+            return intTy.getWidth();
+        if (isa<LLVM::LLVMPointerType>(val.getType()))
+            return 64;
+        return 64;
+    }
+
+    unsigned inferStoreValueWidth(Value val, const RegisterTracker& regs) {
+        if (auto intTy = dyn_cast<IntegerType>(val.getType())) {
+            if (intTy.getWidth() < 64)
+                return intTy.getWidth();
+        }
+
+        if (auto zext = val.getDefiningOp<LLVM::ZExtOp>()) {
+            if (auto intTy = dyn_cast<IntegerType>(zext.getArg().getType()))
+                return intTy.getWidth();
+        }
+
+        if (auto sext = val.getDefiningOp<LLVM::SExtOp>()) {
+            if (auto intTy = dyn_cast<IntegerType>(sext.getArg().getType()))
+                return intTy.getWidth();
+        }
+
+        if (auto trunc = val.getDefiningOp<LLVM::TruncOp>()) {
+            if (auto intTy = dyn_cast<IntegerType>(trunc.getResult().getType()))
+                return intTy.getWidth();
+        }
+
+        if (auto load = val.getDefiningOp<LLVM::LoadOp>()) {
+            if (auto regName = regs.getRegName(load.getAddr()))
+                return RegisterTracker::inferRegWidth(*regName);
+        }
+
+        return inferValueWidth(val);
+    }
+
+    void emitRegisterOrMemoryWrite(OpBuilder& builder, Location loc,
+                                   Value destination, Value originalValue,
+                                   Value widenedResult,
+                                   const RegisterTracker& regs,
+                                   IntegerAttr addrAttr) {
+        auto regName = regs.getRegName(destination);
+        unsigned width = regName
+            ? RegisterTracker::inferRegWidth(*regName)
+            : inferValueWidth(originalValue);
+
+        Value resultVal = widenedResult;
+        if (width < 64) {
+            resultVal = builder.create<LLVM::TruncOp>(
+                loc, builder.getIntegerType(width), resultVal);
+        }
+
+        if (regName) {
+            builder.create<helix::low::RegWriteOp>(
+                loc,
+                resultVal,
+                builder.getStringAttr(*regName),
+                builder.getUI32IntegerAttr(width),
+                addrAttr);
+            return;
+        }
+
+        builder.create<helix::low::MemWriteOp>(
+            loc,
+            ensureInt64(destination, builder, loc),
+            resultVal,
+            builder.getUI32IntegerAttr(width),
+            addrAttr);
     }
 
     /// Helper to strip casts for register equality checking
@@ -778,6 +1208,227 @@ private:
             loc, builder.getI64Type(), builder.getI64IntegerAttr(0));
     }
 
+    std::optional<Value> findLatestRegWriteInBlock(
+        Block* block, Block::iterator endIt, llvm::StringRef canonicalReg) {
+        if (!block)
+            return std::nullopt;
+
+        for (auto it = endIt; it != block->begin();) {
+            --it;
+            if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(&*it)) {
+                llvm::StringRef lookup =
+                    helix::analysis::getCanonicalX86Register(regWrite.getRegName());
+                if (lookup.empty())
+                    lookup = regWrite.getRegName();
+                if (lookup == canonicalReg)
+                    return regWrite.getValue();
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<Value> findLatestRegWriteInPredecessors(
+        Block* block, llvm::StringRef canonicalReg, unsigned depth,
+        llvm::DenseSet<Block*>& visiting) {
+        if (!block || depth == 0 || !visiting.insert(block).second)
+            return std::nullopt;
+
+        std::optional<Value> candidate;
+        for (Block* pred : block->getPredecessors()) {
+            auto value = findLatestRegWriteInBlock(pred, pred->end(), canonicalReg);
+            if (!value)
+                value = findLatestRegWriteInPredecessors(
+                    pred, canonicalReg, depth - 1, visiting);
+            if (!value) {
+                visiting.erase(block);
+                return std::nullopt;
+            }
+            if (candidate && *candidate != *value) {
+                visiting.erase(block);
+                return std::nullopt;
+            }
+            candidate = *value;
+        }
+
+        visiting.erase(block);
+        return candidate;
+    }
+
+    llvm::SmallVector<Value, 4> collectWin64CallArgs(
+        Operation* beforeOp, unsigned predecessorDepth = 2) {
+        static constexpr std::array<std::string_view, 4> kWin64ArgRegs = {
+            "RCX", "RDX", "R8", "R9"
+        };
+
+        auto* block = beforeOp ? beforeOp->getBlock() : nullptr;
+        if (!block)
+            return {};
+
+        llvm::DenseMap<llvm::StringRef, Value> regState;
+        for (auto& op : block->getOperations()) {
+            if (&op == beforeOp)
+                break;
+            if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(&op)) {
+                llvm::StringRef lookup =
+                    helix::analysis::getCanonicalX86Register(regWrite.getRegName());
+                if (lookup.empty())
+                    lookup = regWrite.getRegName();
+                regState[lookup] = regWrite.getValue();
+            }
+        }
+
+        llvm::SmallVector<Value, 4> args;
+        for (auto argReg : kWin64ArgRegs) {
+            llvm::StringRef key(argReg.data(), argReg.size());
+            auto it = regState.find(key);
+            if (it == regState.end()) {
+                llvm::DenseSet<Block*> visiting;
+                auto fromPreds = findLatestRegWriteInPredecessors(
+                    block, key, predecessorDepth, visiting);
+                if (!fromPreds)
+                    break;
+                regState[key] = *fromPreds;
+                it = regState.find(key);
+            }
+            args.push_back(it->second);
+        }
+
+        return args;
+    }
+
+    std::optional<LLVM::StoreOp> findLatestStoreToPointerInBlock(
+        Block* block, Block::iterator endIt, Value ptr) {
+        if (!block)
+            return std::nullopt;
+
+        ptr = RegisterTracker::stripPointerAliases(ptr);
+        for (auto it = endIt; it != block->begin();) {
+            --it;
+            auto store = dyn_cast<LLVM::StoreOp>(&*it);
+            if (!store)
+                continue;
+            if (RegisterTracker::stripPointerAliases(store.getAddr()) == ptr)
+                return store;
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<int64_t> tryEvaluateBookkeepingValue(
+        Value value,
+        llvm::function_ref<std::optional<int64_t>(Value)> resolvePointer,
+        llvm::SmallPtrSetImpl<Operation*>& visiting) {
+        if (!value)
+            return std::nullopt;
+
+        auto* defOp = value.getDefiningOp();
+        if (!defOp)
+            return std::nullopt;
+        if (!visiting.insert(defOp).second)
+            return std::nullopt;
+
+        auto eraseOnReturn = llvm::make_scope_exit([&] {
+            visiting.erase(defOp);
+        });
+
+        if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                return intAttr.getValue().getSExtValue();
+        }
+
+        if (auto constOp = dyn_cast<arith::ConstantOp>(defOp)) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                return intAttr.getValue().getSExtValue();
+        }
+
+        if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value"))
+            return intAttr.getValue().getSExtValue();
+
+        if (auto load = dyn_cast<LLVM::LoadOp>(defOp))
+            return resolvePointer(RegisterTracker::stripPointerAliases(load.getAddr()));
+
+        if (auto add = dyn_cast<LLVM::AddOp>(defOp)) {
+            auto lhs = tryEvaluateBookkeepingValue(
+                add.getLhs(), resolvePointer, visiting);
+            auto rhs = tryEvaluateBookkeepingValue(
+                add.getRhs(), resolvePointer, visiting);
+            if (lhs && rhs)
+                return *lhs + *rhs;
+            return std::nullopt;
+        }
+
+        if (auto sub = dyn_cast<LLVM::SubOp>(defOp)) {
+            auto lhs = tryEvaluateBookkeepingValue(
+                sub.getLhs(), resolvePointer, visiting);
+            auto rhs = tryEvaluateBookkeepingValue(
+                sub.getRhs(), resolvePointer, visiting);
+            if (lhs && rhs)
+                return *lhs - *rhs;
+            return std::nullopt;
+        }
+
+        if (auto zext = dyn_cast<LLVM::ZExtOp>(defOp))
+            return tryEvaluateBookkeepingValue(
+                zext.getArg(), resolvePointer, visiting);
+        if (auto sext = dyn_cast<LLVM::SExtOp>(defOp))
+            return tryEvaluateBookkeepingValue(
+                sext.getArg(), resolvePointer, visiting);
+        if (auto trunc = dyn_cast<LLVM::TruncOp>(defOp))
+            return tryEvaluateBookkeepingValue(
+                trunc.getArg(), resolvePointer, visiting);
+        if (auto ptrToInt = dyn_cast<LLVM::PtrToIntOp>(defOp))
+            return tryEvaluateBookkeepingValue(
+                ptrToInt.getArg(), resolvePointer, visiting);
+        if (auto intToPtr = dyn_cast<LLVM::IntToPtrOp>(defOp))
+            return tryEvaluateBookkeepingValue(
+                intToPtr.getArg(), resolvePointer, visiting);
+
+        return std::nullopt;
+    }
+
+    std::optional<int64_t> resolvePointerValueBefore(
+        Block* block, Block::iterator endIt, Value ptr, unsigned depth,
+        llvm::DenseSet<Block*>& visitingBlocks) {
+        if (!block || depth == 0)
+            return std::nullopt;
+
+        ptr = RegisterTracker::stripPointerAliases(ptr);
+
+        if (auto store = findLatestStoreToPointerInBlock(block, endIt, ptr)) {
+            llvm::SmallPtrSet<Operation*, 16> visitingValues;
+            auto resolveNestedPointer =
+                [&](Value nestedPtr) -> std::optional<int64_t> {
+                return resolvePointerValueBefore(
+                    block, Block::iterator(store->getOperation()),
+                    nestedPtr, depth - 1, visitingBlocks);
+            };
+            return tryEvaluateBookkeepingValue(
+                store->getValue(), resolveNestedPointer, visitingValues);
+        }
+
+        if (!visitingBlocks.insert(block).second)
+            return std::nullopt;
+
+        std::optional<int64_t> candidate;
+        for (Block* pred : block->getPredecessors()) {
+            auto value = resolvePointerValueBefore(
+                pred, pred->end(), ptr, depth - 1, visitingBlocks);
+            if (!value) {
+                visitingBlocks.erase(block);
+                return std::nullopt;
+            }
+            if (candidate && *candidate != *value) {
+                visitingBlocks.erase(block);
+                return std::nullopt;
+            }
+            candidate = *value;
+        }
+
+        visitingBlocks.erase(block);
+        return candidate;
+    }
+
     /// Convert a recognized Remill semantic function call to HelixLow ops.
     void convertSemantic(LLVM::CallOp call, OpBuilder& builder,
                          const RegisterTracker& regs,
@@ -858,8 +1509,8 @@ private:
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
                     *kind,
-                    ensureInt64(lhs, builder, loc),   // lhs
-                    ensureInt64(rhs, builder, loc),   // rhs
+                    ensureInt64(lhs, builder, loc, &regs, &pcTracker),   // lhs
+                    ensureInt64(rhs, builder, loc, &regs, &pcTracker),   // rhs
                     addrAttr,
                     UnitAttr{});
 
@@ -904,7 +1555,7 @@ private:
                 } else if (!isa<LLVM::LLVMPointerType>(destRegPtr.getType())) {
                     builder.create<helix::low::MemWriteOp>(
                         loc,
-                        ensureInt64(destRegPtr, builder, loc),
+                        ensureInt64(destRegPtr, builder, loc, &regs, &pcTracker),
                         binOp.getResult(),
                         builder.getUI32IntegerAttr(64),
                         addrAttr);
@@ -935,8 +1586,10 @@ private:
                     /*zero_flag=*/i1Ty,
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
-                    ensureInt64(safeGetOperand(call, 2, builder, loc), builder, loc),
-                    ensureInt64(safeGetOperand(call, 3, builder, loc), builder, loc),
+                    ensureInt64(safeGetOperand(call, 2, builder, loc), builder, loc,
+                                &regs, &pcTracker),
+                    ensureInt64(safeGetOperand(call, 3, builder, loc), builder, loc,
+                                &regs, &pcTracker),
                     addrAttr);
                 
                 builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
@@ -967,7 +1620,7 @@ private:
                         /*zero_flag=*/i1Ty,
                         /*sign_flag=*/i1Ty,
                         /*overflow_flag=*/i1Ty,
-                        ensureInt64(lhs, builder, loc),
+                        ensureInt64(lhs, builder, loc, &regs, &pcTracker),
                         zero,
                         addrAttr);
 
@@ -980,8 +1633,8 @@ private:
                         loc,
                         /*zero_flag=*/i1Ty,
                         /*sign_flag=*/i1Ty,
-                        ensureInt64(lhs, builder, loc),
-                        ensureInt64(rhs, builder, loc),
+                        ensureInt64(lhs, builder, loc, &regs, &pcTracker),
+                        ensureInt64(rhs, builder, loc, &regs, &pcTracker),
                         addrAttr);
 
                     builder.create<helix::low::RegWriteOp>(loc, testOp.getZeroFlag(), builder.getStringAttr("ZF"), builder.getUI32IntegerAttr(1), addrAttr);
@@ -1035,7 +1688,7 @@ private:
                         auto memRead = builder.create<helix::low::MemReadOp>(
                             loc,
                             readTy,
-                            ensureInt64(srcValue, builder, loc),
+                            ensureInt64(srcValue, builder, loc, &regs, &pcTracker),
                             builder.getUI32IntegerAttr(readWidth),
                             addrAttr);
                         finalVal = memRead.getResult();
@@ -1060,15 +1713,29 @@ private:
                     // Emit as MemWriteOp — this is a side-effecting store that
                     // must be preserved (not a dead register write).
                     Value finalVal = srcValue;
+                    unsigned writeWidth = inferStoreValueWidth(srcValue, regs);
+                    if (semInfo.has_memory_dst && semInfo.src_width != 0)
+                        writeWidth = std::min(writeWidth, semInfo.src_width);
+                    auto writeTy = builder.getIntegerType(writeWidth);
+
                     if (isa<LLVM::LLVMPointerType>(finalVal.getType())) {
                         finalVal = builder.create<LLVM::PtrToIntOp>(
-                            loc, builder.getI64Type(), finalVal);
+                            loc, writeTy, finalVal);
+                    } else if (auto intTy = dyn_cast<IntegerType>(finalVal.getType())) {
+                        if (intTy.getWidth() > writeWidth) {
+                            finalVal = builder.create<LLVM::TruncOp>(
+                                loc, writeTy, finalVal);
+                        } else if (intTy.getWidth() < writeWidth) {
+                            finalVal = builder.create<LLVM::ZExtOp>(
+                                loc, writeTy, finalVal);
+                        }
                     }
+
                     builder.create<helix::low::MemWriteOp>(
                         loc,
-                        ensureInt64(destRegPtr, builder, loc),
-                        ensureInt64(finalVal, builder, loc),
-                        builder.getUI32IntegerAttr(64),
+                        ensureInt64(destRegPtr, builder, loc, &regs, &pcTracker),
+                        finalVal,
+                        builder.getUI32IntegerAttr(writeWidth),
                         addrAttr);
                 }
             }
@@ -1099,7 +1766,7 @@ private:
                 builder.create<helix::low::MovSxOp>(
                     loc,
                     i64Ty,
-                    ensureInt64(call.getOperand(2), builder, loc),
+                    ensureInt64(call.getOperand(2), builder, loc, &regs, &pcTracker),
                     builder.getUI32IntegerAttr(64),
                     addrAttr);
             }
@@ -1174,46 +1841,82 @@ private:
                 uint64_t targetAddr = 0;
                 bool addrResolved = false;
 
-                if (auto* defOp = targetVal.getDefiningOp()) {
-                    // Case 1: Direct constant integer (LLVM::ConstantOp).
-                    if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
-                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-                            targetAddr = intAttr.getValue().getZExtValue();
-                            addrResolved = true;
-                        }
-                    }
-                    // Case 2: arith.constant or other op with "value" attribute.
-                    if (!addrResolved) {
-                        if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value")) {
-                            targetAddr = intAttr.getValue().getZExtValue();
-                            addrResolved = true;
-                        }
-                    }
-                    // Case 3: PC-relative offset (add %pc, offset).
-                    // Pattern: %result = llvm.add %pc_val, %offset
-                    if (!addrResolved) {
-                        if (auto addOp = dyn_cast<LLVM::AddOp>(defOp)) {
-                            uint64_t offsetVal = 0;
-                            bool hasOffset = false;
+                if (auto evaluated = pcTracker.tryEvaluate(targetVal, regs)) {
+                    targetAddr = static_cast<uint64_t>(*evaluated);
+                    addrResolved = true;
+                }
 
-                            // Check if either operand is a constant and the other
-                            // is a PC-related value.
-                            for (unsigned i = 0; i < 2; ++i) {
-                                auto operand = addOp->getOperand(i);
-                                if (auto* innerDef = operand.getDefiningOp()) {
-                                    if (auto innerConst = dyn_cast<LLVM::ConstantOp>(innerDef)) {
-                                        if (auto iAttr = dyn_cast<IntegerAttr>(innerConst.getValue())) {
-                                            offsetVal = iAttr.getValue().getZExtValue();
-                                            hasOffset = true;
-                                        }
-                                    }
-                                }
+                // Remill direct calls also carry NEXT_PC as operand 4:
+                //   CALLI(..., target_addr, NEXT_PC_ptr, next_pc, RETURN_PC_ptr)
+                // If the full target expression did not fold cleanly, recover
+                // the common rel32 shape from `next_pc +/- imm32`.
+                auto tryResolveRelativeTargetFromNextPc =
+                    [&](Value nextPcVal) -> std::optional<uint64_t> {
+                    auto nextPc = pcTracker.tryEvaluate(nextPcVal, regs);
+                    if (!nextPc)
+                        return std::nullopt;
+
+                    if (auto add = targetVal.getDefiningOp<LLVM::AddOp>()) {
+                        if (add.getLhs() == nextPcVal) {
+                            if (auto disp =
+                                    pcTracker.tryEvaluate(add.getRhs(), regs)) {
+                                return static_cast<uint64_t>(*nextPc + *disp);
                             }
-                            // Use the current PC as the base for relative calls.
-                            if (hasOffset && pcTracker.has_pc) {
-                                targetAddr = pcTracker.current_pc + offsetVal;
-                                addrResolved = true;
+                        }
+                        if (add.getRhs() == nextPcVal) {
+                            if (auto disp =
+                                    pcTracker.tryEvaluate(add.getLhs(), regs)) {
+                                return static_cast<uint64_t>(*nextPc + *disp);
                             }
+                        }
+                    }
+
+                    if (auto sub = targetVal.getDefiningOp<LLVM::SubOp>()) {
+                        if (sub.getLhs() == nextPcVal) {
+                            if (auto disp =
+                                    pcTracker.tryEvaluate(sub.getRhs(), regs)) {
+                                return static_cast<uint64_t>(*nextPc - *disp);
+                            }
+                        }
+                    }
+
+                    return std::nullopt;
+                };
+
+                if (!addrResolved && call.getNumOperands() >= 5) {
+                    if (auto relTarget =
+                            tryResolveRelativeTargetFromNextPc(call.getOperand(4))) {
+                        targetAddr = *relTarget;
+                        addrResolved = true;
+                    }
+                }
+
+                // Final fallback for direct rel32 calls: use the current call
+                // site address plus the 5-byte CALL length when the target is
+                // still shaped as `next_pc +/- displacement`.
+                if (!addrResolved && addrAttr) {
+                    auto inferDisp = [&](Value value) -> std::optional<int64_t> {
+                        if (auto add = value.getDefiningOp<LLVM::AddOp>()) {
+                            if (auto rhs = pcTracker.tryEvaluate(add.getRhs(), regs))
+                                return rhs;
+                            if (auto lhs = pcTracker.tryEvaluate(add.getLhs(), regs))
+                                return lhs;
+                        }
+                        if (auto sub = value.getDefiningOp<LLVM::SubOp>()) {
+                            if (auto rhs = pcTracker.tryEvaluate(sub.getRhs(), regs))
+                                return -*rhs;
+                        }
+                        return std::nullopt;
+                    };
+
+                    if (auto disp = inferDisp(targetVal)) {
+                        auto nextPcGuess =
+                            static_cast<int64_t>(addrAttr.getValue().getZExtValue()) + 5;
+                        // Bias toward true rel32 displacements, not tiny
+                        // arithmetic noise that belongs to indirect calls.
+                        if (std::llabs(*disp) >= 0x100) {
+                            targetAddr = static_cast<uint64_t>(nextPcGuess + *disp);
+                            addrResolved = true;
                         }
                     }
                 }
@@ -1227,27 +1930,9 @@ private:
                     call->emitRemark("unresolved call target address");
                 }
 
-                // ─── Argument Recovery (Windows x64 ABI) ────────────────
-                // Scan backward in the current block to find the most recent
-                // writes to RCX, RDX, R8, R9 to populate the call arguments.
-                mlir::Value arg0, arg1, arg2, arg3;
-                for (auto it = mlir::Block::reverse_iterator(call);
-                     it != call->getBlock()->rend(); ++it) {
-                    if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(*it)) {
-                        auto regName = regWrite.getRegName();
-                        if (!arg0 && regName == "RCX") arg0 = regWrite.getValue();
-                        else if (!arg1 && regName == "RDX") arg1 = regWrite.getValue();
-                        else if (!arg2 && regName == "R8") arg2 = regWrite.getValue();
-                        else if (!arg3 && regName == "R9") arg3 = regWrite.getValue();
-                    }
-                    if (arg0 && arg1 && arg2 && arg3) break;
-                }
-
-                llvm::SmallVector<mlir::Value, 4> callArgs;
-                if (arg0) callArgs.push_back(arg0);
-                if (arg1) callArgs.push_back(arg1);
-                if (arg2) callArgs.push_back(arg2);
-                if (arg3) callArgs.push_back(arg3);
+                // Recover Win64 register arguments across the current block
+                // boundary when the call setup is split by short branches.
+                auto callArgs = collectWin64CallArgs(call.getOperation());
 
                 builder.create<helix::low::CallOp>(
                     loc,
@@ -1611,25 +2296,11 @@ private:
                 auto unOp = builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Not,
-                    ensureInt64(val, builder, loc),
+                    ensureInt64(val, builder, loc, &regs, &pcTracker),
                     addrAttr);
-                
-                auto regName = regs.getRegName(destRegPtr);
-                unsigned width = 64;
-                if (regName) {
-                    width = RegisterTracker::inferRegWidth(*regName);
-                }
-                Value resultVal = unOp.getResult();
-                if (width < 64) {
-                    resultVal = builder.create<LLVM::TruncOp>(loc, builder.getIntegerType(width), resultVal);
-                }
-                
-                builder.create<helix::low::RegWriteOp>(
-                    loc,
-                    resultVal,
-                    builder.getStringAttr(regName ? *regName : "unknown"),
-                    builder.getUI32IntegerAttr(width),
-                    addrAttr);
+
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, val,
+                                          unOp.getResult(), regs, addrAttr);
             }
             break;
         }
@@ -1641,27 +2312,14 @@ private:
                 auto unOp = builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Inc,
-                    ensureInt64(val, builder, loc),
+                    ensureInt64(val, builder, loc, &regs, &pcTracker),
                     addrAttr);
-                
-                auto regName = regs.getRegName(destRegPtr);
-                unsigned width = 64;
-                if (regName) {
-                    width = RegisterTracker::inferRegWidth(*regName);
-                }
-                Value resultVal = unOp.getResult();
-                if (width < 64) {
-                    resultVal = builder.create<LLVM::TruncOp>(loc, builder.getIntegerType(width), resultVal);
-                }
-                
+
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, val,
+                                          unOp.getResult(), regs, addrAttr);
                 builder.create<helix::low::RegWriteOp>(
-                    loc,
-                    resultVal,
-                    builder.getStringAttr(regName ? *regName : "unknown"),
-                    builder.getUI32IntegerAttr(width),
-                    addrAttr);
-                
-                builder.create<helix::low::RegWriteOp>(loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"), builder.getUI32IntegerAttr(1), addrAttr);
+                    loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
+                    builder.getUI32IntegerAttr(1), addrAttr);
             }
             break;
         }
@@ -1673,27 +2331,14 @@ private:
                 auto unOp = builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Dec,
-                    ensureInt64(val, builder, loc),
+                    ensureInt64(val, builder, loc, &regs, &pcTracker),
                     addrAttr);
-                
-                auto regName = regs.getRegName(destRegPtr);
-                unsigned width = 64;
-                if (regName) {
-                    width = RegisterTracker::inferRegWidth(*regName);
-                }
-                Value resultVal = unOp.getResult();
-                if (width < 64) {
-                    resultVal = builder.create<LLVM::TruncOp>(loc, builder.getIntegerType(width), resultVal);
-                }
-                
+
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, val,
+                                          unOp.getResult(), regs, addrAttr);
                 builder.create<helix::low::RegWriteOp>(
-                    loc,
-                    resultVal,
-                    builder.getStringAttr(regName ? *regName : "unknown"),
-                    builder.getUI32IntegerAttr(width),
-                    addrAttr);
-                
-                builder.create<helix::low::RegWriteOp>(loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"), builder.getUI32IntegerAttr(1), addrAttr);
+                    loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
+                    builder.getUI32IntegerAttr(1), addrAttr);
             }
             break;
         }
@@ -1730,16 +2375,35 @@ private:
             // LEA is a pure address computation, not a memory access.
             // In Remill IR it computes base + index*scale + disp.
             if (call.getNumOperands() >= 4) {
+                auto destRegPtr = safeGetOperand(call, 2, builder, loc);
+                auto effectiveAddr =
+                    ensureInt64(call.getOperand(3), builder, loc, &regs, &pcTracker);
                 auto zero = builder.create<LLVM::ConstantOp>(
                     loc, i64Ty, builder.getI64IntegerAttr(0));
                 auto signedI64Ty = IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
                 builder.create<helix::low::LeaOp>(
                     loc, i64Ty,
-                    ensureInt64(call.getOperand(2), builder, loc),   // base
-                    ensureInt64(call.getOperand(3), builder, loc),   // index
+                    ensureInt64(call.getOperand(2), builder, loc, &regs, &pcTracker),   // base
+                    ensureInt64(call.getOperand(3), builder, loc, &regs, &pcTracker),   // index
                     builder.getUI32IntegerAttr(1),  // scale
                     IntegerAttr::get(signedI64Ty, 0), // displacement
                     addrAttr);
+
+                if (auto destRegName = regs.getRegName(destRegPtr)) {
+                    llvm::StringRef canonical =
+                        helix::analysis::getCanonicalX86Register(*destRegName);
+                    if (canonical.empty())
+                        canonical = *destRegName;
+
+                    if (canonical == "RCX") {
+                        builder.create<helix::low::RegWriteOp>(
+                            loc,
+                            effectiveAddr,
+                            builder.getStringAttr(canonical),
+                            builder.getUI32IntegerAttr(64),
+                            addrAttr);
+                    }
+                }
             }
             break;
         }
@@ -1772,8 +2436,8 @@ private:
                     /*zero_flag=*/i1Ty,
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
+                    ensureInt64(baseVal, builder, loc, &regs, &pcTracker),
+                    ensureInt64(bitOffset, builder, loc, &regs, &pcTracker),
                     addrAttr);
                 // BT only sets CF; write all flags for consistency.
                 builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);

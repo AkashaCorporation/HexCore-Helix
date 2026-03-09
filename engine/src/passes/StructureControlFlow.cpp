@@ -137,6 +137,9 @@ struct IfRegion {
     /// The condition value for the branch.
     Value condition;
 
+    /// Whether the then-path comes from the branch's false successor.
+    bool invertCondition = false;
+
     /// Blocks comprising the "then" path (fallthrough on false).
     llvm::SmallVector<Block*, 4> thenBlocks;
 
@@ -427,11 +430,22 @@ static Value extractLoopCondition(Block* block, Block* header,
 /// @param falseTarget  The false branch target.
 /// @param branchBlock  The block containing the conditional branch.
 /// @param dom          Dominance information.
-/// @param maxDepth     Maximum number of blocks to walk forward (default 8).
+/// @param maxDepth     Maximum number of blocks to walk forward (default 32).
 /// @return             The merge block, or nullptr if not found.
 static Block* findMergeBlock(Block* trueTarget, Block* falseTarget,
                              Block* branchBlock, const DominanceInfo& dom,
-                             unsigned maxDepth = 8) {
+                             const PostDominanceInfo& postDom,
+                             unsigned maxDepth = 32) {
+    if (Block* postDomMerge =
+            postDom.findNearestCommonDominator(trueTarget, falseTarget)) {
+        if (postDomMerge != branchBlock &&
+            postDomMerge != trueTarget &&
+            postDomMerge != falseTarget &&
+            dom.dominates(branchBlock, postDomMerge)) {
+            return postDomMerge;
+        }
+    }
+
     // Collect blocks reachable from the true path (bounded walk).
     llvm::SmallDenseSet<Block*, 16> trueReachable;
     {
@@ -490,11 +504,107 @@ static Block* findMergeBlock(Block* trueTarget, Block* falseTarget,
     return nullptr;
 }
 
-/// Collect all blocks on a path from `start` to `end` (exclusive of `end`),
-/// following single-successor chains.  Returns empty if the path branches
-/// or doesn't reach `end` within `maxDepth` steps.
+/// Return the sole non-label operation in a block, or nullptr if the block
+/// contains multiple non-label operations.
+static Operation* getSingleNonLabelOp(Block* block) {
+    if (!block)
+        return nullptr;
+
+    Operation* nonLabelOp = nullptr;
+    for (auto& op : *block) {
+        if (isa<helix::high::LabelOp>(op))
+            continue;
+        if (nonLabelOp)
+            return nullptr;
+        nonLabelOp = &op;
+    }
+    return nonLabelOp;
+}
+
+/// Follow chains of label-only blocks with a single unconditional successor and
+/// return the final trivial `ret` block if one is reached.
+static helix::low::RetOp findTrivialReturnOp(Block* start,
+                                             unsigned maxDepth = 16) {
+    if (!start)
+        return {};
+
+    llvm::SmallPtrSet<Block*, 8> visited;
+    Block* current = start;
+    unsigned depth = 0;
+
+    while (current && depth < maxDepth && visited.insert(current).second) {
+        Operation* onlyOp = getSingleNonLabelOp(current);
+        if (!onlyOp)
+            return {};
+
+        if (auto ret = dyn_cast<helix::low::RetOp>(onlyOp))
+            return ret;
+
+        if (onlyOp == current->getTerminator() &&
+            onlyOp->getNumSuccessors() == 1) {
+            current = onlyOp->getSuccessor(0);
+            ++depth;
+            continue;
+        }
+
+        return {};
+    }
+
+    return {};
+}
+
+/// Inside a structured if-region, unconditional branches to the parent merge
+/// block are redundant: control returns to the parent block after the region.
+/// Rewrite them to `yield`, or to `ret` when that merge is just a shared
+/// return block.
+static void rewriteStructuredRegionExits(Region& region,
+                                         Block* mergeBlock,
+                                         OpBuilder& builder) {
+    helix::low::RetOp mergeRet = findTrivialReturnOp(mergeBlock);
+
+    for (auto& block : region) {
+        auto* terminator = block.getTerminator();
+        if (!terminator ||
+            isa<helix::high::YieldOp>(terminator) ||
+            isa<helix::low::RetOp>(terminator))
+            continue;
+
+        if (terminator->getNumSuccessors() != 1)
+            continue;
+
+        Block* successor = terminator->getSuccessor(0);
+        const bool exitsToMerge = mergeBlock && successor == mergeBlock;
+        helix::low::RetOp successorRet;
+        if (!exitsToMerge)
+            successorRet = findTrivialReturnOp(successor);
+
+        if (!exitsToMerge && !successorRet)
+            continue;
+
+        builder.setInsertionPoint(terminator);
+        if (exitsToMerge && !mergeRet) {
+            builder.create<helix::high::YieldOp>(
+                terminator->getLoc(), mlir::Value{});
+        } else {
+            auto retAddr = exitsToMerge
+                ? mergeRet->getAttrOfType<IntegerAttr>("address")
+                : successorRet->getAttrOfType<IntegerAttr>("address");
+            builder.create<helix::low::RetOp>(terminator->getLoc(), retAddr);
+        }
+        terminator->erase();
+    }
+}
+
+/// Collect all blocks on a path from `start` to `end` (exclusive of `end`).
+///
+/// Fast path: accept a simple single-successor chain.
+/// Fallback: accept a small single-entry / single-exit subgraph that is fully
+/// contained between `start` and `end`. This lets us absorb short diamonds and
+/// nested local conditionals into one structured if-region instead of leaving
+/// them behind as goto spaghetti.
 static llvm::SmallVector<Block*, 4>
-collectPathBlocks(Block* start, Block* end, unsigned maxDepth = 8) {
+collectPathBlocks(Block* start, Block* end, Block* entryBlock = nullptr,
+                  unsigned maxDepth = 32) {
     llvm::SmallVector<Block*, 4> path;
     Block* current = start;
     unsigned depth = 0;
@@ -512,7 +622,68 @@ collectPathBlocks(Block* start, Block* end, unsigned maxDepth = 8) {
     if (current == end)
         return path;
 
-    // If we didn't reach end via single-successor chain, return just the
+    // Fallback: collect a bounded closed region between `start` and `end`.
+    llvm::SmallSetVector<Block*, 8> regionBlocks;
+    llvm::SmallVector<Block*, 8> worklist;
+    regionBlocks.insert(start);
+    worklist.push_back(start);
+
+    unsigned visited = 0;
+    while (!worklist.empty() && visited < maxDepth) {
+        Block* block = worklist.pop_back_val();
+        ++visited;
+
+        auto* term = block->getTerminator();
+        if (!term)
+            return {start};
+
+        for (Block* succ : term->getSuccessors()) {
+            if (succ == end)
+                continue;
+            if (succ == entryBlock)
+                return {start};
+            if (regionBlocks.insert(succ))
+                worklist.push_back(succ);
+        }
+    }
+
+    // Region too large or cyclic in a way we don't understand: stay
+    // conservative and structure only the first block.
+    if (!worklist.empty())
+        return {start};
+
+    for (Block* block : regionBlocks) {
+        // Enforce single entry: blocks inside the candidate region may only
+        // be reached from within the region, except for `start`, which may be
+        // entered from the original branch block.
+        for (Block* pred : block->getPredecessors()) {
+            if (regionBlocks.count(pred))
+                continue;
+            if (block == start && pred == entryBlock)
+                continue;
+            return {start};
+        }
+
+        // Enforce single exit: successors must stay inside the region or jump
+        // to the known merge block.
+        auto* term = block->getTerminator();
+        if (!term)
+            return {start};
+        for (Block* succ : term->getSuccessors()) {
+            if (succ == end || regionBlocks.count(succ))
+                continue;
+            return {start};
+        }
+    }
+
+    llvm::SmallVector<Block*, 4> regionPath;
+    regionPath.reserve(regionBlocks.size());
+    for (Block* block : regionBlocks)
+        regionPath.push_back(block);
+    if (!regionPath.empty())
+        return regionPath;
+
+    // If we didn't reach end in a shape we can safely absorb, return just the
     // start block (conservative: at least structure the first block).
     return {start};
 }
@@ -1053,27 +1224,17 @@ private:
             });
         }
 
-        // Phase 3: Detect and structure if/else patterns.
-        llvm::SmallVector<IfRegion, 8> ifRegions;
-        if (failed(recoverIfElse(funcBody, domInfo, structuredBlocks, ifRegions)))
+        // Phase 3: Detect and structure if/else patterns in the top-level
+        // function body, then recurse into nested regions created by the
+        // recovered If/While/DoWhile ops.
+        if (failed(structureIfRegions(funcBody, func, builder, structuredBlocks)))
             return failure();
-
-        for (auto& ifRegion : ifRegions) {
-            if (structuredBlocks.count(ifRegion.branchBlock))
-                continue;
-
-            if (failed(structureIf(ifRegion, func, builder)))
-                return failure();
-
-            structuredBlocks.insert(ifRegion.branchBlock);
-            for (Block* b : ifRegion.thenBlocks)
-                structuredBlocks.insert(b);
-            for (Block* b : ifRegion.elseBlocks)
-                structuredBlocks.insert(b);
-        }
+        if (failed(structureNestedControlRegions(funcBody, func, builder)))
+            return failure();
 
         // Phase 4: Emit goto/label for remaining irreducible edges.
         // Re-collect edges since the CFG may have changed.
+        DominanceInfo finalDomInfo(func);
         auto remainingEdges = collectCFGEdges(funcBody);
         for (const auto& edge : remainingEdges) {
             // Skip edges where the SOURCE was already structured (its branch
@@ -1094,8 +1255,8 @@ private:
 
             // Recompute edge kind (domInfo may be stale but still usable for
             // cross-edge detection on unmodified blocks).
-            if (!domInfo.dominates(edge.target, edge.source) &&
-                !domInfo.dominates(edge.source, edge.target)) {
+            if (!finalDomInfo.dominates(edge.target, edge.source) &&
+                !finalDomInfo.dominates(edge.source, edge.target)) {
                 isCrossEdge = true;
             }
 
@@ -1302,6 +1463,70 @@ private:
         return success();
     }
 
+    LogicalResult structureIfRegions(
+        Region& region,
+        helix::low::FuncOp func,
+        OpBuilder& builder,
+        llvm::SmallPtrSet<Block*, 16>& structuredBlocks) {
+        if (region.empty())
+            return success();
+
+        while (true) {
+            DominanceInfo domInfo(func);
+            PostDominanceInfo postDomInfo(func);
+            llvm::SmallVector<IfRegion, 8> ifRegions;
+            if (failed(recoverIfElse(region, domInfo, postDomInfo,
+                                     structuredBlocks, ifRegions)))
+                return failure();
+
+            bool changed = false;
+            for (auto& ifRegion : ifRegions) {
+                if (structuredBlocks.count(ifRegion.branchBlock))
+                    continue;
+
+                if (failed(structureIf(ifRegion, func, builder)))
+                    return failure();
+
+                structuredBlocks.insert(ifRegion.branchBlock);
+                for (Block* b : ifRegion.thenBlocks)
+                    structuredBlocks.insert(b);
+                for (Block* b : ifRegion.elseBlocks)
+                    structuredBlocks.insert(b);
+                changed = true;
+            }
+
+            if (!changed)
+                break;
+        }
+
+        return success();
+    }
+
+    LogicalResult structureNestedControlRegions(Region& region,
+                                                helix::low::FuncOp func,
+                                                OpBuilder& builder) {
+        llvm::SmallVector<Region*, 8> nestedRegions;
+        for (auto& block : region) {
+            for (auto& op : block) {
+                for (Region& nestedRegion : op.getRegions()) {
+                    if (!nestedRegion.empty())
+                        nestedRegions.push_back(&nestedRegion);
+                }
+            }
+        }
+
+        for (Region* nestedRegion : nestedRegions) {
+            llvm::SmallPtrSet<Block*, 16> nestedStructuredBlocks;
+            if (failed(structureIfRegions(*nestedRegion, func, builder,
+                                          nestedStructuredBlocks)))
+                return failure();
+            if (failed(structureNestedControlRegions(*nestedRegion, func, builder)))
+                return failure();
+        }
+
+        return success();
+    }
+
     // ─── If/Else Recovery ─────────────────────────────────────────────────
 
     /// Scan the function body for forward conditional branches and build
@@ -1311,8 +1536,13 @@ private:
     /// to find the merge point, instead of requiring direct convergence.
     LogicalResult recoverIfElse(Region& funcBody,
                                 const DominanceInfo& domInfo,
+                                const PostDominanceInfo& postDomInfo,
                                 const llvm::SmallPtrSet<Block*, 16>& structuredBlocks,
                                 llvm::SmallVectorImpl<IfRegion>& result) {
+        llvm::SmallPtrSet<Block*, 16> regionBlocks;
+        for (auto& block : funcBody)
+            regionBlocks.insert(&block);
+
         for (auto& block : funcBody) {
             // Skip blocks already structured (e.g., as part of a loop).
             if (structuredBlocks.count(&block))
@@ -1351,33 +1581,62 @@ private:
             ifRegion.branchBlock = &block;
             ifRegion.condition   = condition;
 
+            const bool trueInRegion = regionBlocks.count(trueTarget);
+            const bool falseInRegion = regionBlocks.count(falseTarget);
+
+            if (trueInRegion != falseInRegion) {
+                Block* localTarget = trueInRegion ? trueTarget : falseTarget;
+                Block* mergeBlock = trueInRegion ? falseTarget : trueTarget;
+                ifRegion.invertCondition = !trueInRegion;
+                ifRegion.thenBlocks =
+                    collectPathBlocks(localTarget, mergeBlock, &block);
+                if (ifRegion.thenBlocks.empty())
+                    ifRegion.thenBlocks.push_back(localTarget);
+                ifRegion.mergeBlock = mergeBlock;
+                ifRegion.hasElse = false;
+                result.push_back(std::move(ifRegion));
+                continue;
+            }
+
             if (dominatesTrue && dominatesFalse) {
                 // Both targets dominated → if/else with a merge point.
                 // Use relaxed merge detection: walk forward from both targets
                 // to find a common successor.
                 Block* mergeBlock = findMergeBlock(
-                    trueTarget, falseTarget, &block, domInfo);
+                    trueTarget, falseTarget, &block, domInfo, postDomInfo, 32);
 
-                if (mergeBlock) {
+                if (mergeBlock && mergeBlock != trueTarget &&
+                    mergeBlock != falseTarget) {
                     // Collect blocks on the then-path and else-path up to merge.
-                    ifRegion.thenBlocks = collectPathBlocks(trueTarget, mergeBlock);
-                    ifRegion.elseBlocks = collectPathBlocks(falseTarget, mergeBlock);
+                    ifRegion.thenBlocks = collectPathBlocks(trueTarget, mergeBlock, &block);
+                    ifRegion.elseBlocks = collectPathBlocks(falseTarget, mergeBlock, &block);
                     ifRegion.mergeBlock = mergeBlock;
                     ifRegion.hasElse = true;
                 } else {
-                    // No merge found — treat as if-without-else with then=true.
-                    ifRegion.thenBlocks.push_back(trueTarget);
+                    // No merge found — prefer a multi-block if-without-else
+                    // over immediately falling back to goto spaghetti.
+                    ifRegion.thenBlocks =
+                        collectPathBlocks(trueTarget, falseTarget, &block);
+                    if (ifRegion.thenBlocks.empty())
+                        ifRegion.thenBlocks.push_back(trueTarget);
                     ifRegion.mergeBlock = falseTarget;
                     ifRegion.hasElse = false;
                 }
             } else if (dominatesTrue) {
                 // Only true target dominated → if-without-else.
-                ifRegion.thenBlocks.push_back(trueTarget);
+                ifRegion.thenBlocks =
+                    collectPathBlocks(trueTarget, falseTarget, &block);
+                if (ifRegion.thenBlocks.empty())
+                    ifRegion.thenBlocks.push_back(trueTarget);
                 ifRegion.mergeBlock = falseTarget;
                 ifRegion.hasElse = false;
             } else {
                 // Only false target dominated → inverted if (negate condition).
-                ifRegion.thenBlocks.push_back(falseTarget);
+                ifRegion.invertCondition = true;
+                ifRegion.thenBlocks =
+                    collectPathBlocks(falseTarget, trueTarget, &block);
+                if (ifRegion.thenBlocks.empty())
+                    ifRegion.thenBlocks.push_back(falseTarget);
                 ifRegion.mergeBlock = trueTarget;
                 ifRegion.hasElse = false;
             }
@@ -1402,9 +1661,18 @@ private:
         builder.setInsertionPoint(terminator);
         auto loc = terminator->getLoc();
 
+        Value ifCondition = ifRegion.condition;
+        if (ifRegion.invertCondition && ifCondition &&
+            ifCondition.getType().isInteger(1)) {
+            auto trueConst = builder.create<arith::ConstantOp>(
+                loc, builder.getI1Type(), builder.getBoolAttr(true));
+            ifCondition = builder.create<arith::XOrIOp>(
+                loc, ifCondition, trueConst);
+        }
+
         // Create the helix_high.if operation.
         auto ifOp = builder.create<helix::high::IfOp>(
-            loc, ifRegion.condition, IntegerAttr{});
+            loc, ifCondition, IntegerAttr{});
 
         // Move then-blocks into the IfOp's then-region.
         Region& thenRegion = ifOp.getThenRegion();
@@ -1412,6 +1680,7 @@ private:
             thenRegion.getBlocks().splice(thenRegion.end(),
                 block->getParent()->getBlocks(), block->getIterator());
         }
+        rewriteStructuredRegionExits(thenRegion, ifRegion.mergeBlock, builder);
 
         // Ensure the then-region has a yield/terminator.
         if (!thenRegion.empty()) {
@@ -1430,6 +1699,7 @@ private:
                 elseRegion.getBlocks().splice(elseRegion.end(),
                     block->getParent()->getBlocks(), block->getIterator());
             }
+            rewriteStructuredRegionExits(elseRegion, ifRegion.mergeBlock, builder);
 
             // Ensure the else-region has a yield/terminator.
             if (!elseRegion.empty()) {
@@ -1445,7 +1715,10 @@ private:
         // Replace the original conditional branch with a fallthrough to the
         // merge block (if it exists).
         builder.setInsertionPoint(terminator);
-        if (ifRegion.mergeBlock) {
+        if (auto mergeRet = findTrivialReturnOp(ifRegion.mergeBlock)) {
+            auto retAddr = mergeRet->getAttrOfType<IntegerAttr>("address");
+            builder.create<helix::low::RetOp>(loc, retAddr);
+        } else if (ifRegion.mergeBlock) {
             builder.create<helix::low::JmpOp>(loc, IntegerAttr{}, IntegerAttr{}, ifRegion.mergeBlock);
         } else {
             // If there's no merge block, both paths diverge (e.g. return).

@@ -34,6 +34,7 @@
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
+#include "helix/analysis/X86RegisterInfo.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -47,7 +48,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
@@ -83,136 +83,10 @@ namespace {
 // Register Alias Tables
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Describes the relationship between a sub-register and its canonical
-/// 64-bit parent register.
-struct SubRegInfo {
-    /// The canonical 64-bit parent register name (e.g., "RAX").
-    llvm::StringRef parent;
+using SubRegInfo = helix::analysis::X86SubRegInfo;
 
-    /// Bit width of this sub-register (8, 16, 32, or 64).
-    unsigned width;
-
-    /// Bit offset within the parent register.
-    /// AL = 0, AH = 8, AX = 0, EAX = 0.
-    unsigned bitOffset;
-};
-
-/// Map a register name to its canonical 64-bit parent and sub-register info.
-///
-/// This covers the full x86-64 general-purpose register file:
-///   RAX/EAX/AX/AL/AH, RBX/EBX/BX/BL/BH, RCX/ECX/CX/CL/CH,
-///   RDX/EDX/DX/DL/DH, RSI/ESI/SI/SIL, RDI/EDI/DI/DIL,
-///   RSP/ESP/SP/SPL, RBP/EBP/BP/BPL, R8-R15 and their sub-variants.
-///
-/// @param reg  The register name (case-insensitive matching uses uppercase).
-/// @return     SubRegInfo describing the parent relationship, or std::nullopt
-///             for unknown registers.
 static std::optional<SubRegInfo> getSubRegInfo(llvm::StringRef reg) {
-    // Normalize: the op attributes from RemillToHelixLow store names in
-    // uppercase (RAX, EAX, etc.), so we match directly.
-    //
-    // Note: using StringSwitch for compile-time optimization of the lookup.
-    // clang-format off
-    auto result = llvm::StringSwitch<std::optional<SubRegInfo>>(reg)
-        // ── RAX family ────────────────────────────────────────────────────
-        .Case("RAX", SubRegInfo{"RAX", 64, 0})
-        .Case("EAX", SubRegInfo{"RAX", 32, 0})
-        .Case("AX",  SubRegInfo{"RAX", 16, 0})
-        .Case("AL",  SubRegInfo{"RAX", 8,  0})
-        .Case("AH",  SubRegInfo{"RAX", 8,  8})
-        // ── RBX family ────────────────────────────────────────────────────
-        .Case("RBX", SubRegInfo{"RBX", 64, 0})
-        .Case("EBX", SubRegInfo{"RBX", 32, 0})
-        .Case("BX",  SubRegInfo{"RBX", 16, 0})
-        .Case("BL",  SubRegInfo{"RBX", 8,  0})
-        .Case("BH",  SubRegInfo{"RBX", 8,  8})
-        // ── RCX family ────────────────────────────────────────────────────
-        .Case("RCX", SubRegInfo{"RCX", 64, 0})
-        .Case("ECX", SubRegInfo{"RCX", 32, 0})
-        .Case("CX",  SubRegInfo{"RCX", 16, 0})
-        .Case("CL",  SubRegInfo{"RCX", 8,  0})
-        .Case("CH",  SubRegInfo{"RCX", 8,  8})
-        // ── RDX family ────────────────────────────────────────────────────
-        .Case("RDX", SubRegInfo{"RDX", 64, 0})
-        .Case("EDX", SubRegInfo{"RDX", 32, 0})
-        .Case("DX",  SubRegInfo{"RDX", 16, 0})
-        .Case("DL",  SubRegInfo{"RDX", 8,  0})
-        .Case("DH",  SubRegInfo{"RDX", 8,  8})
-        // ── RSI family ────────────────────────────────────────────────────
-        .Case("RSI", SubRegInfo{"RSI", 64, 0})
-        .Case("ESI", SubRegInfo{"RSI", 32, 0})
-        .Case("SI",  SubRegInfo{"RSI", 16, 0})
-        .Case("SIL", SubRegInfo{"RSI", 8,  0})
-        // ── RDI family ────────────────────────────────────────────────────
-        .Case("RDI", SubRegInfo{"RDI", 64, 0})
-        .Case("EDI", SubRegInfo{"RDI", 32, 0})
-        .Case("DI",  SubRegInfo{"RDI", 16, 0})
-        .Case("DIL", SubRegInfo{"RDI", 8,  0})
-        // ── RSP family ────────────────────────────────────────────────────
-        .Case("RSP", SubRegInfo{"RSP", 64, 0})
-        .Case("ESP", SubRegInfo{"RSP", 32, 0})
-        .Case("SP",  SubRegInfo{"RSP", 16, 0})
-        .Case("SPL", SubRegInfo{"RSP", 8,  0})
-        // ── RBP family ────────────────────────────────────────────────────
-        .Case("RBP", SubRegInfo{"RBP", 64, 0})
-        .Case("EBP", SubRegInfo{"RBP", 32, 0})
-        .Case("BP",  SubRegInfo{"RBP", 16, 0})
-        .Case("BPL", SubRegInfo{"RBP", 8,  0})
-        // ── R8-R15 families ───────────────────────────────────────────────
-        .Case("R8",   SubRegInfo{"R8",  64, 0})
-        .Case("R8D",  SubRegInfo{"R8",  32, 0})
-        .Case("R8W",  SubRegInfo{"R8",  16, 0})
-        .Case("R8B",  SubRegInfo{"R8",  8,  0})
-        .Case("R9",   SubRegInfo{"R9",  64, 0})
-        .Case("R9D",  SubRegInfo{"R9",  32, 0})
-        .Case("R9W",  SubRegInfo{"R9",  16, 0})
-        .Case("R9B",  SubRegInfo{"R9",  8,  0})
-        .Case("R10",  SubRegInfo{"R10", 64, 0})
-        .Case("R10D", SubRegInfo{"R10", 32, 0})
-        .Case("R10W", SubRegInfo{"R10", 16, 0})
-        .Case("R10B", SubRegInfo{"R10", 8,  0})
-        .Case("R11",  SubRegInfo{"R11", 64, 0})
-        .Case("R11D", SubRegInfo{"R11", 32, 0})
-        .Case("R11W", SubRegInfo{"R11", 16, 0})
-        .Case("R11B", SubRegInfo{"R11", 8,  0})
-        .Case("R12",  SubRegInfo{"R12", 64, 0})
-        .Case("R12D", SubRegInfo{"R12", 32, 0})
-        .Case("R12W", SubRegInfo{"R12", 16, 0})
-        .Case("R12B", SubRegInfo{"R12", 8,  0})
-        .Case("R13",  SubRegInfo{"R13", 64, 0})
-        .Case("R13D", SubRegInfo{"R13", 32, 0})
-        .Case("R13W", SubRegInfo{"R13", 16, 0})
-        .Case("R13B", SubRegInfo{"R13", 8,  0})
-        .Case("R14",  SubRegInfo{"R14", 64, 0})
-        .Case("R14D", SubRegInfo{"R14", 32, 0})
-        .Case("R14W", SubRegInfo{"R14", 16, 0})
-        .Case("R14B", SubRegInfo{"R14", 8,  0})
-        .Case("R15",  SubRegInfo{"R15", 64, 0})
-        .Case("R15D", SubRegInfo{"R15", 32, 0})
-        .Case("R15W", SubRegInfo{"R15", 16, 0})
-        .Case("R15B", SubRegInfo{"R15", 8,  0})
-        // ── XMM registers (128-bit SIMD) ─────────────────────────────────
-        // Modeled as 64-bit to match our i64 RegWriteOp value type.
-        .Case("XMM0",  SubRegInfo{"XMM0",  64, 0})
-        .Case("XMM1",  SubRegInfo{"XMM1",  64, 0})
-        .Case("XMM2",  SubRegInfo{"XMM2",  64, 0})
-        .Case("XMM3",  SubRegInfo{"XMM3",  64, 0})
-        .Case("XMM4",  SubRegInfo{"XMM4",  64, 0})
-        .Case("XMM5",  SubRegInfo{"XMM5",  64, 0})
-        .Case("XMM6",  SubRegInfo{"XMM6",  64, 0})
-        .Case("XMM7",  SubRegInfo{"XMM7",  64, 0})
-        .Case("XMM8",  SubRegInfo{"XMM8",  64, 0})
-        .Case("XMM9",  SubRegInfo{"XMM9",  64, 0})
-        .Case("XMM10", SubRegInfo{"XMM10", 64, 0})
-        .Case("XMM11", SubRegInfo{"XMM11", 64, 0})
-        .Case("XMM12", SubRegInfo{"XMM12", 64, 0})
-        .Case("XMM13", SubRegInfo{"XMM13", 64, 0})
-        .Case("XMM14", SubRegInfo{"XMM14", 64, 0})
-        .Case("XMM15", SubRegInfo{"XMM15", 64, 0})
-        .Default(std::nullopt);
-    // clang-format on
-
-    return result;
+    return helix::analysis::getX86SubRegInfo(reg);
 }
 
 /// Convert a canonical 64-bit register name to its lowercase variable name.
@@ -224,6 +98,14 @@ static std::optional<SubRegInfo> getSubRegInfo(llvm::StringRef reg) {
 static std::string regToVarName(llvm::StringRef canonicalReg) {
     std::string name = canonicalReg.lower();
     return name;
+}
+
+static uint32_t getNextAvailableVarId(helix::low::FuncOp func) {
+    uint32_t nextId = 0;
+    func.walk([&](helix::high::VarDeclOp decl) {
+        nextId = std::max(nextId, decl.getVarId() + 1);
+    });
+    return nextId;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -651,6 +533,7 @@ private:
 
         OpBuilder builder(func->getContext());
         VariableTracker tracker;
+        tracker.varIdCounter = getNextAvailableVarId(func);
 
         // ── Initialize calling convention info ───────────────────────────
         // The RecoverCallingConventionPass sets "calling_convention" and
@@ -677,19 +560,6 @@ private:
                                 << (isWin64 ? "win64" : "sysv")
                                 << ", hasReturn="
                                 << tracker.hasReturnValue << ")\n");
-
-        // ── Pre-scan: count writes per register per block ────────────────
-        // This enables creating separate variables when the same register
-        // is written in multiple distinct execution paths (basic blocks).
-        llvm::StringMap<llvm::SmallDenseSet<Block*, 4>> regWriteBlocks;
-        funcBody.walk([&](helix::low::RegWriteOp writeOp) {
-            auto regName = writeOp.getRegName();
-            auto subRegOpt = getSubRegInfo(regName);
-            if (subRegOpt) {
-                regWriteBlocks[subRegOpt->parent].insert(
-                    writeOp->getBlock());
-            }
-        });
 
         // ── Phase 1: Replace RegRead operations ──────────────────────────
 
@@ -810,65 +680,15 @@ private:
 
             auto& subReg = *subRegOpt;
 
-            // ── Multiple-write detection ─────────────────────────────────
-            // If this register is written in multiple distinct blocks, create
-            // a separate variable for each write site (Requirement 8.3).
-            auto writeBlocksIt = regWriteBlocks.find(subReg.parent);
-            bool hasMultipleWriteBlocks =
-                writeBlocksIt != regWriteBlocks.end() &&
-                writeBlocksIt->second.size() > 1;
-
-            Operation* varDecl;
-            if (hasMultipleWriteBlocks &&
-                !tracker.argRegPositions.count(subReg.parent)) {
-                // Check if we already have a declaration for this
-                // register+block combination.
-                auto blockKey = std::make_pair(
-                    llvm::StringRef(subReg.parent), writeOp->getBlock());
-                auto blockIt = tracker.regBlockDecl.find(blockKey);
-                if (blockIt != tracker.regBlockDecl.end()) {
-                    varDecl = blockIt->second;
-                } else {
-                    // Create a new variable with a unique suffix.
-                    unsigned writeIdx = tracker.regWriteCount[subReg.parent]++;
-                    std::string baseName = regToVarName(subReg.parent);
-                    std::string varName;
-                    if (writeIdx == 0) {
-                        varName = baseName;
-                    } else {
-                        // Append a letter suffix: _a, _b, _c, ...
-                        char suffix = 'a' + static_cast<char>(
-                            writeIdx < 26 ? writeIdx : 25);
-                        varName = std::format("{}_{}", baseName, suffix);
-                    }
-
-                    auto declOp = declBuilder.create<helix::high::VarDeclOp>(
-                        funcLoc,
-                        /*var_id=*/tracker.varIdCounter++,
-                        /*var_name=*/varName,
-                        /*storage=*/helix::high::StorageKind::Register,
-                        /*stack_offset=*/IntegerAttr{},
-                        /*init=*/Value{},
-                        /*address=*/IntegerAttr{});
-
-                    varDecl = declOp;
-                    tracker.regBlockDecl[blockKey] = declOp;
-                    // Also register in regToDecl if first write.
-                    if (writeIdx == 0)
-                        tracker.regToDecl[subReg.parent] = declOp;
-                    ++NumRegVarsCreated;
-                    ++NumMultiDefVars;
-
-                    LLVM_DEBUG(llvm::dbgs()
-                        << "  Multi-def variable: " << varName
-                        << " (from " << subReg.parent
-                        << ", block " << writeOp->getBlock() << ")\n");
-                }
-            } else {
-                // Single write path or argument register — use standard naming.
-                varDecl = tracker.getOrDeclareRegVar(
-                    subReg.parent, declBuilder, funcLoc, writeOp);
-            }
+            // NOTE: Splitting a register into per-block variables is unsafe in
+            // the current pass architecture because reads are rewritten before
+            // writes. A later block-local split can leave existing var.ref ops
+            // pointing at the canonical register variable while assignments are
+            // redirected to a different declaration, creating phantom
+            // uninitialized registers in the output. Prefer one canonical
+            // variable until def-use partitioning is made SSA-aware.
+            Operation* varDecl = tracker.getOrDeclareRegVar(
+                subReg.parent, declBuilder, funcLoc, writeOp);
 
             builder.setInsertionPoint(writeOp);
 

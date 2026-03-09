@@ -38,6 +38,7 @@
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
+#include "helix/analysis/X86RegisterInfo.h"
 
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/IR/Builders.h"
@@ -524,6 +525,7 @@ static bool hasAnyUncertainFlags(Operation* op) {
 ///
 /// Live operations:
 ///   - helix_low.jcc, helix_low.jmp  (branch — affects control flow)
+///   - helix_high.if / while / do_while / for (structured control flow)
 ///   - helix_low.call, helix_high.call (function call — observable side effect)
 ///   - helix_low.ret, helix_high.return (return — observable output)
 ///   - helix_low.mem.write (memory write — observable side effect)
@@ -531,6 +533,10 @@ static bool hasAnyUncertainFlags(Operation* op) {
 static bool isLiveConsumer(Operation* op) {
     return isa<helix::low::JccOp>(op) ||
            isa<helix::low::JmpOp>(op) ||
+           isa<helix::high::IfOp>(op) ||
+           isa<helix::high::WhileOp>(op) ||
+           isa<helix::high::DoWhileOp>(op) ||
+           isa<helix::high::ForOp>(op) ||
            isa<helix::low::CallOp>(op) ||
            isa<helix::high::CallOp>(op) ||
            isa<helix::low::RetOp>(op) ||
@@ -687,13 +693,15 @@ static bool isDeadUndefAssign(helix::high::AssignOp assignOp,
 static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
                                 const Liveness& liveness) {
     auto regName = writeOp.getRegName();
+    auto canonicalReg = helix::analysis::getCanonicalX86Register(regName);
+    auto normalizedReg = canonicalReg.empty() ? regName : canonicalReg;
 
     // Never remove writes to RSP or RBP — they're handled by the
     // stack pointer bookkeeping and frame pointer passes respectively.
-    // Also, never remove writes to SIMD vector registers because RemillToHelixLow 
+    // Also, never remove writes to SIMD vector registers because RemillToHelixLow
     // erases their semantic reads, leading to false dead stores and missing offsets.
-    if (regName == "RSP" || regName == "RBP" || 
-        regName.starts_with("XMM") || regName.starts_with("YMM") || regName.starts_with("ZMM"))
+    if (normalizedReg == "RSP" || normalizedReg == "RBP" ||
+        helix::analysis::isX86VectorRegister(regName))
         return false;
 
     // Check if the written value has any uses at all.  In SSA form, a
@@ -718,7 +726,9 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
 
         // Check for a read of the same register.
         if (auto readOp = dyn_cast<helix::low::RegReadOp>(&op)) {
-            if (readOp.getRegName() == regName) {
+            if (helix::analysis::areX86RegistersAliased(readOp.getRegName(),
+                                                        normalizedReg) ||
+                readOp.getRegName() == regName) {
                 foundRead = true;
                 break;
             }
@@ -726,7 +736,9 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
 
         // Check for an overwrite of the same register.
         if (auto nextWrite = dyn_cast<helix::low::RegWriteOp>(&op)) {
-            if (nextWrite.getRegName() == regName) {
+            if (helix::analysis::areX86RegistersAliased(nextWrite.getRegName(),
+                                                        normalizedReg) ||
+                nextWrite.getRegName() == regName) {
                 foundOverwrite = true;
                 break;
             }
@@ -736,14 +748,7 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
         // (RAX, RCX, RDX, R8, R9, R10, R11 on Win64), a call acts as an
         // overwrite.  If the register is non-volatile, the call preserves it.
         if (isa<helix::low::CallOp>(&op)) {
-            static constexpr std::string_view kVolatile[] = {
-                "RAX", "RCX", "RDX", "R8", "R9", "R10", "R11"
-            };
-            bool isVolatile = std::any_of(
-                std::begin(kVolatile), std::end(kVolatile),
-                [&](std::string_view v) { return v == std::string_view(regName); });
-
-            if (isVolatile) {
+            if (helix::analysis::isWin64VolatileX86Register(normalizedReg)) {
                 foundOverwrite = true;
                 break;
             }
@@ -752,7 +757,8 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
         // A return uses RAX (return value).  If we're writing to RAX and
         // there's a return ahead, the write is NOT dead.
         if (isa<helix::low::RetOp>(&op)) {
-            if (regName == "RAX" || regName.starts_with("XMM") || regName.starts_with("YMM") || regName.starts_with("ZMM")) {
+            if (helix::analysis::isX86GeneralPurposeReturnRegister(normalizedReg) ||
+                helix::analysis::isX86VectorRegister(regName)) {
                 foundRead = true;  // RAX and Vector Registers are implicitly read by RET.
                 break;
             }

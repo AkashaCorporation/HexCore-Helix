@@ -281,8 +281,21 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
         // Find the first operand type (destination):
         // "3MnW" = memory write destination
         // "3RnW" = register write destination
-        if (suffix.find("MnW") != std::string_view::npos) {
+        if (auto mnwPos = suffix.find("MnW"); mnwPos != std::string_view::npos) {
             has_mem_dst = true;
+            // Infer width from the destination memory operand for forms like:
+            //   MnWIjE -> 32-bit store
+            //   MnWImE -> 64-bit store
+            //   MnWIhE -> 8-bit store
+            //   MnWItE -> 16-bit store
+            if (auto typedPos = suffix.find("MnWI", mnwPos);
+                typedPos != std::string_view::npos && typedPos + 4 < suffix.size()) {
+                char typeChar = suffix[typedPos + 4];
+                if (typeChar == 'j') src_w = 32;
+                else if (typeChar == 'm') src_w = 64;
+                else if (typeChar == 'h') src_w = 8;
+                else if (typeChar == 't') src_w = 16;
+            }
         }
 
         // Find if there's a memory source operand (Mn without W following it).
