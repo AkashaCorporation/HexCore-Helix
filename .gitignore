@@ -5,6 +5,7 @@ Cargo.lock
 
 # C++ Build
 /engine/build/
+/engine/build-tests/
 /engine/out/
 *.o
 *.a
@@ -36,6 +37,17 @@ crates/helix-core/src/generated/
 log*.txt
 build_error.log
 cmake_gen.log
+/build_ninja.log
+/build_ninja.err
+/build_ninja.log.err
+/build_run.log
+/pseudo_build.log
+/test_build.log
+/test_configure.log
+/mlir_debug_dump.txt
+/bone_pos_calc*.c
+/projectile_constructor*.c
+/tests/remill-7/debug*.log
 
 # OS
 .DS_Store

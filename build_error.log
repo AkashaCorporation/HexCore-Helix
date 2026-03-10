@@ -1,4 +1,0 @@
-Vers├úo do MSBuild 17.14.14+a129329f1 para .NET Framework
-
-  Engine.cpp
-C:\Users\Mazum\Desktop\HexCore-Helix\engine\src\Engine.cpp(8,10): error C1083: N├úo ├® poss├¡vel abrir arquivo incluir: 'mlir/IR/MLIRContext.h': No such file or directory [C:\Users\Mazum\Desktop\HexCore-Helix\engine\build\helix_engine.vcxproj]
