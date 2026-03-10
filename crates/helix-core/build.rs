@@ -6,6 +6,28 @@
 use std::env;
 use std::path::PathBuf;
 
+fn root_from_cmake_dir(dir: PathBuf) -> PathBuf {
+    dir.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or(dir)
+}
+
+fn command_output(cmd: &str, arg: &str) -> Option<String> {
+    let output = std::process::Command::new(cmd).arg(arg).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
@@ -14,44 +36,50 @@ fn main() {
     let engine_build_dir = project_root.join("engine").join("build");
 
     // LLVM/MLIR build directory — configurable via environment variables.
-    // Priority: MLIR_DIR > LLVM_BUILD_DIR > llvm-config --prefix > fallback
+    // Priority: MLIR_DIR > LLVM_BUILD_DIR > LLVM_DIR > llvm-config > common prefixes
     let llvm_build = if let Ok(dir) = env::var("MLIR_DIR") {
-        // MLIR_DIR typically points to lib/cmake/mlir; we want the build root.
-        let mlir_path = PathBuf::from(&dir);
-        mlir_path.parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(dir))
+        root_from_cmake_dir(PathBuf::from(dir))
     } else if let Ok(dir) = env::var("LLVM_BUILD_DIR") {
         PathBuf::from(dir)
-    } else if let Ok(output) = std::process::Command::new("llvm-config")
-        .arg("--prefix")
-        .output()
-    {
-        let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !prefix.is_empty() {
-            PathBuf::from(prefix)
-        } else {
-            panic!(
-                "Could not determine LLVM/MLIR build directory.\n\
-                 Set one of these environment variables:\n\
-                 - MLIR_DIR: path to MLIR CMake config (e.g., /usr/lib/cmake/mlir)\n\
-                 - LLVM_BUILD_DIR: path to the LLVM/MLIR build root"
-            );
-        }
+    } else if let Ok(dir) = env::var("LLVM_DIR") {
+        root_from_cmake_dir(PathBuf::from(dir))
+    } else if let Some(libdir) = command_output("llvm-config", "--libdir") {
+        let libdir_path = PathBuf::from(&libdir);
+        libdir_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(libdir_path)
+    } else if let Some(prefix) = command_output("llvm-config", "--prefix") {
+        PathBuf::from(prefix)
     } else {
-        panic!(
-            "Could not determine LLVM/MLIR build directory.\n\
-             Set one of these environment variables:\n\
-             - MLIR_DIR: path to MLIR CMake config (e.g., /usr/lib/cmake/mlir)\n\
-             - LLVM_BUILD_DIR: path to the LLVM/MLIR build root"
-        );
+        let common_roots = [
+            "/usr/lib/llvm-18",
+            "/usr/local/opt/llvm",
+            "/opt/homebrew/opt/llvm",
+            "C:/Program Files/LLVM",
+        ];
+
+        common_roots
+            .iter()
+            .map(PathBuf::from)
+            .find(|root| root.join("lib").exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not determine LLVM/MLIR build directory.\n\
+                     Set one of these environment variables:\n\
+                     - MLIR_DIR: path to MLIR CMake config (e.g., /usr/lib/llvm-18/lib/cmake/mlir)\n\
+                     - LLVM_DIR: path to LLVM CMake config (e.g., /usr/lib/llvm-18/lib/cmake/llvm)\n\
+                     - LLVM_BUILD_DIR: path to the LLVM/MLIR build root"
+                );
+            })
     };
     let llvm_lib_dir = llvm_build.join("lib");
 
     // ─── Link the Helix engine static library ──────────────────────────
-    println!("cargo:rustc-link-search=native={}", engine_build_dir.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        engine_build_dir.display()
+    );
     println!("cargo:rustc-link-lib=static=helix_engine");
 
     // ─── Link LLVM static libraries ────────────────────────────────────
@@ -244,13 +272,17 @@ fn main() {
 
     // ─── Re-run triggers ───────────────────────────────────────────────
     println!("cargo:rerun-if-env-changed=MLIR_DIR");
+    println!("cargo:rerun-if-env-changed=LLVM_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_BUILD_DIR");
     let engine_lib_name = if cfg!(target_os = "windows") {
         "helix_engine.lib"
     } else {
         "libhelix_engine.a"
     };
-    println!("cargo:rerun-if-changed={}", engine_build_dir.join(engine_lib_name).display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        engine_build_dir.join(engine_lib_name).display()
+    );
 
     let schemas_dir = project_root.join("schemas");
     if schemas_dir.exists() {

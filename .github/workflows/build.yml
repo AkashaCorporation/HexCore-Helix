@@ -11,6 +11,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  LLVM_VERSION: "18"
+  LLVM_BUILD_DIR: /usr/lib/llvm-18
+  LLVM_DIR: /usr/lib/llvm-18/lib/cmake/llvm
+  MLIR_DIR: /usr/lib/llvm-18/lib/cmake/mlir
 
 jobs:
   # ─── Rust Check & Lint ──────────────────────────────────────────────────────
@@ -34,6 +38,16 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install LLVM/MLIR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
+
+      - name: Build native engine for Rust workspace
+        run: |
+          cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+          cmake --build engine/build --parallel
+
       - name: Check workspace
         run: cargo check --workspace
 
@@ -48,57 +62,52 @@ jobs:
 
   # ─── C++ Engine Build ───────────────────────────────────────────────────────
   engine-build:
-    name: C++ Engine (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: C++ Engine (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install LLVM/MLIR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
+
       - name: Configure CMake
-        run: cmake -B engine/build -S engine -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
 
       - name: Build
         run: cmake --build engine/build --config Release
 
   # ─── NAPI-RS Build (Multi-Platform) ─────────────────────────────────────────
   napi-build:
-    name: NAPI-RS Build (${{ matrix.settings.target }})
+    name: NAPI-RS Build (x86_64-unknown-linux-gnu)
     needs: [rust-check, engine-build]
-    runs-on: ${{ matrix.settings.host }}
-    strategy:
-      fail-fast: false
-      matrix:
-        settings:
-          - host: windows-latest
-            target: x86_64-pc-windows-msvc
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - host: macos-latest
-            target: aarch64-apple-darwin
-          - host: macos-13
-            target: x86_64-apple-darwin
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.settings.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
+      - name: Install LLVM/MLIR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
+
       - name: Install dependencies
         run: npm install
 
       - name: Build C++ Engine
         run: |
-          cmake -B engine/build -S engine -DCMAKE_BUILD_TYPE=Release
-          cmake --build engine/build --config Release
+          cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+          cmake --build engine/build --parallel
 
       - name: Build NAPI-RS
         run: npm run build
@@ -106,7 +115,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bindings-${{ matrix.settings.target }}
+          name: bindings-x86_64-unknown-linux-gnu
           path: "*.node"
           if-no-files-found: error
 
