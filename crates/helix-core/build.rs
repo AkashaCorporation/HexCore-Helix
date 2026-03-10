@@ -28,6 +28,69 @@ fn command_output(cmd: &str, arg: &str) -> Option<String> {
     }
 }
 
+fn command_output_args(cmd: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn emit_system_link_token(token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+
+    if let Some(dir) = token.strip_prefix("-L") {
+        println!("cargo:rustc-link-search=native={}", dir);
+        return;
+    }
+
+    if token == "-pthread" {
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        return;
+    }
+
+    if let Some(lib) = token.strip_prefix("-l") {
+        if !lib.is_empty() {
+            println!("cargo:rustc-link-lib=dylib={}", lib);
+        }
+        return;
+    }
+
+    let path = PathBuf::from(token);
+    if !path.is_absolute() {
+        return;
+    }
+
+    if let Some(parent) = path.parent() {
+        println!("cargo:rustc-link-search=native={}", parent.display());
+    }
+
+    let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
+        return;
+    };
+    let Some(stripped) = file_name.strip_prefix("lib") else {
+        return;
+    };
+
+    for suffix in [".so", ".a", ".dylib"] {
+        if let Some((lib, _)) = stripped.split_once(suffix) {
+            if !lib.is_empty() {
+                println!("cargo:rustc-link-lib=dylib={}", lib);
+            }
+            return;
+        }
+    }
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
@@ -265,6 +328,17 @@ fn main() {
     // On Linux/macOS, link C++ standard library
     if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
+        if let Some(system_libs) =
+            command_output_args("llvm-config", &["--system-libs", "--link-static"])
+        {
+            for token in system_libs.split_whitespace() {
+                emit_system_link_token(token);
+            }
+        } else {
+            for lib in ["tinfo", "z", "zstd", "xml2", "ffi"] {
+                println!("cargo:rustc-link-lib=dylib={}", lib);
+            }
+        }
     }
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=dylib=c++");
