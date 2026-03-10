@@ -6,7 +6,7 @@
 
 use crate::decompile::decompile_ir;
 use crate::error::HelixError;
-use crate::pipeline::{IrLifter, IrLiftOutput, LiftIrInput};
+use crate::pipeline::{IrLiftOutput, IrLifter, LiftIrInput};
 
 /// Lifter that consumes Remill LLVM IR text and produces pseudo-C.
 ///

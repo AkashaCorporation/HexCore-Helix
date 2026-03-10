@@ -195,11 +195,7 @@ impl DiagnosticSink {
     }
 
     /// Convenience: add a module-level info diagnostic (no function context).
-    pub fn module_info(
-        &mut self,
-        kind: DiagnosticKind,
-        message: impl Into<String>,
-    ) {
+    pub fn module_info(&mut self, kind: DiagnosticKind, message: impl Into<String>) {
         self.push(Diagnostic {
             severity: Severity::Info,
             kind,
@@ -241,10 +237,7 @@ impl DiagnosticSink {
 
     /// Filter diagnostics by kind.
     pub fn by_kind(&self, kind: DiagnosticKind) -> Vec<&Diagnostic> {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.kind == kind)
-            .collect()
+        self.diagnostics.iter().filter(|d| d.kind == kind).collect()
     }
 
     /// Filter diagnostics by function name.
@@ -319,9 +312,24 @@ mod tests {
     fn sink_collects_diagnostics() {
         let mut sink = DiagnosticSink::new();
         sink.error("sub_100", 0x100, DiagnosticKind::ParseError, "bad IR");
-        sink.warn("sub_100", 0x110, DiagnosticKind::UnresolvedType, "unknown type for RAX");
-        sink.info("sub_100", 0x100, DiagnosticKind::Recovery, "3 args recovered");
-        sink.hint("sub_200", 0x200, DiagnosticKind::MissingSignature, "add signature for sub_200");
+        sink.warn(
+            "sub_100",
+            0x110,
+            DiagnosticKind::UnresolvedType,
+            "unknown type for RAX",
+        );
+        sink.info(
+            "sub_100",
+            0x100,
+            DiagnosticKind::Recovery,
+            "3 args recovered",
+        );
+        sink.hint(
+            "sub_200",
+            0x200,
+            DiagnosticKind::MissingSignature,
+            "add signature for sub_200",
+        );
 
         assert_eq!(sink.len(), 4);
         assert!(sink.has_errors());

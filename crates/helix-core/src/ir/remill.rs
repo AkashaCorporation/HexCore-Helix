@@ -407,27 +407,25 @@ pub fn semantic_to_helix_low(semantic: &Semantic) -> Option<HelixLowOp> {
 /// Mirrors the C++ `getJccCondition()` in `RemillDemangler.cpp`.
 pub fn jcc_condition(semantic: &Semantic) -> Option<&'static str> {
     match semantic {
-        Semantic::Jcc(cc) => {
-            match cc.as_str() {
-                "JZ" | "JE" => Some("z"),
-                "JNZ" | "JNE" => Some("nz"),
-                "JB" | "JC" | "JNAE" => Some("b"),
-                "JNB" | "JNC" | "JAE" => Some("nb"),
-                "JBE" | "JNA" => Some("be"),
-                "JNBE" | "JA" => Some("nbe"),
-                "JL" | "JNGE" => Some("l"),
-                "JNL" | "JGE" => Some("nl"),
-                "JLE" | "JNG" => Some("le"),
-                "JNLE" | "JG" => Some("nle"),
-                "JS" => Some("s"),
-                "JNS" => Some("ns"),
-                "JO" => Some("o"),
-                "JNO" => Some("no"),
-                "JP" | "JPE" => Some("p"),
-                "JNP" | "JPO" => Some("np"),
-                _ => None,
-            }
-        }
+        Semantic::Jcc(cc) => match cc.as_str() {
+            "JZ" | "JE" => Some("z"),
+            "JNZ" | "JNE" => Some("nz"),
+            "JB" | "JC" | "JNAE" => Some("b"),
+            "JNB" | "JNC" | "JAE" => Some("nb"),
+            "JBE" | "JNA" => Some("be"),
+            "JNBE" | "JA" => Some("nbe"),
+            "JL" | "JNGE" => Some("l"),
+            "JNL" | "JGE" => Some("nl"),
+            "JLE" | "JNG" => Some("le"),
+            "JNLE" | "JG" => Some("nle"),
+            "JS" => Some("s"),
+            "JNS" => Some("ns"),
+            "JO" => Some("o"),
+            "JNO" => Some("no"),
+            "JP" | "JPE" => Some("p"),
+            "JNP" | "JPO" => Some("np"),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -481,10 +479,7 @@ pub fn detect_self_operand_idiom(
 ///
 /// Returns the transformed operation, or `None` if the operation should be
 /// eliminated (e.g., MOV reg, reg).
-pub fn apply_idiom(
-    op: &HelixLowOp,
-    idiom: &IdiomPattern,
-) -> Option<HelixLowOp> {
+pub fn apply_idiom(op: &HelixLowOp, idiom: &IdiomPattern) -> Option<HelixLowOp> {
     match idiom {
         IdiomPattern::SelfXor => {
             // XOR reg, reg → still emitted as BinOp(Xor) but with is_self_xor
@@ -625,7 +620,10 @@ mod tests {
         let name = "_ZN12_GLOBAL__N_13ADDI3MnWIhE2MnIhE2RnIhLb1EEEEP6MemoryS8_R5StateT_T0_T1_";
         assert_eq!(decode_mangled_name(name), Semantic::Add);
         let classes = decode_operand_classes(name);
-        assert_eq!(classes, vec![OpClass::MemWrite, OpClass::MemRead, OpClass::RegRead]);
+        assert_eq!(
+            classes,
+            vec![OpClass::MemWrite, OpClass::MemRead, OpClass::RegRead]
+        );
     }
 
     // ── semantic_to_helix_low tests ──────────────────────────────────────
@@ -669,12 +667,18 @@ mod tests {
     #[test]
     fn test_cmp_test_map_correctly() {
         assert_eq!(semantic_to_helix_low(&Semantic::Cmp), Some(HelixLowOp::Cmp));
-        assert_eq!(semantic_to_helix_low(&Semantic::Test), Some(HelixLowOp::Test));
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Test),
+            Some(HelixLowOp::Test)
+        );
     }
 
     #[test]
     fn test_control_flow_maps() {
-        assert_eq!(semantic_to_helix_low(&Semantic::Call), Some(HelixLowOp::Call));
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Call),
+            Some(HelixLowOp::Call)
+        );
         assert_eq!(semantic_to_helix_low(&Semantic::Ret), Some(HelixLowOp::Ret));
         assert_eq!(semantic_to_helix_low(&Semantic::Jmp), Some(HelixLowOp::Jmp));
         assert_eq!(
@@ -690,22 +694,40 @@ mod tests {
     #[test]
     fn test_nop_int3_maps() {
         assert_eq!(semantic_to_helix_low(&Semantic::Nop), Some(HelixLowOp::Nop));
-        assert_eq!(semantic_to_helix_low(&Semantic::Int3), Some(HelixLowOp::Int3));
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Int3),
+            Some(HelixLowOp::Int3)
+        );
     }
 
     #[test]
     fn test_data_movement_maps() {
-        assert_eq!(semantic_to_helix_low(&Semantic::Mov), Some(HelixLowOp::RegWrite));
-        assert_eq!(semantic_to_helix_low(&Semantic::MovZx), Some(HelixLowOp::MovZx));
-        assert_eq!(semantic_to_helix_low(&Semantic::MovSx), Some(HelixLowOp::MovSx));
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Mov),
+            Some(HelixLowOp::RegWrite)
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::MovZx),
+            Some(HelixLowOp::MovZx)
+        );
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::MovSx),
+            Some(HelixLowOp::MovSx)
+        );
         assert_eq!(semantic_to_helix_low(&Semantic::Lea), Some(HelixLowOp::Lea));
-        assert_eq!(semantic_to_helix_low(&Semantic::Push), Some(HelixLowOp::Push));
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Push),
+            Some(HelixLowOp::Push)
+        );
         assert_eq!(semantic_to_helix_low(&Semantic::Pop), Some(HelixLowOp::Pop));
     }
 
     #[test]
     fn test_unknown_returns_none() {
-        assert_eq!(semantic_to_helix_low(&Semantic::Unknown("FOO".into())), None);
+        assert_eq!(
+            semantic_to_helix_low(&Semantic::Unknown("FOO".into())),
+            None
+        );
     }
 
     #[test]

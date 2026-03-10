@@ -4,7 +4,6 @@
 ///
 /// Estes testes requerem os arquivos de teste em `tests/Remill-*/`.
 /// Se os arquivos não existirem, os testes são ignorados automaticamente.
-
 use helix_core::decompile::decompile_ir_via_hir;
 
 /// Caminho raiz dos testes Remill (relativo à raiz do workspace)
@@ -36,33 +35,60 @@ fn assert_valid_decompile_output(source: &str, case_name: &str) {
     assert!(has_type_info, "{}: sem informação de tipo", case_name);
 
     // 3. Contém operação aritmética ou atribuição
-    let has_assign_or_arith = source.contains(" = ") || source.contains(" += ") || source.contains(" -= ");
-    assert!(has_assign_or_arith, "{}: sem atribuição/aritmética", case_name);
+    let has_assign_or_arith =
+        source.contains(" = ") || source.contains(" += ") || source.contains(" -= ");
+    assert!(
+        has_assign_or_arith,
+        "{}: sem atribuição/aritmética",
+        case_name
+    );
 
     // 4. Contém nomes de registradores reais (case-insensitive)
     let src_lower = source.to_lowercase();
-    let real_regs = ["rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi",
-                     "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "al", "cl"];
+    let real_regs = [
+        "rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15", "al", "cl",
+    ];
     let has_real_reg = real_regs.iter().any(|r| src_lower.contains(r));
-    assert!(has_real_reg, "{}: sem nomes de registradores reais", case_name);
+    assert!(
+        has_real_reg,
+        "{}: sem nomes de registradores reais",
+        case_name
+    );
 
     // 5. Chaves balanceadas
     let open = source.chars().filter(|&c| c == '{').count();
     let close = source.chars().filter(|&c| c == '}').count();
-    assert_eq!(open, close, "{}: chaves desbalanceadas ({} abrem, {} fecham)", case_name, open, close);
+    assert_eq!(
+        open, close,
+        "{}: chaves desbalanceadas ({} abrem, {} fecham)",
+        case_name, open, close
+    );
 }
 
 fn run_remill_test(case: &str, ll_file: &str) {
     let ir = match load_ir(case, ll_file) {
         Some(ir) => ir,
         None => {
-            eprintln!("SKIP: {}/{} não encontrado (dados de teste ausentes)", case, ll_file);
+            eprintln!(
+                "SKIP: {}/{} não encontrado (dados de teste ausentes)",
+                case, ll_file
+            );
             return;
         }
     };
-    let result = decompile_ir_via_hir(&ir).unwrap_or_else(|e| panic!("{}: pipeline falhou: {}", case, e));
-    assert!(result.function_count > 0, "{}: nenhuma função recuperada", case);
-    assert!(result.instruction_count > 0, "{}: nenhuma instrução decodificada", case);
+    let result =
+        decompile_ir_via_hir(&ir).unwrap_or_else(|e| panic!("{}: pipeline falhou: {}", case, e));
+    assert!(
+        result.function_count > 0,
+        "{}: nenhuma função recuperada",
+        case
+    );
+    assert!(
+        result.instruction_count > 0,
+        "{}: nenhuma instrução decodificada",
+        case
+    );
     assert_valid_decompile_output(&result.source, case);
 }
 

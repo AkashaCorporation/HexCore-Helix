@@ -119,10 +119,21 @@ struct SwitchPattern {
 
 #[derive(Debug, Clone)]
 enum Scope {
-    Switch { end_pc: u64, sid: usize },
-    If { end_pc: u64 },
-    IfElse { else_start_pc: u64, end_pc: u64, in_else: bool },
-    While { end_pc: u64 },
+    Switch {
+        end_pc: u64,
+        sid: usize,
+    },
+    If {
+        end_pc: u64,
+    },
+    IfElse {
+        else_start_pc: u64,
+        end_pc: u64,
+        in_else: bool,
+    },
+    While {
+        end_pc: u64,
+    },
 }
 
 struct IfInfo {
@@ -217,7 +228,7 @@ pub fn transform_with_signatures(
     let mut regs: HashMap<String, RegVal> = HashMap::new();
     let mut fresh: HashSet<String> = HashSet::new();
     let mut vc: u32 = 0;
-    
+
     let mut active_scopes: Vec<Scope> = Vec::new();
 
     for (i, insn) in insns.iter().enumerate() {
@@ -302,7 +313,9 @@ pub fn transform_with_signatures(
                         in_else: false,
                     });
                 } else {
-                    active_scopes.push(Scope::If { end_pc: info.target_pc });
+                    active_scopes.push(Scope::If {
+                        end_pc: info.target_pc,
+                    });
                 }
             }
         }
@@ -323,7 +336,11 @@ pub fn transform_with_signatures(
 
         // Emit case/default labels for the currently active switch.
         let active_sid = active_scopes.iter().rev().find_map(|s| {
-            if let Scope::Switch { sid, .. } = s { Some(*sid) } else { None }
+            if let Scope::Switch { sid, .. } = s {
+                Some(*sid)
+            } else {
+                None
+            }
         });
 
         if let Some(sid) = active_sid {

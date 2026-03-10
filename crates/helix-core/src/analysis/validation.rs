@@ -64,11 +64,7 @@ pub fn validate_module(
 }
 
 /// Validate a single function.
-fn validate_function(
-    func: &HirFunction,
-    signatures: &SignatureDb,
-    sink: &mut DiagnosticSink,
-) {
+fn validate_function(func: &HirFunction, signatures: &SignatureDb, sink: &mut DiagnosticSink) {
     let func_name = &func.name;
     let addr = func.address;
 
@@ -160,9 +156,7 @@ fn validate_function(
     // 7. Check for unreachable code after return
     let mut found_return = false;
     for stmt in &func.body {
-        if found_return
-            && !matches!(stmt, HirStmt::Comment { .. } | HirStmt::Label { .. })
-        {
+        if found_return && !matches!(stmt, HirStmt::Comment { .. } | HirStmt::Label { .. }) {
             sink.info(
                 func_name,
                 addr,
@@ -225,9 +219,7 @@ fn check_call_signatures(
             HirStmt::For { body, .. } => {
                 check_call_signatures(body, func_name, func_addr, signatures, sink);
             }
-            HirStmt::Switch {
-                cases, default, ..
-            } => {
+            HirStmt::Switch { cases, default, .. } => {
                 for case in cases {
                     check_call_signatures(&case.body, func_name, func_addr, signatures, sink);
                 }
@@ -461,7 +453,10 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let result = validate_module(&module, &sigs, &mut sink);
 
-        assert!(result.warnings > 0, "should have warnings about undeclared var");
+        assert!(
+            result.warnings > 0,
+            "should have warnings about undeclared var"
+        );
     }
 
     #[test]
@@ -529,6 +524,9 @@ mod tests {
         validate_module(&module, &sigs, &mut sink);
 
         let dead_code = sink.by_kind(DiagnosticKind::DeadCode);
-        assert!(!dead_code.is_empty(), "should detect unreachable code after return");
+        assert!(
+            !dead_code.is_empty(),
+            "should detect unreachable code after return"
+        );
     }
 }

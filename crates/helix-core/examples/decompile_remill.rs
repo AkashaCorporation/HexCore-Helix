@@ -7,8 +7,16 @@ use helix_core::decompile::decompile_ir_via_hir;
 fn main() {
     let cases = [
         ("Remill-1", "01-camera-init.ll", "04-camera-init.helix.c"),
-        ("Remill-2", "01-aim-assist-init.ll", "04-aim-assist-init.helix.c"),
-        ("Remill-3", "01-swarm-serialization.ll", "04-swarm-serialization.helix.c"),
+        (
+            "Remill-2",
+            "01-aim-assist-init.ll",
+            "04-aim-assist-init.helix.c",
+        ),
+        (
+            "Remill-3",
+            "01-swarm-serialization.ll",
+            "04-swarm-serialization.helix.c",
+        ),
         ("Remill-4", "01-swarm-write.ll", "04-swarm-write.helix.c"),
         ("Remill-5", "01-name-writing.ll", "04-name-writing.helix.c"),
         ("remill-7", "bone_pos_calc.ll", "bone_pos_calc.helix.c"),
@@ -25,8 +33,10 @@ fn main() {
             Ok(result) => {
                 std::fs::write(&out_path, &result.source)
                     .unwrap_or_else(|e| panic!("Falha ao escrever {}: {}", out_path, e));
-                println!("✅ {} → {} ({} funções, {} instruções, {} linhas)",
-                    ir_path, out_path,
+                println!(
+                    "✅ {} → {} ({} funções, {} instruções, {} linhas)",
+                    ir_path,
+                    out_path,
                     result.function_count,
                     result.instruction_count,
                     result.source.lines().count(),

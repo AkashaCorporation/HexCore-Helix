@@ -5,9 +5,9 @@
 
 use std::collections::HashSet;
 
-use crate::ir::{Operand, RemillInsn};
-use crate::ir::remill::Semantic;
 use crate::ir::hir::{HirExpr, HirFunction, HirStmt, HirVarId};
+use crate::ir::remill::Semantic;
+use crate::ir::{Operand, RemillInsn};
 
 // ─── Register Liveness ──────────────────────────────────────────────────────
 
@@ -493,10 +493,7 @@ fn collect_liveness_from_stmts(
                 // Record dependency: LHS var depends on RHS vars.
                 if let HirExpr::Var { id: lhs_id, .. } = lhs {
                     let rhs_vars = extract_var_refs(rhs);
-                    depends_on
-                        .entry(*lhs_id)
-                        .or_default()
-                        .extend(rhs_vars);
+                    depends_on.entry(*lhs_id).or_default().extend(rhs_vars);
                 }
                 // If the RHS is a call, the LHS is directly live (side effect).
                 if matches!(rhs, HirExpr::Call { .. }) {
@@ -535,21 +532,13 @@ fn collect_liveness_from_stmts(
                 ..
             } => {
                 if let Some(init_stmt) = init {
-                    collect_liveness_from_stmts(
-                        &[*init_stmt.clone()],
-                        directly_live,
-                        depends_on,
-                    );
+                    collect_liveness_from_stmts(&[*init_stmt.clone()], directly_live, depends_on);
                 }
                 if let Some(cond_expr) = cond {
                     collect_var_refs(cond_expr, directly_live);
                 }
                 if let Some(step_stmt) = step {
-                    collect_liveness_from_stmts(
-                        &[*step_stmt.clone()],
-                        directly_live,
-                        depends_on,
-                    );
+                    collect_liveness_from_stmts(&[*step_stmt.clone()], directly_live, depends_on);
                 }
                 collect_liveness_from_stmts(body, directly_live, depends_on);
             }
@@ -561,18 +550,10 @@ fn collect_liveness_from_stmts(
             } => {
                 collect_var_refs(expr, directly_live);
                 for case in cases {
-                    collect_liveness_from_stmts(
-                        &case.body,
-                        directly_live,
-                        depends_on,
-                    );
+                    collect_liveness_from_stmts(&case.body, directly_live, depends_on);
                 }
                 if let Some(default_stmts) = default {
-                    collect_liveness_from_stmts(
-                        default_stmts,
-                        directly_live,
-                        depends_on,
-                    );
+                    collect_liveness_from_stmts(default_stmts, directly_live, depends_on);
                 }
             }
             HirStmt::VarDecl { .. }
@@ -759,11 +740,7 @@ mod tests {
         HirExpr, HirFunction, HirStmt, HirStorage, HirType, HirVar, HirVarId, Span,
     };
 
-    fn mk_func(
-        params: Vec<HirVar>,
-        locals: Vec<HirVar>,
-        body: Vec<HirStmt>,
-    ) -> HirFunction {
+    fn mk_func(params: Vec<HirVar>, locals: Vec<HirVar>, body: Vec<HirStmt>) -> HirFunction {
         HirFunction {
             name: "test_func".into(),
             address: 0x1000,
@@ -817,8 +794,14 @@ mod tests {
         );
 
         let liveness = compute_hir_var_liveness(&func);
-        assert!(liveness.dead.contains(&HirVarId(0)), "dead_var should be dead");
-        assert!(liveness.live.contains(&HirVarId(1)), "live_var should be live");
+        assert!(
+            liveness.dead.contains(&HirVarId(0)),
+            "dead_var should be dead"
+        );
+        assert!(
+            liveness.live.contains(&HirVarId(1)),
+            "live_var should be live"
+        );
     }
 
     #[test]
@@ -864,8 +847,14 @@ mod tests {
         );
 
         let liveness = compute_hir_var_liveness(&func);
-        assert!(liveness.live.contains(&HirVarId(0)), "x should be live (transitive)");
-        assert!(liveness.live.contains(&HirVarId(1)), "y should be live (returned)");
+        assert!(
+            liveness.live.contains(&HirVarId(0)),
+            "x should be live (transitive)"
+        );
+        assert!(
+            liveness.live.contains(&HirVarId(1)),
+            "y should be live (returned)"
+        );
     }
 
     #[test]

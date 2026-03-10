@@ -41,5 +41,3 @@ pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSink, Severity};
 pub use error::HelixError;
 pub use metrics::PipelineMetrics;
 pub use types::{Address, ArchKind, BasicBlock, ControlFlowGraph, Instruction, Register};
-
-

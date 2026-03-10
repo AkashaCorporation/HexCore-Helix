@@ -207,9 +207,7 @@ impl fmt::Display for HirType {
                 }
                 write!(f, ")")
             }
-            HirType::Struct {
-                name: Some(n), ..
-            } => write!(f, "struct {}", n),
+            HirType::Struct { name: Some(n), .. } => write!(f, "struct {}", n),
             HirType::Struct { name: None, .. } => write!(f, "struct <anon>"),
             HirType::Array {
                 element,

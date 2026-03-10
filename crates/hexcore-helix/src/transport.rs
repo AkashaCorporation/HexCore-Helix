@@ -7,8 +7,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use helix_core::flatbuf::cfg::{self, CfgData, CfgFunctionData};
 use helix_core::flatbuf::ast::{self, AstData, AstFunctionData};
+use helix_core::flatbuf::cfg::{self, CfgData, CfgFunctionData};
 
 /// Serialize a control flow graph into a FlatBuffer for the Graph View.
 ///
@@ -76,11 +76,7 @@ pub(crate) fn build_cfg_data(
 }
 
 /// Constrói AstData a partir de dados do pipeline Helix.
-pub(crate) fn build_ast_data(
-    module_name: &str,
-    source: &str,
-    function_count: usize,
-) -> AstData {
+pub(crate) fn build_ast_data(module_name: &str, source: &str, function_count: usize) -> AstData {
     let functions = vec![AstFunctionData {
         name: format!("module_{}", function_count),
         address: 0,

@@ -133,7 +133,11 @@ impl HelixEngine {
     #[napi]
     pub fn version(&self) -> String {
         let native_ver = EngineHandle::version();
-        format!("helix-js={} native={}", env!("CARGO_PKG_VERSION"), native_ver)
+        format!(
+            "helix-js={} native={}",
+            env!("CARGO_PKG_VERSION"),
+            native_ver
+        )
     }
 
     /// Get the target architecture name.
@@ -169,7 +173,10 @@ impl HelixEngine {
             match handle.decompile(bytes, base, entry) {
                 Ok(flatbuf) => {
                     return Ok(DecompileResult {
-                        source: format!("// MLIR decompilation via FlatBuffer ({} bytes)", flatbuf.len()),
+                        source: format!(
+                            "// MLIR decompilation via FlatBuffer ({} bytes)",
+                            flatbuf.len()
+                        ),
                         function_name: format!("sub_{:x}", entry),
                         entry_address: format!("0x{:x}", entry),
                         block_count: 0,
@@ -295,11 +302,8 @@ impl HelixEngine {
         };
 
         let ast_buffer = {
-            let ast_data = crate::transport::build_ast_data(
-                "module",
-                &output.source,
-                output.function_count,
-            );
+            let ast_data =
+                crate::transport::build_ast_data("module", &output.source, output.function_count);
             helix_core::flatbuf::ast::serialize_ast(&ast_data)
                 .ok()
                 .map(Buffer::from)
@@ -358,11 +362,8 @@ impl HelixEngine {
         };
 
         let ast_buffer = {
-            let ast_data = crate::transport::build_ast_data(
-                "module",
-                &output.source,
-                output.function_count,
-            );
+            let ast_data =
+                crate::transport::build_ast_data("module", &output.source, output.function_count);
             helix_core::flatbuf::ast::serialize_ast(&ast_data)
                 .ok()
                 .map(Buffer::from)

@@ -7,11 +7,8 @@
 use helix_core::decompile::{decompile_ir, decompile_ir_via_hir};
 
 fn main() {
-    let file = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "log1.txt".into());
-    let ir = std::fs::read_to_string(&file)
-        .unwrap_or_else(|_| panic!("Failed to read {}", file));
+    let file = std::env::args().nth(1).unwrap_or_else(|| "log1.txt".into());
+    let ir = std::fs::read_to_string(&file).unwrap_or_else(|_| panic!("Failed to read {}", file));
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  HexCore Helix — Pipeline Comparison: {}", file);

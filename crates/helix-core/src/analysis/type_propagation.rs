@@ -11,9 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::hir::{
-    HirBinOp, HirExpr, HirFunction, HirModule, HirStmt, HirType, HirVarId,
-};
+use crate::ir::hir::{HirBinOp, HirExpr, HirFunction, HirModule, HirStmt, HirType, HirVarId};
 use crate::signatures::SignatureDb;
 
 /// Maximum iterations before declaring convergence.
@@ -144,7 +142,9 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
 
     match stmt {
         HirStmt::VarDecl {
-            var_id, init: Some(expr), ..
+            var_id,
+            init: Some(expr),
+            ..
         } => {
             let expr_ty = infer_expr_type(env, expr, signatures);
             changed |= env.set(*var_id, expr_ty);
@@ -159,7 +159,10 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
                 if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
                     let src_ty = env.get(*src_id);
                     if let HirType::Int { bits: src_bits, .. } = src_ty {
-                        let refined = HirType::Int { signed: *signed, bits: *src_bits };
+                        let refined = HirType::Int {
+                            signed: *signed,
+                            bits: *src_bits,
+                        };
                         changed |= env.set(*src_id, refined);
                     }
                 }
@@ -186,7 +189,10 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
                 if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
                     let src_ty = env.get(*src_id);
                     if let HirType::Int { bits: src_bits, .. } = src_ty {
-                        let refined = HirType::Int { signed: *signed, bits: *src_bits };
+                        let refined = HirType::Int {
+                            signed: *signed,
+                            bits: *src_bits,
+                        };
                         changed |= env.set(*src_id, refined);
                     }
                 }
@@ -194,7 +200,11 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
 
             // LEA: address computation results are pointers.
             // In the HIR, LEA is represented as AddressOf unary expressions.
-            if let HirExpr::Unary { op: crate::ir::hir::HirUnaryOp::AddressOf, .. } = rhs {
+            if let HirExpr::Unary {
+                op: crate::ir::hir::HirUnaryOp::AddressOf,
+                ..
+            } = rhs
+            {
                 if let HirExpr::Var { id, .. } = lhs {
                     changed |= env.set(*id, HirType::void_ptr());
                 }
@@ -364,8 +374,8 @@ pub fn parse_c_type_name(name: &str) -> HirType {
         "float" => HirType::Float { bits: 32 },
         "double" => HirType::Float { bits: 64 },
         "void*" | "LPVOID" | "PVOID" => HirType::void_ptr(),
-        "HANDLE" | "HMODULE" | "HINSTANCE" | "HWND" | "HDC" | "HBITMAP" | "HBRUSH"
-        | "HCURSOR" | "HFONT" | "HGDIOBJ" | "HICON" | "HMENU" | "HRGN" => {
+        "HANDLE" | "HMODULE" | "HINSTANCE" | "HWND" | "HDC" | "HBITMAP" | "HBRUSH" | "HCURSOR"
+        | "HFONT" | "HGDIOBJ" | "HICON" | "HMENU" | "HRGN" => {
             HirType::void_ptr() // Win32 handles are opaque pointers
         }
         "LPCSTR" | "PCSTR" | "const char*" => HirType::ptr(HirType::i8()),
@@ -399,10 +409,7 @@ mod tests {
     #[test]
     fn parse_pointer_types() {
         assert_eq!(parse_c_type_name("int*"), HirType::ptr(HirType::i32()));
-        assert_eq!(
-            parse_c_type_name("char*"),
-            HirType::ptr(HirType::i8())
-        );
+        assert_eq!(parse_c_type_name("char*"), HirType::ptr(HirType::i8()));
     }
 
     #[test]

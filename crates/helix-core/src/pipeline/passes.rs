@@ -89,28 +89,22 @@ impl TransformPass for EmptyBlockMerge {
             let mut i = 0;
             while i < cfg.blocks.len() {
                 if cfg.blocks[i].successors.len() == 1
-                    && cfg.blocks[i].successors[0].kind
-                        == crate::types::CfgEdgeKind::Unconditional
+                    && cfg.blocks[i].successors[0].kind == crate::types::CfgEdgeKind::Unconditional
                 {
                     let target = cfg.blocks[i].successors[0].target;
                     if pred_count.get(&target).copied().unwrap_or(0) == 1 {
                         // Find the target block
-                        if let Some(target_idx) =
-                            cfg.blocks.iter().position(|b| b.start == target)
+                        if let Some(target_idx) = cfg.blocks.iter().position(|b| b.start == target)
                         {
                             if target_idx != i {
-                                let target_block = cfg.blocks.remove(
-                                    if target_idx > i {
-                                        target_idx
-                                    } else {
-                                        // Adjust if target was before current
-                                        i -= 1;
-                                        target_idx
-                                    },
-                                );
-                                cfg.blocks[i]
-                                    .instructions
-                                    .extend(target_block.instructions);
+                                let target_block = cfg.blocks.remove(if target_idx > i {
+                                    target_idx
+                                } else {
+                                    // Adjust if target was before current
+                                    i -= 1;
+                                    target_idx
+                                });
+                                cfg.blocks[i].instructions.extend(target_block.instructions);
                                 cfg.blocks[i].end = target_block.end;
                                 cfg.blocks[i].successors = target_block.successors;
                                 merged = true;

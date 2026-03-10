@@ -113,11 +113,7 @@ impl fmt::Display for PipelineMetrics {
             self.functions_recovered,
             self.basic_blocks,
         )?;
-        writeln!(
-            f,
-            "  Throughput: {:.1} instr/ms",
-            self.overall_throughput()
-        )?;
+        writeln!(f, "  Throughput: {:.1} instr/ms", self.overall_throughput())?;
         writeln!(
             f,
             "  Types: {} resolved, {} unresolved",

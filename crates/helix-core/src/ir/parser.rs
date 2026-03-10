@@ -534,9 +534,7 @@ fn preprocess_new_format(ir: &str) -> Result<PreprocessResult, String> {
             // Extract the function name from declare line
             if let Some(at_pos) = trimmed.find('@') {
                 let after_at = &trimmed[at_pos + 1..];
-                let end = after_at
-                    .find('(')
-                    .unwrap_or(after_at.len());
+                let end = after_at.find('(').unwrap_or(after_at.len());
                 let name = after_at[..end].to_string();
                 declared_intrinsics.push(name);
             }
@@ -616,7 +614,8 @@ fn parse_register_metadata(ir: &str) -> HashMap<u32, String> {
         if let Some(c_pos) = trimmed.find("c\"") {
             let after_c = &trimmed[c_pos + 2..];
             // Find the end — either \00" or just "
-            let name_end = after_c.find("\\00\"")
+            let name_end = after_c
+                .find("\\00\"")
                 .or_else(|| after_c.find('"'))
                 .unwrap_or(after_c.len());
             let name = after_c[..name_end].to_string();
@@ -631,10 +630,7 @@ fn parse_register_metadata(ir: &str) -> HashMap<u32, String> {
 
 /// Resolve register name from a GEP instruction with `!remill_register !N` annotation.
 /// Returns `Some((var_name, register_name))` if resolved, `None` otherwise.
-fn resolve_gep_register(
-    line: &str,
-    metadata: &HashMap<u32, String>,
-) -> Option<(String, String)> {
+fn resolve_gep_register(line: &str, metadata: &HashMap<u32, String>) -> Option<(String, String)> {
     // Must be a GEP on %struct.State
     if !line.contains("getelementptr inbounds %struct.State") {
         return None;
@@ -1199,14 +1195,27 @@ attributes #0 = { noduplicate noinline nounwind optnone }
         assert_eq!(result.source_file, "llvm-link");
         assert_eq!(result.target_triple, "x86_64-unknown-windows-msvc-coff");
         assert_eq!(result.declared_intrinsics.len(), 2);
-        assert!(result.declared_intrinsics.contains(&"__remill_read_memory_8".to_string()));
-        assert!(result.declared_intrinsics.contains(&"__remill_write_memory_8".to_string()));
+        assert!(result
+            .declared_intrinsics
+            .contains(&"__remill_read_memory_8".to_string()));
+        assert!(result
+            .declared_intrinsics
+            .contains(&"__remill_write_memory_8".to_string()));
         // Struct defs, declares, attributes, metadata should be filtered out
         // Only the define and GEP instruction lines should remain
-        assert!(result.instruction_lines.iter().any(|l| l.contains("define ptr @lifted_5368709120")));
-        assert!(result.instruction_lines.iter().any(|l| l.contains("getelementptr")));
+        assert!(result
+            .instruction_lines
+            .iter()
+            .any(|l| l.contains("define ptr @lifted_5368709120")));
+        assert!(result
+            .instruction_lines
+            .iter()
+            .any(|l| l.contains("getelementptr")));
         // Struct defs should NOT be in instruction lines
-        assert!(!result.instruction_lines.iter().any(|l| l.contains("%struct.State = type")));
+        assert!(!result
+            .instruction_lines
+            .iter()
+            .any(|l| l.contains("%struct.State = type")));
         // Register metadata should be extracted
         assert_eq!(result.register_metadata.get(&6), Some(&"RAX".to_string()));
     }
@@ -1262,7 +1271,10 @@ define ptr @lifted_5368907311(ptr noalias %state, i64 %program_counter, ptr noal
         let module = parse_remill_ir(&ir).unwrap();
         // Should parse successfully with new format
         assert!(!module.name.is_empty());
-        assert!(!module.instructions.is_empty(), "should produce instructions from new format IR");
+        assert!(
+            !module.instructions.is_empty(),
+            "should produce instructions from new format IR"
+        );
         assert_eq!(module.arch, "amd64");
         assert_eq!(module.target_triple, "x86_64-unknown-windows-msvc-coff");
         // Should have register metadata

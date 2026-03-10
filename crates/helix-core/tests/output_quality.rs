@@ -6,7 +6,6 @@
 /// measured against concrete numbers.
 ///
 /// **Validates: Requirement 10.3** (absence of forbidden patterns in output)
-
 use helix_core::pipeline::pseudoc_emitter::validate_output;
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -43,14 +42,8 @@ fn output_real_has_known_violations() {
 
     // Categorise violations
     let undef_count = violations.iter().filter(|v| v.contains("__undef")).count();
-    let mangled_count = violations
-        .iter()
-        .filter(|v| v.contains("mangled"))
-        .count();
-    let register_count = violations
-        .iter()
-        .filter(|v| v.contains("register"))
-        .count();
+    let mangled_count = violations.iter().filter(|v| v.contains("mangled")).count();
+    let register_count = violations.iter().filter(|v| v.contains("register")).count();
 
     // The old output has __undef on almost every other line
     assert!(

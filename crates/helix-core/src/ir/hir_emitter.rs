@@ -44,11 +44,7 @@ impl Default for EmitOptions {
 }
 
 /// Emit a complete [`HirModule`] as pseudo-C source code.
-pub fn emit_module(
-    module: &HirModule,
-    signatures: &SignatureDb,
-    options: &EmitOptions,
-) -> String {
+pub fn emit_module(module: &HirModule, signatures: &SignatureDb, options: &EmitOptions) -> String {
     let mut out = String::new();
 
     out.push_str("// Decompiled by HexCore Helix\n");
@@ -129,7 +125,10 @@ fn emit_function(
             }
             _ => String::new(),
         };
-        out.push_str(&format!("{}{}  {};{}\n", options.indent, ty, local.name, comment));
+        out.push_str(&format!(
+            "{}{}  {};{}\n",
+            options.indent, ty, local.name, comment
+        ));
     }
 
     if !stack_locals.is_empty() || !reg_locals.is_empty() {
@@ -524,9 +523,7 @@ fn format_type(ty: &HirType) -> String {
                 .join(", ");
             format!("{}(*)({})", format_type(ret), params_str)
         }
-        HirType::Struct {
-            name: Some(n), ..
-        } => format!("struct {}", n),
+        HirType::Struct { name: Some(n), .. } => format!("struct {}", n),
         HirType::Struct { name: None, .. } => "struct <anon>".to_string(),
         HirType::Array {
             element,
@@ -550,8 +547,7 @@ fn resolve_call_target(
     match target {
         HirExpr::AddrLit { address, .. } => {
             if let Some(sig) = signatures.lookup(*address) {
-                let ret_ty =
-                    crate::analysis::type_propagation::parse_c_type_name(&sig.return_type);
+                let ret_ty = crate::analysis::type_propagation::parse_c_type_name(&sig.return_type);
                 (sig.name.clone(), ret_ty)
             } else {
                 (format!("sub_{:x}", address), fallback_ret.clone())
@@ -855,25 +851,35 @@ mod tests {
                 return_type: HirType::Void,
                 params: vec![],
                 locals: vec![],
-                body: vec![
-                    HirStmt::While {
-                        cond: HirExpr::Binary {
-                            op: HirBinOp::Ne,
-                            lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: Span::single(0x100) }),
-                            rhs: Box::new(HirExpr::IntLit { value: 0, ty: HirType::i32(), span: Span::single(0x100) }),
-                            ty: HirType::Bool,
+                body: vec![HirStmt::While {
+                    cond: HirExpr::Binary {
+                        op: HirBinOp::Ne,
+                        lhs: Box::new(HirExpr::Var {
+                            id: HirVarId(0),
                             span: Span::single(0x100),
-                        },
-                        body: vec![
-                            HirStmt::Assign {
-                                lhs: HirExpr::Var { id: HirVarId(0), span: Span::single(0x104) },
-                                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: Span::single(0x104) },
-                                span: Span::single(0x104),
-                            },
-                        ],
+                        }),
+                        rhs: Box::new(HirExpr::IntLit {
+                            value: 0,
+                            ty: HirType::i32(),
+                            span: Span::single(0x100),
+                        }),
+                        ty: HirType::Bool,
                         span: Span::single(0x100),
                     },
-                ],
+                    body: vec![HirStmt::Assign {
+                        lhs: HirExpr::Var {
+                            id: HirVarId(0),
+                            span: Span::single(0x104),
+                        },
+                        rhs: HirExpr::IntLit {
+                            value: 1,
+                            ty: HirType::i32(),
+                            span: Span::single(0x104),
+                        },
+                        span: Span::single(0x104),
+                    }],
+                    span: Span::single(0x100),
+                }],
                 calling_convention: None,
                 is_variadic: false,
                 span: Span::single(0x100),
@@ -899,32 +905,47 @@ mod tests {
                 return_type: HirType::Void,
                 params: vec![],
                 locals: vec![],
-                body: vec![
-                    HirStmt::If {
-                        cond: HirExpr::Binary {
-                            op: HirBinOp::Eq,
-                            lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: Span::single(0x100) }),
-                            rhs: Box::new(HirExpr::IntLit { value: 0, ty: HirType::i32(), span: Span::single(0x100) }),
-                            ty: HirType::Bool,
+                body: vec![HirStmt::If {
+                    cond: HirExpr::Binary {
+                        op: HirBinOp::Eq,
+                        lhs: Box::new(HirExpr::Var {
+                            id: HirVarId(0),
                             span: Span::single(0x100),
-                        },
-                        then_body: vec![
-                            HirStmt::Assign {
-                                lhs: HirExpr::Var { id: HirVarId(1), span: Span::single(0x104) },
-                                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: Span::single(0x104) },
-                                span: Span::single(0x104),
-                            },
-                        ],
-                        else_body: Some(vec![
-                            HirStmt::Assign {
-                                lhs: HirExpr::Var { id: HirVarId(1), span: Span::single(0x108) },
-                                rhs: HirExpr::IntLit { value: 2, ty: HirType::i32(), span: Span::single(0x108) },
-                                span: Span::single(0x108),
-                            },
-                        ]),
+                        }),
+                        rhs: Box::new(HirExpr::IntLit {
+                            value: 0,
+                            ty: HirType::i32(),
+                            span: Span::single(0x100),
+                        }),
+                        ty: HirType::Bool,
                         span: Span::single(0x100),
                     },
-                ],
+                    then_body: vec![HirStmt::Assign {
+                        lhs: HirExpr::Var {
+                            id: HirVarId(1),
+                            span: Span::single(0x104),
+                        },
+                        rhs: HirExpr::IntLit {
+                            value: 1,
+                            ty: HirType::i32(),
+                            span: Span::single(0x104),
+                        },
+                        span: Span::single(0x104),
+                    }],
+                    else_body: Some(vec![HirStmt::Assign {
+                        lhs: HirExpr::Var {
+                            id: HirVarId(1),
+                            span: Span::single(0x108),
+                        },
+                        rhs: HirExpr::IntLit {
+                            value: 2,
+                            ty: HirType::i32(),
+                            span: Span::single(0x108),
+                        },
+                        span: Span::single(0x108),
+                    }]),
+                    span: Span::single(0x100),
+                }],
                 calling_convention: None,
                 is_variadic: false,
                 span: Span::single(0x100),
@@ -956,8 +977,15 @@ mod tests {
                         span: Span::single(0x100),
                     },
                     HirStmt::Assign {
-                        lhs: HirExpr::Var { id: HirVarId(0), span: Span::single(0x104) },
-                        rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: Span::single(0x104) },
+                        lhs: HirExpr::Var {
+                            id: HirVarId(0),
+                            span: Span::single(0x104),
+                        },
+                        rhs: HirExpr::IntLit {
+                            value: 1,
+                            ty: HirType::i32(),
+                            span: Span::single(0x104),
+                        },
                         span: Span::single(0x104),
                     },
                     HirStmt::Goto {
@@ -976,6 +1004,10 @@ mod tests {
         let source = emit_module(&module, &sigs, &options);
 
         assert!(source.contains("loc_100:"), "should emit label: {}", source);
-        assert!(source.contains("goto loc_100;"), "should emit goto: {}", source);
+        assert!(
+            source.contains("goto loc_100;"),
+            "should emit goto: {}",
+            source
+        );
     }
 }

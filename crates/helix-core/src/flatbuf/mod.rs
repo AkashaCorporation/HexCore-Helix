@@ -4,8 +4,8 @@
 //! `cfg.fbs`, `ast.fbs` e `common.fbs` usando a crate `flatbuffers`.
 //! Gerado manualmente pois `flatc` não está disponível no ambiente de build.
 
-pub mod cfg;
 pub mod ast;
+pub mod cfg;
 
 /// File identifier para CFG FlatBuffers
 pub const CFG_FILE_IDENTIFIER: &str = "HCFG";

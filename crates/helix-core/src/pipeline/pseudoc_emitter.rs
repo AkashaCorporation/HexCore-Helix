@@ -5,7 +5,9 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{AstNode, DataType, Expression, Function, Statement, StorageClass, UnaryOp, BinaryOp, Variable};
+use crate::ast::{
+    AstNode, BinaryOp, DataType, Expression, Function, Statement, StorageClass, UnaryOp, Variable,
+};
 use crate::error::HelixError;
 use crate::pipeline::{EmitFormat, EmitOutput, Emitter};
 
@@ -147,26 +149,25 @@ impl PseudoCEmitter {
             (stack, reg, temp)
         };
 
-        let emit_local_group = |out: &mut String, line_num: &mut u32, locals: &[&Variable], indent: &str| {
-            for local in locals {
-                let ty = format_data_type(&local.ty);
-                let comment = match local.stack_offset {
-                    Some(off) => format!("  // [rsp+0x{:x}]", off),
-                    None => String::new(),
-                };
-                out.push_str(&format!(
-                    "{}{}  {};{}\n",
-                    indent, ty, local.name, comment
-                ));
-                *line_num += 1;
-            }
-        };
+        let emit_local_group =
+            |out: &mut String, line_num: &mut u32, locals: &[&Variable], indent: &str| {
+                for local in locals {
+                    let ty = format_data_type(&local.ty);
+                    let comment = match local.stack_offset {
+                        Some(off) => format!("  // [rsp+0x{:x}]", off),
+                        None => String::new(),
+                    };
+                    out.push_str(&format!("{}{}  {};{}\n", indent, ty, local.name, comment));
+                    *line_num += 1;
+                }
+            };
 
         emit_local_group(out, line_num, &stack_locals, &self.indent);
         emit_local_group(out, line_num, &register_locals, &self.indent);
         emit_local_group(out, line_num, &temp_locals, &self.indent);
 
-        let has_locals = !stack_locals.is_empty() || !register_locals.is_empty() || !temp_locals.is_empty();
+        let has_locals =
+            !stack_locals.is_empty() || !register_locals.is_empty() || !temp_locals.is_empty();
 
         if has_locals {
             out.push('\n');
@@ -389,37 +390,74 @@ fn collect_vars_in_stmt(stmt: &Statement, refs: &mut HashSet<String>) {
         }
         Statement::Expr(expr) => collect_vars_in_expr(expr, refs),
         Statement::Return(Some(expr)) => collect_vars_in_expr(expr, refs),
-        Statement::Return(None) | Statement::Break | Statement::Continue
-        | Statement::Goto(_) | Statement::Label(_) | Statement::Asm(_)
+        Statement::Return(None)
+        | Statement::Break
+        | Statement::Continue
+        | Statement::Goto(_)
+        | Statement::Label(_)
+        | Statement::Asm(_)
         | Statement::Comment(_) => {}
-        Statement::If { cond, then_body, else_body } => {
+        Statement::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             collect_vars_in_expr(cond, refs);
-            for s in then_body { collect_vars_in_stmt(s, refs); }
+            for s in then_body {
+                collect_vars_in_stmt(s, refs);
+            }
             if let Some(else_stmts) = else_body {
-                for s in else_stmts { collect_vars_in_stmt(s, refs); }
+                for s in else_stmts {
+                    collect_vars_in_stmt(s, refs);
+                }
             }
         }
         Statement::While { cond, body } => {
             collect_vars_in_expr(cond, refs);
-            for s in body { collect_vars_in_stmt(s, refs); }
+            for s in body {
+                collect_vars_in_stmt(s, refs);
+            }
         }
         Statement::DoWhile { body, cond } => {
-            for s in body { collect_vars_in_stmt(s, refs); }
+            for s in body {
+                collect_vars_in_stmt(s, refs);
+            }
             collect_vars_in_expr(cond, refs);
         }
-        Statement::For { init, cond, step, body } => {
-            if let Some(s) = init { collect_vars_in_stmt(s, refs); }
-            if let Some(e) = cond { collect_vars_in_expr(e, refs); }
-            if let Some(s) = step { collect_vars_in_stmt(s, refs); }
-            for s in body { collect_vars_in_stmt(s, refs); }
+        Statement::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(s) = init {
+                collect_vars_in_stmt(s, refs);
+            }
+            if let Some(e) = cond {
+                collect_vars_in_expr(e, refs);
+            }
+            if let Some(s) = step {
+                collect_vars_in_stmt(s, refs);
+            }
+            for s in body {
+                collect_vars_in_stmt(s, refs);
+            }
         }
-        Statement::Switch { expr, cases, default } => {
+        Statement::Switch {
+            expr,
+            cases,
+            default,
+        } => {
             collect_vars_in_expr(expr, refs);
             for case in cases {
-                for s in &case.body { collect_vars_in_stmt(s, refs); }
+                for s in &case.body {
+                    collect_vars_in_stmt(s, refs);
+                }
             }
             if let Some(default_body) = default {
-                for s in default_body { collect_vars_in_stmt(s, refs); }
+                for s in default_body {
+                    collect_vars_in_stmt(s, refs);
+                }
             }
         }
     }
@@ -427,7 +465,9 @@ fn collect_vars_in_stmt(stmt: &Statement, refs: &mut HashSet<String>) {
 
 fn collect_vars_in_expr(expr: &Expression, refs: &mut HashSet<String>) {
     match expr {
-        Expression::Var(var) => { refs.insert(var.name.clone()); }
+        Expression::Var(var) => {
+            refs.insert(var.name.clone());
+        }
         Expression::Unary { operand, .. } => collect_vars_in_expr(operand, refs),
         Expression::Binary { lhs, rhs, .. } => {
             collect_vars_in_expr(lhs, refs);
@@ -436,23 +476,31 @@ fn collect_vars_in_expr(expr: &Expression, refs: &mut HashSet<String>) {
         Expression::Cast { expr: inner, .. } => collect_vars_in_expr(inner, refs),
         Expression::Call { target, args } => {
             collect_vars_in_expr(target, refs);
-            for a in args { collect_vars_in_expr(a, refs); }
+            for a in args {
+                collect_vars_in_expr(a, refs);
+            }
         }
         Expression::Subscript { base, index } => {
             collect_vars_in_expr(base, refs);
             collect_vars_in_expr(index, refs);
         }
-        Expression::Member { expr: inner, .. }
-        | Expression::DerefMember { expr: inner, .. } => {
+        Expression::Member { expr: inner, .. } | Expression::DerefMember { expr: inner, .. } => {
             collect_vars_in_expr(inner, refs);
         }
-        Expression::Ternary { cond, then_expr, else_expr } => {
+        Expression::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
             collect_vars_in_expr(cond, refs);
             collect_vars_in_expr(then_expr, refs);
             collect_vars_in_expr(else_expr, refs);
         }
-        Expression::IntLit(_) | Expression::FloatLit(_) | Expression::StringLit(_)
-        | Expression::AddressLit(_) | Expression::Unknown(_) => {}
+        Expression::IntLit(_)
+        | Expression::FloatLit(_)
+        | Expression::StringLit(_)
+        | Expression::AddressLit(_)
+        | Expression::Unknown(_) => {}
     }
 }
 
@@ -650,10 +698,7 @@ pub fn validate_output(source: &str) -> Vec<String> {
         while let Some(pos) = source[start..].find(mangled_prefix) {
             let abs_pos = start + pos;
             if !is_inside_line_comment(source, abs_pos) {
-                violations.push(format!(
-                    "mangled Remill name found at offset {}",
-                    abs_pos
-                ));
+                violations.push(format!("mangled Remill name found at offset {}", abs_pos));
             }
             start = abs_pos + mangled_prefix.len();
         }
@@ -661,8 +706,8 @@ pub fn validate_output(source: &str) -> Vec<String> {
 
     // 3. Raw register names outside comments (case-insensitive, word-boundary)
     let registers = [
-        "rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi",
-        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15",
     ];
     let lower_source = source.to_ascii_lowercase();
     for reg in &registers {
@@ -732,7 +777,10 @@ mod tests {
             }],
             body: vec![Statement::Return(Some(Expression::Var(Variable {
                 name: "var_8".to_string(),
-                ty: DataType::Int { signed: true, bits: 32 },
+                ty: DataType::Int {
+                    signed: true,
+                    bits: 32,
+                },
                 storage: StorageClass::Stack,
                 stack_offset: Some(8),
             })))],
@@ -785,7 +833,10 @@ mod tests {
             op: BinaryOp::Add,
             lhs: Box::new(Expression::Var(Variable {
                 name: "a".to_string(),
-                ty: DataType::Int { signed: true, bits: 32 },
+                ty: DataType::Int {
+                    signed: true,
+                    bits: 32,
+                },
                 storage: StorageClass::Register,
                 stack_offset: None,
             })),
@@ -801,7 +852,11 @@ mod tests {
     fn validate_clean_output() {
         let source = "// Decompiled by HexCore Helix\nvoid main(void) {\n    int32_t var_8;\n    return 0;\n}\n";
         let violations = validate_output(source);
-        assert!(violations.is_empty(), "expected no violations, got: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got: {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -839,7 +894,8 @@ mod tests {
         // rax is inside a comment — should not be flagged
         assert!(
             !violations.iter().any(|v| v.contains("rax")),
-            "register in comment should not be flagged: {:?}", violations
+            "register in comment should not be flagged: {:?}",
+            violations
         );
     }
 
@@ -856,7 +912,8 @@ mod tests {
         let violations = validate_output(source);
         assert!(
             !violations.iter().any(|v| v.contains("mangled")),
-            "mangled name in comment should not be flagged: {:?}", violations
+            "mangled name in comment should not be flagged: {:?}",
+            violations
         );
     }
 
@@ -867,8 +924,8 @@ mod tests {
         let violations = validate_output(source);
         assert!(
             !violations.iter().any(|v| v.contains("r8")),
-            "r8 inside identifier should not be flagged: {:?}", violations
+            "r8 inside identifier should not be flagged: {:?}",
+            violations
         );
     }
-
 }

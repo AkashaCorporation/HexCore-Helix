@@ -116,34 +116,52 @@ pub fn deserialize_ast(buf: &[u8]) -> Result<AstData, String> {
 // ── Helpers de leitura (mesma lógica do cfg.rs) ──────────────────────
 
 fn read_u32(buf: &[u8], pos: usize) -> u32 {
-    if pos + 4 > buf.len() { return 0; }
-    u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]])
+    if pos + 4 > buf.len() {
+        return 0;
+    }
+    u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
 }
 
 fn read_u16(buf: &[u8], pos: usize) -> u16 {
-    if pos + 2 > buf.len() { return 0; }
-    u16::from_le_bytes([buf[pos], buf[pos+1]])
+    if pos + 2 > buf.len() {
+        return 0;
+    }
+    u16::from_le_bytes([buf[pos], buf[pos + 1]])
 }
 
 fn read_u64(buf: &[u8], pos: usize) -> u64 {
-    if pos + 8 > buf.len() { return 0; }
+    if pos + 8 > buf.len() {
+        return 0;
+    }
     u64::from_le_bytes([
-        buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-        buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+        buf[pos],
+        buf[pos + 1],
+        buf[pos + 2],
+        buf[pos + 3],
+        buf[pos + 4],
+        buf[pos + 5],
+        buf[pos + 6],
+        buf[pos + 7],
     ])
 }
 
 fn read_fb_string(buf: &[u8], table_pos: usize, field_offset: u16) -> Option<String> {
     let vtable_offset = read_u32(buf, table_pos) as i32;
     let vtable_pos = (table_pos as i32 - vtable_offset) as usize;
-    if vtable_pos + 4 > buf.len() { return None; }
+    if vtable_pos + 4 > buf.len() {
+        return None;
+    }
 
     let vtable_size = read_u16(buf, vtable_pos) as usize;
     let field_idx = field_offset as usize;
-    if field_idx + 2 > vtable_size { return None; }
+    if field_idx + 2 > vtable_size {
+        return None;
+    }
 
     let field_rel = read_u16(buf, vtable_pos + field_idx) as usize;
-    if field_rel == 0 { return None; }
+    if field_rel == 0 {
+        return None;
+    }
 
     let string_offset_pos = table_pos + field_rel;
     let string_rel = read_u32(buf, string_offset_pos) as usize;
@@ -151,7 +169,9 @@ fn read_fb_string(buf: &[u8], table_pos: usize, field_offset: u16) -> Option<Str
 
     let str_len = read_u32(buf, string_pos) as usize;
     let str_start = string_pos + 4;
-    if str_start + str_len > buf.len() { return None; }
+    if str_start + str_len > buf.len() {
+        return None;
+    }
 
     String::from_utf8(buf[str_start..str_start + str_len].to_vec()).ok()
 }
@@ -159,14 +179,20 @@ fn read_fb_string(buf: &[u8], table_pos: usize, field_offset: u16) -> Option<Str
 fn read_fb_u64(buf: &[u8], table_pos: usize, field_offset: u16) -> u64 {
     let vtable_offset = read_u32(buf, table_pos) as i32;
     let vtable_pos = (table_pos as i32 - vtable_offset) as usize;
-    if vtable_pos + 4 > buf.len() { return 0; }
+    if vtable_pos + 4 > buf.len() {
+        return 0;
+    }
 
     let vtable_size = read_u16(buf, vtable_pos) as usize;
     let field_idx = field_offset as usize;
-    if field_idx + 2 > vtable_size { return 0; }
+    if field_idx + 2 > vtable_size {
+        return 0;
+    }
 
     let field_rel = read_u16(buf, vtable_pos + field_idx) as usize;
-    if field_rel == 0 { return 0; }
+    if field_rel == 0 {
+        return 0;
+    }
 
     read_u64(buf, table_pos + field_rel)
 }
@@ -174,14 +200,20 @@ fn read_fb_u64(buf: &[u8], table_pos: usize, field_offset: u16) -> u64 {
 fn read_fb_u32(buf: &[u8], table_pos: usize, field_offset: u16) -> u32 {
     let vtable_offset = read_u32(buf, table_pos) as i32;
     let vtable_pos = (table_pos as i32 - vtable_offset) as usize;
-    if vtable_pos + 4 > buf.len() { return 0; }
+    if vtable_pos + 4 > buf.len() {
+        return 0;
+    }
 
     let vtable_size = read_u16(buf, vtable_pos) as usize;
     let field_idx = field_offset as usize;
-    if field_idx + 2 > vtable_size { return 0; }
+    if field_idx + 2 > vtable_size {
+        return 0;
+    }
 
     let field_rel = read_u16(buf, vtable_pos + field_idx) as usize;
-    if field_rel == 0 { return 0; }
+    if field_rel == 0 {
+        return 0;
+    }
 
     read_u32(buf, table_pos + field_rel)
 }
@@ -189,14 +221,20 @@ fn read_fb_u32(buf: &[u8], table_pos: usize, field_offset: u16) -> u32 {
 fn read_fb_vector_tables(buf: &[u8], table_pos: usize, field_offset: u16) -> Vec<usize> {
     let vtable_offset = read_u32(buf, table_pos) as i32;
     let vtable_pos = (table_pos as i32 - vtable_offset) as usize;
-    if vtable_pos + 4 > buf.len() { return Vec::new(); }
+    if vtable_pos + 4 > buf.len() {
+        return Vec::new();
+    }
 
     let vtable_size = read_u16(buf, vtable_pos) as usize;
     let field_idx = field_offset as usize;
-    if field_idx + 2 > vtable_size { return Vec::new(); }
+    if field_idx + 2 > vtable_size {
+        return Vec::new();
+    }
 
     let field_rel = read_u16(buf, vtable_pos + field_idx) as usize;
-    if field_rel == 0 { return Vec::new(); }
+    if field_rel == 0 {
+        return Vec::new();
+    }
 
     let vec_offset_pos = table_pos + field_rel;
     let vec_rel = read_u32(buf, vec_offset_pos) as usize;
@@ -222,16 +260,14 @@ mod tests {
     fn ast_roundtrip() {
         let data = AstData {
             module_name: "wwz_module".into(),
-            functions: vec![
-                AstFunctionData {
-                    name: "sub_140000000".into(),
-                    address: 0x140000000,
-                    source: "int64_t sub_140000000(void) {\n    rax = rbx + 1;\n}".into(),
-                    param_count: 0,
-                    local_count: 2,
-                    stmt_count: 1,
-                },
-            ],
+            functions: vec![AstFunctionData {
+                name: "sub_140000000".into(),
+                address: 0x140000000,
+                source: "int64_t sub_140000000(void) {\n    rax = rbx + 1;\n}".into(),
+                param_count: 0,
+                local_count: 2,
+                stmt_count: 1,
+            }],
         };
 
         let buf = serialize_ast(&data).expect("serialize falhou");

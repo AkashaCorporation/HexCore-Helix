@@ -7,8 +7,8 @@
 //!   06-helix-mlir.c    — C++ MLIR engine output
 //!   06-helix-rust.c    — Pure Rust pipeline output
 
-use helix_core::ffi::EngineHandle;
 use helix_core::decompile_ir;
+use helix_core::ffi::EngineHandle;
 use std::path::Path;
 
 fn main() {
@@ -29,7 +29,11 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Input: {}", file);
-    println!("  IR size: {} bytes ({} lines)", ir.len(), ir.lines().count());
+    println!(
+        "  IR size: {} bytes ({} lines)",
+        ir.len(),
+        ir.lines().count()
+    );
     println!();
 
     // ─── Test 1: MLIR C++ Engine ───────────────────────────────────────
@@ -40,7 +44,11 @@ fn main() {
             let out_path = output_dir.join("06-helix-mlir.c");
             std::fs::write(&out_path, source).expect("Failed to write MLIR output");
             println!("  ✅ MLIR pipeline succeeded!");
-            println!("  Output: {} bytes ({} lines)", source.len(), source.lines().count());
+            println!(
+                "  Output: {} bytes ({} lines)",
+                source.len(),
+                source.lines().count()
+            );
             println!("  Saved: {}", out_path.display());
         }
         Err(e) => {
@@ -57,7 +65,11 @@ fn main() {
             let out_path = output_dir.join("06-helix-rust.c");
             std::fs::write(&out_path, source).expect("Failed to write Rust output");
             println!("  ✅ Rust pipeline succeeded!");
-            println!("  Output: {} bytes ({} lines)", source.len(), source.lines().count());
+            println!(
+                "  Output: {} bytes ({} lines)",
+                source.len(),
+                source.lines().count()
+            );
             println!("  Saved: {}", out_path.display());
         }
         Err(e) => {
@@ -74,8 +86,16 @@ fn main() {
     if mlir_ok && rust_ok {
         let mlir_src = mlir_result.as_ref().unwrap();
         let rust_src = rust_result.as_ref().unwrap();
-        println!("  MLIR:  {} lines, {} bytes", mlir_src.lines().count(), mlir_src.len());
-        println!("  Rust:  {} lines, {} bytes", rust_src.lines().count(), rust_src.len());
+        println!(
+            "  MLIR:  {} lines, {} bytes",
+            mlir_src.lines().count(),
+            mlir_src.len()
+        );
+        println!(
+            "  Rust:  {} lines, {} bytes",
+            rust_src.lines().count(),
+            rust_src.len()
+        );
 
         if mlir_src == rust_src {
             println!("  ⚠️  Outputs are identical (MLIR may have fallen back to Rust)");
@@ -109,7 +129,8 @@ fn test_mlir_pipeline(ir: &str) -> Result<String, String> {
     println!("  Creating engine took: {:?}", start.elapsed());
 
     let decompile_start = std::time::Instant::now();
-    let result = engine.decompile_ir_text(ir)
+    let result = engine
+        .decompile_ir_text(ir)
         .map_err(|e| format!("decompile_ir_text failed: {}", e))?;
 
     println!("  Decompilation took: {:?}", decompile_start.elapsed());
@@ -120,8 +141,7 @@ fn test_mlir_pipeline(ir: &str) -> Result<String, String> {
 fn test_rust_pipeline(ir: &str) -> Result<String, String> {
     let start = std::time::Instant::now();
 
-    let output = decompile_ir(ir)
-        .map_err(|e| format!("decompile_ir failed: {}", e))?;
+    let output = decompile_ir(ir).map_err(|e| format!("decompile_ir failed: {}", e))?;
 
     println!("  Decompilation took: {:?}", start.elapsed());
     println!("  Functions: {}", output.function_count);

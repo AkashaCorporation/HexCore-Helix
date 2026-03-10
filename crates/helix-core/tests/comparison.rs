@@ -3,7 +3,6 @@
 ///
 /// Requer os arquivos de teste em `tests/Remill-*/`.
 /// Se ausentes, o teste de comparação é ignorado automaticamente.
-
 use helix_core::decompile::decompile_ir_via_hir;
 
 // ── Métricas ──────────────────────────────────────────────────────────
@@ -33,7 +32,8 @@ fn count_temp_vars(code: &str) -> usize {
     let mut i = 0;
     while i < len {
         if bytes[i] == b't' {
-            let is_word_start = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+            let is_word_start =
+                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
             if is_word_start && i + 1 < len && bytes[i + 1].is_ascii_digit() {
                 let start = i;
                 i += 1;
@@ -57,7 +57,9 @@ fn count_boilerplate_ops(code: &str) -> usize {
     let mut count = 0;
     for line in code.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("//") { continue; }
+        if trimmed.starts_with("//") {
+            continue;
+        }
         for kw in &boilerplate {
             if trimmed.contains(kw) {
                 count += 1;
@@ -70,9 +72,12 @@ fn count_boilerplate_ops(code: &str) -> usize {
 
 /// Verifica presença de estruturas de controle
 fn has_control_structures(code: &str) -> bool {
-    code.contains("if (") || code.contains("if(")
-        || code.contains("while (") || code.contains("while(")
-        || code.contains("for (") || code.contains("for(")
+    code.contains("if (")
+        || code.contains("if(")
+        || code.contains("while (")
+        || code.contains("while(")
+        || code.contains("for (")
+        || code.contains("for(")
 }
 
 fn compute_metrics(code: &str) -> ComparisonMetrics {
@@ -94,17 +99,44 @@ struct TestCase {
 }
 
 const CASES: &[TestCase] = &[
-    TestCase { name: "camera-init", dir: "Remill-1", ll_file: "01-camera-init.ll", rellic_file: "02-camera-init.c" },
-    TestCase { name: "aim-assist-init", dir: "Remill-2", ll_file: "01-aim-assist-init.ll", rellic_file: "02-aim-assist-init.c" },
-    TestCase { name: "swarm-serialization", dir: "Remill-3", ll_file: "01-swarm-serialization.ll", rellic_file: "02-swarm-serialization.c" },
-    TestCase { name: "swarm-write", dir: "Remill-4", ll_file: "01-swarm-write.ll", rellic_file: "02-swarm-write.c" },
-    TestCase { name: "name-writing", dir: "Remill-5", ll_file: "01-name-writing.ll", rellic_file: "02-name-writing.c" },
+    TestCase {
+        name: "camera-init",
+        dir: "Remill-1",
+        ll_file: "01-camera-init.ll",
+        rellic_file: "02-camera-init.c",
+    },
+    TestCase {
+        name: "aim-assist-init",
+        dir: "Remill-2",
+        ll_file: "01-aim-assist-init.ll",
+        rellic_file: "02-aim-assist-init.c",
+    },
+    TestCase {
+        name: "swarm-serialization",
+        dir: "Remill-3",
+        ll_file: "01-swarm-serialization.ll",
+        rellic_file: "02-swarm-serialization.c",
+    },
+    TestCase {
+        name: "swarm-write",
+        dir: "Remill-4",
+        ll_file: "01-swarm-write.ll",
+        rellic_file: "02-swarm-write.c",
+    },
+    TestCase {
+        name: "name-writing",
+        dir: "Remill-5",
+        ll_file: "01-name-writing.ll",
+        rellic_file: "02-name-writing.c",
+    },
 ];
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf()
 }
 
@@ -126,7 +158,10 @@ fn load_rellic(case: &TestCase) -> Option<(String, ComparisonMetrics)> {
     Some((code, metrics))
 }
 
-fn generate_report(cases: &[TestCase], results: &[(ComparisonMetrics, ComparisonMetrics)]) -> String {
+fn generate_report(
+    cases: &[TestCase],
+    results: &[(ComparisonMetrics, ComparisonMetrics)],
+) -> String {
     let mut md = String::new();
     md.push_str("# Helix vs Rellic — Relatório de Comparação\n\n");
     md.push_str("Data: 2026-02-23\n\n");
@@ -146,11 +181,22 @@ fn generate_report(cases: &[TestCase], results: &[(ComparisonMetrics, Comparison
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             case.name,
-            helix_m.effective_lines, rellic_m.effective_lines,
-            helix_m.temp_var_count, rellic_m.temp_var_count,
-            helix_m.boilerplate_ops, rellic_m.boilerplate_ops,
-            if helix_m.has_control_structures { "✓" } else { "✗" },
-            if rellic_m.has_control_structures { "✓" } else { "✗" },
+            helix_m.effective_lines,
+            rellic_m.effective_lines,
+            helix_m.temp_var_count,
+            rellic_m.temp_var_count,
+            helix_m.boilerplate_ops,
+            rellic_m.boilerplate_ops,
+            if helix_m.has_control_structures {
+                "✓"
+            } else {
+                "✗"
+            },
+            if rellic_m.has_control_structures {
+                "✓"
+            } else {
+                "✗"
+            },
             status,
         ));
     }
@@ -185,21 +231,34 @@ fn comparison_helix_vs_rellic() {
     }
 
     // Gera relatório
-    let report = generate_report(&available_cases.iter().map(|c| TestCase {
-        name: c.name, dir: c.dir, ll_file: c.ll_file, rellic_file: c.rellic_file,
-    }).collect::<Vec<_>>(), &results);
+    let report = generate_report(
+        &available_cases
+            .iter()
+            .map(|c| TestCase {
+                name: c.name,
+                dir: c.dir,
+                ll_file: c.ll_file,
+                rellic_file: c.rellic_file,
+            })
+            .collect::<Vec<_>>(),
+        &results,
+    );
 
     // Salva em tests/reports/
     let report_path = workspace_root().join("tests/reports/helix-vs-rellic.md");
     let _ = std::fs::write(&report_path, &report);
 
     // Verificação: Helix deve produzir menos linhas que Rellic na maioria dos casos
-    let helix_wins = results.iter().filter(|(h, r)| h.effective_lines < r.effective_lines).count();
+    let helix_wins = results
+        .iter()
+        .filter(|(h, r)| h.effective_lines < r.effective_lines)
+        .count();
     let total = results.len();
     assert!(
         helix_wins * 2 >= total,
         "Helix deveria ser mais conciso que Rellic na maioria dos casos, mas ganhou apenas {}/{}",
-        helix_wins, total
+        helix_wins,
+        total
     );
 }
 

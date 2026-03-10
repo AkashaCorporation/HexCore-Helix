@@ -135,7 +135,13 @@ fn recover_function_calls(
         if call_indices.contains(&i) {
             if let HirStmt::Assign {
                 lhs,
-                rhs: HirExpr::Call { target, ret_ty, span, .. },
+                rhs:
+                    HirExpr::Call {
+                        target,
+                        ret_ty,
+                        span,
+                        ..
+                    },
                 span: stmt_span,
             } = stmt
             {
@@ -151,7 +157,11 @@ fn recover_function_calls(
                     ret_ty.clone()
                 } else {
                     // Default: if result is used, assume void* (common for Win64)
-                    if used { HirType::void_ptr() } else { HirType::Void }
+                    if used {
+                        HirType::void_ptr()
+                    } else {
+                        HirType::Void
+                    }
                 };
 
                 if !args.is_empty() {
@@ -368,7 +378,10 @@ fn resolve_stmt_from_state(
             expr: resolve_expr_from_state(expr, state, var_names),
             span: *span,
         },
-        HirStmt::Return { value: Some(expr), span } => HirStmt::Return {
+        HirStmt::Return {
+            value: Some(expr),
+            span,
+        } => HirStmt::Return {
             value: Some(resolve_expr_from_state(expr, state, var_names)),
             span: *span,
         },
@@ -427,14 +440,25 @@ fn resolve_expr_from_state(
             }
             expr.clone()
         }
-        HirExpr::Binary { op, lhs, rhs, ty, span } => HirExpr::Binary {
+        HirExpr::Binary {
+            op,
+            lhs,
+            rhs,
+            ty,
+            span,
+        } => HirExpr::Binary {
             op: *op,
             lhs: Box::new(resolve_expr_from_state(lhs, state, var_names)),
             rhs: Box::new(resolve_expr_from_state(rhs, state, var_names)),
             ty: ty.clone(),
             span: *span,
         },
-        HirExpr::Unary { op, operand, ty, span } => HirExpr::Unary {
+        HirExpr::Unary {
+            op,
+            operand,
+            ty,
+            span,
+        } => HirExpr::Unary {
             op: *op,
             operand: Box::new(resolve_expr_from_state(operand, state, var_names)),
             ty: ty.clone(),
@@ -469,7 +493,11 @@ fn mark_consumed_for_call(
             break;
         }
 
-        if let HirStmt::Assign { lhs: HirExpr::Var { id, .. }, .. } = stmt {
+        if let HirStmt::Assign {
+            lhs: HirExpr::Var { id, .. },
+            ..
+        } = stmt
+        {
             if let Some(name) = var_names.get(id) {
                 let lower = name.to_lowercase();
                 if WIN64_ARG_REGS.contains(&lower.as_str()) {
@@ -492,11 +520,18 @@ fn mark_consumed_for_call(
 fn find_call_indices(body: &[HirStmt]) -> Vec<usize> {
     body.iter()
         .enumerate()
-        .filter(|(_, stmt)| matches!(
-            stmt,
-            HirStmt::Assign { rhs: HirExpr::Call { .. }, .. }
-            | HirStmt::Expr { expr: HirExpr::Call { .. }, .. }
-        ))
+        .filter(|(_, stmt)| {
+            matches!(
+                stmt,
+                HirStmt::Assign {
+                    rhs: HirExpr::Call { .. },
+                    ..
+                } | HirStmt::Expr {
+                    expr: HirExpr::Call { .. },
+                    ..
+                }
+            )
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -505,16 +540,20 @@ fn find_call_indices(body: &[HirStmt]) -> Vec<usize> {
 fn is_boundary(stmt: &HirStmt) -> bool {
     matches!(
         stmt,
-        HirStmt::Assign { rhs: HirExpr::Call { .. }, .. }
-        | HirStmt::Expr { expr: HirExpr::Call { .. }, .. }
-        | HirStmt::Return { .. }
-        | HirStmt::If { .. }
-        | HirStmt::While { .. }
-        | HirStmt::Switch { .. }
-        | HirStmt::Break { .. }
-        | HirStmt::Continue { .. }
-        | HirStmt::Goto { .. }
-        | HirStmt::Label { .. }
+        HirStmt::Assign {
+            rhs: HirExpr::Call { .. },
+            ..
+        } | HirStmt::Expr {
+            expr: HirExpr::Call { .. },
+            ..
+        } | HirStmt::Return { .. }
+            | HirStmt::If { .. }
+            | HirStmt::While { .. }
+            | HirStmt::Switch { .. }
+            | HirStmt::Break { .. }
+            | HirStmt::Continue { .. }
+            | HirStmt::Goto { .. }
+            | HirStmt::Label { .. }
     )
 }
 
@@ -522,16 +561,20 @@ fn is_boundary(stmt: &HirStmt) -> bool {
 fn is_stack_adjustment(stmt: &HirStmt, var_names: &HashMap<HirVarId, String>) -> bool {
     if let HirStmt::Assign {
         lhs: HirExpr::Var { id, .. },
-        rhs: HirExpr::Binary { op: HirBinOp::Sub, lhs: bin_lhs, rhs: bin_rhs, .. },
+        rhs:
+            HirExpr::Binary {
+                op: HirBinOp::Sub,
+                lhs: bin_lhs,
+                rhs: bin_rhs,
+                ..
+            },
         ..
     } = stmt
     {
         if let Some(name) = var_names.get(id) {
             if name.to_lowercase() == "rsp" {
                 if let HirExpr::Var { id: lhs_id, .. } = bin_lhs.as_ref() {
-                    if lhs_id == id
-                        && matches!(bin_rhs.as_ref(), HirExpr::IntLit { .. })
-                    {
+                    if lhs_id == id && matches!(bin_rhs.as_ref(), HirExpr::IntLit { .. }) {
                         return true;
                     }
                 }
@@ -551,7 +594,10 @@ fn is_result_used(
 ) -> bool {
     // Get the RAX var_id from the call's LHS
     let rax_id = match &body[call_idx] {
-        HirStmt::Assign { lhs: HirExpr::Var { id, .. }, .. } => {
+        HirStmt::Assign {
+            lhs: HirExpr::Var { id, .. },
+            ..
+        } => {
             if var_names.get(id).map(|n| n.to_lowercase()) == Some("rax".to_string()) {
                 *id
             } else {
@@ -572,9 +618,13 @@ fn is_result_used(
         // Stop at next call or return
         if matches!(
             stmt,
-            HirStmt::Assign { rhs: HirExpr::Call { .. }, .. }
-            | HirStmt::Expr { expr: HirExpr::Call { .. }, .. }
-            | HirStmt::Return { .. }
+            HirStmt::Assign {
+                rhs: HirExpr::Call { .. },
+                ..
+            } | HirStmt::Expr {
+                expr: HirExpr::Call { .. },
+                ..
+            } | HirStmt::Return { .. }
         ) {
             return false;
         }
@@ -588,7 +638,9 @@ fn stmt_reads_var(stmt: &HirStmt, target_id: HirVarId) -> bool {
     match stmt {
         HirStmt::Assign { rhs, .. } => expr_references_var(rhs, target_id),
         HirStmt::Expr { expr, .. } => expr_references_var(expr, target_id),
-        HirStmt::Return { value: Some(expr), .. } => expr_references_var(expr, target_id),
+        HirStmt::Return {
+            value: Some(expr), ..
+        } => expr_references_var(expr, target_id),
         _ => false,
     }
 }
@@ -596,7 +648,10 @@ fn stmt_reads_var(stmt: &HirStmt, target_id: HirVarId) -> bool {
 /// Check if a statement defines (writes to) a particular variable.
 fn stmt_defines_var(stmt: &HirStmt, target_id: HirVarId) -> bool {
     match stmt {
-        HirStmt::Assign { lhs: HirExpr::Var { id, .. }, .. } => *id == target_id,
+        HirStmt::Assign {
+            lhs: HirExpr::Var { id, .. },
+            ..
+        } => *id == target_id,
         HirStmt::VarDecl { var_id, .. } => *var_id == target_id,
         _ => false,
     }
@@ -620,7 +675,12 @@ fn expr_references_var(expr: &HirExpr, target_id: HirVarId) -> bool {
         }
         HirExpr::FieldAccess { expr, .. } => expr_references_var(expr, target_id),
         HirExpr::DerefFieldAccess { expr, .. } => expr_references_var(expr, target_id),
-        HirExpr::Ternary { cond, then_expr, else_expr, .. } => {
+        HirExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
             expr_references_var(cond, target_id)
                 || expr_references_var(then_expr, target_id)
                 || expr_references_var(else_expr, target_id)
@@ -723,10 +783,17 @@ fn collect_read_vars(stmt: &HirStmt, out: &mut HashSet<HirVarId>) {
         HirStmt::Expr { expr, .. } => {
             collect_read_vars_from_expr(expr, out);
         }
-        HirStmt::Return { value: Some(expr), .. } => {
+        HirStmt::Return {
+            value: Some(expr), ..
+        } => {
             collect_read_vars_from_expr(expr, out);
         }
-        HirStmt::If { cond, then_body, else_body, .. } => {
+        HirStmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
             collect_read_vars_from_expr(cond, out);
             for s in then_body {
                 collect_read_vars(s, out);
@@ -796,7 +863,12 @@ fn collect_read_vars_from_expr(expr: &HirExpr, out: &mut HashSet<HirVarId>) {
         HirExpr::DerefFieldAccess { expr, .. } => {
             collect_read_vars_from_expr(expr, out);
         }
-        HirExpr::Ternary { cond, then_expr, else_expr, .. } => {
+        HirExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
             collect_read_vars_from_expr(cond, out);
             collect_read_vars_from_expr(then_expr, out);
             collect_read_vars_from_expr(else_expr, out);
@@ -821,7 +893,10 @@ fn has_side_effects(expr: &HirExpr) -> bool {
 /// is never read again, because they represent meaningful data flow.
 fn rhs_reads_memory(expr: &HirExpr) -> bool {
     match expr {
-        HirExpr::Unary { op: HirUnaryOp::Deref, .. } => true,
+        HirExpr::Unary {
+            op: HirUnaryOp::Deref,
+            ..
+        } => true,
         HirExpr::Subscript { .. } => true,
         HirExpr::Binary { lhs, rhs, .. } => rhs_reads_memory(lhs) || rhs_reads_memory(rhs),
         HirExpr::Cast { expr, .. } => rhs_reads_memory(expr),
@@ -852,11 +927,7 @@ fn derive_result_name(target: &HirExpr, signatures: &SignatureDb, counter: u32) 
             // Use abbreviated function name
             let name = &sig.name;
             // Truncate long names
-            let short = if name.len() > 16 {
-                &name[..16]
-            } else {
-                name
-            };
+            let short = if name.len() > 16 { &name[..16] } else { name };
             return format!("result_{}", short);
         }
         // Use last 4 hex digits of address
@@ -876,9 +947,7 @@ fn derive_result_name(target: &HirExpr, signatures: &SignatureDb, counter: u32) 
 fn is_simple_expr(expr: &HirExpr) -> bool {
     matches!(
         expr,
-        HirExpr::IntLit { .. }
-            | HirExpr::AddrLit { .. }
-            | HirExpr::Var { .. }
+        HirExpr::IntLit { .. } | HirExpr::AddrLit { .. } | HirExpr::Var { .. }
     )
 }
 
@@ -980,14 +1049,28 @@ mod tests {
         let result = recover_function_calls(&mut func, &sigs);
 
         assert_eq!(result.calls_recovered, 1, "should recover 1 call");
-        assert_eq!(result.args_recovered, 3, "should recover 3 args (rcx, rdx, r8)");
-        assert!(result.stmts_eliminated >= 3, "should eliminate arg-setup stmts");
+        assert_eq!(
+            result.args_recovered, 3,
+            "should recover 3 args (rcx, rdx, r8)"
+        );
+        assert!(
+            result.stmts_eliminated >= 3,
+            "should eliminate arg-setup stmts"
+        );
 
         // The call should now have args
         let has_call_with_args = func.body.iter().any(|s| {
-            if let HirStmt::Expr { expr: HirExpr::Call { args, .. }, .. } = s {
+            if let HirStmt::Expr {
+                expr: HirExpr::Call { args, .. },
+                ..
+            } = s
+            {
                 args.len() == 3
-            } else if let HirStmt::Assign { rhs: HirExpr::Call { args, .. }, .. } = s {
+            } else if let HirStmt::Assign {
+                rhs: HirExpr::Call { args, .. },
+                ..
+            } = s
+            {
                 args.len() == 3
             } else {
                 false
@@ -1041,7 +1124,11 @@ mod tests {
 
         // Should have a new local variable with descriptive name
         let has_result = func.locals.iter().any(|v| v.name.starts_with("result_"));
-        assert!(has_result, "should have result_ var in locals: {:?}", func.locals.iter().map(|v| &v.name).collect::<Vec<_>>());
+        assert!(
+            has_result,
+            "should have result_ var in locals: {:?}",
+            func.locals.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1071,9 +1158,19 @@ mod tests {
 
         // Should be an Expr statement, not an Assign
         let has_expr_call = func.body.iter().any(|s| {
-            matches!(s, HirStmt::Expr { expr: HirExpr::Call { .. }, .. })
+            matches!(
+                s,
+                HirStmt::Expr {
+                    expr: HirExpr::Call { .. },
+                    ..
+                }
+            )
         });
-        assert!(has_expr_call, "unused result should become Expr stmt: {:?}", func.body);
+        assert!(
+            has_expr_call,
+            "unused result should become Expr stmt: {:?}",
+            func.body
+        );
     }
 
     #[test]
@@ -1121,10 +1218,7 @@ mod tests {
             address: 0x500,
             return_type: HirType::Void,
             params: vec![],
-            locals: vec![
-                mk_reg_var(0, "rax"),
-                mk_reg_var(1, "rcx"),
-            ],
+            locals: vec![mk_reg_var(0, "rax"), mk_reg_var(1, "rcx")],
             body: vec![
                 // rax = call sub_1000()
                 mk_call_stmt(0x1000, 0),
@@ -1159,16 +1253,20 @@ mod tests {
         assert!(result.args_recovered >= 1, "should recover at least 1 arg");
 
         // The second call should have the first call's result as its argument
-        let call_with_result_arg = func.body.iter().any(|s| {
-            match s {
-                HirStmt::Expr { expr: HirExpr::Call { args, .. }, .. } => {
-                    args.iter().any(|a| matches!(a, HirExpr::Var { id, .. } if id.0 >= 1000))
-                }
-                HirStmt::Assign { rhs: HirExpr::Call { args, .. }, .. } => {
-                    args.iter().any(|a| matches!(a, HirExpr::Var { id, .. } if id.0 >= 1000))
-                }
-                _ => false,
-            }
+        let call_with_result_arg = func.body.iter().any(|s| match s {
+            HirStmt::Expr {
+                expr: HirExpr::Call { args, .. },
+                ..
+            } => args
+                .iter()
+                .any(|a| matches!(a, HirExpr::Var { id, .. } if id.0 >= 1000)),
+            HirStmt::Assign {
+                rhs: HirExpr::Call { args, .. },
+                ..
+            } => args
+                .iter()
+                .any(|a| matches!(a, HirExpr::Var { id, .. } if id.0 >= 1000)),
+            _ => false,
         });
         assert!(call_with_result_arg, "second call should have v0 as arg");
     }
@@ -1178,26 +1276,24 @@ mod tests {
         let mut module = HirModule {
             name: "test.exe".into(),
             arch: "amd64".into(),
-            functions: vec![
-                HirFunction {
-                    name: "sub_100".into(),
-                    address: 0x100,
-                    return_type: HirType::Void,
-                    params: vec![],
-                    locals: vec![
-                        mk_reg_var(0, "rcx"),
-                        mk_reg_var(1, "rax"),
-                    ],
-                    body: vec![
-                        mk_assign_reg(0, 42),
-                        mk_call_stmt(0x1000, 1),
-                        HirStmt::Return { value: None, span: Span::single(0x200) },
-                    ],
-                    calling_convention: Some("win64".into()),
-                    is_variadic: false,
-                    span: Span::single(0x100),
-                },
-            ],
+            functions: vec![HirFunction {
+                name: "sub_100".into(),
+                address: 0x100,
+                return_type: HirType::Void,
+                params: vec![],
+                locals: vec![mk_reg_var(0, "rcx"), mk_reg_var(1, "rax")],
+                body: vec![
+                    mk_assign_reg(0, 42),
+                    mk_call_stmt(0x1000, 1),
+                    HirStmt::Return {
+                        value: None,
+                        span: Span::single(0x200),
+                    },
+                ],
+                calling_convention: Some("win64".into()),
+                is_variadic: false,
+                span: Span::single(0x100),
+            }],
         };
 
         let sigs = SignatureDb::new();

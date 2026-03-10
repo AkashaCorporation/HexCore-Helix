@@ -22,8 +22,8 @@
 //! look backward for the nearest CMP/TEST comment and replace the
 //! placeholder with a proper comparison expression.
 
-use crate::ir::hir::*;
 use crate::diagnostics::{DiagnosticKind, DiagnosticSink};
+use crate::ir::hir::*;
 
 /// Result of control flow structuring.
 #[derive(Debug, Clone, Default)]
@@ -278,10 +278,7 @@ fn parse_operand_expr(
 
     let lower = text.to_lowercase();
     if let Some(id) = var_names.get(&lower) {
-        return HirExpr::Var {
-            id: *id,
-            span,
-        };
+        return HirExpr::Var { id: *id, span };
     }
 
     HirExpr::Unknown {
@@ -298,14 +295,14 @@ fn cc_to_comparison_op(cc: &str, invert: bool) -> Option<HirBinOp> {
     let op = match cc.to_ascii_uppercase().as_str() {
         "E" | "Z" => HirBinOp::Eq,
         "NE" | "NZ" => HirBinOp::Ne,
-        "A" | "NBE" => HirBinOp::Gt,   // unsigned above
+        "A" | "NBE" => HirBinOp::Gt,        // unsigned above
         "AE" | "NB" | "NC" => HirBinOp::Ge, // unsigned above or equal
         "B" | "NAE" | "C" => HirBinOp::Lt,  // unsigned below
-        "BE" | "NA" => HirBinOp::Le,    // unsigned below or equal
-        "G" | "NLE" => HirBinOp::Gt,   // signed greater
-        "GE" | "NL" => HirBinOp::Ge,   // signed greater or equal
-        "L" | "NGE" => HirBinOp::Lt,   // signed less
-        "LE" | "NG" => HirBinOp::Le,   // signed less or equal
+        "BE" | "NA" => HirBinOp::Le,        // unsigned below or equal
+        "G" | "NLE" => HirBinOp::Gt,        // signed greater
+        "GE" | "NL" => HirBinOp::Ge,        // signed greater or equal
+        "L" | "NGE" => HirBinOp::Lt,        // signed less
+        "LE" | "NG" => HirBinOp::Le,        // signed less or equal
         _ => return None,
     };
 
@@ -388,10 +385,8 @@ fn structure_statements(
     // Mark CMP/TEST + Jcc pairs and JMP comments for consumption
     for br in &branches {
         consumed_indices.insert(br.stmt_idx); // the Jcc comment itself
-        // Look backward for the CMP/TEST that feeds this Jcc
-        if br.stmt_idx > 0
-            && extract_cmp_info(&stmts[br.stmt_idx - 1]).is_some()
-        {
+                                              // Look backward for the CMP/TEST that feeds this Jcc
+        if br.stmt_idx > 0 && extract_cmp_info(&stmts[br.stmt_idx - 1]).is_some() {
             consumed_indices.insert(br.stmt_idx - 1);
         }
     }
@@ -506,7 +501,13 @@ fn structure_statements(
                 jmp.stmt_idx + 1 == *start || jmp.stmt_idx + 1 == *end
             });
             let is_loop_jmp = while_targets.iter().any(|(start, _end, _)| {
-                jmp.target_addr == Some(stmts.get(*start).map(|s| s.stmt_span().start_addr).unwrap_or(0))
+                jmp.target_addr
+                    == Some(
+                        stmts
+                            .get(*start)
+                            .map(|s| s.stmt_span().start_addr)
+                            .unwrap_or(0),
+                    )
             });
             if !is_else_jmp && !is_loop_jmp && !addr_to_idx.contains_key(&target_addr) {
                 goto_targets.insert(target_addr);
@@ -580,19 +581,22 @@ fn structure_statements(
             if_idx += 1;
 
             // Check for else: if the statement before end_idx is a JMP forward
-            let (then_end, else_body_raw, else_end_idx) = detect_else(stmts, start, end, &jumps, &consumed_indices);
+            let (then_end, else_body_raw, else_end_idx) =
+                detect_else(stmts, start, end, &jumps, &consumed_indices);
 
             // Collect the then-body (include CMP/Jcc for recursive structuring)
             let raw_then: Vec<HirStmt> = stmts[start..then_end].to_vec();
 
             // Recursively structure the then-body for nested control flow
-            let (then_body, nested_then) = structure_statements(&raw_then, func_name, sink, var_names);
+            let (then_body, nested_then) =
+                structure_statements(&raw_then, func_name, sink, var_names);
             result.ifs_recovered += nested_then.ifs_recovered;
             result.loops_recovered += nested_then.loops_recovered;
 
             // Recursively structure the else-body if present
             let else_body = else_body_raw.map(|raw_else| {
-                let (structured_else, nested_else) = structure_statements(&raw_else, func_name, sink, var_names);
+                let (structured_else, nested_else) =
+                    structure_statements(&raw_else, func_name, sink, var_names);
                 result.ifs_recovered += nested_else.ifs_recovered;
                 result.loops_recovered += nested_else.loops_recovered;
                 structured_else
@@ -724,7 +728,10 @@ fn parse_jcc_comment(text: &str) -> Option<(String, String)> {
         let cc_raw = parts[0].trim();
         let target = parts[1].trim().to_string();
         // Strip leading 'j'/'J' to get the raw condition code
-        if let Some(cc) = cc_raw.strip_prefix('j').or_else(|| cc_raw.strip_prefix('J')) {
+        if let Some(cc) = cc_raw
+            .strip_prefix('j')
+            .or_else(|| cc_raw.strip_prefix('J'))
+        {
             return Some((cc.to_string(), target));
         }
     }
@@ -754,9 +761,7 @@ fn parse_address(target: &str) -> Option<u64> {
 /// Invert a condition expression for if-fallthrough semantics.
 fn invert_condition(cond: HirExpr, span: Span) -> HirExpr {
     match cond {
-        HirExpr::Binary {
-            op, lhs, rhs, ..
-        } => {
+        HirExpr::Binary { op, lhs, rhs, .. } => {
             if let Some(inv) = invert_binop(op) {
                 HirExpr::Binary {
                     op: inv,
@@ -814,9 +819,9 @@ fn detect_else(
                         // This is a forward JMP: there's an else block
                         // Then body is [start, end-1), else body is [end, jmp_target_idx)
                         let then_end = end - 1; // exclude the JMP
-                        let else_end = stmts.iter().position(|s| {
-                            s.stmt_span().start_addr == jmp_target
-                        });
+                        let else_end = stmts
+                            .iter()
+                            .position(|s| s.stmt_span().start_addr == jmp_target);
                         if let Some(else_end_idx) = else_end {
                             let else_body: Vec<HirStmt> = stmts[end..else_end_idx]
                                 .iter()
@@ -873,7 +878,9 @@ impl StmtSpan for HirStmt {
 /// only at the top-level (depth 0) scope.
 pub fn eliminate_dead_code(stmts: &mut Vec<HirStmt>) {
     // Find the first unconditional return at the top level
-    let return_idx = stmts.iter().position(|s| matches!(s, HirStmt::Return { .. }));
+    let return_idx = stmts
+        .iter()
+        .position(|s| matches!(s, HirStmt::Return { .. }));
 
     if let Some(idx) = return_idx {
         // Check if there are statements after the return
@@ -900,8 +907,14 @@ pub fn eliminate_redundant_gotos(stmts: &mut Vec<HirStmt>) {
         changed = false;
         let mut i = 0;
         while i + 1 < stmts.len() {
-            if let (HirStmt::Goto { label: goto_label, .. }, HirStmt::Label { name: label_name, .. }) =
-                (&stmts[i], &stmts[i + 1])
+            if let (
+                HirStmt::Goto {
+                    label: goto_label, ..
+                },
+                HirStmt::Label {
+                    name: label_name, ..
+                },
+            ) = (&stmts[i], &stmts[i + 1])
             {
                 if goto_label == label_name {
                     // Remove the goto (keep the label for now; orphan pass will clean it)
@@ -917,7 +930,11 @@ pub fn eliminate_redundant_gotos(stmts: &mut Vec<HirStmt>) {
     // Pass 2: Recursively clean gotos inside structured blocks
     for stmt in stmts.iter_mut() {
         match stmt {
-            HirStmt::If { then_body, else_body, .. } => {
+            HirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 eliminate_redundant_gotos(then_body);
                 if let Some(else_stmts) = else_body {
                     eliminate_redundant_gotos(else_stmts);
@@ -955,7 +972,11 @@ fn collect_existing_labels(stmts: &[HirStmt], labels: &mut std::collections::Has
             HirStmt::Label { name, .. } => {
                 labels.insert(name.clone());
             }
-            HirStmt::If { then_body, else_body, .. } => {
+            HirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_existing_labels(then_body, labels);
                 if let Some(else_stmts) = else_body {
                     collect_existing_labels(else_stmts, labels);
@@ -973,7 +994,10 @@ fn collect_existing_labels(stmts: &[HirStmt], labels: &mut std::collections::Has
 }
 
 /// Remove gotos whose target label doesn't exist in the statement list.
-fn remove_orphan_gotos(stmts: &mut Vec<HirStmt>, existing_labels: &std::collections::HashSet<String>) {
+fn remove_orphan_gotos(
+    stmts: &mut Vec<HirStmt>,
+    existing_labels: &std::collections::HashSet<String>,
+) {
     stmts.retain(|s| {
         if let HirStmt::Goto { label, .. } = s {
             existing_labels.contains(label)
@@ -985,7 +1009,11 @@ fn remove_orphan_gotos(stmts: &mut Vec<HirStmt>, existing_labels: &std::collecti
     // Recurse into structured blocks
     for stmt in stmts.iter_mut() {
         match stmt {
-            HirStmt::If { then_body, else_body, .. } => {
+            HirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 remove_orphan_gotos(then_body, existing_labels);
                 if let Some(else_stmts) = else_body {
                     remove_orphan_gotos(else_stmts, existing_labels);
@@ -1015,7 +1043,11 @@ fn remove_orphan_labels(stmts: &mut Vec<HirStmt>, referenced: &std::collections:
     // Recurse into structured blocks
     for stmt in stmts.iter_mut() {
         match stmt {
-            HirStmt::If { then_body, else_body, .. } => {
+            HirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 remove_orphan_labels(then_body, referenced);
                 if let Some(else_stmts) = else_body {
                     remove_orphan_labels(else_stmts, referenced);
@@ -1039,7 +1071,11 @@ fn collect_goto_targets(stmts: &[HirStmt], targets: &mut std::collections::HashS
             HirStmt::Goto { label, .. } => {
                 targets.insert(label.clone());
             }
-            HirStmt::If { then_body, else_body, .. } => {
+            HirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_goto_targets(then_body, targets);
                 if let Some(else_stmts) = else_body {
                     collect_goto_targets(else_stmts, targets);
@@ -1181,7 +1217,13 @@ mod tests {
         if let HirStmt::Assign { rhs, .. } = &stmts[1] {
             if let HirExpr::Ternary { cond, .. } = rhs {
                 assert!(
-                    matches!(cond.as_ref(), HirExpr::Binary { op: HirBinOp::Eq, .. }),
+                    matches!(
+                        cond.as_ref(),
+                        HirExpr::Binary {
+                            op: HirBinOp::Eq,
+                            ..
+                        }
+                    ),
                     "expected Eq comparison, got {:?}",
                     cond
                 );
@@ -1233,7 +1275,13 @@ mod tests {
         if let HirStmt::Assign { rhs, .. } = &stmts[1] {
             if let HirExpr::Ternary { cond, .. } = rhs {
                 assert!(
-                    matches!(cond.as_ref(), HirExpr::Binary { op: HirBinOp::Ne, .. }),
+                    matches!(
+                        cond.as_ref(),
+                        HirExpr::Binary {
+                            op: HirBinOp::Ne,
+                            ..
+                        }
+                    ),
                     "expected Ne comparison for cmovne+test, got {:?}",
                     cond
                 );
@@ -1276,28 +1324,54 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let (structured, result) = structure_statements(&stmts, "test_func", &mut sink, &std::collections::HashMap::new());
+        let (structured, result) = structure_statements(
+            &stmts,
+            "test_func",
+            &mut sink,
+            &std::collections::HashMap::new(),
+        );
 
-        assert!(result.ifs_recovered >= 1, "should recover at least one if block");
+        assert!(
+            result.ifs_recovered >= 1,
+            "should recover at least one if block"
+        );
 
         // Output should contain an If statement
         let has_if = structured.iter().any(|s| matches!(s, HirStmt::If { .. }));
-        assert!(has_if, "structured output should contain an If block: {:?}", structured);
+        assert!(
+            has_if,
+            "structured output should contain an If block: {:?}",
+            structured
+        );
     }
 
     #[test]
     fn test_invert_condition() {
         let eq = HirExpr::Binary {
             op: HirBinOp::Eq,
-            lhs: Box::new(HirExpr::IntLit { value: 1, ty: HirType::i64(), span: Span::UNKNOWN }),
-            rhs: Box::new(HirExpr::IntLit { value: 0, ty: HirType::i64(), span: Span::UNKNOWN }),
+            lhs: Box::new(HirExpr::IntLit {
+                value: 1,
+                ty: HirType::i64(),
+                span: Span::UNKNOWN,
+            }),
+            rhs: Box::new(HirExpr::IntLit {
+                value: 0,
+                ty: HirType::i64(),
+                span: Span::UNKNOWN,
+            }),
             ty: HirType::Bool,
             span: Span::UNKNOWN,
         };
 
         let inverted = invert_condition(eq, Span::UNKNOWN);
         assert!(
-            matches!(&inverted, HirExpr::Binary { op: HirBinOp::Ne, .. }),
+            matches!(
+                &inverted,
+                HirExpr::Binary {
+                    op: HirBinOp::Ne,
+                    ..
+                }
+            ),
             "expected Ne after inverting Eq, got {:?}",
             inverted
         );
@@ -1381,8 +1455,15 @@ mod tests {
                 span: mk_span(0x104),
             },
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x108) },
-                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x108) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(0),
+                    span: mk_span(0x108),
+                },
+                rhs: HirExpr::IntLit {
+                    value: 1,
+                    ty: HirType::i32(),
+                    span: mk_span(0x108),
+                },
                 span: mk_span(0x108),
             },
             HirStmt::Comment {
@@ -1390,13 +1471,27 @@ mod tests {
                 span: mk_span(0x10c),
             },
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x114) },
-                rhs: HirExpr::IntLit { value: 2, ty: HirType::i32(), span: mk_span(0x114) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(0),
+                    span: mk_span(0x114),
+                },
+                rhs: HirExpr::IntLit {
+                    value: 2,
+                    ty: HirType::i32(),
+                    span: mk_span(0x114),
+                },
                 span: mk_span(0x114),
             },
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(1), span: mk_span(0x118) },
-                rhs: HirExpr::IntLit { value: 3, ty: HirType::i32(), span: mk_span(0x118) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(1),
+                    span: mk_span(0x118),
+                },
+                rhs: HirExpr::IntLit {
+                    value: 3,
+                    ty: HirType::i32(),
+                    span: mk_span(0x118),
+                },
                 span: mk_span(0x118),
             },
             HirStmt::Return {
@@ -1406,31 +1501,53 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let (structured, result) = structure_statements(&stmts, "test_if_else", &mut sink, &std::collections::HashMap::new());
+        let (structured, result) = structure_statements(
+            &stmts,
+            "test_if_else",
+            &mut sink,
+            &std::collections::HashMap::new(),
+        );
 
         assert!(result.ifs_recovered >= 1, "should recover at least one if");
 
         // Find the If statement
         let if_stmt = structured.iter().find(|s| matches!(s, HirStmt::If { .. }));
-        assert!(if_stmt.is_some(), "should contain an If block: {:?}", structured);
+        assert!(
+            if_stmt.is_some(),
+            "should contain an If block: {:?}",
+            structured
+        );
 
-        if let Some(HirStmt::If { then_body, else_body, .. }) = if_stmt {
+        if let Some(HirStmt::If {
+            then_body,
+            else_body,
+            ..
+        }) = if_stmt
+        {
             assert!(!then_body.is_empty(), "then_body should not be empty");
-            assert!(else_body.is_some(), "else_body should be present for if/else pattern");
+            assert!(
+                else_body.is_some(),
+                "else_body should be present for if/else pattern"
+            );
             let else_stmts = else_body.as_ref().unwrap();
             assert!(!else_stmts.is_empty(), "else_body should not be empty");
         }
 
         // The else body statements should NOT appear as standalone statements after the If
-        let standalone_assigns: Vec<_> = structured.iter().filter(|s| {
-            if let HirStmt::Assign { span, .. } = s {
-                span.start_addr == 0x114 || span.start_addr == 0x118
-            } else {
-                false
-            }
-        }).collect();
-        assert!(standalone_assigns.is_empty(),
-            "else body statements should not appear as standalone after the If block");
+        let standalone_assigns: Vec<_> = structured
+            .iter()
+            .filter(|s| {
+                if let HirStmt::Assign { span, .. } = s {
+                    span.start_addr == 0x114 || span.start_addr == 0x118
+                } else {
+                    false
+                }
+            })
+            .collect();
+        assert!(
+            standalone_assigns.is_empty(),
+            "else body statements should not appear as standalone after the If block"
+        );
     }
 
     // ─── Task 8.2: While detection with back-edge ───────────────────────────
@@ -1446,16 +1563,33 @@ mod tests {
         // 0x110: return
         let stmts = vec![
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x100) },
-                rhs: HirExpr::IntLit { value: 0, ty: HirType::i32(), span: mk_span(0x100) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(0),
+                    span: mk_span(0x100),
+                },
+                rhs: HirExpr::IntLit {
+                    value: 0,
+                    ty: HirType::i32(),
+                    span: mk_span(0x100),
+                },
                 span: mk_span(0x100),
             },
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x104) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(0),
+                    span: mk_span(0x104),
+                },
                 rhs: HirExpr::Binary {
                     op: HirBinOp::Add,
-                    lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: mk_span(0x104) }),
-                    rhs: Box::new(HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x104) }),
+                    lhs: Box::new(HirExpr::Var {
+                        id: HirVarId(0),
+                        span: mk_span(0x104),
+                    }),
+                    rhs: Box::new(HirExpr::IntLit {
+                        value: 1,
+                        ty: HirType::i32(),
+                        span: mk_span(0x104),
+                    }),
                     ty: HirType::i32(),
                     span: mk_span(0x104),
                 },
@@ -1476,12 +1610,26 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let (structured, result) = structure_statements(&stmts, "test_while", &mut sink, &std::collections::HashMap::new());
+        let (structured, result) = structure_statements(
+            &stmts,
+            "test_while",
+            &mut sink,
+            &std::collections::HashMap::new(),
+        );
 
-        assert!(result.loops_recovered >= 1, "should recover at least one while loop");
+        assert!(
+            result.loops_recovered >= 1,
+            "should recover at least one while loop"
+        );
 
-        let while_stmt = structured.iter().find(|s| matches!(s, HirStmt::While { .. }));
-        assert!(while_stmt.is_some(), "should contain a While block: {:?}", structured);
+        let while_stmt = structured
+            .iter()
+            .find(|s| matches!(s, HirStmt::While { .. }));
+        assert!(
+            while_stmt.is_some(),
+            "should contain a While block: {:?}",
+            structured
+        );
 
         if let Some(HirStmt::While { body, .. }) = while_stmt {
             assert!(!body.is_empty(), "while body should not be empty");
@@ -1504,8 +1652,15 @@ mod tests {
         // 0x124: return
         let stmts = vec![
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x100) },
-                rhs: HirExpr::IntLit { value: 0, ty: HirType::i32(), span: mk_span(0x100) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(0),
+                    span: mk_span(0x100),
+                },
+                rhs: HirExpr::IntLit {
+                    value: 0,
+                    ty: HirType::i32(),
+                    span: mk_span(0x100),
+                },
                 span: mk_span(0x100),
             },
             HirStmt::Comment {
@@ -1517,16 +1672,33 @@ mod tests {
                 span: mk_span(0x108),
             },
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(1), span: mk_span(0x10c) },
-                rhs: HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x10c) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(1),
+                    span: mk_span(0x10c),
+                },
+                rhs: HirExpr::IntLit {
+                    value: 1,
+                    ty: HirType::i32(),
+                    span: mk_span(0x10c),
+                },
                 span: mk_span(0x10c),
             },
             HirStmt::Assign {
-                lhs: HirExpr::Var { id: HirVarId(0), span: mk_span(0x118) },
+                lhs: HirExpr::Var {
+                    id: HirVarId(0),
+                    span: mk_span(0x118),
+                },
                 rhs: HirExpr::Binary {
                     op: HirBinOp::Add,
-                    lhs: Box::new(HirExpr::Var { id: HirVarId(0), span: mk_span(0x118) }),
-                    rhs: Box::new(HirExpr::IntLit { value: 1, ty: HirType::i32(), span: mk_span(0x118) }),
+                    lhs: Box::new(HirExpr::Var {
+                        id: HirVarId(0),
+                        span: mk_span(0x118),
+                    }),
+                    rhs: Box::new(HirExpr::IntLit {
+                        value: 1,
+                        ty: HirType::i32(),
+                        span: mk_span(0x118),
+                    }),
                     ty: HirType::i32(),
                     span: mk_span(0x118),
                 },
@@ -1547,19 +1719,33 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let (structured, result) = structure_statements(&stmts, "test_nested", &mut sink, &std::collections::HashMap::new());
+        let (structured, result) = structure_statements(
+            &stmts,
+            "test_nested",
+            &mut sink,
+            &std::collections::HashMap::new(),
+        );
 
         assert!(result.loops_recovered >= 1, "should recover a while loop");
 
         // Find the while loop
-        let while_stmt = structured.iter().find(|s| matches!(s, HirStmt::While { .. }));
-        assert!(while_stmt.is_some(), "should contain a While block: {:?}", structured);
+        let while_stmt = structured
+            .iter()
+            .find(|s| matches!(s, HirStmt::While { .. }));
+        assert!(
+            while_stmt.is_some(),
+            "should contain a While block: {:?}",
+            structured
+        );
 
         // Check that the while body contains a nested If
         if let Some(HirStmt::While { body, .. }) = while_stmt {
             let has_nested_if = body.iter().any(|s| matches!(s, HirStmt::If { .. }));
-            assert!(has_nested_if,
-                "while body should contain a nested If block: {:?}", body);
+            assert!(
+                has_nested_if,
+                "while body should contain a nested If block: {:?}",
+                body
+            );
         }
     }
 
@@ -1580,5 +1766,4 @@ mod tests {
         assert!(matches!(goto, HirStmt::Goto { .. }));
         assert!(matches!(label, HirStmt::Label { .. }));
     }
-
 }
