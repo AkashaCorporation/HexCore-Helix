@@ -92,40 +92,32 @@ fn structure_function(func: &mut HirFunction, sink: &mut DiagnosticSink) -> Cont
 ///
 /// When we see a ternary with `Unknown("flags.XX")`, look backward for
 /// the nearest CMP/TEST comment and build a proper comparison expression.
-fn recover_cmov_conditions(stmts: &mut Vec<HirStmt>) -> usize {
+fn recover_cmov_conditions(stmts: &mut [HirStmt]) -> usize {
     let mut resolved = 0;
 
     // First, collect CMP/TEST info from comments
-    let cmp_info: Vec<Option<CmpInfo>> = stmts
-        .iter()
-        .map(|s| extract_cmp_info(s))
-        .collect();
+    let cmp_info: Vec<Option<CmpInfo>> = stmts.iter().map(extract_cmp_info).collect();
 
     // Now scan for CMOVs and resolve their conditions
-    for i in 0..stmts.len() {
-        if let HirStmt::Assign { rhs, span, .. } = &stmts[i] {
-            if let HirExpr::Ternary { cond, .. } = rhs {
-                if let HirExpr::Unknown { description, .. } = cond.as_ref() {
-                    if description.starts_with("flags.") {
-                        let cc = &description[6..]; // e.g., "e", "ne", "b", etc.
+    for (i, stmt) in stmts.iter_mut().enumerate() {
+        if let HirStmt::Assign {
+            rhs: HirExpr::Ternary { cond, .. },
+            span,
+            ..
+        } = stmt
+        {
+            if let HirExpr::Unknown { description, .. } = cond.as_ref() {
+                if let Some(cc) = description.strip_prefix("flags.") {
+                    if let Some(info) = find_preceding_cmp(&cmp_info, i) {
+                        let cond_expr = build_condition_expr(
+                            cc,
+                            &info,
+                            *span,
+                            &std::collections::HashMap::new(),
+                        );
 
-                        // Look backward for nearest CMP/TEST
-                        if let Some(info) = find_preceding_cmp(&cmp_info, i) {
-                            let cond_expr = build_condition_expr(
-                                cc,
-                                &info,
-                                *span,
-                                &std::collections::HashMap::new(),
-                            );
-
-                            // Replace the ternary's condition
-                            if let HirStmt::Assign { rhs, .. } = &mut stmts[i] {
-                                if let HirExpr::Ternary { cond, .. } = rhs {
-                                    *cond = Box::new(cond_expr);
-                                    resolved += 1;
-                                }
-                            }
-                        }
+                        **cond = cond_expr;
+                        resolved += 1;
                     }
                 }
             }
@@ -142,59 +134,49 @@ struct CmpInfo {
     is_test: bool,
     /// Left-hand operand string.
     lhs: String,
-    /// Right-hand operand string (empty for TEST with single arg = "lhs, lhs").
+    /// Right-hand operand string (empty for TEST?).
     rhs: String,
-    /// Span of the original CMP/TEST.
-    #[allow(dead_code)]
-    span: Span,
 }
 
-/// Try to extract CMP/TEST information from a comment statement.
+/// Try to extract CMP/TEST info from a comment statement.
 fn extract_cmp_info(stmt: &HirStmt) -> Option<CmpInfo> {
-    if let HirStmt::Comment { text, span } = stmt {
+    if let HirStmt::Comment { text, .. } = stmt {
         let text = text.trim();
-        if let Some(rest) = text.strip_prefix("cmp ") {
-            let parts: Vec<&str> = rest.splitn(2, ", ").collect();
-            if parts.len() == 2 {
-                return Some(CmpInfo {
-                    is_test: false,
-                    lhs: parts[0].trim().to_string(),
-                    rhs: parts[1].trim().to_string(),
-                    span: *span,
-                });
-            }
-        } else if let Some(rest) = text.strip_prefix("test ") {
-            let parts: Vec<&str> = rest.splitn(2, ", ").collect();
-            if parts.len() == 2 {
-                return Some(CmpInfo {
-                    is_test: true,
-                    lhs: parts[0].trim().to_string(),
-                    rhs: parts[1].trim().to_string(),
-                    span: *span,
-                });
-            }
+
+        // Expected forms:
+        //   "CMP lhs, rhs"
+        //   "TEST lhs, rhs"
+        if let Some(rest) = text.strip_prefix("CMP ") {
+            let (lhs, rhs) = split_operands(rest)?;
+            return Some(CmpInfo {
+                is_test: false,
+                lhs: lhs.to_string(),
+                rhs: rhs.to_string(),
+            });
+        }
+        if let Some(rest) = text.strip_prefix("TEST ") {
+            let (lhs, rhs) = split_operands(rest)?;
+            return Some(CmpInfo {
+                is_test: true,
+                lhs: lhs.to_string(),
+                rhs: rhs.to_string(),
+            });
         }
     }
     None
 }
 
-/// Find the nearest preceding CMP/TEST info before index `before`.
-fn find_preceding_cmp(cmp_info: &[Option<CmpInfo>], before: usize) -> Option<CmpInfo> {
-    let mut j = before;
-    while j > 0 {
-        j -= 1;
-        if let Some(info) = &cmp_info[j] {
-            return Some(info.clone());
-        }
-        // Don't look too far back — CMP/TEST should be close to CMOV
-        if before - j > 10 {
-            break;
-        }
-    }
-    None
+fn split_operands(text: &str) -> Option<(&str, &str)> {
+    let (lhs, rhs) = text.split_once(',')?;
+    Some((lhs.trim(), rhs.trim()))
 }
 
-/// Build a condition expression from a condition code and CMP/TEST info.
+/// Find the nearest preceding CMP/TEST comment before statement `idx`.
+fn find_preceding_cmp(cmp_info: &[Option<CmpInfo>], idx: usize) -> Option<CmpInfo> {
+    cmp_info[..idx].iter().rev().flatten().next().cloned()
+}
+
+/// Build a HIR condition expression from a condition code and CMP/TEST info.
 fn build_condition_expr(
     cc: &str,
     info: &CmpInfo,
@@ -202,14 +184,13 @@ fn build_condition_expr(
     var_names: &std::collections::HashMap<String, HirVarId>,
 ) -> HirExpr {
     let lhs = parse_operand_expr(&info.lhs, span, var_names);
+    let rhs = parse_operand_expr(&info.rhs, span, var_names);
 
     if info.is_test {
-        // TEST sets ZF based on (lhs & rhs). Common pattern: TEST reg, reg → checks if zero.
         let lhs_str = &info.lhs;
         let rhs_str = &info.rhs;
 
         if lhs_str == rhs_str {
-            // TEST reg, reg → simplify to "reg op 0" (common idiom)
             let zero = HirExpr::IntLit {
                 value: 0,
                 ty: HirType::i64(),
@@ -229,12 +210,10 @@ fn build_condition_expr(
                 },
             }
         } else {
-            // TEST with different operands → (lhs & rhs) op 0
-            let rhs_expr = parse_operand_expr(rhs_str, span, var_names);
             let and_expr = HirExpr::Binary {
                 op: HirBinOp::BitAnd,
                 lhs: Box::new(lhs),
-                rhs: Box::new(rhs_expr),
+                rhs: Box::new(rhs),
                 ty: HirType::i64(),
                 span,
             };
@@ -258,8 +237,6 @@ fn build_condition_expr(
             }
         }
     } else {
-        // CMP: direct comparison
-        let rhs = parse_operand_expr(&info.rhs, span, var_names);
         match cc_to_comparison_op(cc, false) {
             Some(op) => HirExpr::Binary {
                 op,
@@ -276,53 +253,37 @@ fn build_condition_expr(
     }
 }
 
-/// Parse a textual operand (from a comment) into an HirExpr.
-///
-/// When `var_names` is provided, register names are resolved to proper
-/// `HirExpr::Var` references instead of `HirExpr::Unknown`, producing
-/// clean condition expressions without `/* */` wrappers.
 fn parse_operand_expr(
     text: &str,
     span: Span,
     var_names: &std::collections::HashMap<String, HirVarId>,
 ) -> HirExpr {
-    let text = text.trim();
-
-    // Try to parse as hex immediate
     if let Some(hex) = text.strip_prefix("0x") {
-        if let Ok(v) = i64::from_str_radix(hex, 16) {
+        if let Ok(value) = u64::from_str_radix(hex, 16) {
             return HirExpr::IntLit {
-                value: v,
+                value: value as i64,
                 ty: HirType::i64(),
                 span,
             };
         }
     }
 
-    // Try to parse as decimal immediate
-    if let Ok(v) = text.parse::<i64>() {
+    if let Ok(value) = text.parse::<i64>() {
         return HirExpr::IntLit {
-            value: v,
+            value,
             ty: HirType::i64(),
             span,
         };
     }
 
-    // Memory operand: [reg + 0xNN]
-    if text.starts_with('[') && text.ends_with(']') {
-        return HirExpr::Unknown {
-            description: text.to_string(),
+    let lower = text.to_lowercase();
+    if let Some(id) = var_names.get(&lower) {
+        return HirExpr::Var {
+            id: *id,
             span,
         };
     }
 
-    // Register — resolve to HirExpr::Var if the name is in the variable map
-    let lower = text.to_lowercase();
-    if let Some(&id) = var_names.get(&lower) {
-        return HirExpr::Var { id, span };
-    }
-
-    // Fallback: unknown variable reference
     HirExpr::Unknown {
         description: text.to_string(),
         span,
@@ -428,10 +389,10 @@ fn structure_statements(
     for br in &branches {
         consumed_indices.insert(br.stmt_idx); // the Jcc comment itself
         // Look backward for the CMP/TEST that feeds this Jcc
-        if br.stmt_idx > 0 {
-            if extract_cmp_info(&stmts[br.stmt_idx - 1]).is_some() {
-                consumed_indices.insert(br.stmt_idx - 1);
-            }
+        if br.stmt_idx > 0
+            && extract_cmp_info(&stmts[br.stmt_idx - 1]).is_some()
+        {
+            consumed_indices.insert(br.stmt_idx - 1);
         }
     }
     for jmp in &jumps {
@@ -512,12 +473,12 @@ fn structure_statements(
                 let src_addr = br.span.start_addr;
                 if target_addr > src_addr {
                     // Forward: check if it was classified as an if
-                    if addr_to_idx.get(&target_addr).is_some() {
+                    if addr_to_idx.contains_key(&target_addr) {
                         set.insert(br.stmt_idx);
                     }
                 } else if target_addr < src_addr {
                     // Backward: check if it was classified as a while
-                    if addr_to_idx.get(&target_addr).is_some() {
+                    if addr_to_idx.contains_key(&target_addr) {
                         set.insert(br.stmt_idx);
                     }
                 }
@@ -547,7 +508,7 @@ fn structure_statements(
             let is_loop_jmp = while_targets.iter().any(|(start, _end, _)| {
                 jmp.target_addr == Some(stmts.get(*start).map(|s| s.stmt_span().start_addr).unwrap_or(0))
             });
-            if !is_else_jmp && !is_loop_jmp && addr_to_idx.get(&target_addr).is_none() {
+            if !is_else_jmp && !is_loop_jmp && !addr_to_idx.contains_key(&target_addr) {
                 goto_targets.insert(target_addr);
                 goto_sources.push((jmp.stmt_idx, target_addr, jmp.span));
             }
@@ -595,10 +556,7 @@ fn structure_statements(
 
             // Collect the loop body (between start and end, including CMP/Jcc
             // comments so recursive structuring can process nested patterns)
-            let raw_body: Vec<HirStmt> = stmts[start..end]
-                .iter()
-                .cloned()
-                .collect();
+            let raw_body: Vec<HirStmt> = stmts[start..end].to_vec();
 
             // Recursively structure the loop body for nested control flow
             let (body, nested_result) = structure_statements(&raw_body, func_name, sink, var_names);
@@ -625,10 +583,7 @@ fn structure_statements(
             let (then_end, else_body_raw, else_end_idx) = detect_else(stmts, start, end, &jumps, &consumed_indices);
 
             // Collect the then-body (include CMP/Jcc for recursive structuring)
-            let raw_then: Vec<HirStmt> = stmts[start..then_end]
-                .iter()
-                .cloned()
-                .collect();
+            let raw_then: Vec<HirStmt> = stmts[start..then_end].to_vec();
 
             // Recursively structure the then-body for nested control flow
             let (then_body, nested_then) = structure_statements(&raw_then, func_name, sink, var_names);

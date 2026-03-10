@@ -185,7 +185,7 @@ impl PseudoCEmitter {
     fn emit_statement(
         &self,
         out: &mut String,
-        line_map: &mut Vec<(u32, u64)>,
+        _line_map: &mut Vec<(u32, u64)>,
         line_num: &mut u32,
         stmt: &Statement,
         depth: usize,
@@ -245,13 +245,13 @@ impl PseudoCEmitter {
                 out.push_str(&format!("{}if ({}) {{\n", pad, format_expr(cond)));
                 *line_num += 1;
                 for s in then_body {
-                    self.emit_statement(out, line_map, line_num, s, depth + 1);
+                    self.emit_statement(out, _line_map, line_num, s, depth + 1);
                 }
                 if let Some(else_stmts) = else_body {
                     out.push_str(&format!("{}}} else {{\n", pad));
                     *line_num += 1;
                     for s in else_stmts {
-                        self.emit_statement(out, line_map, line_num, s, depth + 1);
+                        self.emit_statement(out, _line_map, line_num, s, depth + 1);
                     }
                 }
                 out.push_str(&format!("{}}}\n", pad));
@@ -262,7 +262,7 @@ impl PseudoCEmitter {
                 out.push_str(&format!("{}while ({}) {{\n", pad, format_expr(cond)));
                 *line_num += 1;
                 for s in body {
-                    self.emit_statement(out, line_map, line_num, s, depth + 1);
+                    self.emit_statement(out, _line_map, line_num, s, depth + 1);
                 }
                 out.push_str(&format!("{}}}\n", pad));
                 *line_num += 1;
@@ -272,7 +272,7 @@ impl PseudoCEmitter {
                 out.push_str(&format!("{}do {{\n", pad));
                 *line_num += 1;
                 for s in body {
-                    self.emit_statement(out, line_map, line_num, s, depth + 1);
+                    self.emit_statement(out, _line_map, line_num, s, depth + 1);
                 }
                 out.push_str(&format!("{}}} while ({});\n", pad, format_expr(cond)));
                 *line_num += 1;
@@ -299,7 +299,7 @@ impl PseudoCEmitter {
                 ));
                 *line_num += 1;
                 for s in body {
-                    self.emit_statement(out, line_map, line_num, s, depth + 1);
+                    self.emit_statement(out, _line_map, line_num, s, depth + 1);
                 }
                 out.push_str(&format!("{}}}\n", pad));
                 *line_num += 1;
@@ -318,14 +318,14 @@ impl PseudoCEmitter {
                         *line_num += 1;
                     }
                     for s in &case.body {
-                        self.emit_statement(out, line_map, line_num, s, depth + 1);
+                        self.emit_statement(out, _line_map, line_num, s, depth + 1);
                     }
                 }
                 if let Some(default_body) = default {
                     out.push_str(&format!("{}default:\n", pad));
                     *line_num += 1;
                     for s in default_body {
-                        self.emit_statement(out, line_map, line_num, s, depth + 1);
+                        self.emit_statement(out, _line_map, line_num, s, depth + 1);
                     }
                 }
                 out.push_str(&format!("{}}}\n", pad));

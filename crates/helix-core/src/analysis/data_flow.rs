@@ -357,8 +357,7 @@ pub fn compute_flag_liveness_for_insn(insns: &[RemillInsn], idx: usize) -> FlagL
     let mut liveness = FlagLiveness::default();
 
     // Scan forward to find flag consumers.
-    for j in (idx + 1)..insns.len() {
-        let consumer = &insns[j];
+    for consumer in insns.iter().skip(idx + 1) {
         match &consumer.semantic {
             Semantic::Jcc(cond) => {
                 liveness.mark_from_jcc(cond);

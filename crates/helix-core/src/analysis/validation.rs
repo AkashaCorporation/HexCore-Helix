@@ -160,16 +160,16 @@ fn validate_function(
     // 7. Check for unreachable code after return
     let mut found_return = false;
     for stmt in &func.body {
-        if found_return {
-            if !matches!(stmt, HirStmt::Comment { .. } | HirStmt::Label { .. }) {
-                sink.info(
-                    func_name,
-                    addr,
-                    DiagnosticKind::DeadCode,
-                    "unreachable code after return statement",
-                );
-                break;
-            }
+        if found_return
+            && !matches!(stmt, HirStmt::Comment { .. } | HirStmt::Label { .. })
+        {
+            sink.info(
+                func_name,
+                addr,
+                DiagnosticKind::DeadCode,
+                "unreachable code after return statement",
+            );
+            break;
         }
         if matches!(stmt, HirStmt::Return { .. }) {
             found_return = true;

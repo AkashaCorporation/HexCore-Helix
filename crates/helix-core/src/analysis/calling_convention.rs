@@ -529,10 +529,10 @@ fn is_stack_adjustment(stmt: &HirStmt, var_names: &HashMap<HirVarId, String>) ->
         if let Some(name) = var_names.get(id) {
             if name.to_lowercase() == "rsp" {
                 if let HirExpr::Var { id: lhs_id, .. } = bin_lhs.as_ref() {
-                    if lhs_id == id {
-                        if matches!(bin_rhs.as_ref(), HirExpr::IntLit { .. }) {
-                            return true;
-                        }
+                    if lhs_id == id
+                        && matches!(bin_rhs.as_ref(), HirExpr::IntLit { .. })
+                    {
+                        return true;
                     }
                 }
             }

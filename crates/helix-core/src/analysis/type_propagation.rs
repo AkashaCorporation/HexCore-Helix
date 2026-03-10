@@ -150,14 +150,17 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
             changed |= env.set(*var_id, expr_ty);
 
             // MOVZX/MOVSX: propagate signedness to source variable.
-            if let HirExpr::Cast { expr: inner, to_ty, .. } = expr {
-                if let HirType::Int { signed, .. } = to_ty {
-                    if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
-                        let src_ty = env.get(*src_id);
-                        if let HirType::Int { bits: src_bits, .. } = src_ty {
-                            let refined = HirType::Int { signed: *signed, bits: *src_bits };
-                            changed |= env.set(*src_id, refined);
-                        }
+            if let HirExpr::Cast {
+                expr: inner,
+                to_ty: HirType::Int { signed, .. },
+                ..
+            } = expr
+            {
+                if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
+                    let src_ty = env.get(*src_id);
+                    if let HirType::Int { bits: src_bits, .. } = src_ty {
+                        let refined = HirType::Int { signed: *signed, bits: *src_bits };
+                        changed |= env.set(*src_id, refined);
                     }
                 }
             }
@@ -173,15 +176,18 @@ fn propagate_stmt(env: &mut TypeEnv, stmt: &HirStmt, signatures: &SignatureDb) -
             // In the HIR, MOVZX/MOVSX are represented as Cast expressions.
             // The cast target type carries the signedness info that should
             // also be applied to the source operand at its original width.
-            if let HirExpr::Cast { expr: inner, to_ty, .. } = rhs {
-                if let HirType::Int { signed, .. } = to_ty {
-                    // Propagate signedness to the source variable at its width
-                    if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
-                        let src_ty = env.get(*src_id);
-                        if let HirType::Int { bits: src_bits, .. } = src_ty {
-                            let refined = HirType::Int { signed: *signed, bits: *src_bits };
-                            changed |= env.set(*src_id, refined);
-                        }
+            if let HirExpr::Cast {
+                expr: inner,
+                to_ty: HirType::Int { signed, .. },
+                ..
+            } = rhs
+            {
+                // Propagate signedness to the source variable at its width
+                if let HirExpr::Var { id: src_id, .. } = inner.as_ref() {
+                    let src_ty = env.get(*src_id);
+                    if let HirType::Int { bits: src_bits, .. } = src_ty {
+                        let refined = HirType::Int { signed: *signed, bits: *src_bits };
+                        changed |= env.set(*src_id, refined);
                     }
                 }
             }

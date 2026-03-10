@@ -199,9 +199,8 @@ pub fn decode_mangled_name(mangled: &str) -> Semantic {
             } else if semantic_name.starts_with("CMOV") && semantic_name.len() > 4 {
                 let cc = &semantic_name[4..];
                 Semantic::CMov(cc.to_string())
-            } else if semantic_name.starts_with("REP") {
+            } else if let Some(suffix) = semantic_name.strip_prefix("REP") {
                 // REP prefix for string operations
-                let suffix = &semantic_name[3..];
                 if suffix.starts_with("MOVS") {
                     Semantic::RepMovs
                 } else if suffix.starts_with("STOS") {

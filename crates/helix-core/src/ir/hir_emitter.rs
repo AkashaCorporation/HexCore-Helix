@@ -519,7 +519,7 @@ fn format_type(ty: &HirType) -> String {
         HirType::FuncPtr { ret, params } => {
             let params_str = params
                 .iter()
-                .map(|p| format_type(p))
+                .map(format_type)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{}(*)({})", format_type(ret), params_str)

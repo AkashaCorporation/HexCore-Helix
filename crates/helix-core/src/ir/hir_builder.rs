@@ -640,11 +640,7 @@ fn lower_insn(b: &mut FuncBuilder, insn: &RemillInsn) {
 
         // ── DIV / IDIV: complex multi-register output ────────────────
         Semantic::Div | Semantic::IDiv => {
-            let op = if insn.semantic == Semantic::Div {
-                HirBinOp::Div
-            } else {
-                HirBinOp::Div // IDIV is signed division; type info handles signedness
-            };
+            let op = HirBinOp::Div; // IDIV signedness is handled by type propagation
             if let (Some(lhs), Some(src1), Some(src2)) = (
                 lower_operand_lhs(b, &insn.dst, span),
                 lower_operand_rhs(b, insn.srcs.first(), span),

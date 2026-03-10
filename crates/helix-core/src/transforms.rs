@@ -226,36 +226,49 @@ pub fn transform_with_signatures(
         }
 
         // Close scopes that end at current PC
-        loop {
-            if let Some(scope) = active_scopes.last() {
-                match scope {
-                    Scope::Switch { end_pc, .. } if *end_pc == insn.pc => {
-                        stmts.push(HLStmt::SwitchEnd);
-                        active_scopes.pop();
-                    }
-                    Scope::If { end_pc } if *end_pc == insn.pc => {
-                        stmts.push(HLStmt::IfEnd);
-                        active_scopes.pop();
-                    }
-                    Scope::IfElse { else_start_pc, in_else: false, .. } if *else_start_pc == insn.pc => {
-                        stmts.push(HLStmt::Else);
-                        if let Some(Scope::IfElse { else_start_pc, end_pc, .. }) = active_scopes.pop() {
-                            active_scopes.push(Scope::IfElse { else_start_pc, end_pc, in_else: true });
-                        }
-                        break; // Important: Enter else, do not pop more scopes yet.
-                    }
-                    Scope::IfElse { end_pc, in_else: true, .. } if *end_pc == insn.pc => {
-                        stmts.push(HLStmt::IfEnd);
-                        active_scopes.pop();
-                    }
-                    Scope::While { end_pc } if *end_pc == insn.pc => {
-                        stmts.push(HLStmt::WhileEnd);
-                        active_scopes.pop();
-                    }
-                    _ => break,
+        while let Some(scope) = active_scopes.last() {
+            match scope {
+                Scope::Switch { end_pc, .. } if *end_pc == insn.pc => {
+                    stmts.push(HLStmt::SwitchEnd);
+                    active_scopes.pop();
                 }
-            } else {
-                break;
+                Scope::If { end_pc } if *end_pc == insn.pc => {
+                    stmts.push(HLStmt::IfEnd);
+                    active_scopes.pop();
+                }
+                Scope::IfElse {
+                    else_start_pc,
+                    in_else: false,
+                    ..
+                } if *else_start_pc == insn.pc => {
+                    stmts.push(HLStmt::Else);
+                    if let Some(Scope::IfElse {
+                        else_start_pc,
+                        end_pc,
+                        ..
+                    }) = active_scopes.pop()
+                    {
+                        active_scopes.push(Scope::IfElse {
+                            else_start_pc,
+                            end_pc,
+                            in_else: true,
+                        });
+                    }
+                    break; // Important: Enter else, do not pop more scopes yet.
+                }
+                Scope::IfElse {
+                    end_pc,
+                    in_else: true,
+                    ..
+                } if *end_pc == insn.pc => {
+                    stmts.push(HLStmt::IfEnd);
+                    active_scopes.pop();
+                }
+                Scope::While { end_pc } if *end_pc == insn.pc => {
+                    stmts.push(HLStmt::WhileEnd);
+                    active_scopes.pop();
+                }
+                _ => break,
             }
         }
 
