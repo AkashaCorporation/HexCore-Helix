@@ -21,6 +21,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <format>
 #include <string>
 
 using namespace mlir;
