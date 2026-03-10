@@ -142,20 +142,20 @@ struct CmpInfo {
 fn extract_cmp_info(stmt: &HirStmt) -> Option<CmpInfo> {
     if let HirStmt::Comment { text, .. } = stmt {
         let text = text.trim();
+        let (opcode, operands) = text.split_once(' ')?;
 
-        // Expected forms:
-        //   "CMP lhs, rhs"
-        //   "TEST lhs, rhs"
-        if let Some(rest) = text.strip_prefix("CMP ") {
-            let (lhs, rhs) = split_operands(rest)?;
+        // Accept both the lowercase comments emitted by our HIR builder and
+        // uppercase forms that may appear in imported/debug fixtures.
+        if opcode.eq_ignore_ascii_case("cmp") {
+            let (lhs, rhs) = split_operands(operands)?;
             return Some(CmpInfo {
                 is_test: false,
                 lhs: lhs.to_string(),
                 rhs: rhs.to_string(),
             });
         }
-        if let Some(rest) = text.strip_prefix("TEST ") {
-            let (lhs, rhs) = split_operands(rest)?;
+        if opcode.eq_ignore_ascii_case("test") {
+            let (lhs, rhs) = split_operands(operands)?;
             return Some(CmpInfo {
                 is_test: true,
                 lhs: lhs.to_string(),
