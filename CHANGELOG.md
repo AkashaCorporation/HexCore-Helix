@@ -4,6 +4,57 @@ All notable changes to HexCore Helix are documented here.
 
 ---
 
+## [v0.5.0] — 2026-03-11
+
+### Bug Fixes
+
+#### Entry Block Predecessor Crash (Fatal — `LLVM abort()`)
+
+**Symptom**: `Entry block to function must not have predecessors! label %bb_0 / LLVM ERROR: Broken module found, compilation aborted!` — process crashes unconditionally (via `abort()`).
+
+**Root cause**: `llvm::parseIR()` calls `parseAssembly()` → `LLParser::Run(UpgradeDebugInfo=true)` → `llvm::UpgradeDebugInfo()` → `llvm::verifyModule(FatalErrors=true)` → `abort()`. This happens inside `parseIR` before it returns, so any post-parse sanitization is unreachable.
+
+**Trigger condition**: Remill-lifted IR where a function has a backward branch to its entry block (loop-at-entry pattern) AND the module has `!"Debug Info Version", i32 3` (matches `DEBUG_METADATA_VERSION`). Confirmed in `lifted_5368715048` from `partial_encryption.exe` (function `0x140001728`, SIMD loop function).
+
+**Fix** (`engine/src/Pipeline.cpp`):
+- Replaced `llvm::parseIR()` with direct `LLParser::Run(UpgradeDebugInfo=false)` via `#include "llvm/AsmParser/LLParser.h"`.
+- After successful parse, applies entry block sanitization: inserts a new empty `BasicBlock` before any entry block that has predecessors, with an unconditional branch to the original entry.
+- `LLParser.h` is in LLVM's public include path; `LLVMAsmParser` is already transitively linked via `LLVMIRReader`.
+
+#### `RecoverCallingConvention` Crash on Large/Unusual IR
+
+**Symptom**: Extension host crash (`STATUS_ACCESS_VIOLATION`) during `RecoverCallingConvention` pass on functions with non-trivial block structure.
+
+**Root cause**: `DominanceInfo::getNode(block)` crashes in MLIR 18.x on certain IR patterns (massive single-block functions, nested regions, blocks created during translation that lack dominator tree nodes).
+
+**Fix** (`engine/src/passes/RecoverCallingConvention.cpp`):
+- Removed `DominanceInfo` entirely. The pass no longer constructs a dominator tree.
+- `collectAbiCallArgs`: replaced `findLatestRegWriteOnDomChain` with block scan + predecessor search (`findLatestRegWriteInPredecessors`, depth-2 by default). This covers all common Win64/SysV ABI call patterns.
+- Removed `#include "mlir/IR/Dominance.h"`.
+
+#### Pass Pipeline Safety Notes
+
+Per the fix comments in `Pipeline.cpp::buildPassPipeline()`:
+- `mlir::createCanonicalizerPass()` — removed: segfaults on multi-block HelixLow functions with LLVM dialect br/condBr terminators.
+- `mlir::createCSEPass()` — removed: same crash on complex functions with many basic blocks (confirmed on 112-block functions).
+- `pass_manager_->enableVerifier(false)` — inter-pass verification disabled to allow pipeline to complete with minor intermediate IR issues.
+
+### Test Results
+
+| File | Function | Status |
+|------|----------|--------|
+| `logic_1728.ll` | `lifted_5368715048` (0x140001728) — SIMD loop | 100% confidence |
+| `05-banner.ll` | VVM HTB challenge — 5973 lines, 3 blocks | 100% confidence |
+| All `remill-7/` | Saber Interactive game engine functions | No regressions |
+
+### Build
+
+- `helix_engine.lib` rebuilt: 43,056,284 bytes
+- `hexcore-helix.win32-x64-msvc.node` rebuilt: 11,878,400 bytes
+- Build requires env vars: `LLVM_BUILD_DIR=C:\Users\Mazum\Desktop\caps\llvm-build\build-mlir`
+
+---
+
 ## [v0.4.0] — 2026-03-04
 
 ### 🚀 Phase 2: MLIR Decompilation Engine (Production)

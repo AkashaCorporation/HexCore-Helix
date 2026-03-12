@@ -138,8 +138,6 @@ struct PropagateTypesPass
 
     void runOnOperation() override {
         auto module = getOperation();
-
-        // Propagate types in HelixLow functions.
         module.walk([&](helix::low::FuncOp func) {
             propagateTypesLow(func);
         });

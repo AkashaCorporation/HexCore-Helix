@@ -25,10 +25,13 @@
 #include "mlir/IR/Verifier.h"
 
 // LLVM includes
-#include "llvm/IRReader/IRReader.h"
+#include "llvm/AsmParser/LLParser.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 
 #include <cassert>
 #include <format>
@@ -174,22 +177,30 @@ Pipeline::parseLLVMIR(llvm::StringRef ir_text) {
         return std::unexpected("parseLLVMIR: input IR text is empty");
     }
 
-    // Wrap the text in a MemoryBuffer (no copy; the buffer borrows the
-    // StringRef data, which must outlive the parse call).
+    // We use LLParser directly with UpgradeDebugInfo=false rather than the
+    // llvm::parseIR() convenience wrapper.
+    //
+    // Root cause: parseIR() -> parseAssembly() -> LLParser::Run(UpgradeDebugInfo=true)
+    // -> llvm::UpgradeDebugInfo() -> llvm::verifyModule() with FatalErrors=true.
+    // For Remill-lifted IR that contains backward branches to the first block
+    // (a common pattern for loops at function entry), the verifier fires
+    // "Entry block to function must not have predecessors!" and calls abort().
+    // Our entry-block fix (below) runs AFTER parsing, so it cannot help here.
+    // Passing UpgradeDebugInfo=false skips that internal verification pass;
+    // we sanitise the entry blocks ourselves immediately after parsing.
+    auto module = std::make_unique<llvm::Module>("<helix-input>", *llvm_ctx_);
+
+    llvm::SourceMgr src_mgr;
     auto mem_buf = llvm::MemoryBuffer::getMemBuffer(
-        ir_text,
-        /*BufferName=*/"<helix-input>",
-        /*RequiresNullTerminator=*/false
-    );
+        ir_text, "<helix-input>", /*RequiresNullTerminator=*/false);
+    src_mgr.AddNewSourceBuffer(std::move(mem_buf), llvm::SMLoc());
 
     llvm::SMDiagnostic diag;
-    auto module = llvm::parseIR(
-        *mem_buf,
-        diag,
-        *llvm_ctx_
-    );
+    llvm::LLParser parser(
+        ir_text, src_mgr, diag, module.get(),
+        /*Index=*/nullptr, *llvm_ctx_);
 
-    if (!module) {
+    if (parser.Run(/*UpgradeDebugInfo=*/false)) {
         // Format a detailed error message from the SMDiagnostic.
         std::string msg;
         llvm::raw_string_ostream os(msg);
@@ -197,6 +208,22 @@ Pipeline::parseLLVMIR(llvm::StringRef ir_text) {
         return std::unexpected(
             std::format("parseLLVMIR: failed to parse LLVM IR: {}", msg)
         );
+    }
+
+    // Sanitize: LLVM requires that entry blocks have no predecessors.
+    // Remill can produce functions where a backward branch (e.g. a loop)
+    // targets the very first block, which violates this invariant and causes
+    // LLVM to call abort() with "Broken module found".  Fix by inserting a
+    // new empty entry block that unconditionally branches to the original one.
+    for (auto& func : *module) {
+        if (func.isDeclaration() || func.empty())
+            continue;
+        auto& entry = func.getEntryBlock();
+        if (!entry.hasNPredecessors(0)) {
+            auto* newEntry = llvm::BasicBlock::Create(
+                func.getContext(), "", &func, &entry);
+            llvm::BranchInst::Create(&entry, newEntry);
+        }
     }
 
     return module;
@@ -260,10 +287,11 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     pm.addPass(createStructureControlFlowPass());
     pm.addPass(createRecoverVariablesPass());
     pm.addPass(createEliminateDeadCodePass());
-    pm.addPass(mlir::createCSEPass());
     // NOTE: Canonicalizer removed — it segfaults on multi-block HelixLow
     // functions with LLVM dialect br/condBr terminators crossing regions.
-    // CSE handles the necessary optimizations instead.
+    // NOTE: CSEPass also removed — same crash on complex functions with many
+    // basic blocks (confirmed on sethitpoints/ROTTR, 112 blocks). Both MLIR
+    // built-in passes are unsafe on HelixLow multi-block IR.
 }
 
 void Pipeline::ensurePipelineBuilt() {
@@ -302,7 +330,6 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
             std::format("runPasses: MLIR pass pipeline failed: {}", detail)
         );
     }
-    
     // Dump IR for debugging
     std::error_code ec;
     llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec);

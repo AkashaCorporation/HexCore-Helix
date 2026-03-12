@@ -7,6 +7,11 @@
 ///   - Folds register writes that set up call arguments into helix_high.call ops
 ///   - Names return values (RAX for integer, XMM0 for float)
 ///   - Marks callee-saved register restores as dead
+///
+/// NOTE: DominanceInfo is intentionally not used for block scanning here.
+/// domInfo.getNode() crashes on certain IR patterns (massive single-block
+/// functions, nested regions) in MLIR 18.x. The block scan + predecessor
+/// search covers all common calling convention patterns without dominator trees.
 
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
@@ -14,7 +19,6 @@
 #include "helix/analysis/X86RegisterInfo.h"
 #include "helix/analysis/SignatureDb.h"
 
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -143,42 +147,18 @@ static std::optional<Value> findLatestRegWriteInPredecessors(
     return candidate;
 }
 
-static std::optional<Value> findLatestRegWriteOnDomChain(
-    Block* block, Block::iterator endIt, llvm::StringRef canonicalReg,
-    DominanceInfo& domInfo, unsigned maxDepth = 8) {
-    Block* current = block;
-    Block::iterator currentEnd = endIt;
-
-    for (unsigned depth = 0; current && depth < maxDepth; ++depth) {
-        if (auto value =
-                findLatestRegWriteInBlock(current, currentEnd, canonicalReg)) {
-            return value;
-        }
-
-        auto* node = domInfo.getNode(current);
-        if (!node)
-            break;
-        auto* idom = node->getIDom();
-        if (!idom)
-            break;
-
-        current = idom->getBlock();
-        if (!current)
-            break;
-        currentEnd = current->end();
-    }
-
-    return std::nullopt;
-}
-
+/// Collect argument values for a call by scanning the block before `beforeOp`
+/// and predecessor blocks. Does not use DominanceInfo (which can crash on
+/// large/unusual IR in MLIR 18.x); the block scan + predecessor search covers
+/// all common ABI call patterns.
 static llvm::SmallVector<Value, 6> collectAbiCallArgs(
     Operation* beforeOp, llvm::ArrayRef<std::string_view> argRegs,
-    DominanceInfo& domInfo,
     unsigned predecessorDepth = 2) {
     auto* block = beforeOp ? beforeOp->getBlock() : nullptr;
     if (!block)
         return {};
 
+    // Build a map of the most recent register write before beforeOp.
     llvm::DenseMap<llvm::StringRef, Value> regState;
     for (auto& op : block->getOperations()) {
         if (&op == beforeOp)
@@ -200,14 +180,7 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
         llvm::StringRef key(argReg);
         auto it = regState.find(key);
         if (it == regState.end()) {
-            auto fromDomChain = findLatestRegWriteOnDomChain(
-                block, Block::iterator(beforeOp), key, domInfo);
-            if (fromDomChain) {
-                regState[key] = *fromDomChain;
-                it = regState.find(key);
-            }
-        }
-        if (it == regState.end()) {
+            // Not in the current block — check predecessor blocks.
             llvm::DenseSet<Block*> visiting;
             auto fromPreds = findLatestRegWriteInPredecessors(
                 block, key, predecessorDepth, visiting);
@@ -318,14 +291,13 @@ private:
         // Phase 3: Materialize ABI argument values directly on helix_low.call.
         llvm::SmallVector<helix::low::CallOp, 16> calls;
         func.walk([&](helix::low::CallOp call) { calls.push_back(call); });
-        DominanceInfo domInfo(func);
 
         for (auto call : calls) {
             auto targetName = call.getTargetName();
             const bool isDirectNamedCall =
                 targetName.has_value() && targetName->starts_with("sub_");
             auto argValues =
-                collectAbiCallArgs(call.getOperation(), argRegs, domInfo);
+                collectAbiCallArgs(call.getOperation(), argRegs);
             auto existingArgs = call.getArgs();
             const bool canMaterializeArgs =
                 isDirectNamedCall || existingArgs.empty();
@@ -357,7 +329,8 @@ private:
         }
 
         // Phase 4: Identify return value.
-        // If the function has a reg.read of RAX near its return, it returns a value.
+        // If the function has a reg.write to RAX/XMM0 before its return, it
+        // returns a value.
         bool hasReturnValue = false;
         func.walk([&](helix::low::RetOp ret) {
             // Check if there's a reg.write to RAX before this return

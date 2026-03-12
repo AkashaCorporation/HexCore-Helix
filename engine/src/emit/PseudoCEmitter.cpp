@@ -921,7 +921,6 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
     currentFunctionIsWin64_ = true;
     if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention"))
         currentFunctionIsWin64_ = (ccAttr.getValue() == "win64");
-
     // Initialize block labels for the entire function
     globalBlockCounter_ = 1;
     blockLabels_.clear();
@@ -2437,6 +2436,7 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
 
     // Helper: resolve a block to a label name, even if it's outside this region.
     auto resolveBlockLabel = [&](Block* dest) -> std::string {
+        if (!dest) return "";
         // Prefer LabelOp name if the block has one (emitted by StructureControlFlow).
         for (auto& op : *dest) {
             if (auto labelOp = dyn_cast<helix::high::LabelOp>(&op))
