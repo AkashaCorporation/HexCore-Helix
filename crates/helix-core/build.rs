@@ -1,95 +1,10 @@
-//! Build script for helix-core.
+//! Build script for helix-core (simplified, no CMake dependency).
 //!
 //! Links against the pre-built C++ engine (helix_engine.lib) and all
-//! required LLVM/MLIR static libraries for the MLIR decompilation pipeline.
+//! required LLVM/MLIR static libraries directly without CMake configs.
 
 use std::env;
 use std::path::PathBuf;
-
-fn root_from_cmake_dir(dir: PathBuf) -> PathBuf {
-    dir.parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or(dir)
-}
-
-fn command_output(cmd: &str, arg: &str) -> Option<String> {
-    let output = std::process::Command::new(cmd).arg(arg).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-fn command_output_args(cmd: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(cmd).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-fn emit_system_link_token(token: &str) {
-    let token = token.trim();
-    if token.is_empty() {
-        return;
-    }
-
-    if let Some(dir) = token.strip_prefix("-L") {
-        println!("cargo:rustc-link-search=native={}", dir);
-        return;
-    }
-
-    if token == "-pthread" {
-        println!("cargo:rustc-link-lib=dylib=pthread");
-        return;
-    }
-
-    if let Some(lib) = token.strip_prefix("-l") {
-        if !lib.is_empty() {
-            println!("cargo:rustc-link-lib=dylib={}", lib);
-        }
-        return;
-    }
-
-    let path = PathBuf::from(token);
-    if !path.is_absolute() {
-        return;
-    }
-
-    if let Some(parent) = path.parent() {
-        println!("cargo:rustc-link-search=native={}", parent.display());
-    }
-
-    let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
-        return;
-    };
-    let Some(stripped) = file_name.strip_prefix("lib") else {
-        return;
-    };
-
-    for suffix in [".so", ".a", ".dylib"] {
-        if let Some((lib, _)) = stripped.split_once(suffix) {
-            if !lib.is_empty() {
-                println!("cargo:rustc-link-lib=dylib={}", lib);
-            }
-            return;
-        }
-    }
-}
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -98,45 +13,39 @@ fn main() {
     // ─── Paths ─────────────────────────────────────────────────────────
     let engine_build_dir = project_root.join("engine").join("build");
 
-    // LLVM/MLIR build directory — configurable via environment variables.
-    // Priority: MLIR_DIR > LLVM_BUILD_DIR > LLVM_DIR > llvm-config > common prefixes
-    let llvm_build = if let Ok(dir) = env::var("MLIR_DIR") {
-        root_from_cmake_dir(PathBuf::from(dir))
-    } else if let Ok(dir) = env::var("LLVM_BUILD_DIR") {
+    // LLVM/MLIR lib directory — simplified detection
+    let llvm_lib_dir = if let Ok(dir) = env::var("LLVM_LIB_DIR") {
+        // Direct lib dir (highest priority for CI)
         PathBuf::from(dir)
     } else if let Ok(dir) = env::var("LLVM_DIR") {
-        root_from_cmake_dir(PathBuf::from(dir))
-    } else if let Some(libdir) = command_output("llvm-config", "--libdir") {
-        let libdir_path = PathBuf::from(&libdir);
-        libdir_path
+        // LLVM_DIR points to lib/cmake/llvm, go up to lib
+        PathBuf::from(dir)
             .parent()
+            .and_then(|p| p.parent())
             .map(|p| p.to_path_buf())
-            .unwrap_or(libdir_path)
-    } else if let Some(prefix) = command_output("llvm-config", "--prefix") {
-        PathBuf::from(prefix)
+            .unwrap_or_else(|| PathBuf::from(dir))
+    } else if let Ok(dir) = env::var("LLVM_BUILD_DIR") {
+        // LLVM_BUILD_DIR points to build root
+        PathBuf::from(dir).join("lib")
     } else {
-        let common_roots = [
-            "/usr/lib/llvm-18",
-            "/usr/local/opt/llvm",
-            "/opt/homebrew/opt/llvm",
-            "C:/Program Files/LLVM",
-        ];
-
-        common_roots
-            .iter()
-            .map(PathBuf::from)
-            .find(|root| root.join("lib").exists())
-            .unwrap_or_else(|| {
-                panic!(
-                    "Could not determine LLVM/MLIR build directory.\n\
-                     Set one of these environment variables:\n\
-                     - MLIR_DIR: path to MLIR CMake config (e.g., /usr/lib/llvm-18/lib/cmake/mlir)\n\
-                     - LLVM_DIR: path to LLVM CMake config (e.g., /usr/lib/llvm-18/lib/cmake/llvm)\n\
-                     - LLVM_BUILD_DIR: path to the LLVM/MLIR build root"
-                );
-            })
+        panic!(
+            "Could not determine LLVM/MLIR lib directory.\n\
+             Set one of these environment variables:\n\
+             - LLVM_LIB_DIR: direct path to lib dir (e.g., /path/to/llvm/lib)\n\
+             - LLVM_DIR: path to LLVM CMake config (e.g., /path/to/lib/cmake/llvm)\n\
+             - LLVM_BUILD_DIR: path to LLVM build root"
+        );
     };
-    let llvm_lib_dir = llvm_build.join("lib");
+
+    if !llvm_lib_dir.exists() {
+        panic!(
+            "LLVM lib directory does not exist: {}\n\
+             Check your LLVM_LIB_DIR, LLVM_DIR, or LLVM_BUILD_DIR environment variable.",
+            llvm_lib_dir.display()
+        );
+    }
+
+    println!("cargo:warning=Using LLVM libs from: {}", llvm_lib_dir.display());
 
     // ─── Link the Helix engine static library ──────────────────────────
     println!(
@@ -146,12 +55,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=helix_engine");
 
     // ─── Link LLVM static libraries ────────────────────────────────────
-    // These match the components from CMakeLists.txt:
-    //   core, support, irreader, analysis, passes, target,
-    //   x86codegen/asmparser/desc/info, aarch64codegen/asmparser/desc/info
     println!("cargo:rustc-link-search=native={}", llvm_lib_dir.display());
 
-    // Core LLVM libraries (order matters for static linking — dependents first)
+    // Core LLVM libraries (order matters for static linking)
     let llvm_libs = [
         // High-level
         "LLVMPasses",
@@ -216,7 +122,6 @@ fn main() {
     }
 
     // ─── Link MLIR static libraries ────────────────────────────────────
-    // These match the target_link_libraries from CMakeLists.txt
     let mlir_libs = [
         // Core MLIR
         "MLIRIR",
@@ -241,9 +146,9 @@ fn main() {
         "MLIRInferTypeOpInterface",
         // Arith Dialect
         "MLIRArithDialect",
-        // UB Dialect (dependency of ArithDialect — PoisonOp)
+        // UB Dialect
         "MLIRUBDialect",
-        // Func Dialect (dependency of translation infra)
+        // Func Dialect
         "MLIRFuncDialect",
         // Control Flow Dialect
         "MLIRControlFlowDialect",
@@ -256,7 +161,7 @@ fn main() {
         "MLIRTensorUtils",
         "MLIRMemRefUtils",
         "MLIRSCFUtils",
-        // Additional dependencies pulled in transitively
+        // Additional dependencies
         "MLIRParser",
         "MLIRAsmParser",
         "MLIRBytecodeReader",
@@ -300,7 +205,7 @@ fn main() {
         // Translation registration
         "MLIRFromLLVMIRTranslationRegistration",
         "MLIRToLLVMIRTranslationRegistration",
-        // NVVMDialect pulled in by MLIRLLVMIRToNVVMTranslation
+        // NVVMDialect
         "MLIRNVVMDialect",
         "MLIRDLTIDialect",
     ];
@@ -310,7 +215,6 @@ fn main() {
     }
 
     // ─── Windows System Libraries ──────────────────────────────────────
-    // LLVM/MLIR on Windows needs these system libraries
     if cfg!(target_os = "windows") {
         println!("cargo:rustc-link-lib=dylib=msvcrt");
         println!("cargo:rustc-link-lib=dylib=shell32");
@@ -325,19 +229,11 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=version");
     }
 
-    // On Linux/macOS, link C++ standard library
+    // On Linux/macOS, link C++ standard library and system libs
     if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
-        if let Some(system_libs) =
-            command_output_args("llvm-config", &["--system-libs", "--link-static"])
-        {
-            for token in system_libs.split_whitespace() {
-                emit_system_link_token(token);
-            }
-        } else {
-            for lib in ["tinfo", "z", "zstd", "xml2", "ffi"] {
-                println!("cargo:rustc-link-lib=dylib={}", lib);
-            }
+        for lib in ["tinfo", "z", "zstd", "xml2", "ffi"] {
+            println!("cargo:rustc-link-lib=dylib={}", lib);
         }
     }
     if cfg!(target_os = "macos") {
@@ -345,9 +241,10 @@ fn main() {
     }
 
     // ─── Re-run triggers ───────────────────────────────────────────────
-    println!("cargo:rerun-if-env-changed=MLIR_DIR");
+    println!("cargo:rerun-if-env-changed=LLVM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_BUILD_DIR");
+    
     let engine_lib_name = if cfg!(target_os = "windows") {
         "helix_engine.lib"
     } else {
@@ -357,9 +254,4 @@ fn main() {
         "cargo:rerun-if-changed={}",
         engine_build_dir.join(engine_lib_name).display()
     );
-
-    let schemas_dir = project_root.join("schemas");
-    if schemas_dir.exists() {
-        println!("cargo:rerun-if-changed={}", schemas_dir.display());
-    }
 }
