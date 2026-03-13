@@ -11,7 +11,25 @@ fn main() {
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
 
     // ─── Paths ─────────────────────────────────────────────────────────
-    let engine_build_dir = project_root.join("engine").join("build");
+    // Try to find pre-built engine lib in deps first (CI), then local build
+    let engine_lib_search_paths = [
+        project_root.join("engine").join("deps").join("llvm-mlir").join("engine"),
+        project_root.join("engine").join("build").join("Release"),
+        project_root.join("engine").join("build"),
+    ];
+    
+    let engine_build_dir = engine_lib_search_paths
+        .iter()
+        .find(|p| {
+            let lib_name = if cfg!(target_os = "windows") {
+                "helix_engine.lib"
+            } else {
+                "libhelix_engine.a"
+            };
+            p.join(lib_name).exists()
+        })
+        .cloned()
+        .unwrap_or_else(|| project_root.join("engine").join("build"));
 
     // LLVM/MLIR lib directory — simplified detection
     let llvm_lib_dir = if let Ok(dir) = env::var("LLVM_LIB_DIR") {
