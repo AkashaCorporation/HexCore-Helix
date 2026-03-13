@@ -19,8 +19,8 @@ fn main() {
         PathBuf::from(dir)
     } else if let Ok(dir) = env::var("LLVM_DIR") {
         // LLVM_DIR points to lib/cmake/llvm, go up to lib
-        PathBuf::from(dir)
-            .parent()
+        let path = PathBuf::from(&dir);
+        path.parent()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from(dir))
