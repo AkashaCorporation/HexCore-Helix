@@ -146,6 +146,10 @@ private:
     /// Label names referenced by explicit `helix_high.goto`.
     std::unordered_set<std::string> referencedLabelNames_;
 
+    /// Labels that are only followed by other labels and a final `return`.
+    /// Maps label name → true if the goto can be replaced with `return`.
+    std::unordered_set<std::string> returnOnlyLabels_;
+
     /// Active calling convention for the function currently being emitted.
     bool currentFunctionIsWin64_ = true;
 
@@ -169,6 +173,13 @@ private:
 
     /// Per-function identifier aliases (e.g. param_1 -> this).
     std::unordered_map<std::string, std::string> nameAliases_;
+
+    /// Stack offset → variable name map for resolving `rbp ± offset` in low-level ops.
+    /// Populated from VarDeclOps with StorageKind::Stack.
+    std::unordered_map<int64_t, std::string> stackOffsetToVarName_;
+
+    /// Global address → variable name map for naming `*0xADDR` accesses.
+    std::map<uint64_t, std::string> globalAddrToVarName_;
 
     /// Learnt base addresses for synthetic call-target temporaries (v0, v1, ...).
     std::unordered_map<std::string, int64_t> syntheticCallBaseAddrs_;

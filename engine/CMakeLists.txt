@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(helix_engine
-    VERSION 0.2.0
+    VERSION 1.0.0
     LANGUAGES CXX C
-    DESCRIPTION "HexCore Helix Decompilation Engine — C++23/MLIR Core"
+    DESCRIPTION "HexCore Helix Decompilation Engine — C++23/MLIR 3-Tier Architecture"
 )
 
 # ─── C++23 Standard ─────────────────────────────────────────────────────────────
@@ -26,12 +26,6 @@ endif()
 option(HELIX_USE_LLVM "Link against LLVM/MLIR libraries" ON)
 
 if(HELIX_USE_LLVM)
-    # Hint: set LLVM_DIR and MLIR_DIR to point to the CMake config directories,
-    # e.g.:  cmake -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
-    #              -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir ..
-    # Or via environment variables:
-    #   export LLVM_DIR=/path/to/llvm/lib/cmake/llvm
-    #   export MLIR_DIR=/path/to/llvm/lib/cmake/mlir
     if(NOT DEFINED LLVM_DIR AND DEFINED ENV{LLVM_DIR})
         set(LLVM_DIR $ENV{LLVM_DIR})
     endif()
@@ -56,9 +50,11 @@ if(HELIX_USE_LLVM)
 
     set(HELIX_TABLEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dialects)
     set(HELIX_TABLEGEN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/helix/dialects)
+    set(HELIX_IFACE_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/helix)
 
     # Ensure output directories exist
     file(MAKE_DIRECTORY ${HELIX_TABLEGEN_OUTPUT_DIR})
+    file(MAKE_DIRECTORY ${HELIX_IFACE_OUTPUT_DIR})
 
     # Find mlir-tblgen
     find_program(MLIR_TBLGEN_EXE mlir-tblgen HINTS ${LLVM_TOOLS_BINARY_DIR})
@@ -67,143 +63,110 @@ if(HELIX_USE_LLVM)
     else()
         message(STATUS "Found mlir-tblgen: ${MLIR_TBLGEN_EXE}")
 
-        # TableGen include paths — MLIR_INCLUDE_DIRS may have multiple entries
+        # TableGen include paths
         set(TBLGEN_INCLUDES "")
         foreach(inc_dir ${MLIR_INCLUDE_DIRS})
             list(APPEND TBLGEN_INCLUDES "-I${inc_dir}")
         endforeach()
         list(APPEND TBLGEN_INCLUDES "-I${CMAKE_CURRENT_SOURCE_DIR}")
 
-        # ── HelixLow Dialect TableGen ────────────────────────────────────
-        set(HELIX_LOW_TD ${HELIX_TABLEGEN_DIR}/HelixLowOps.td)
+        # ── Macro: generate all .inc files for a dialect ──────────────────
+        macro(helix_tablegen_dialect DIALECT_NAME OPS_TD DIALECT_TD TYPES_TD)
+            set(_OPS_TD_PATH ${HELIX_TABLEGEN_DIR}/${OPS_TD})
+            set(_DIALECT_TD_PATH ${HELIX_TABLEGEN_DIR}/${DIALECT_TD})
+            set(_TYPES_TD_PATH ${HELIX_TABLEGEN_DIR}/${TYPES_TD})
+            set(_OUT ${HELIX_TABLEGEN_OUTPUT_DIR})
 
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowOps.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-op-decls ${TBLGEN_INCLUDES} ${HELIX_LOW_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowOps.h.inc
-            DEPENDS ${HELIX_LOW_TD}
-            COMMENT "Generating HelixLow op declarations"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowOps.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-op-defs ${TBLGEN_INCLUDES} ${HELIX_LOW_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowOps.cpp.inc
-            DEPENDS ${HELIX_LOW_TD}
-            COMMENT "Generating HelixLow op definitions"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowDialect.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-decls ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixLowDialect.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowDialect.h.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixLowDialect.td
-            COMMENT "Generating HelixLow dialect declaration"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowDialect.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-defs ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixLowDialect.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowDialect.cpp.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixLowDialect.td
-            COMMENT "Generating HelixLow dialect definition"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowEnums.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-decls ${TBLGEN_INCLUDES} ${HELIX_LOW_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowEnums.h.inc
-            DEPENDS ${HELIX_LOW_TD}
-            COMMENT "Generating HelixLow enum declarations"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowEnums.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-defs ${TBLGEN_INCLUDES} ${HELIX_LOW_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowEnums.cpp.inc
-            DEPENDS ${HELIX_LOW_TD}
-            COMMENT "Generating HelixLow enum definitions"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowTypes.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-decls ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixLowTypes.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowTypes.h.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixLowTypes.td
-            COMMENT "Generating HelixLow type declarations"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowTypes.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-defs ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixLowTypes.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowTypes.cpp.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixLowTypes.td
-            COMMENT "Generating HelixLow type definitions"
-        )
+            # Op declarations/definitions
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Ops.h.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-op-decls ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
+                    -o ${_OUT}/${DIALECT_NAME}Ops.h.inc
+                DEPENDS ${_OPS_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} op declarations"
+            )
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Ops.cpp.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-op-defs ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
+                    -o ${_OUT}/${DIALECT_NAME}Ops.cpp.inc
+                DEPENDS ${_OPS_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} op definitions"
+            )
 
-        # ── HelixHigh Dialect TableGen ───────────────────────────────────
-        set(HELIX_HIGH_TD ${HELIX_TABLEGEN_DIR}/HelixHighOps.td)
+            # Dialect declarations/definitions
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Dialect.h.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-decls ${TBLGEN_INCLUDES}
+                    ${_DIALECT_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Dialect.h.inc
+                DEPENDS ${_DIALECT_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} dialect declaration"
+            )
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Dialect.cpp.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-defs ${TBLGEN_INCLUDES}
+                    ${_DIALECT_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Dialect.cpp.inc
+                DEPENDS ${_DIALECT_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} dialect definition"
+            )
 
+            # Enum declarations/definitions
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Enums.h.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-decls ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
+                    -o ${_OUT}/${DIALECT_NAME}Enums.h.inc
+                DEPENDS ${_OPS_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} enum declarations"
+            )
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Enums.cpp.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-defs ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
+                    -o ${_OUT}/${DIALECT_NAME}Enums.cpp.inc
+                DEPENDS ${_OPS_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} enum definitions"
+            )
+
+            # Type declarations/definitions
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Types.h.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-decls ${TBLGEN_INCLUDES}
+                    ${_TYPES_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Types.h.inc
+                DEPENDS ${_TYPES_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} type declarations"
+            )
+            add_custom_command(
+                OUTPUT ${_OUT}/${DIALECT_NAME}Types.cpp.inc
+                COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-defs ${TBLGEN_INCLUDES}
+                    ${_TYPES_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Types.cpp.inc
+                DEPENDS ${_TYPES_TD_PATH}
+                COMMENT "Generating ${DIALECT_NAME} type definitions"
+            )
+        endmacro()
+
+        # ── Generate all three dialects ──────────────────────────────────
+        helix_tablegen_dialect(HelixLow  HelixLowOps.td  HelixLowDialect.td  HelixLowTypes.td)
+        helix_tablegen_dialect(HelixMid  HelixMidOps.td  HelixMidDialect.td  HelixMidTypes.td)
+        helix_tablegen_dialect(HelixHigh HelixHighOps.td HelixHighDialect.td HelixHighTypes.td)
+
+        # ── Helix Interfaces TableGen ────────────────────────────────────
+        set(HELIX_IFACE_TD ${HELIX_TABLEGEN_DIR}/HelixInterfaces.td)
         add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighOps.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-op-decls ${TBLGEN_INCLUDES} ${HELIX_HIGH_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighOps.h.inc
-            DEPENDS ${HELIX_HIGH_TD}
-            COMMENT "Generating HelixHigh op declarations"
+            OUTPUT ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
+            COMMAND ${MLIR_TBLGEN_EXE} -gen-op-interface-decls ${TBLGEN_INCLUDES}
+                ${HELIX_IFACE_TD} -o ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
+            DEPENDS ${HELIX_IFACE_TD}
+            COMMENT "Generating Helix interface declarations"
         )
         add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighOps.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-op-defs ${TBLGEN_INCLUDES} ${HELIX_HIGH_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighOps.cpp.inc
-            DEPENDS ${HELIX_HIGH_TD}
-            COMMENT "Generating HelixHigh op definitions"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighDialect.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-decls ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixHighDialect.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighDialect.h.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixHighDialect.td
-            COMMENT "Generating HelixHigh dialect declaration"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighDialect.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-defs ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixHighDialect.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighDialect.cpp.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixHighDialect.td
-            COMMENT "Generating HelixHigh dialect definition"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighEnums.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-decls ${TBLGEN_INCLUDES} ${HELIX_HIGH_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighEnums.h.inc
-            DEPENDS ${HELIX_HIGH_TD}
-            COMMENT "Generating HelixHigh enum declarations"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighEnums.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-defs ${TBLGEN_INCLUDES} ${HELIX_HIGH_TD}
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighEnums.cpp.inc
-            DEPENDS ${HELIX_HIGH_TD}
-            COMMENT "Generating HelixHigh enum definitions"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighTypes.h.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-decls ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixHighTypes.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighTypes.h.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixHighTypes.td
-            COMMENT "Generating HelixHigh type declarations"
-        )
-        add_custom_command(
-            OUTPUT ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighTypes.cpp.inc
-            COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-defs ${TBLGEN_INCLUDES}
-                ${HELIX_TABLEGEN_DIR}/HelixHighTypes.td
-                -o ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighTypes.cpp.inc
-            DEPENDS ${HELIX_TABLEGEN_DIR}/HelixHighTypes.td
-            COMMENT "Generating HelixHigh type definitions"
+            OUTPUT ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
+            COMMAND ${MLIR_TBLGEN_EXE} -gen-op-interface-defs ${TBLGEN_INCLUDES}
+                ${HELIX_IFACE_TD} -o ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
+            DEPENDS ${HELIX_IFACE_TD}
+            COMMENT "Generating Helix interface definitions"
         )
 
-        # Collect all generated files as a custom target
+        # ── Collect all generated files ──────────────────────────────────
         add_custom_target(helix_tablegen ALL DEPENDS
+            # HelixLow
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowOps.h.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowOps.cpp.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowDialect.h.inc
@@ -212,6 +175,16 @@ if(HELIX_USE_LLVM)
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowEnums.cpp.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowTypes.h.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixLowTypes.cpp.inc
+            # HelixMid (NEW in v1.0)
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidOps.h.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidOps.cpp.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidDialect.h.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidDialect.cpp.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidEnums.h.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidEnums.cpp.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidTypes.h.inc
+            ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixMidTypes.cpp.inc
+            # HelixHigh
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighOps.h.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighOps.cpp.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighDialect.h.inc
@@ -220,6 +193,9 @@ if(HELIX_USE_LLVM)
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighEnums.cpp.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighTypes.h.inc
             ${HELIX_TABLEGEN_OUTPUT_DIR}/HelixHighTypes.cpp.inc
+            # Interfaces
+            ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
+            ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
         )
     endif()
 endif()
@@ -232,9 +208,11 @@ set(HELIX_SOURCES
     src/CApi.cpp
     src/Pipeline.cpp
 
-    # Dialects
+    # Dialects — 3-tier architecture (Low → Mid → High)
     src/dialects/HelixLowDialect.cpp
     src/dialects/HelixLowOps.cpp
+    src/dialects/HelixMidDialect.cpp          # NEW v1.0
+    src/dialects/HelixMidOps.cpp              # NEW v1.0
     src/dialects/HelixHighDialect.cpp
     src/dialects/HelixHighOps.cpp
 
@@ -242,7 +220,7 @@ set(HELIX_SOURCES
     src/analysis/RemillDemangler.cpp
     src/analysis/SignatureDb.cpp
 
-    # Passes
+    # Passes — original v0.5 analysis passes
     src/passes/Passes.cpp
     src/passes/RemillToHelixLow.cpp
     src/passes/RecoverStackLayout.cpp
@@ -252,6 +230,14 @@ set(HELIX_SOURCES
     src/passes/RecoverVariables.cpp
     src/passes/EliminateDeadCode.cpp
 
+    # Passes — v3.8.0 optimization passes
+    src/passes/RecoverMagicDivision.cpp        # NEW v3.8.0
+    src/passes/DevirtualizeIndirectCalls.cpp   # NEW v3.8.0
+    src/passes/InterProceduralTypePropagation.cpp  # NEW v3.8.0
+
+    # Passes — v1.0 dialect conversion passes
+    src/passes/HelixLowToMid.cpp              # NEW v1.0
+    src/passes/HelixMidToHigh.cpp             # NEW v1.0
     # Emitters
     src/emit/PseudoCEmitter.cpp
     src/emit/FlatBufSerializer.cpp
@@ -261,13 +247,21 @@ set(HELIX_HEADERS
     include/helix/Engine.h
     include/helix/Types.h
     include/helix/Pipeline.h
+    include/helix/Interfaces.h                # NEW v1.0
     include/helix/passes/Passes.h
+    # Dialects — Low
     include/helix/dialects/HelixLowDialect.h
     include/helix/dialects/HelixLowTypes.h
     include/helix/dialects/HelixLowOps.h
+    # Dialects — Mid (NEW v1.0)
+    include/helix/dialects/HelixMidDialect.h
+    include/helix/dialects/HelixMidTypes.h
+    include/helix/dialects/HelixMidOps.h
+    # Dialects — High
     include/helix/dialects/HelixHighDialect.h
     include/helix/dialects/HelixHighTypes.h
     include/helix/dialects/HelixHighOps.h
+    # Emitters & Analysis
     include/helix/emit/PseudoCEmitter.h
     include/helix/emit/FlatBufSerializer.h
     include/helix/analysis/RemillDemangler.h
@@ -288,7 +282,7 @@ if(TARGET helix_tablegen)
     add_dependencies(helix_engine helix_tablegen)
 endif()
 
-# Phase 2: Link LLVM/MLIR
+# Link LLVM/MLIR
 if(HELIX_USE_LLVM)
     # Core LLVM libraries needed for decompilation
     llvm_map_components_to_libnames(LLVM_LIBS
@@ -338,13 +332,13 @@ if(HELIX_USE_LLVM)
         MLIRFunctionInterfaces
         MLIRInferTypeOpInterface
 
-        # Arith Dialect (arith::ConstantOp, ShRUIOp, etc. in RecoverVariables)
+        # Arith Dialect
         MLIRArithDialect
 
-        # UB Dialect (dependency of ArithDialect in MLIR 18+ — PoisonOp/PoisonAttr)
+        # UB Dialect (dependency of ArithDialect in MLIR 18+)
         MLIRUBDialect
 
-        # Func Dialect (required by LLVM IR translation infrastructure)
+        # Func Dialect (required by LLVM IR translation)
         MLIRFuncDialect
 
         # Control Flow Dialect (cf::BranchOp in StructureControlFlow)
@@ -353,8 +347,9 @@ if(HELIX_USE_LLVM)
         # SCF Dialect (structured control flow)
         MLIRSCFDialect
 
-        # DLTI Dialect (required by translateLLVMIRToModule for data layout)
+        # DLTI Dialect (required by translateLLVMIRToModule)
         MLIRDLTIDialect
+
     )
 endif()
 
@@ -379,12 +374,9 @@ if(HELIX_BUILD_TOOLS)
     )
 
     # MLIR's internal recursion can blow the default 1 MB stack on large IR
-    # inputs.  Set the PE default stack reserve to 16 MB so that both the
-    # main thread and any std::thread spawned by the engine get enough room.
+    # inputs.  Set the PE default stack reserve to 64 MB.
     if(MSVC)
         target_link_options(helix_tool PRIVATE /STACK:67108864)
-    else()
-        # On Linux/macOS, control via ulimit or pthread_attr; linker flags vary.
     endif()
 
     install(TARGETS helix_tool RUNTIME DESTINATION bin)
@@ -409,13 +401,16 @@ endif()
 # ─── Summary ─────────────────────────────────────────────────────────────────────
 
 message(STATUS "")
-message(STATUS "=== HexCore Helix Engine ===")
-message(STATUS "  Version:      ${PROJECT_VERSION}")
-message(STATUS "  C++ Std:      C++${CMAKE_CXX_STANDARD}")
-message(STATUS "  LLVM/MLIR:    ${HELIX_USE_LLVM}")
-message(STATUS "  FlatBuffers:  ${flatbuffers_FOUND}")
-message(STATUS "  CLI Tool:     ${HELIX_BUILD_TOOLS}")
-message(STATUS "  Tests:        ${HELIX_BUILD_TESTS}")
-message(STATUS "  Build Type:   ${CMAKE_BUILD_TYPE}")
-message(STATUS "============================")
+message(STATUS "╔══════════════════════════════════════════╗")
+message(STATUS "║   HexCore Helix Engine v${PROJECT_VERSION}           ║")
+message(STATUS "╠══════════════════════════════════════════╣")
+message(STATUS "║  Architecture:  3-Tier (Low→Mid→High)   ║")
+message(STATUS "║  C++ Standard:  C++${CMAKE_CXX_STANDARD}                    ║")
+message(STATUS "║  LLVM/MLIR:     ${HELIX_USE_LLVM}                      ║")
+message(STATUS "║  Emitter:       PseudoC                   ║")
+message(STATUS "║  FlatBuffers:   ${flatbuffers_FOUND}")
+message(STATUS "║  CLI Tool:      ${HELIX_BUILD_TOOLS}")
+message(STATUS "║  Tests:         ${HELIX_BUILD_TESTS}")
+message(STATUS "║  Build Type:    ${CMAKE_BUILD_TYPE}")
+message(STATUS "╚══════════════════════════════════════════╝")
 message(STATUS "")

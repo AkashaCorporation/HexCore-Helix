@@ -4,6 +4,40 @@ All notable changes to HexCore Helix are documented here.
 
 ---
 
+## [v0.6.0] — 2026-03-14
+
+### 3-Tier Dialect Architecture (v1.0)
+
+The engine now uses a **three-tier MLIR dialect pipeline**: HelixLow (machine-level) → HelixMid (ISA-agnostic typed SSA) → HelixHigh (C source-level).
+
+- **HelixMid dialect** — New intermediate dialect with typed variables, comparisons, select, memcpy/memset intrinsics
+- **HelixLowToMid pass** — Converts registers → abstract variable slots, flags → comparisons, CMOV → select, REP MOVS/STOS → memcpy/memset
+- **HelixMidToHigh pass** — Converts abstract slots → named C variables, typed expressions → C-level ops
+- **EmitC removed** — PseudoCEmitter is the sole emission backend; all EmitC dialect references cleaned out
+
+### Optimization Passes (HexCore v3.8.0)
+
+Four community-requested features:
+
+- **RecoverMagicDivision** — Detects compiler-generated `(x * magic) >> shift` patterns and reverses them to clean `x / divisor` expressions
+- **DevirtualizeIndirectCalls** — Intra-procedural dataflow analysis to track vtable pointer stores, resolve indirect calls through vtable slots, and annotate with function names
+- **InterProceduralTypePropagation** — Propagates argument and return types across function call boundaries until convergence, eliminating the int64_t flood from ABI register-width defaults
+- **Node Splitting in StructureControlFlow** — Handles irreducible control flow by duplicating merge nodes, converting irreducible loops into reducible ones before structuring
+
+### Output Quality Improvements
+
+- **Goto-to-return optimization** — Labels followed only by a return are inlined: `goto label_ret` → `return value`
+- **Redundant cast elimination** — Suppresses `(int64_t)(...)` wrapping around dereferences, struct field access, and global names
+- **Stack variable resolution** — Populates variable names from VarDeclOps and resolves `rbp ± offset` patterns in memory operations
+
+### Build
+
+- `helix_engine.lib` rebuilt: 61,711,128 bytes (without EmitC)
+- `hexcore-helix.win32-x64-msvc.node` rebuilt: 13,481,984 bytes
+- Version bumped to `0.6.0` across Cargo workspace, npm package, and VSCode extension
+
+---
+
 ## [v0.5.0] — 2026-03-11
 
 ### Bug Fixes

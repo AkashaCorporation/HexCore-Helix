@@ -7,23 +7,33 @@ This repository is public and tracks the real engine work. The focus is practica
 ## What Helix Does
 
 - Lifts machine code through Remill-generated LLVM IR
-- Lowers IR into Helix-specific MLIR dialects
+- Lowers IR through a **3-tier MLIR dialect pipeline** (HelixLow → HelixMid → HelixHigh)
 - Recovers stack layout, parameters, locals, and variable intent
 - Reconstructs direct calls, vtable calls, and recursive calls
 - Simplifies flags and comparisons into readable conditions
+- Reverses compiler optimizations (magic division, strength reduction)
+- Propagates types across function boundaries
 - Structures as much control flow as possible before emission
 - Emits pseudo-C through the standalone `helix_tool`
 
 ## Current Focus
 
-As of March 2026, the C++23/MLIR pipeline is the primary backend.
+As of March 2026, the C++23/MLIR pipeline is the primary backend running a 3-tier architecture.
 
-- `RemillToHelixLow` handles Remill IR lowering and address tracking
-- `RecoverStackLayout` reconstructs Win64 stack parameters and locals
-- `RecoverCallingConvention` materializes real call arguments
-- `StructureControlFlow` turns CFG regions into structured flow where possible
-- `RecoverVariables` and `EliminateDeadCode` reduce register noise
-- `PseudoCEmitter` formats the final pseudo-C and suppresses obvious artifacts
+### Pass Pipeline
+
+1. `RemillToHelixLow` — Remill IR lowering and address tracking
+2. `RecoverStackLayout` — Win64 stack parameter and local reconstruction
+3. `RecoverCallingConvention` — ABI argument materialization
+4. `PropagateTypes` — Intra-procedural type inference to fixed point
+5. `InterProceduralTypePropagation` — Cross-function type propagation
+6. `StructureControlFlow` — CFG structuring with irreducible loop handling
+7. `RecoverVariables` / `EliminateDeadCode` — Register noise reduction
+8. `HelixLowToMid` — Machine-level → ISA-agnostic typed SSA
+9. `RecoverMagicDivision` — Reverses `(x * magic) >> shift` → `x / divisor`
+10. `DevirtualizeIndirectCalls` — Vtable dataflow analysis
+11. `HelixMidToHigh` — Typed SSA → C source-level representation
+12. `PseudoCEmitter` — Final pseudo-C formatting with goto-to-return and cast elimination
 
 The Rust workspace remains part of the project for shared types, transport, and IDE-facing integration.
 

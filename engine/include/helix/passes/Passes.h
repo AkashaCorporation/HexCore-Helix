@@ -66,6 +66,51 @@ std::unique_ptr<mlir::Pass> createRecoverVariablesPass();
 /// register writes, stack pointer bookkeeping (rsp = rsp ± N).
 std::unique_ptr<mlir::Pass> createEliminateDeadCodePass();
 
+// ─── Optimization Passes (v3.8.0) ────────────────────────────────────────────
+
+/// Create the magic number division recovery pass.
+///
+/// Detects compiler-generated magic number multiply+shift patterns that
+/// implement division by a constant, and reverses them to clean division
+/// expressions:  `(x * magic) >> shift`  →  `x / divisor`
+std::unique_ptr<mlir::Pass> createRecoverMagicDivisionPass();
+
+/// Create the devirtualization pass for indirect calls.
+///
+/// Performs intra-procedural dataflow analysis to track vtable pointer stores
+/// and resolve indirect calls through vtable slots.  Annotates calls with
+/// vtable address and offset information; resolves to function names when
+/// the target address matches a known function.
+std::unique_ptr<mlir::Pass> createDevirtualizeIndirectCallsPass();
+
+/// Create the inter-procedural type propagation pass.
+///
+/// Propagates type information across function call boundaries:
+/// argument types from caller to callee parameters, and return types
+/// from callee back to caller.  Iterates until convergence to eliminate
+/// the int64_t flood from ABI register-width defaults.
+std::unique_ptr<mlir::Pass> createInterProceduralTypePropagationPass();
+
+// ─── Dialect Conversion Passes (v1.0 3-tier architecture) ────────────────────
+
+/// Create the HelixLow → HelixMid conversion pass.
+///
+/// Converts machine-level ops to ISA-agnostic typed SSA:
+///   - reg.read/reg.write → var.ref/assign (abstract slots)
+///   - mem.read/mem.write → typed load/store
+///   - flag-producing binop → pure value binexpr
+///   - CMOV → select, CMP/TEST → comparison expressions
+///   - REP MOVS/STOS → memcpy/memset intrinsics
+std::unique_ptr<mlir::Pass> createHelixLowToMidPass();
+
+/// Create the HelixMid → HelixHigh conversion pass.
+///
+/// Converts ISA-agnostic typed SSA to C source-level representation:
+///   - Abstract variable slots → named variables
+///   - Typed expressions → C-level binary/unary ops
+///   - select → ternary, memcpy/memset → call
+std::unique_ptr<mlir::Pass> createHelixMidToHighPass();
+
 // ─── Pass Registration ───────────────────────────────────────────────────────
 
 /// Register all Helix passes with the MLIR pass registry.

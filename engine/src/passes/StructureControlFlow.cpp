@@ -75,6 +75,8 @@ STATISTIC(NumDoWhileRecovered,  "Number of do-while loops recovered");
 STATISTIC(NumIfRecovered,       "Number of if/else blocks recovered");
 STATISTIC(NumTernaryRecovered,  "Number of CMOV -> ternary conversions");
 STATISTIC(NumGotoEmitted,       "Number of goto/label pairs emitted (irreducible)");
+STATISTIC(NumNodesSplit,        "Number of nodes split to break irreducible regions");
+STATISTIC(NumGotosEliminated,   "Number of sequential goto/labels eliminated");
 
 namespace {
 
@@ -1232,6 +1234,21 @@ private:
         if (failed(structureNestedControlRegions(funcBody, func, builder)))
             return failure();
 
+        // Phase 3.5: Node splitting for irreducible control flow.
+        //
+        // Identifies irreducible SCCs (multiple entry points) and performs
+        // controlled node splitting: clones the smallest entry node so that
+        // all external edges go to the clone, leaving the original with only
+        // internal predecessors.  This reduces the number of entry points,
+        // potentially making the SCC reducible (structurable as a loop).
+        //
+        // References:
+        //   - Yakdan et al., "No More Gotos" (NDSS 2015), §4.3
+        //   - Janssen & Corporaal, "Making Graphs Reducible" (1997)
+        if (failed(attemptNodeSplitting(funcBody, func, builder,
+                                        structuredBlocks)))
+            return failure();
+
         // Phase 4: Emit goto/label for remaining irreducible edges.
         // Re-collect edges since the CFG may have changed.
         DominanceInfo finalDomInfo(func);
@@ -1266,6 +1283,15 @@ private:
             // that have no corresponding label in the output.
             bool targetsStructuredBlock =
                 isJccOp && structuredBlocks.count(edge.target);
+
+            // Skip sequential fallthroughs: if the jump target is the very
+            // next block in the region, no goto/label is needed — the code
+            // will naturally fall through.
+            if (isJmpOp && !isCrossEdge && !targetsStructuredBlock &&
+                edge.target == edge.source->getNextNode()) {
+                ++NumGotosEliminated;
+                continue;
+            }
 
             if (isJmpOp || isCrossEdge || targetsStructuredBlock) {
                 emitGotoLabel(edge, func, builder);
@@ -1733,6 +1759,221 @@ private:
                          << (ifRegion.hasElse ? "/else" : "")
                          << " at block\n";
         });
+
+        return success();
+    }
+
+    // ─── Node Splitting (Phase 3.5) ──────────────────────────────────────
+
+    /// Attempt controlled node splitting to make irreducible SCCs reducible.
+    ///
+    /// For each irreducible SCC (multiple entry points from outside):
+    ///   1. Find all entry nodes (blocks with at least one external predecessor)
+    ///   2. Pick the smallest entry node (fewest operations)
+    ///   3. Clone it — redirect all external edges to the clone
+    ///   4. The original now has only internal predecessors (no longer an entry)
+    ///   5. The SCC has one fewer entry → may become reducible
+    ///
+    /// After splitting, re-attempt loop recovery on the modified region.
+    ///
+    /// Limits: max 3 iterations, max 20 ops per cloned block, to prevent
+    /// code explosion.
+    LogicalResult attemptNodeSplitting(
+        Region& funcBody, helix::low::FuncOp func,
+        OpBuilder& builder,
+        llvm::SmallPtrSet<Block*, 16>& structuredBlocks)
+    {
+        constexpr unsigned kMaxIterations = 3;
+        constexpr unsigned kMaxBlockOps = 20;
+
+        for (unsigned iter = 0; iter < kMaxIterations; ++iter) {
+            // Find SCCs in the residual (unstructured) CFG.
+            auto sccLoops = findSCCLoops(funcBody, structuredBlocks);
+
+            bool anyModified = false;
+
+            for (auto& scc : sccLoops) {
+                if (scc.body.empty())
+                    continue;
+
+                llvm::SmallPtrSet<Block*, 8> sccBlocks(scc.body.begin(),
+                                                       scc.body.end());
+
+                // Find entry nodes: SCC blocks reachable from outside.
+                llvm::SmallVector<Block*, 4> entryNodes;
+                for (Block* b : scc.body) {
+                    for (Block* pred : b->getPredecessors()) {
+                        if (!sccBlocks.count(pred) &&
+                            !structuredBlocks.count(pred)) {
+                            entryNodes.push_back(b);
+                            break;
+                        }
+                    }
+                }
+
+                // If 0 or 1 entries, it's already a natural loop or dead code.
+                if (entryNodes.size() <= 1)
+                    continue;
+
+                LLVM_DEBUG({
+                    llvm::dbgs() << "  [NodeSplit] Irreducible SCC: "
+                                 << scc.body.size() << " blocks, "
+                                 << entryNodes.size() << " entries\n";
+                });
+
+                // Pick the smallest entry node to split.
+                Block* toSplit = entryNodes[0];
+                for (Block* e : entryNodes) {
+                    if (e->getOperations().size() < toSplit->getOperations().size())
+                        toSplit = e;
+                }
+
+                // Safety: don't clone large blocks (code explosion).
+                if (toSplit->getOperations().size() > kMaxBlockOps)
+                    continue;
+
+                // Safety: check that no SSA value defined in this block
+                // is used outside the SCC.  (Values used within the SCC
+                // are fine — both the original and clone's successors are
+                // in the SCC.)
+                bool canSplit = true;
+                for (auto& op : *toSplit) {
+                    for (auto result : op.getResults()) {
+                        for (auto* user : result.getUsers()) {
+                            Block* userBlock = user->getBlock();
+                            if (!sccBlocks.count(userBlock) &&
+                                userBlock != toSplit) {
+                                canSplit = false;
+                                break;
+                            }
+                        }
+                        if (!canSplit) break;
+                    }
+                    if (!canSplit) break;
+                }
+
+                if (!canSplit) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  [NodeSplit] Skip: SSA values escape SCC\n");
+                    continue;
+                }
+
+                // Collect external predecessors (those to redirect to clone).
+                llvm::SmallVector<Block*, 4> externalPreds;
+                for (Block* pred : toSplit->getPredecessors()) {
+                    if (!sccBlocks.count(pred))
+                        externalPreds.push_back(pred);
+                }
+
+                if (externalPreds.empty())
+                    continue;
+
+                // Clone the block.
+                IRMapping mapping;
+                Block* clone = new Block();
+
+                // Clone all operations from toSplit into clone.
+                for (auto& op : *toSplit) {
+                    clone->push_back(op.clone(mapping));
+                }
+
+                // Remap the clone's terminator successors: if the terminator
+                // points to blocks in the SCC, keep those targets (the clone
+                // should branch into the same SCC body blocks).  This is
+                // correct because the clone represents the same code path.
+                // The successor references are already set by the clone().
+
+                // Insert the clone after the original block.
+                funcBody.getBlocks().insertAfter(
+                    Region::iterator(toSplit), clone);
+
+                // Redirect all external predecessors to the clone.
+                for (Block* extPred : externalPreds) {
+                    auto* term = extPred->getTerminator();
+                    for (unsigned i = 0; i < term->getNumSuccessors(); ++i) {
+                        if (term->getSuccessor(i) == toSplit)
+                            term->setSuccessor(clone, i);
+                    }
+                }
+
+                anyModified = true;
+                ++NumNodesSplit;
+
+                LLVM_DEBUG({
+                    llvm::dbgs() << "  [NodeSplit] Split block ("
+                                 << toSplit->getOperations().size()
+                                 << " ops), redirected "
+                                 << externalPreds.size()
+                                 << " external edges\n";
+                });
+
+                // Only split one node per SCC per iteration to avoid
+                // cascading issues.  Re-check on next iteration.
+                break;
+            }
+
+            if (!anyModified)
+                break;
+
+            // After splitting, re-attempt loop and if/else recovery
+            // on the modified CFG.
+            DominanceInfo postSplitDom(func);
+            auto postSplitEdges = collectCFGEdges(funcBody);
+
+            for (const auto& edge : postSplitEdges) {
+                if (structuredBlocks.count(edge.source) ||
+                    structuredBlocks.count(edge.target))
+                    continue;
+
+                uint64_t srcAddr = edge.source->empty()
+                    ? 0 : getOpAddress(&edge.source->back());
+                uint64_t tgtAddr = edge.target->empty()
+                    ? 0 : getOpAddress(&edge.target->front());
+
+                if (srcAddr == 0 || tgtAddr == 0 || tgtAddr > srcAddr)
+                    continue;
+
+                // This is a new back-edge — try to structure it.
+                Block* header = edge.target;
+                Block* latch  = edge.source;
+
+                NaturalLoop loop;
+                loop.header = header;
+                loop.latch  = latch;
+
+                bool inRange = false;
+                for (auto& block : funcBody) {
+                    if (&block == header) inRange = true;
+                    if (inRange) loop.body.insert(&block);
+                    if (&block == latch) break;
+                }
+
+                if (loop.body.empty() || !loop.body.count(header))
+                    continue;
+
+                bool atLatch = false;
+                loop.condition = extractLoopCondition(latch, header, atLatch);
+                if (loop.condition) {
+                    loop.conditionAtLatch = true;
+                } else {
+                    loop.condition = extractLoopCondition(header, header, atLatch);
+                    loop.conditionAtLatch = false;
+                }
+
+                if (failed(structureLoop(loop, func, builder, postSplitDom)))
+                    continue;
+
+                for (Block* b : loop.body)
+                    structuredBlocks.insert(b);
+
+                LLVM_DEBUG({
+                    llvm::dbgs() << "  [NodeSplit] Recovered loop after split\n";
+                });
+            }
+
+            // Also re-attempt if/else recovery.
+            (void)structureIfRegions(funcBody, func, builder, structuredBlocks);
+        }
 
         return success();
     }

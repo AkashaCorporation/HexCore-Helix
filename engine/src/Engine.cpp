@@ -5,6 +5,7 @@
 #include "helix/Pipeline.h"
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowDialect.h"
+#include "helix/dialects/HelixMidDialect.h"     // v1.0
 #include "helix/dialects/HelixHighDialect.h"
 
 #include "mlir/IR/MLIRContext.h"
@@ -43,8 +44,8 @@ Engine::Engine(HelixArch arch)
     mlir_context_->getOrLoadDialect<mlir::func::FuncDialect>();
     mlir_context_->getOrLoadDialect<mlir::scf::SCFDialect>();
     mlir_context_->getOrLoadDialect<helix::low::HelixLowDialect>();
+    mlir_context_->getOrLoadDialect<helix::mid::HelixMidDialect>();   // v1.0
     mlir_context_->getOrLoadDialect<helix::high::HelixHighDialect>();
-
     // Register all Helix passes.
     registerHelixPasses();
 
@@ -59,7 +60,7 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 // ─── API ───────────────────────────────────────────────────────────────────────
 
 const char* Engine::version() noexcept {
-    return "0.2.0-mlir";
+    return "1.0.0-mlir-3tier";
 }
 
 HelixStatus Engine::decompile(

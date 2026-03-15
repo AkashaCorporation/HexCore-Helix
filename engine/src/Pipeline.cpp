@@ -12,6 +12,7 @@
 #include "helix/emit/PseudoCEmitter.h"
 #include "helix/emit/FlatBufSerializer.h"
 #include "helix/dialects/HelixLowDialect.h"
+#include "helix/dialects/HelixMidDialect.h"
 #include "helix/dialects/HelixHighDialect.h"
 
 // MLIR includes
@@ -159,6 +160,7 @@ Pipeline::Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch)
     // Load the Helix dialects so the pass pipeline can create their ops.
     mlir_ctx_->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
     mlir_ctx_->getOrLoadDialect<helix::low::HelixLowDialect>();
+    mlir_ctx_->getOrLoadDialect<helix::mid::HelixMidDialect>();   // v1.0
     mlir_ctx_->getOrLoadDialect<helix::high::HelixHighDialect>();
 }
 
@@ -278,20 +280,49 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
 // ============================================================================
 
 void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
-    // Phase 1: Conversion from LLVM Dialect to HelixLow
+    // ═══════════════════════════════════════════════════════════════════════
+    // v1.0 Three-Tier Pipeline: Low → Mid → High (→ EmitC optional)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── Tier 1: LLVM Dialect → HelixLow ─────────────────────────────────
+    //    Remill pattern recognition: converts LLVM IR patterns to
+    //    machine-level HelixLow operations (registers, flags, raw memory).
     pm.addPass(createRemillToHelixLowPass());
 
+    // ── Tier 1 Analysis: HelixLow-level passes ──────────────────────────
+    //    These passes operate on machine-level IR to recover high-level
+    //    information while register/flag semantics are still explicit.
     pm.addPass(createRecoverStackLayoutPass());
     pm.addPass(createRecoverCallingConventionPass());
     pm.addPass(createPropagateTypesPass());
+    pm.addPass(createInterProceduralTypePropagationPass());
     pm.addPass(createStructureControlFlowPass());
     pm.addPass(createRecoverVariablesPass());
     pm.addPass(createEliminateDeadCodePass());
-    // NOTE: Canonicalizer removed — it segfaults on multi-block HelixLow
+
+    // NOTE: Canonicalizer removed — segfaults on multi-block HelixLow
     // functions with LLVM dialect br/condBr terminators crossing regions.
-    // NOTE: CSEPass also removed — same crash on complex functions with many
-    // basic blocks (confirmed on sethitpoints/ROTTR, 112 blocks). Both MLIR
-    // built-in passes are unsafe on HelixLow multi-block IR.
+    // NOTE: CSEPass also removed — same crash on complex functions with
+    // many basic blocks. Both are unsafe on HelixLow multi-block IR.
+
+    // ── Tier 2: HelixLow → HelixMid (v1.0) ──────────────────────────────
+    //    Converts remaining machine-level ops to ISA-agnostic typed SSA:
+    //    registers → abstract variables, flags → comparisons,
+    //    raw memory → typed loads/stores, CMOV → select.
+    pm.addPass(createHelixLowToMidPass());
+
+    // ── Tier 2.5: HelixMid Optimization Passes (v3.8.0) ────────────────
+    //    Semantic optimizations on ISA-agnostic typed SSA:
+    //    - Magic number division reversal (mul+shift → div)
+    //    - Indirect call devirtualization (vtable DataFlow analysis)
+    pm.addPass(createRecoverMagicDivisionPass());
+    pm.addPass(createDevirtualizeIndirectCallsPass());
+
+    // ── Tier 3: HelixMid → HelixHigh (v1.0) ───────────────────────────
+    //    Applies variable naming, finalizes type annotations, converts
+    //    abstract slots to named C variables.
+    pm.addPass(createHelixMidToHighPass());
+
 }
 
 void Pipeline::ensurePipelineBuilt() {

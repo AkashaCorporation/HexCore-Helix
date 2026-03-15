@@ -1,6 +1,6 @@
 {
     "name": "@hexcore/helix",
-    "version": "0.1.0",
+    "version": "0.6.0",
     "description": "HexCore Helix — Next-generation decompilation engine powered by Rust, C++23/MLIR, and FlatBuffers",
     "main": "index.js",
     "types": "index.d.ts",

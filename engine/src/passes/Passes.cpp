@@ -28,6 +28,25 @@ void registerHelixPasses() {
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createEliminateDeadCodePass();
     });
+
+    // v3.8.0 optimization passes
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createRecoverMagicDivisionPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createDevirtualizeIndirectCallsPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createInterProceduralTypePropagationPass();
+    });
+
+    // v1.0 dialect conversion passes
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createHelixLowToMidPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createHelixMidToHighPass();
+    });
 }
 
 } // namespace helix
