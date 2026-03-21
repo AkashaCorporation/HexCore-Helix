@@ -77,6 +77,7 @@ STATISTIC(NumTernaryRecovered,  "Number of CMOV -> ternary conversions");
 STATISTIC(NumGotoEmitted,       "Number of goto/label pairs emitted (irreducible)");
 STATISTIC(NumNodesSplit,        "Number of nodes split to break irreducible regions");
 STATISTIC(NumGotosEliminated,   "Number of sequential goto/labels eliminated");
+STATISTIC(NumValuesPromoted,    "Number of escaping values promoted to variables");
 
 namespace {
 
@@ -155,6 +156,165 @@ struct IfRegion {
     /// Whether this if has an else clause.
     bool hasElse = false;
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Escaping Value Detection and Promotion
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Describes a value that "escapes" from a region — i.e., is defined inside
+/// the region but used outside it.
+struct EscapingValue {
+    /// The SSA value that escapes.
+    Value value;
+
+    /// The operation that defines this value.
+    Operation* definingOp;
+
+    /// All uses of this value that are outside the region.
+    llvm::SmallVector<OpOperand*, 4> externalUses;
+};
+
+/// Counter for generating unique promoted variable names within a function.
+static thread_local unsigned promotedVarCounter = 0;
+
+/// Detect all values defined within the given blocks that are used outside
+/// those blocks.
+///
+/// @param regionBlocks  The set of blocks that will be moved into a region.
+/// @param excludeBlock  Optional block to exclude from "external" consideration
+///                      (e.g., the block containing the structured op itself).
+/// @return              List of escaping values with their external uses.
+static llvm::SmallVector<EscapingValue, 4>
+detectEscapingValues(const llvm::SmallSetVector<Block*, 8>& regionBlocks,
+                     Block* excludeBlock = nullptr) {
+    llvm::SmallVector<EscapingValue, 4> escaping;
+
+    // Build a set for O(1) lookup.
+    llvm::SmallPtrSet<Block*, 8> regionBlockSet(regionBlocks.begin(),
+                                                 regionBlocks.end());
+
+    for (Block* block : regionBlocks) {
+        for (auto& op : *block) {
+            for (auto result : op.getResults()) {
+                EscapingValue ev;
+                ev.value = result;
+                ev.definingOp = &op;
+
+                for (auto& use : result.getUses()) {
+                    Block* userBlock = use.getOwner()->getBlock();
+
+                    // Skip uses within the region.
+                    if (regionBlockSet.count(userBlock))
+                        continue;
+
+                    // Skip uses in the excluded block (the block we're
+                    // inserting the structured op into).
+                    if (excludeBlock && userBlock == excludeBlock)
+                        continue;
+
+                    ev.externalUses.push_back(&use);
+                }
+
+                if (!ev.externalUses.empty())
+                    escaping.push_back(std::move(ev));
+            }
+        }
+    }
+
+    return escaping;
+}
+
+/// Overload for array-based block lists.
+static llvm::SmallVector<EscapingValue, 4>
+detectEscapingValues(llvm::ArrayRef<Block*> regionBlocks,
+                     Block* excludeBlock = nullptr) {
+    llvm::SmallSetVector<Block*, 8> blockSet;
+    for (Block* b : regionBlocks)
+        blockSet.insert(b);
+    return detectEscapingValues(blockSet, excludeBlock);
+}
+
+/// Promote escaping values to variables.
+///
+/// For each escaping value:
+///   1. Create a var.decl BEFORE the structured region (at insertionPoint).
+///   2. AFTER the defining op (inside the region), emit an assign to the var.
+///   3. Replace all external uses with a var.ref to the variable.
+///
+/// This simulates C's variable scoping where a variable declared before a
+/// loop/if can be assigned inside and read after.
+///
+/// @param escaping        List of escaping values to promote.
+/// @param insertionPoint  Where to insert var.decl ops (before the structured op).
+/// @param builder         OpBuilder for creating new operations.
+/// @return                Number of values promoted.
+static unsigned promoteEscapingValues(
+    llvm::ArrayRef<EscapingValue> escaping,
+    Operation* insertionPoint,
+    OpBuilder& builder) {
+
+    if (escaping.empty())
+        return 0;
+
+    unsigned promoted = 0;
+
+    for (const auto& ev : escaping) {
+        // Generate a unique variable name.
+        std::string varName = std::format("_promoted_{}", promotedVarCounter++);
+        uint32_t varId = promotedVarCounter;
+
+        auto loc = ev.definingOp->getLoc();
+        auto valueType = ev.value.getType();
+
+        // 1. Create var.decl BEFORE the structured region.
+        builder.setInsertionPoint(insertionPoint);
+        auto varDecl = builder.create<helix::high::VarDeclOp>(
+            loc,
+            /*var_id=*/varId,
+            /*var_name=*/varName,
+            /*storage=*/helix::high::StorageKind::Temporary,
+            /*stack_offset=*/IntegerAttr{},
+            /*init=*/Value{},
+            /*address=*/IntegerAttr{});
+
+        // 2. AFTER the defining op, assign the value to the variable.
+        builder.setInsertionPointAfter(ev.definingOp);
+        auto assignTarget = builder.create<helix::high::VarRefOp>(
+            loc,
+            valueType,
+            varDecl.getVarId(),
+            varDecl.getVarName(),
+            IntegerAttr{});
+        builder.create<helix::high::AssignOp>(
+            loc,
+            assignTarget.getResult(),
+            ev.value,
+            IntegerAttr{});
+
+        // 3. Replace all external uses with var.ref.
+        for (auto* use : ev.externalUses) {
+            builder.setInsertionPoint(use->getOwner());
+            auto varRef = builder.create<helix::high::VarRefOp>(
+                use->getOwner()->getLoc(),
+                valueType,
+                varDecl.getVarId(),
+                varDecl.getVarName(),
+                IntegerAttr{});
+            use->set(varRef.getResult());
+        }
+
+        ++promoted;
+        ++NumValuesPromoted;
+
+        LLVM_DEBUG({
+            llvm::dbgs() << "  [Promote] Promoted escaping value to '"
+                         << varName << "' (" << ev.externalUses.size()
+                         << " external uses)\n";
+        });
+    }
+
+    return promoted;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Helper Functions
@@ -1362,6 +1522,28 @@ private:
         builder.setInsertionPointToStart(loop.header);
         auto loc = loop.header->front().getLoc();
 
+        // ── Detect and promote escaping values BEFORE restructuring ──────
+        //
+        // Values defined inside the loop body that are used outside must be
+        // promoted to variables. This prevents "Use leaves the current parent
+        // region" errors after moving operations into the structured region.
+        auto escapingValues = detectEscapingValues(loop.body, loop.header);
+        if (!escapingValues.empty()) {
+            // Find the insertion point for var.decl: before the first op in header.
+            Operation* declInsertPoint = &loop.header->front();
+            unsigned promoted = promoteEscapingValues(
+                escapingValues, declInsertPoint, builder);
+            LLVM_DEBUG({
+                if (promoted > 0) {
+                    llvm::dbgs() << "  [Loop] Promoted " << promoted
+                                 << " escaping value(s) to variables\n";
+                }
+            });
+        }
+
+        // Reset insertion point after potential promotions.
+        builder.setInsertionPointToStart(loop.header);
+
         // Build the condition.  If we recovered a condition value, we use it
         // directly.  Otherwise we emit a `true` constant (infinite loop).
         Value condValue = loop.condition;
@@ -1683,6 +1865,36 @@ private:
         auto* terminator = ifRegion.branchBlock->getTerminator();
         if (!terminator)
             return success();
+
+        // ── Detect and promote escaping values BEFORE restructuring ──────
+        //
+        // Values defined inside the then/else blocks that are used outside
+        // (e.g., in the merge block) must be promoted to variables.
+        {
+            // Collect all blocks that will be moved into the if regions.
+            llvm::SmallVector<Block*, 8> allIfBlocks;
+            allIfBlocks.append(ifRegion.thenBlocks.begin(),
+                               ifRegion.thenBlocks.end());
+            if (ifRegion.hasElse) {
+                allIfBlocks.append(ifRegion.elseBlocks.begin(),
+                                   ifRegion.elseBlocks.end());
+            }
+
+            auto escapingValues = detectEscapingValues(
+                allIfBlocks, ifRegion.branchBlock);
+
+            if (!escapingValues.empty()) {
+                // Insert var.decl before the terminator (where the IfOp will go).
+                unsigned promoted = promoteEscapingValues(
+                    escapingValues, terminator, builder);
+                LLVM_DEBUG({
+                    if (promoted > 0) {
+                        llvm::dbgs() << "  [If] Promoted " << promoted
+                                     << " escaping value(s) to variables\n";
+                    }
+                });
+            }
+        }
 
         builder.setInsertionPoint(terminator);
         auto loc = terminator->getLoc();

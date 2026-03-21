@@ -4,6 +4,34 @@ All notable changes to HexCore Helix are documented here.
 
 ---
 
+## [v0.6.1] — 2026-03-21
+
+### Bug Fixes
+
+#### MLIR Liveness Assertion Fix (Fatal — `Use leaves the current parent region`)
+
+**Symptom**: MSVC Runtime Library assertion failure during decompilation: `Assertion failed: "Use leaves the current parent region"` in `llvm-project\mlir\lib\Analysis\Liveness.cpp`.
+
+**Root cause**: `StructureControlFlow.cpp` moves blocks into structured regions (`IfOp`, `WhileOp`, `DoWhileOp`) without checking if values defined inside those regions are used outside. MLIR's SSA dominance rules require that values defined in a region cannot escape that region.
+
+**Trigger condition**: Any function where a value computed inside a loop or conditional branch is used after the structured region ends (common in variable assignments within if/else or loop bodies).
+
+**Fix** (`engine/src/passes/StructureControlFlow.cpp`):
+- Added `EscapingValue` struct and `detectEscapingValues()` helper to identify values with external uses
+- Added `promoteEscapingValues()` function that creates `VarDeclOp` temporaries for escaping values
+- Integrated value promotion into `structureLoop()` and `structureIf()` before moving blocks into regions
+- New statistic: `NumValuesPromoted` tracks how many values were promoted to variables
+
+**Architecture**: This is the correct solution — it simulates C variable scoping where values assigned inside blocks remain accessible outside. The promoted variables appear naturally in the decompiled output.
+
+### Build
+
+- `helix_engine.lib` rebuilt with value promotion fix
+- `hexcore-helix.win32-x64-msvc.node` rebuilt: 13,487,616 bytes
+- Version bumped to `0.6.1` across Cargo workspace, npm package
+
+---
+
 ## [v0.6.0] — 2026-03-14
 
 ### 3-Tier Dialect Architecture (v1.0)
