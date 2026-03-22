@@ -406,8 +406,29 @@ struct MidCallToHighCall : public OpConversionPattern<mid::CallOp> {
         std::string callee_name;
         if (auto name_attr = op.getCalleeNameAttr())
             callee_name = name_attr.getValue().str();
-        else
-            callee_name = std::format("sub_{:X}", op.getCalleeAddr());
+        else if (op->hasAttr("is_indirect")) {
+            if (auto vtableAttr = op->getAttrOfType<IntegerAttr>("vtable_offset")) {
+                // Vtable pattern detected: CALL [reg+offset]
+                // Generate a name that PseudoCEmitter can recognize.
+                uint64_t offset = vtableAttr.getValue().getZExtValue();
+                callee_name = std::format("__vtable_0x{:x}", offset);
+            } else {
+                auto addr = op.getCalleeAddr();
+                if (addr != 0)
+                    // Known indirect target address (e.g. resolved vtable slot)
+                    callee_name = std::format("__indirect_{:x}", addr);
+                else
+                    // Truly unresolved indirect call (runtime-computed target).
+                    // Do NOT use the instruction address as callee — it's the
+                    // address of the CALL instruction, not the function called.
+                    callee_name = "__indirect_call";
+            }
+        } else {
+            auto addr = op.getCalleeAddr();
+            callee_name = addr != 0
+                ? std::format("sub_{:x}", addr)
+                : "sub_unknown";
+        }
 
         auto new_op = rewriter.create<high::CallOp>(
             op.getLoc(),

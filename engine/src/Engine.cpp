@@ -60,7 +60,7 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 // ─── API ───────────────────────────────────────────────────────────────────────
 
 const char* Engine::version() noexcept {
-    return "1.0.0-mlir-3tier";
+    return "0.6.1";
 }
 
 HelixStatus Engine::decompile(

@@ -3,15 +3,18 @@
 //! Exposes `HelixEngine` as a JavaScript class with methods for
 //! decompilation, CFG retrieval, and AST access.
 //!
-//! **Dual Pipeline Architecture**:
-//! - `decompile_ir()` routes through the **C++ MLIR engine** for maximum quality
-//! - `decompile_ir_rust()` uses the **pure Rust pipeline** as fallback
+//! **Pipeline Architecture (v0.7+)**:
+//! - `decompile_ir()` routes through the **C++ MLIR engine** exclusively.
+//! - The Rust pipeline is deprecated and available behind `--features rust-pipeline`.
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use helix_core::ffi::EngineHandle;
+
+#[cfg(feature = "rust-pipeline")]
 use helix_core::pipeline::remill_lifter::RemillIrLifter;
+#[cfg(feature = "rust-pipeline")]
 use helix_core::pipeline::{IrPipeline, LiftIrInput};
 
 // ─── Architecture Enum (JS-visible) ────────────────────────────────────────────
@@ -223,7 +226,10 @@ impl HelixEngine {
     /// This is the **primary integration path** for the HexCore IDE.
     /// Routes through: LLVM IR → MLIR translation → HelixLow → HelixHigh → Pseudo-C
     ///
-    /// Falls back to the Rust pipeline if the MLIR engine is unavailable.
+    /// Decompile Remill LLVM IR using the C++ MLIR pipeline.
+    ///
+    /// Since v0.7, the Rust HIR pipeline is no longer used as a fallback.
+    /// If the MLIR engine fails, the error is returned directly.
     #[napi]
     pub fn decompile_ir(&mut self, ir_text: String) -> Result<DecompileResult> {
         if self.disposed {
@@ -238,35 +244,55 @@ impl HelixEngine {
             ));
         }
 
-        // ── Try MLIR C++ pipeline first ──
-        if let Some(ref mut handle) = self.mlir_handle {
-            match handle.decompile_ir_text(&ir_text) {
-                Ok(source) => {
-                    return Ok(DecompileResult {
-                        source,
-                        function_name: "mlir_decompiled".to_string(),
-                        entry_address: String::new(),
-                        block_count: 0,
-                        instruction_count: 0,
-                        cfg_buffer: None,
-                        ast_buffer: None,
-                        pipeline: "mlir".to_string(),
-                    });
-                }
-                Err(e) => {
-                    // Log the MLIR error and fall back to Rust pipeline
-                    eprintln!("MLIR pipeline failed (falling back to Rust): {}", e);
-                }
-            }
-        }
+        // ── MLIR C++ pipeline (sole pipeline since v0.7) ──
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "MLIR engine not initialized. Cannot decompile without C++ engine.",
+            )
+        })?;
 
-        // ── Fallback: Rust pipeline ──
-        self.decompile_ir_rust(ir_text)
+        let source = handle
+            .decompile_ir_text(&ir_text)
+            .map_err(|e| Error::from_reason(format!("MLIR pipeline failed: {}", e)))?;
+
+        Ok(DecompileResult {
+            source,
+            function_name: "mlir_decompiled".to_string(),
+            entry_address: String::new(),
+            block_count: 0,
+            instruction_count: 0,
+            cfg_buffer: None,
+            ast_buffer: None,
+            pipeline: "mlir".to_string(),
+        })
     }
 
+    /// Release engine resources. The engine cannot be used after this call.
+    #[napi]
+    pub fn dispose(&mut self) {
+        self.disposed = true;
+        // Drop the MLIR engine handle
+        self.mlir_handle = None;
+    }
+
+    /// Check if the engine has been disposed.
+    #[napi(getter)]
+    pub fn is_disposed(&self) -> bool {
+        self.disposed
+    }
+}
+
+// ─── Deprecated Rust Pipeline Methods (feature-gated) ──────────────────────
+//
+// These methods are only available when built with `--features rust-pipeline`.
+// Since v0.7, the C++ MLIR pipeline is the sole production path.
+
+#[cfg(feature = "rust-pipeline")]
+#[napi]
+impl HelixEngine {
     /// Decompile using the **pure Rust pipeline** (no C++ engine required).
     ///
-    /// This is the fallback path and can be called directly for comparison.
+    /// Deprecated since v0.7: Use `decompile_ir()` instead (MLIR pipeline).
     #[napi]
     pub fn decompile_ir_rust(&self, ir_text: String) -> Result<DecompileResult> {
         if self.disposed {
@@ -289,7 +315,6 @@ impl HelixEngine {
             .execute(&input)
             .map_err(|e| Error::from_reason(format!("Decompilation failed: {}", e)))?;
 
-        // Build FlatBuffer data
         let cfg_buffer = {
             let cfg_data = crate::transport::build_cfg_data(
                 "module",
@@ -323,8 +348,7 @@ impl HelixEngine {
 
     /// Decompile Remill LLVM IR and return metrics alongside the result.
     ///
-    /// Same as `decompile_ir` but also returns pipeline performance data.
-    /// Note: Metrics are currently from the Rust pipeline only.
+    /// Deprecated since v0.7: Metrics are from the Rust pipeline only.
     #[napi]
     pub fn decompile_ir_with_metrics(
         &self,
@@ -389,19 +413,5 @@ impl HelixEngine {
         };
 
         Ok((result, metrics_result))
-    }
-
-    /// Release engine resources. The engine cannot be used after this call.
-    #[napi]
-    pub fn dispose(&mut self) {
-        self.disposed = true;
-        // Drop the MLIR engine handle
-        self.mlir_handle = None;
-    }
-
-    /// Check if the engine has been disposed.
-    #[napi(getter)]
-    pub fn is_disposed(&self) -> bool {
-        self.disposed
     }
 }

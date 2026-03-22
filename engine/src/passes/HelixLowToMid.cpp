@@ -356,21 +356,115 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
         low::CallOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
-        // Extract the target address from the constant operand
-        uint64_t target_addr = 0;
-        if (auto addr_attr = op.getAddressAttr())
-            target_addr = addr_attr.getUInt();
+        // Resolve the actual callee address.
+        //
+        // Priority:
+        //   1. If target_name is "sub_<hex>", parse the callee address from it.
+        //   2. If the target_addr operand is a constant, use it directly.
+        //   3. Fall back to instruction address (address attr) — but mark
+        //      the call as indirect so downstream passes don't confuse it
+        //      with a direct call to that address.
+        uint64_t callee_addr = 0;
+        bool is_indirect = false;
+        StringAttr callee_name_attr = op.getTargetNameAttr();
+
+        if (callee_name_attr) {
+            // Parse address from "sub_<hex>" style name.
+            auto name = callee_name_attr.getValue();
+            if (name.starts_with("sub_")) {
+                auto hexPart = name.drop_front(4);
+                uint64_t parsed = 0;
+                if (!hexPart.getAsInteger(16, parsed))
+                    callee_addr = parsed;
+            }
+        }
+
+        if (callee_addr == 0) {
+            // Try to evaluate the SSA target operand to a constant.
+            auto targetVal = op.getTargetAddr();
+            if (auto constOp = targetVal.getDefiningOp<LLVM::ConstantOp>()) {
+                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                    callee_addr = intAttr.getValue().getZExtValue();
+            } else if (auto constOp = targetVal.getDefiningOp<arith::ConstantOp>()) {
+                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                    callee_addr = intAttr.getValue().getZExtValue();
+            }
+        }
+
+        // Track vtable offset for indirect calls with base+offset pattern.
+        // CALL [RAX+0x18] shows up as an AddOp where one operand is the
+        // constant vtable offset and the other is the base register read.
+        int64_t vtable_offset = -1;
+
+        if (callee_addr == 0) {
+            // Target is indirect (runtime-computed).  Leave callee_addr = 0
+            // so downstream passes know the target is truly unresolved.
+            // The instruction address is already in the `address` attribute.
+            is_indirect = true;
+
+            // Try to extract vtable offset from the target expression.
+            // Pattern: target_addr = Add(base_reg, constant_offset)
+            auto targetVal = op.getTargetAddr();
+
+            // Check LLVM::AddOp pattern
+            if (auto addOp = targetVal.getDefiningOp<LLVM::AddOp>()) {
+                // Try RHS as constant
+                if (auto rhsConst = addOp.getRhs().getDefiningOp<LLVM::ConstantOp>()) {
+                    if (auto intAttr = dyn_cast<IntegerAttr>(rhsConst.getValue()))
+                        vtable_offset = intAttr.getValue().getSExtValue();
+                }
+                // Try LHS as constant (commuted)
+                if (vtable_offset < 0) {
+                    if (auto lhsConst = addOp.getLhs().getDefiningOp<LLVM::ConstantOp>()) {
+                        if (auto intAttr = dyn_cast<IntegerAttr>(lhsConst.getValue()))
+                            vtable_offset = intAttr.getValue().getSExtValue();
+                    }
+                }
+            }
+
+            // Check arith::AddIOp pattern
+            if (vtable_offset < 0) {
+                if (auto addOp = targetVal.getDefiningOp<arith::AddIOp>()) {
+                    if (auto rhsConst = addOp.getRhs().getDefiningOp<arith::ConstantOp>()) {
+                        if (auto intAttr = dyn_cast<IntegerAttr>(rhsConst.getValue()))
+                            vtable_offset = intAttr.getValue().getSExtValue();
+                    }
+                    if (vtable_offset < 0) {
+                        if (auto lhsConst = addOp.getLhs().getDefiningOp<arith::ConstantOp>()) {
+                            if (auto intAttr = dyn_cast<IntegerAttr>(lhsConst.getValue()))
+                                vtable_offset = intAttr.getValue().getSExtValue();
+                        }
+                    }
+                }
+            }
+
+            // Check helix::low::LeaOp pattern (LEA with displacement)
+            if (vtable_offset < 0) {
+                if (auto leaOp = targetVal.getDefiningOp<low::LeaOp>()) {
+                    auto disp = leaOp.getDisplacement();
+                    if (disp != 0)
+                        vtable_offset = disp;
+                }
+            }
+        }
 
         // For now, mid.call has no result (void).  Return type recovery
         // happens in later passes.
-        rewriter.create<mid::CallOp>(
+        auto midCall = rewriter.create<mid::CallOp>(
             op.getLoc(),
             /*result=*/TypeRange{},
-            rewriter.getI64IntegerAttr(target_addr),
-            op.getTargetNameAttr(),
+            rewriter.getI64IntegerAttr(callee_addr),
+            callee_name_attr,
             adaptor.getArgs(),
             op.getAddressAttr()
         );
+
+        if (is_indirect) {
+            midCall->setAttr("is_indirect", rewriter.getUnitAttr());
+            if (vtable_offset >= 0)
+                midCall->setAttr("vtable_offset",
+                    rewriter.getI64IntegerAttr(vtable_offset));
+        }
 
         rewriter.eraseOp(op);
         return success();

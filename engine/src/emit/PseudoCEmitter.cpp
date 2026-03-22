@@ -42,6 +42,26 @@ using namespace helix;
 
 #define DEBUG_TYPE "pseudoc-emitter"
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// C operator precedence levels (higher number = tighter binding).
+// Used by formatExpressionWithPrec to decide when parentheses are needed.
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr int kPrecComma      = 1;
+static constexpr int kPrecAssign     = 2;
+static constexpr int kPrecTernary    = 3;
+static constexpr int kPrecLogOr      = 4;
+static constexpr int kPrecLogAnd     = 5;
+static constexpr int kPrecBitOr      = 6;
+static constexpr int kPrecBitXor     = 7;
+static constexpr int kPrecBitAnd     = 8;
+static constexpr int kPrecEqual      = 9;
+static constexpr int kPrecRelational = 10;
+static constexpr int kPrecShift      = 11;
+static constexpr int kPrecAdd        = 12;
+static constexpr int kPrecMul        = 13;
+static constexpr int kPrecUnary      = 14;
+static constexpr int kPrecAtom       = 15;
+
 namespace {
 
 static std::optional<unsigned> parseParamIndex(std::string_view name) {
@@ -835,7 +855,7 @@ bool PseudoCEmitter::isNearBlockStart(Operation* op, unsigned budget) {
 
 void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
     os << "// Decompiled by HexCore Helix\n";
-    os << "// Engine version: 1.0.0-mlir-3tier\n";
+    os << "// Engine version: 0.6.1\n";
     os << "\n";
 }
 
@@ -1574,13 +1594,28 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     // ─── HelixHigh call as statement (side-effecting) ────────────────────
     if (auto call = dyn_cast<helix::high::CallOp>(op)) {
         indent(os, depth);
-        os << call.getTargetName().str() << "(";
+        auto calleeName = call.getTargetName().str();
         auto args = call.getArgs();
-        for (size_t i = 0; i < args.size(); i++) {
-            if (i > 0) os << ", ";
-            os << formatExpression(args[i]);
+
+        // Detect vtable pattern: __vtable_0xNN → base->vfunc_0xNN(rest...)
+        if (calleeName.starts_with("__vtable_0x") && !args.empty()) {
+            // "__vtable_0x18" → offset "0x18"
+            auto offsetStr = calleeName.substr(9); // "__vtable_" is 9 chars → "0x18"
+            auto baseExpr = formatExpression(args[0]);
+            os << baseExpr << "->vfunc_" << offsetStr << "(";
+            for (size_t i = 1; i < args.size(); i++) {
+                if (i > 1) os << ", ";
+                os << formatExpression(args[i]);
+            }
+            os << ")";
+        } else {
+            os << calleeName << "(";
+            for (size_t i = 0; i < args.size(); i++) {
+                if (i > 0) os << ", ";
+                os << formatExpression(args[i]);
+            }
+            os << ")";
         }
-        os << ")";
         if (auto addr = call.getAddress())
             os << std::format(";  // 0x{:x}", *addr);
         else
@@ -2931,6 +2966,10 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
 }
 
 std::string PseudoCEmitter::formatExpression(Value val) {
+    return formatExpressionWithPrec(val, 0);
+}
+
+std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) {
     if (!val)
         return "/* null */";
 
@@ -2966,29 +3005,30 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     // ─── Binary expression ──────────────────────────────────────────────
     if (auto binary = dyn_cast<helix::high::BinaryOp>(defOp)) {
         std::string opStr;
+        int prec = kPrecAdd; // default
         switch (binary.getOp()) {
-        case helix::high::BinaryOpKind::Add:    opStr = "+"; break;
-        case helix::high::BinaryOpKind::Sub:    opStr = "-"; break;
-        case helix::high::BinaryOpKind::Mul:    opStr = "*"; break;
-        case helix::high::BinaryOpKind::Div:    opStr = "/"; break;
-        case helix::high::BinaryOpKind::Mod:    opStr = "%"; break;
-        case helix::high::BinaryOpKind::Shl:    opStr = "<<"; break;
-        case helix::high::BinaryOpKind::Shr:    opStr = ">>"; break;
-        case helix::high::BinaryOpKind::Sar:    opStr = ">>"; break;
-        case helix::high::BinaryOpKind::BitAnd: opStr = "&"; break;
-        case helix::high::BinaryOpKind::BitOr:  opStr = "|"; break;
-        case helix::high::BinaryOpKind::BitXor: opStr = "^"; break;
-        case helix::high::BinaryOpKind::Eq:     opStr = "=="; break;
-        case helix::high::BinaryOpKind::Ne:     opStr = "!="; break;
-        case helix::high::BinaryOpKind::Lt:     opStr = "<"; break;
-        case helix::high::BinaryOpKind::Le:     opStr = "<="; break;
-        case helix::high::BinaryOpKind::Gt:     opStr = ">"; break;
-        case helix::high::BinaryOpKind::Ge:     opStr = ">="; break;
-        case helix::high::BinaryOpKind::LogAnd: opStr = "&&"; break;
-        case helix::high::BinaryOpKind::LogOr:  opStr = "||"; break;
+        case helix::high::BinaryOpKind::Add:    opStr = "+"; prec = kPrecAdd; break;
+        case helix::high::BinaryOpKind::Sub:    opStr = "-"; prec = kPrecAdd; break;
+        case helix::high::BinaryOpKind::Mul:    opStr = "*"; prec = kPrecMul; break;
+        case helix::high::BinaryOpKind::Div:    opStr = "/"; prec = kPrecMul; break;
+        case helix::high::BinaryOpKind::Mod:    opStr = "%"; prec = kPrecMul; break;
+        case helix::high::BinaryOpKind::Shl:    opStr = "<<"; prec = kPrecShift; break;
+        case helix::high::BinaryOpKind::Shr:    opStr = ">>"; prec = kPrecShift; break;
+        case helix::high::BinaryOpKind::Sar:    opStr = ">>"; prec = kPrecShift; break;
+        case helix::high::BinaryOpKind::BitAnd: opStr = "&"; prec = kPrecBitAnd; break;
+        case helix::high::BinaryOpKind::BitOr:  opStr = "|"; prec = kPrecBitOr; break;
+        case helix::high::BinaryOpKind::BitXor: opStr = "^"; prec = kPrecBitXor; break;
+        case helix::high::BinaryOpKind::Eq:     opStr = "=="; prec = kPrecEqual; break;
+        case helix::high::BinaryOpKind::Ne:     opStr = "!="; prec = kPrecEqual; break;
+        case helix::high::BinaryOpKind::Lt:     opStr = "<"; prec = kPrecRelational; break;
+        case helix::high::BinaryOpKind::Le:     opStr = "<="; prec = kPrecRelational; break;
+        case helix::high::BinaryOpKind::Gt:     opStr = ">"; prec = kPrecRelational; break;
+        case helix::high::BinaryOpKind::Ge:     opStr = ">="; prec = kPrecRelational; break;
+        case helix::high::BinaryOpKind::LogAnd: opStr = "&&"; prec = kPrecLogAnd; break;
+        case helix::high::BinaryOpKind::LogOr:  opStr = "||"; prec = kPrecLogOr; break;
         }
-        auto lhsStr = formatExpression(binary.getLhs());
-        auto rhsStr = formatExpression(binary.getRhs());
+        auto lhsStr = formatExpressionWithPrec(binary.getLhs(), prec);
+        auto rhsStr = formatExpressionWithPrec(binary.getRhs(), prec + 1);
 
         if (binary.getOp() == helix::high::BinaryOpKind::Add || binary.getOp() == helix::high::BinaryOpKind::Sub) {
             // Simplify x86 flat-model segment base: (x + *(type)((NULL + 0))) → x
@@ -3026,7 +3066,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                     return std::format("0x{:x}", addr);
                 } catch(...) {}
             }
-            
+
             // ─── Automatic Struct Field Recovery ────────────────────────────
             if (binary.getOp() == helix::high::BinaryOpKind::Add &&
                 lhsStr.find(' ') == std::string::npos &&
@@ -3045,7 +3085,9 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
         }
 
-        return std::format("({} {} {})", lhsStr, opStr, rhsStr);
+        auto result = std::format("{} {} {}", lhsStr, opStr, rhsStr);
+        if (prec < parentPrec) result = "(" + result + ")";
+        return result;
     }
 
     // ─── Unary expression ───────────────────────────────────────────────
@@ -3067,24 +3109,28 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 }
                 if (canNegate) {
                     std::string opStr;
+                    int negPrec = kPrecEqual;
                     switch (negated) {
-                    case helix::high::BinaryOpKind::Eq: opStr = "=="; break;
-                    case helix::high::BinaryOpKind::Ne: opStr = "!="; break;
-                    case helix::high::BinaryOpKind::Lt: opStr = "<"; break;
-                    case helix::high::BinaryOpKind::Le: opStr = "<="; break;
-                    case helix::high::BinaryOpKind::Gt: opStr = ">"; break;
-                    case helix::high::BinaryOpKind::Ge: opStr = ">="; break;
+                    case helix::high::BinaryOpKind::Eq: opStr = "=="; negPrec = kPrecEqual; break;
+                    case helix::high::BinaryOpKind::Ne: opStr = "!="; negPrec = kPrecEqual; break;
+                    case helix::high::BinaryOpKind::Lt: opStr = "<"; negPrec = kPrecRelational; break;
+                    case helix::high::BinaryOpKind::Le: opStr = "<="; negPrec = kPrecRelational; break;
+                    case helix::high::BinaryOpKind::Gt: opStr = ">"; negPrec = kPrecRelational; break;
+                    case helix::high::BinaryOpKind::Ge: opStr = ">="; negPrec = kPrecRelational; break;
                     default: opStr = "??"; break;
                     }
-                    return std::format("({} {} {})",
-                        formatExpression(innerBin.getLhs()), opStr,
-                        formatExpression(innerBin.getRhs()));
+                    auto negResult = std::format("{} {} {}",
+                        formatExpressionWithPrec(innerBin.getLhs(), negPrec),
+                        opStr,
+                        formatExpressionWithPrec(innerBin.getRhs(), negPrec + 1));
+                    if (negPrec < parentPrec) negResult = "(" + negResult + ")";
+                    return negResult;
                 }
             }
         }
 
         // Simplify *&x → x  and  &*x → x  (cancel inverse operations)
-        auto innerExpr = formatExpression(unary.getOperand());
+        auto innerExpr = formatExpressionWithPrec(unary.getOperand(), kPrecUnary);
         if (unary.getOp() == helix::high::UnaryOpKind::Deref &&
             innerExpr.starts_with("&")) {
             auto inner = innerExpr.substr(1);
@@ -3107,26 +3153,44 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         case helix::high::UnaryOpKind::Deref:     opStr = "*"; break;
         case helix::high::UnaryOpKind::AddressOf: opStr = "&"; break;
         }
-        return std::format("({}{})", opStr, innerExpr);
+        auto unaryResult = std::format("{}{}", opStr, innerExpr);
+        if (kPrecUnary < parentPrec) unaryResult = "(" + unaryResult + ")";
+        return unaryResult;
     }
 
     // ─── Cast expression ────────────────────────────────────────────────
     if (auto castOp = dyn_cast<helix::high::CastOp>(defOp)) {
         // Elide identity casts (same type in → out)
         if (castOp.getInput().getType() == castOp.getResult().getType())
-            return formatExpression(castOp.getInput());
-        return std::format("({})({})",
+            return formatExpressionWithPrec(castOp.getInput(), parentPrec);
+        auto castResult = std::format("({})({})",
             formatType(castOp.getResult().getType()),
-            formatExpression(castOp.getInput()));
+            formatExpressionWithPrec(castOp.getInput(), 0));
+        if (kPrecUnary < parentPrec) castResult = "(" + castResult + ")";
+        return castResult;
     }
 
     // ─── Function call expression ───────────────────────────────────────
     if (auto call = dyn_cast<helix::high::CallOp>(defOp)) {
-        std::string result = call.getTargetName().str() + "(";
+        auto calleeName = call.getTargetName().str();
         auto args = call.getArgs();
+
+        // Detect vtable pattern: __vtable_0xNN → base->vfunc_0xNN(rest...)
+        if (calleeName.starts_with("__vtable_0x") && !args.empty()) {
+            auto offsetStr = calleeName.substr(9); // "__vtable_" is 9 chars → "0x18"
+            std::string result = formatExpressionWithPrec(args[0], 0) + "->vfunc_" + offsetStr + "(";
+            for (size_t i = 1; i < args.size(); i++) {
+                if (i > 1) result += ", ";
+                result += formatExpressionWithPrec(args[i], 0);
+            }
+            result += ")";
+            return result;
+        }
+
+        std::string result = calleeName + "(";
         for (size_t i = 0; i < args.size(); i++) {
             if (i > 0) result += ", ";
-            result += formatExpression(args[i]);
+            result += formatExpressionWithPrec(args[i], 0);
         }
         result += ")";
         return result;
@@ -3134,24 +3198,26 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     // ─── Ternary expression ─────────────────────────────────────────────
     if (auto ternary = dyn_cast<helix::high::TernaryOp>(defOp)) {
-        return std::format("({} ? {} : {})",
-            formatExpression(ternary.getCond()),
-            formatExpression(ternary.getTrueVal()),
-            formatExpression(ternary.getFalseVal()));
+        auto ternResult = std::format("{} ? {} : {}",
+            formatExpressionWithPrec(ternary.getCond(), kPrecTernary + 1),
+            formatExpressionWithPrec(ternary.getTrueVal(), 0),
+            formatExpressionWithPrec(ternary.getFalseVal(), kPrecTernary));
+        if (kPrecTernary < parentPrec) ternResult = "(" + ternResult + ")";
+        return ternResult;
     }
 
     // ─── Subscript expression ───────────────────────────────────────────
     if (auto sub = dyn_cast<helix::high::SubscriptOp>(defOp)) {
         return std::format("{}[{}]",
-            formatExpression(sub.getBase()),
-            formatExpression(sub.getIndex()));
+            formatExpressionWithPrec(sub.getBase(), kPrecAtom),
+            formatExpressionWithPrec(sub.getIndex(), 0));
     }
 
     // ─── Field access expression ────────────────────────────────────────
     if (auto field = dyn_cast<helix::high::FieldAccessOp>(defOp)) {
         auto op_str = field.getIsPointer() ? "->" : ".";
         return std::format("{}{}{}",
-            formatExpression(field.getBase()),
+            formatExpressionWithPrec(field.getBase(), kPrecAtom),
             op_str,
             field.getFieldName().str());
     }
@@ -3176,34 +3242,37 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     if (auto midBinExpr = dyn_cast<helix::mid::BinExprOp>(defOp)) {
         std::string opStr;
+        int prec = kPrecAdd;
         switch (midBinExpr.getKind()) {
-        case helix::mid::BinExprKind::Add:    opStr = "+"; break;
-        case helix::mid::BinExprKind::Sub:    opStr = "-"; break;
-        case helix::mid::BinExprKind::Mul:    opStr = "*"; break;
-        case helix::mid::BinExprKind::Div:    opStr = "/"; break;
-        case helix::mid::BinExprKind::Mod:    opStr = "%"; break;
-        case helix::mid::BinExprKind::Shl:    opStr = "<<"; break;
-        case helix::mid::BinExprKind::Shr:    opStr = ">>"; break;
-        case helix::mid::BinExprKind::Sar:    opStr = ">>"; break;
-        case helix::mid::BinExprKind::BitAnd: opStr = "&"; break;
-        case helix::mid::BinExprKind::BitOr:  opStr = "|"; break;
-        case helix::mid::BinExprKind::BitXor: opStr = "^"; break;
-        case helix::mid::BinExprKind::Eq:     opStr = "=="; break;
-        case helix::mid::BinExprKind::Ne:     opStr = "!="; break;
-        case helix::mid::BinExprKind::Lt:     opStr = "<"; break;
-        case helix::mid::BinExprKind::Le:     opStr = "<="; break;
-        case helix::mid::BinExprKind::Gt:     opStr = ">"; break;
-        case helix::mid::BinExprKind::Ge:     opStr = ">="; break;
-        case helix::mid::BinExprKind::LogAnd: opStr = "&&"; break;
-        case helix::mid::BinExprKind::LogOr:  opStr = "||"; break;
+        case helix::mid::BinExprKind::Add:    opStr = "+"; prec = kPrecAdd; break;
+        case helix::mid::BinExprKind::Sub:    opStr = "-"; prec = kPrecAdd; break;
+        case helix::mid::BinExprKind::Mul:    opStr = "*"; prec = kPrecMul; break;
+        case helix::mid::BinExprKind::Div:    opStr = "/"; prec = kPrecMul; break;
+        case helix::mid::BinExprKind::Mod:    opStr = "%"; prec = kPrecMul; break;
+        case helix::mid::BinExprKind::Shl:    opStr = "<<"; prec = kPrecShift; break;
+        case helix::mid::BinExprKind::Shr:    opStr = ">>"; prec = kPrecShift; break;
+        case helix::mid::BinExprKind::Sar:    opStr = ">>"; prec = kPrecShift; break;
+        case helix::mid::BinExprKind::BitAnd: opStr = "&"; prec = kPrecBitAnd; break;
+        case helix::mid::BinExprKind::BitOr:  opStr = "|"; prec = kPrecBitOr; break;
+        case helix::mid::BinExprKind::BitXor: opStr = "^"; prec = kPrecBitXor; break;
+        case helix::mid::BinExprKind::Eq:     opStr = "=="; prec = kPrecEqual; break;
+        case helix::mid::BinExprKind::Ne:     opStr = "!="; prec = kPrecEqual; break;
+        case helix::mid::BinExprKind::Lt:     opStr = "<"; prec = kPrecRelational; break;
+        case helix::mid::BinExprKind::Le:     opStr = "<="; prec = kPrecRelational; break;
+        case helix::mid::BinExprKind::Gt:     opStr = ">"; prec = kPrecRelational; break;
+        case helix::mid::BinExprKind::Ge:     opStr = ">="; prec = kPrecRelational; break;
+        case helix::mid::BinExprKind::LogAnd: opStr = "&&"; prec = kPrecLogAnd; break;
+        case helix::mid::BinExprKind::LogOr:  opStr = "||"; prec = kPrecLogOr; break;
         }
-        auto lhsStr = formatExpression(midBinExpr.getLhs());
-        auto rhsStr = formatExpression(midBinExpr.getRhs());
-        return std::format("({} {} {})", lhsStr, opStr, rhsStr);
+        auto lhsStr = formatExpressionWithPrec(midBinExpr.getLhs(), prec);
+        auto rhsStr = formatExpressionWithPrec(midBinExpr.getRhs(), prec + 1);
+        auto result = std::format("{} {} {}", lhsStr, opStr, rhsStr);
+        if (prec < parentPrec) result = "(" + result + ")";
+        return result;
     }
 
     if (auto midUnExpr = dyn_cast<helix::mid::UnExprOp>(defOp)) {
-        auto inner = formatExpression(midUnExpr.getOperand());
+        auto inner = formatExpressionWithPrec(midUnExpr.getOperand(), kPrecUnary);
         std::string opStr;
         switch (midUnExpr.getKind()) {
         case helix::mid::UnExprKind::Neg:    opStr = "-"; break;
@@ -3212,34 +3281,40 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         case helix::mid::UnExprKind::Deref:  opStr = "*"; break;
         case helix::mid::UnExprKind::AddrOf: opStr = "&"; break;
         }
-        return std::format("({}{})", opStr, inner);
+        auto unResult = std::format("{}{}", opStr, inner);
+        if (kPrecUnary < parentPrec) unResult = "(" + unResult + ")";
+        return unResult;
     }
 
     if (auto midCast = dyn_cast<helix::mid::CastOp>(defOp)) {
         // Elide identity casts
         if (midCast.getInput().getType() == midCast.getResult().getType())
-            return formatExpression(midCast.getInput());
-        return std::format("({})({})",
+            return formatExpressionWithPrec(midCast.getInput(), parentPrec);
+        auto castResult = std::format("({})({})",
             formatType(midCast.getResult().getType()),
-            formatExpression(midCast.getInput()));
+            formatExpressionWithPrec(midCast.getInput(), 0));
+        if (kPrecUnary < parentPrec) castResult = "(" + castResult + ")";
+        return castResult;
     }
 
     if (auto midLoad = dyn_cast<helix::mid::LoadOp>(defOp)) {
-        auto addrStr = formatExpression(midLoad.getAddr());
+        auto addrStr = formatExpressionWithPrec(midLoad.getAddr(), 0);
         if (addrStr.starts_with("&") && addrStr.find("->") != std::string::npos)
             return addrStr.substr(1);
         return std::format("*({})", addrStr);
     }
 
     if (auto midSelect = dyn_cast<helix::mid::SelectOp>(defOp)) {
-        return std::format("({} ? {} : {})",
-            formatExpression(midSelect.getCondition()),
-            formatExpression(midSelect.getTrueVal()),
-            formatExpression(midSelect.getFalseVal()));
+        auto selResult = std::format("{} ? {} : {}",
+            formatExpressionWithPrec(midSelect.getCondition(), kPrecTernary + 1),
+            formatExpressionWithPrec(midSelect.getTrueVal(), 0),
+            formatExpressionWithPrec(midSelect.getFalseVal(), kPrecTernary));
+        if (kPrecTernary < parentPrec) selResult = "(" + selResult + ")";
+        return selResult;
     }
 
     if (auto midFieldPtr = dyn_cast<helix::mid::FieldPtrOp>(defOp)) {
-        auto baseStr = formatExpression(midFieldPtr.getBase());
+        auto baseStr = formatExpressionWithPrec(midFieldPtr.getBase(), kPrecAtom);
         auto offset = midFieldPtr.getFieldOffset();
         if (auto name = midFieldPtr.getFieldName())
             return std::format("&{}->{}",  baseStr, name->str());
@@ -3248,8 +3323,8 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     if (auto midIdxPtr = dyn_cast<helix::mid::IndexPtrOp>(defOp)) {
         return std::format("&{}[{}]",
-            formatExpression(midIdxPtr.getBase()),
-            formatExpression(midIdxPtr.getIndex()));
+            formatExpressionWithPrec(midIdxPtr.getBase(), kPrecAtom),
+            formatExpressionWithPrec(midIdxPtr.getIndex(), 0));
     }
 
     if (auto midAddr = dyn_cast<helix::mid::AddrConstOp>(defOp)) {
@@ -3266,7 +3341,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         auto args = midCall.getArgs();
         for (size_t i = 0; i < args.size(); i++) {
             if (i > 0) result += ", ";
-            result += formatExpression(args[i]);
+            result += formatExpressionWithPrec(args[i], 0);
         }
         result += ")";
         return result;
@@ -3306,7 +3381,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             if (auto* addrDef = memRead.getAddr().getDefiningOp()) {
                 // Check for low::BinOp (rbp - offset) or high::BinaryOp
                 if (auto binop = dyn_cast<helix::low::BinOp>(addrDef)) {
-                    auto lhsStr = formatExpression(binop.getLhs());
+                    auto lhsStr = formatExpressionWithPrec(binop.getLhs(), 0);
                     if (lhsStr == "rbp" || lhsStr == "RBP") {
                         if (auto rhsConst = binop.getRhs().getDefiningOp<arith::ConstantOp>()) {
                             if (auto intAttr = dyn_cast<IntegerAttr>(rhsConst.getValue())) {
@@ -3332,7 +3407,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
         }
 
-        auto addrStr = formatExpression(memRead.getAddr());
+        auto addrStr = formatExpressionWithPrec(memRead.getAddr(), 0);
         // x86-32 flat model: *(NULL) is segment base = 0
         if (addrStr == "NULL" || addrStr == "(void*)(0)")
             return "0";
@@ -3351,15 +3426,15 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         // ─── XOR(A, A) → 0 peephole ────────────────────────────────
         // The classic `xor reg, reg` idiom for zeroing a register.
         if (binop.getKind() == helix::low::BinOpKind::Xor) {
-            auto lhsStr = formatExpression(binop.getLhs());
-            auto rhsStr = formatExpression(binop.getRhs());
+            auto lhsStr = formatExpressionWithPrec(binop.getLhs(), 0);
+            auto rhsStr = formatExpressionWithPrec(binop.getRhs(), 0);
             if (lhsStr == rhsStr)
                 return std::string("0");
         }
         // ─── SUB(A, A) → 0 peephole ────────────────────────────────
         if (binop.getKind() == helix::low::BinOpKind::Sub) {
-            auto lhsStr = formatExpression(binop.getLhs());
-            auto rhsStr = formatExpression(binop.getRhs());
+            auto lhsStr = formatExpressionWithPrec(binop.getLhs(), 0);
+            auto rhsStr = formatExpressionWithPrec(binop.getRhs(), 0);
             if (lhsStr == rhsStr)
                 return std::string("0");
         }
@@ -3368,8 +3443,8 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         if (auto opResult = dyn_cast<OpResult>(val)) {
             unsigned resNum = opResult.getResultNumber();
             if (resNum > 0) {
-                auto lhs = formatExpression(binop.getLhs());
-                auto rhs = formatExpression(binop.getRhs());
+                auto lhs = formatExpressionWithPrec(binop.getLhs(), 0);
+                auto rhs = formatExpressionWithPrec(binop.getRhs(), 0);
                 switch (resNum) {
                 case 1: return std::format("__carry({}, {})", lhs, rhs);
                 case 2: return std::format("(({}) == 0)", lhs);  // zero flag
@@ -3381,24 +3456,25 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         }
 
         std::string opStr;
+        int prec = kPrecAdd;
         switch (binop.getKind()) {
-        case helix::low::BinOpKind::Add:  opStr = "+"; break;
-        case helix::low::BinOpKind::Sub:  opStr = "-"; break;
-        case helix::low::BinOpKind::Mul:  opStr = "*"; break;
-        case helix::low::BinOpKind::IMul: opStr = "*"; break;
-        case helix::low::BinOpKind::Div:  opStr = "/"; break;
-        case helix::low::BinOpKind::IDiv: opStr = "/"; break;
-        case helix::low::BinOpKind::And:  opStr = "&"; break;
-        case helix::low::BinOpKind::Or:   opStr = "|"; break;
-        case helix::low::BinOpKind::Xor:  opStr = "^"; break;
-        case helix::low::BinOpKind::Shl:  opStr = "<<"; break;
-        case helix::low::BinOpKind::Shr:  opStr = ">>"; break;
-        case helix::low::BinOpKind::Sar:  opStr = ">>"; break;
-        case helix::low::BinOpKind::Rol:  opStr = "<<<"; break;
-        case helix::low::BinOpKind::Ror:  opStr = ">>>"; break;
+        case helix::low::BinOpKind::Add:  opStr = "+"; prec = kPrecAdd; break;
+        case helix::low::BinOpKind::Sub:  opStr = "-"; prec = kPrecAdd; break;
+        case helix::low::BinOpKind::Mul:  opStr = "*"; prec = kPrecMul; break;
+        case helix::low::BinOpKind::IMul: opStr = "*"; prec = kPrecMul; break;
+        case helix::low::BinOpKind::Div:  opStr = "/"; prec = kPrecMul; break;
+        case helix::low::BinOpKind::IDiv: opStr = "/"; prec = kPrecMul; break;
+        case helix::low::BinOpKind::And:  opStr = "&"; prec = kPrecBitAnd; break;
+        case helix::low::BinOpKind::Or:   opStr = "|"; prec = kPrecBitOr; break;
+        case helix::low::BinOpKind::Xor:  opStr = "^"; prec = kPrecBitXor; break;
+        case helix::low::BinOpKind::Shl:  opStr = "<<"; prec = kPrecShift; break;
+        case helix::low::BinOpKind::Shr:  opStr = ">>"; prec = kPrecShift; break;
+        case helix::low::BinOpKind::Sar:  opStr = ">>"; prec = kPrecShift; break;
+        case helix::low::BinOpKind::Rol:  opStr = "<<<"; prec = kPrecShift; break;
+        case helix::low::BinOpKind::Ror:  opStr = ">>>"; prec = kPrecShift; break;
         }
-        auto lhsStr = formatExpression(binop.getLhs());
-        auto rhsStr = formatExpression(binop.getRhs());
+        auto lhsStr = formatExpressionWithPrec(binop.getLhs(), prec);
+        auto rhsStr = formatExpressionWithPrec(binop.getRhs(), prec + 1);
 
         if (binop.getKind() == helix::low::BinOpKind::Add || binop.getKind() == helix::low::BinOpKind::Sub) {
 
@@ -3428,7 +3504,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 }
                 return std::format("__readgsqword({})", hexOffset);
             }
-            
+
             auto hasTlsBase = [](const std::string& s) {
                 return s.find("__readgsqword(0x58)") != std::string::npos || s.find("&__local") != std::string::npos;
             };
@@ -3441,7 +3517,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                     return std::format("0x{:x}", addr);
                 } catch(...) {}
             }
-            
+
             // ─── Automatic Struct Field Recovery ────────────────────────────
             if (binop.getKind() == helix::low::BinOpKind::Add &&
                 lhsStr.find(' ') == std::string::npos &&
@@ -3459,7 +3535,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 }
             }
         }
-        
+
         // ─── Hash Function Inlining ─────────────────────────────────────
         if ((binop.getKind() == helix::low::BinOpKind::Mul || binop.getKind() == helix::low::BinOpKind::IMul) &&
             (rhsStr == "0x8001" || rhsStr == "32769")) {
@@ -3469,7 +3545,9 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             return std::format("HASH({})", x);
         }
 
-        return std::format("({} {} {})", lhsStr, opStr, rhsStr);
+        auto result = std::format("{} {} {}", lhsStr, opStr, rhsStr);
+        if (prec < parentPrec) result = "(" + result + ")";
+        return result;
     }
 
     // ─── HelixLow: Unary operation ──────────────────────────────────────
@@ -3478,7 +3556,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         if (auto opResult = dyn_cast<OpResult>(val)) {
             unsigned resNum = opResult.getResultNumber();
             if (resNum > 0) {
-                auto operand = formatExpression(unary.getOperand());
+                auto operand = formatExpressionWithPrec(unary.getOperand(), 0);
                 switch (resNum) {
                 case 1: return std::format("(({}) == 0)", operand); // zero flag
                 case 2: return std::format("(({}) < 0)", operand);  // sign flag
@@ -3487,27 +3565,51 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
         }
 
-        auto operand = formatExpression(unary.getOperand());
+        auto operand = formatExpressionWithPrec(unary.getOperand(), kPrecUnary);
         switch (unary.getKind()) {
-        case helix::low::UnaryOpKind::Neg:   return std::format("(-{})", operand);
-        case helix::low::UnaryOpKind::Not:   return std::format("(~{})", operand);
-        case helix::low::UnaryOpKind::Inc:   return std::format("({} + 1)", operand);
-        case helix::low::UnaryOpKind::Dec:   return std::format("({} - 1)", operand);
-        case helix::low::UnaryOpKind::Bswap: return std::format("__builtin_bswap64({})", operand);
-        case helix::low::UnaryOpKind::Bsf:   return std::format("__builtin_ctzll({})", operand);
-        case helix::low::UnaryOpKind::Bsr:   return std::format("(63 - __builtin_clzll({}))", operand);
+        case helix::low::UnaryOpKind::Neg: {
+            auto r = std::format("-{}", operand);
+            if (kPrecUnary < parentPrec) r = "(" + r + ")";
+            return r;
+        }
+        case helix::low::UnaryOpKind::Not: {
+            auto r = std::format("~{}", operand);
+            if (kPrecUnary < parentPrec) r = "(" + r + ")";
+            return r;
+        }
+        case helix::low::UnaryOpKind::Inc: {
+            auto r = std::format("{} + 1", formatExpressionWithPrec(unary.getOperand(), kPrecAdd));
+            if (kPrecAdd < parentPrec) r = "(" + r + ")";
+            return r;
+        }
+        case helix::low::UnaryOpKind::Dec: {
+            auto r = std::format("{} - 1", formatExpressionWithPrec(unary.getOperand(), kPrecAdd));
+            if (kPrecAdd < parentPrec) r = "(" + r + ")";
+            return r;
+        }
+        case helix::low::UnaryOpKind::Bswap: return std::format("__builtin_bswap64({})", formatExpressionWithPrec(unary.getOperand(), 0));
+        case helix::low::UnaryOpKind::Bsf:   return std::format("__builtin_ctzll({})", formatExpressionWithPrec(unary.getOperand(), 0));
+        case helix::low::UnaryOpKind::Bsr:   return std::format("(63 - __builtin_clzll({}))", formatExpressionWithPrec(unary.getOperand(), 0));
         }
         return std::format("/* unary: {} */", operand);
     }
 
     // ─── HelixLow: Cmp (flag results) ───────────────────────────────────
     if (auto cmp = dyn_cast<helix::low::CmpOp>(defOp)) {
-        auto lhs = formatExpression(cmp.getLhs());
-        auto rhs = formatExpression(cmp.getRhs());
+        auto lhs = formatExpressionWithPrec(cmp.getLhs(), 0);
+        auto rhs = formatExpressionWithPrec(cmp.getRhs(), 0);
         if (auto opResult = dyn_cast<OpResult>(val)) {
             switch (opResult.getResultNumber()) {
-            case 0: return std::format("({} < {})", lhs, rhs);   // carry (borrow)
-            case 1: return std::format("({} == {})", lhs, rhs);  // zero
+            case 0: {
+                auto r = std::format("{} < {}", formatExpressionWithPrec(cmp.getLhs(), kPrecRelational), formatExpressionWithPrec(cmp.getRhs(), kPrecRelational + 1));
+                if (kPrecRelational < parentPrec) r = "(" + r + ")";
+                return r;
+            }
+            case 1: {
+                auto r = std::format("{} == {}", formatExpressionWithPrec(cmp.getLhs(), kPrecEqual), formatExpressionWithPrec(cmp.getRhs(), kPrecEqual + 1));
+                if (kPrecEqual < parentPrec) r = "(" + r + ")";
+                return r;
+            }
             case 2: return std::format("(({} - {}) < 0)", lhs, rhs); // sign
             case 3: return std::format("__overflow({}, {})", lhs, rhs);
             }
@@ -3517,23 +3619,29 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     // ─── HelixLow: Test (flag results) ──────────────────────────────────
     if (auto test = dyn_cast<helix::low::TestOp>(defOp)) {
-        auto lhs = formatExpression(test.getLhs());
-        auto rhs = formatExpression(test.getRhs());
+        auto lhs = formatExpressionWithPrec(test.getLhs(), 0);
+        auto rhs = formatExpressionWithPrec(test.getRhs(), 0);
         if (auto opResult = dyn_cast<OpResult>(val)) {
             switch (opResult.getResultNumber()) {
             case 0: return std::format("(({} & {}) == 0)", lhs, rhs); // zero
             case 1: return std::format("(({} & {}) < 0)", lhs, rhs);  // sign
             }
         }
-        return std::format("({} & {})", lhs, rhs);
+        {
+            auto r = std::format("{} & {}", formatExpressionWithPrec(test.getLhs(), kPrecBitAnd), formatExpressionWithPrec(test.getRhs(), kPrecBitAnd + 1));
+            if (kPrecBitAnd < parentPrec) r = "(" + r + ")";
+            return r;
+        }
     }
 
     // ─── HelixLow: CMov (conditional select) ────────────────────────────
     if (auto cmov = dyn_cast<helix::low::CMovOp>(defOp)) {
-        return std::format("({} ? {} : {})",
-            formatExpression(cmov.getFlagValue()),
-            formatExpression(cmov.getTrueVal()),
-            formatExpression(cmov.getFalseVal()));
+        auto cmovResult = std::format("{} ? {} : {}",
+            formatExpressionWithPrec(cmov.getFlagValue(), kPrecTernary + 1),
+            formatExpressionWithPrec(cmov.getTrueVal(), 0),
+            formatExpressionWithPrec(cmov.getFalseVal(), kPrecTernary));
+        if (kPrecTernary < parentPrec) cmovResult = "(" + cmovResult + ")";
+        return cmovResult;
     }
 
     // ─── HelixLow: MovZx/MovSx (zero/sign extend) ──────────────────────
@@ -3547,7 +3655,9 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         case 64: typeStr = "uint64_t"; break;
         default: typeStr = std::format("uint{}_t", dstWidth); break;
         }
-        return std::format("({}){}", typeStr, formatExpression(movzx.getSrc()));
+        auto castR = std::format("({}){}", typeStr, formatExpressionWithPrec(movzx.getSrc(), kPrecUnary));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
     }
 
     if (auto movsx = dyn_cast<helix::low::MovSxOp>(defOp)) {
@@ -3560,7 +3670,9 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         case 64: typeStr = "int64_t"; break;
         default: typeStr = std::format("int{}_t", dstWidth); break;
         }
-        return std::format("({}){}", typeStr, formatExpression(movsx.getSrc()));
+        auto castR = std::format("({}){}", typeStr, formatExpressionWithPrec(movsx.getSrc(), kPrecUnary));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
     }
 
     // ─── HelixLow: Pop (value from stack) ───────────────────────────────
@@ -3571,11 +3683,13 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     if (auto lea = dyn_cast<helix::low::LeaOp>(defOp)) {
         auto disp = lea.getDisplacement();
         if (disp != 0) {
-            return std::format("({} + {})",
-                formatExpression(lea.getBase()),
+            auto r = std::format("{} + {}",
+                formatExpressionWithPrec(lea.getBase(), kPrecAdd),
                 formatIntLiteral(disp));
+            if (kPrecAdd < parentPrec) r = "(" + r + ")";
+            return r;
         }
-        return formatExpression(lea.getBase());
+        return formatExpressionWithPrec(lea.getBase(), parentPrec);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -3596,8 +3710,8 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     // ─── Binary arithmetic ──────────────────────────────────────────────
     if (auto op = dyn_cast<LLVM::AddOp>(defOp)) {
-        auto lhsStr = formatExpression(op.getLhs());
-        auto rhsStr = formatExpression(op.getRhs());
+        auto lhsStr = formatExpressionWithPrec(op.getLhs(), kPrecAdd);
+        auto rhsStr = formatExpressionWithPrec(op.getRhs(), kPrecAdd + 1);
 
         if (auto lhs = parseFormattedIntegerLiteral(lhsStr)) {
             if (auto rhs = parseFormattedIntegerLiteral(rhsStr))
@@ -3627,7 +3741,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
             return std::format("__readgsqword({})", hexOffset);
         }
-        
+
         // ─── Automatic Struct Field Recovery ────────────────────────────
         if (lhsStr.find(' ') == std::string::npos &&
             lhsStr.find('(') == std::string::npos &&
@@ -3643,23 +3757,29 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 }
             }
         }
-        return std::format("({} + {})", lhsStr, rhsStr);
+        {
+            auto r = std::format("{} + {}", lhsStr, rhsStr);
+            if (kPrecAdd < parentPrec) r = "(" + r + ")";
+            return r;
+        }
     }
 
     if (auto op = dyn_cast<LLVM::SubOp>(defOp)) {
-        auto lhsStr = formatExpression(op.getLhs());
-        auto rhsStr = formatExpression(op.getRhs());
+        auto lhsStr = formatExpressionWithPrec(op.getLhs(), kPrecAdd);
+        auto rhsStr = formatExpressionWithPrec(op.getRhs(), kPrecAdd + 1);
         if (auto lhs = parseFormattedIntegerLiteral(lhsStr)) {
             if (auto rhs = parseFormattedIntegerLiteral(rhsStr))
                 return formatIntLiteral(*lhs - *rhs);
         }
-        return std::format("({} - {})", lhsStr, rhsStr);
+        auto r = std::format("{} - {}", lhsStr, rhsStr);
+        if (kPrecAdd < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
     if (auto op = dyn_cast<LLVM::MulOp>(defOp)) {
-        auto lhsStr = formatExpression(op.getLhs());
-        auto rhsStr = formatExpression(op.getRhs());
-        
+        auto lhsStr = formatExpressionWithPrec(op.getLhs(), kPrecMul);
+        auto rhsStr = formatExpressionWithPrec(op.getRhs(), kPrecMul + 1);
+
         // ─── Hash Function Inlining ─────────────────────────────────────
         if (rhsStr == "0x8001" || rhsStr == "32769") {
             std::string x = lhsStr;
@@ -3667,58 +3787,91 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             else if (x.starts_with("(uint64_t)(")) x = x.substr(11, x.size() - 12);
             return std::format("HASH({})", x);
         }
-        
-        return std::format("({} * {})", lhsStr, rhsStr);
+
+        auto r = std::format("{} * {}", lhsStr, rhsStr);
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
-    if (auto op = dyn_cast<LLVM::UDivOp>(defOp))
-        return std::format("((uint64_t){} / (uint64_t){})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::UDivOp>(defOp)) {
+        auto r = std::format("(uint64_t){} / (uint64_t){}",
+            formatExpressionWithPrec(op.getLhs(), kPrecUnary), formatExpressionWithPrec(op.getRhs(), kPrecUnary));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::SDivOp>(defOp))
-        return std::format("({} / {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::SDivOp>(defOp)) {
+        auto r = std::format("{} / {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecMul), formatExpressionWithPrec(op.getRhs(), kPrecMul + 1));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::URemOp>(defOp))
-        return std::format("((uint64_t){} % (uint64_t){})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::URemOp>(defOp)) {
+        auto r = std::format("(uint64_t){} % (uint64_t){}",
+            formatExpressionWithPrec(op.getLhs(), kPrecUnary), formatExpressionWithPrec(op.getRhs(), kPrecUnary));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::SRemOp>(defOp))
-        return std::format("({} % {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::SRemOp>(defOp)) {
+        auto r = std::format("{} % {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecMul), formatExpressionWithPrec(op.getRhs(), kPrecMul + 1));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     // ─── Bitwise operations ─────────────────────────────────────────────
-    if (auto op = dyn_cast<LLVM::AndOp>(defOp))
-        return std::format("({} & {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::AndOp>(defOp)) {
+        auto r = std::format("{} & {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecBitAnd), formatExpressionWithPrec(op.getRhs(), kPrecBitAnd + 1));
+        if (kPrecBitAnd < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::OrOp>(defOp))
-        return std::format("({} | {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::OrOp>(defOp)) {
+        auto r = std::format("{} | {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecBitOr), formatExpressionWithPrec(op.getRhs(), kPrecBitOr + 1));
+        if (kPrecBitOr < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::XOrOp>(defOp))
-        return std::format("({} ^ {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::XOrOp>(defOp)) {
+        auto r = std::format("{} ^ {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecBitXor), formatExpressionWithPrec(op.getRhs(), kPrecBitXor + 1));
+        if (kPrecBitXor < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     // ─── Shifts ─────────────────────────────────────────────────────────
-    if (auto op = dyn_cast<LLVM::ShlOp>(defOp))
-        return std::format("({} << {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::ShlOp>(defOp)) {
+        auto r = std::format("{} << {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecShift), formatExpressionWithPrec(op.getRhs(), kPrecShift + 1));
+        if (kPrecShift < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::LShrOp>(defOp))
-        return std::format("({} >> {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::LShrOp>(defOp)) {
+        auto r = std::format("{} >> {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecShift), formatExpressionWithPrec(op.getRhs(), kPrecShift + 1));
+        if (kPrecShift < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<LLVM::AShrOp>(defOp))
-        return std::format("((int64_t){} >> {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<LLVM::AShrOp>(defOp)) {
+        auto r = std::format("(int64_t){} >> {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecUnary), formatExpressionWithPrec(op.getRhs(), kPrecShift + 1));
+        if (kPrecShift < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     // ─── Comparison ─────────────────────────────────────────────────────
     if (auto icmp = dyn_cast<LLVM::ICmpOp>(defOp)) {
         std::string cmpStr;
+        int cmpPrec = kPrecRelational;
         switch (icmp.getPredicate()) {
-        case LLVM::ICmpPredicate::eq:  cmpStr = "=="; break;
-        case LLVM::ICmpPredicate::ne:  cmpStr = "!="; break;
+        case LLVM::ICmpPredicate::eq:  cmpStr = "=="; cmpPrec = kPrecEqual; break;
+        case LLVM::ICmpPredicate::ne:  cmpStr = "!="; cmpPrec = kPrecEqual; break;
         case LLVM::ICmpPredicate::slt: cmpStr = "<"; break;
         case LLVM::ICmpPredicate::sle: cmpStr = "<="; break;
         case LLVM::ICmpPredicate::sgt: cmpStr = ">"; break;
@@ -3728,62 +3881,79 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         case LLVM::ICmpPredicate::ugt: cmpStr = ">"; break;
         case LLVM::ICmpPredicate::uge: cmpStr = ">="; break;
         }
-        return std::format("({} {} {})",
-            formatExpression(icmp.getLhs()), cmpStr,
-            formatExpression(icmp.getRhs()));
+        auto r = std::format("{} {} {}",
+            formatExpressionWithPrec(icmp.getLhs(), cmpPrec),
+            cmpStr,
+            formatExpressionWithPrec(icmp.getRhs(), cmpPrec + 1));
+        if (cmpPrec < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
     // ─── Select (ternary) ───────────────────────────────────────────────
-    if (auto sel = dyn_cast<LLVM::SelectOp>(defOp))
-        return std::format("({} ? {} : {})",
-            formatExpression(sel.getCondition()),
-            formatExpression(sel.getTrueValue()),
-            formatExpression(sel.getFalseValue()));
+    if (auto sel = dyn_cast<LLVM::SelectOp>(defOp)) {
+        auto r = std::format("{} ? {} : {}",
+            formatExpressionWithPrec(sel.getCondition(), kPrecTernary + 1),
+            formatExpressionWithPrec(sel.getTrueValue(), 0),
+            formatExpressionWithPrec(sel.getFalseValue(), kPrecTernary));
+        if (kPrecTernary < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     // ─── Integer casts ──────────────────────────────────────────────────
     // Eliminate redundant casts: (int64_t)(expr) when expr is already 64-bit,
     // and (int64_t)((int32_t)(x)) → just (int32_t)(x) if widening back.
     if (auto op = dyn_cast<LLVM::ZExtOp>(defOp)) {
         if (op.getArg().getType() == op.getResult().getType())
-            return formatExpression(op.getArg());
-        auto inner = formatExpression(op.getArg());
+            return formatExpressionWithPrec(op.getArg(), parentPrec);
+        auto inner = formatExpressionWithPrec(op.getArg(), 0);
         auto targetType = formatType(op.getResult().getType());
         // Skip (int64_t) wrapping of memory reads / dereferences — already 64-bit semantically
         if (targetType == "int64_t" &&
             (inner.starts_with("(*") || inner.starts_with("*") ||
              inner.starts_with("g_") || inner.find("->") != std::string::npos))
             return inner;
-        return std::format("({})({})", targetType, inner);
+        auto castR = std::format("({})({})", targetType, inner);
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
     }
 
     if (auto op = dyn_cast<LLVM::SExtOp>(defOp)) {
         if (op.getArg().getType() == op.getResult().getType())
-            return formatExpression(op.getArg());
-        auto inner = formatExpression(op.getArg());
+            return formatExpressionWithPrec(op.getArg(), parentPrec);
+        auto inner = formatExpressionWithPrec(op.getArg(), 0);
         auto targetType = formatType(op.getResult().getType());
         if (targetType == "int64_t" &&
             (inner.starts_with("(*") || inner.starts_with("*") ||
              inner.starts_with("g_") || inner.find("->") != std::string::npos))
             return inner;
-        return std::format("({})({})", targetType, inner);
+        auto castR = std::format("({})({})", targetType, inner);
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
     }
 
     if (auto op = dyn_cast<LLVM::TruncOp>(defOp)) {
         if (op.getArg().getType() == op.getResult().getType())
-            return formatExpression(op.getArg());
-        return std::format("({})({})",
+            return formatExpressionWithPrec(op.getArg(), parentPrec);
+        auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
-            formatExpression(op.getArg()));
+            formatExpressionWithPrec(op.getArg(), 0));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
     }
 
     // ─── Pointer casts ──────────────────────────────────────────────────
-    if (auto op = dyn_cast<LLVM::PtrToIntOp>(defOp))
-        return std::format("(int64_t)({})", formatExpression(op.getArg()));
+    if (auto op = dyn_cast<LLVM::PtrToIntOp>(defOp)) {
+        auto castR = std::format("(int64_t)({})", formatExpressionWithPrec(op.getArg(), 0));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
+    }
 
     if (auto op = dyn_cast<LLVM::IntToPtrOp>(defOp)) {
-        auto expr = formatExpression(op.getArg());
+        auto expr = formatExpressionWithPrec(op.getArg(), 0);
         if (expr == "0") return "NULL";
-        return std::format("(void*)({})", expr);
+        auto castR = std::format("(void*)({})", expr);
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
     }
 
     // ─── Memory load ────────────────────────────────────────────────────
@@ -3792,7 +3962,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                                                         load.getAddr());
             paramIndex && *paramIndex <= currentWin64StackParamLimit_)
             return applyNameAliases(std::format("param_{}", *paramIndex));
-        auto addrStr = formatExpression(load.getAddr());
+        auto addrStr = formatExpressionWithPrec(load.getAddr(), 0);
         // x86-32 flat model: *(NULL) is segment base = 0
         if (addrStr == "NULL" || addrStr == "(void*)(0)")
             return "0";
@@ -3824,7 +3994,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         result += "(";
         for (unsigned i = 0; i < call.getNumOperands(); i++) {
             if (i > 0) result += ", ";
-            result += formatExpression(call.getOperand(i));
+            result += formatExpressionWithPrec(call.getOperand(i), 0);
         }
         result += ")";
         return result;
@@ -3832,11 +4002,11 @@ std::string PseudoCEmitter::formatExpression(Value val) {
 
     // ─── GEP (pointer arithmetic) ───────────────────────────────────────
     if (auto gep = dyn_cast<LLVM::GEPOp>(defOp)) {
-        auto base = formatExpression(gep.getBase());
+        auto base = formatExpressionWithPrec(gep.getBase(), 0);
         auto dynIndices = gep.getDynamicIndices();
         if (dynIndices.empty())
             return base;
-            
+
         // ─── x86 Segment Base Simplification (flat model) ─────────────
         if (dynIndices.size() == 1) {
             auto isSegBase = [](const std::string& s) {
@@ -3848,14 +4018,14 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                        s.find("*(int64_t)((NULL") != std::string::npos ||
                        s == "0" || s == "*(int64_t)(NULL)" || s == "*(NULL)";
             };
-            auto idxStr = formatExpression(dynIndices[0]);
+            auto idxStr = formatExpressionWithPrec(dynIndices[0], 0);
             if (isSegBase(base)) return idxStr;
             if (isSegBase(idxStr)) return base;
         }
 
         // ─── Segment Register Awareness ─────────────────────────────────
         if (dynIndices.size() == 1 && (base == "*(int64_t)(NULL)" || base == "*(NULL)")) {
-            std::string hexOffset = formatExpression(dynIndices[0]);
+            std::string hexOffset = formatExpressionWithPrec(dynIndices[0], 0);
             if (!hexOffset.starts_with("0x")) {
                 try { hexOffset = std::format("0x{:x}", std::stoull(hexOffset)); } catch(...) {}
             }
@@ -3867,7 +4037,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             return s.find("__readgsqword(0x58)") != std::string::npos || s.find("&__local") != std::string::npos;
         };
         if (hasTlsBase(base) && dynIndices.size() == 1) {
-            auto rhsStr = formatExpression(dynIndices[0]);
+            auto rhsStr = formatExpressionWithPrec(dynIndices[0], 0);
             try {
                 uint64_t offset = 0;
                 if (rhsStr.starts_with("0x") || rhsStr.starts_with("0X")) offset = std::stoull(rhsStr.substr(2), nullptr, 16);
@@ -3877,14 +4047,9 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             } catch(...) {}
         }
 
-        std::string result = "(" + base;
-        for (auto idx : dynIndices)
-            result += " + " + formatExpression(idx);
-        result += ")";
-        
         // ─── Automatic Struct Field Recovery ────────────────────────────
         if (dynIndices.size() == 1) {
-            auto rhsStr = formatExpression(dynIndices[0]);
+            auto rhsStr = formatExpressionWithPrec(dynIndices[0], 0);
             if (base.find(' ') == std::string::npos &&
                 base.find('(') == std::string::npos &&
                 !containsSyntheticValueIdentifier(base) &&
@@ -3900,14 +4065,21 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 }
             }
         }
-        
-        return result;
+
+        // General case: base + indices
+        {
+            auto r = formatExpressionWithPrec(gep.getBase(), kPrecAdd);
+            for (auto idx : dynIndices)
+                r += " + " + formatExpressionWithPrec(idx, kPrecAdd + 1);
+            if (kPrecAdd < parentPrec) r = "(" + r + ")";
+            return r;
+        }
     }
 
     // ─── ExtractValue (aggregate member access) ─────────────────────────
     if (auto ev = dyn_cast<LLVM::ExtractValueOp>(defOp)) {
         auto pos = ev.getPosition();
-        std::string result = formatExpression(ev.getContainer());
+        std::string result = formatExpressionWithPrec(ev.getContainer(), kPrecAtom);
         for (auto idx : pos)
             result += std::format(".field{}", idx);
         return result;
@@ -3930,8 +4102,8 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     }
 
     if (auto op = dyn_cast<arith::AddIOp>(defOp)) {
-        auto lhsStr = formatExpression(op.getLhs());
-        auto rhsStr = formatExpression(op.getRhs());
+        auto lhsStr = formatExpressionWithPrec(op.getLhs(), kPrecAdd);
+        auto rhsStr = formatExpressionWithPrec(op.getRhs(), kPrecAdd + 1);
 
         // ─── x86 Segment Base Simplification (flat model) ─────────────
         {
@@ -3956,7 +4128,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
             return std::format("__readgsqword({})", hexOffset);
         }
-        
+
         auto hasTlsBase = [](const std::string& s) {
             return s.find("__readgsqword(0x58)") != std::string::npos || s.find("&__local") != std::string::npos;
         };
@@ -3969,7 +4141,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 return std::format("0x{:x}", addr);
             } catch(...) {}
         }
-        
+
         // ─── Automatic Struct Field Recovery ────────────────────────────
         if (lhsStr.find(' ') == std::string::npos &&
             lhsStr.find('(') == std::string::npos &&
@@ -3986,13 +4158,17 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
         }
 
-        return std::format("({} + {})", lhsStr, rhsStr);
+        {
+            auto r = std::format("{} + {}", lhsStr, rhsStr);
+            if (kPrecAdd < parentPrec) r = "(" + r + ")";
+            return r;
+        }
     }
 
     if (auto op = dyn_cast<arith::SubIOp>(defOp)) {
-        auto lhsStr = formatExpression(op.getLhs());
-        auto rhsStr = formatExpression(op.getRhs());
-        
+        auto lhsStr = formatExpressionWithPrec(op.getLhs(), kPrecAdd);
+        auto rhsStr = formatExpressionWithPrec(op.getRhs(), kPrecAdd + 1);
+
         auto hasTlsBase = [](const std::string& s) {
             return s.find("__readgsqword(0x58)") != std::string::npos || s.find("&__local") != std::string::npos;
         };
@@ -4005,13 +4181,15 @@ std::string PseudoCEmitter::formatExpression(Value val) {
                 return std::format("0x{:x}", addr);
             } catch(...) {}
         }
-        return std::format("({} - {})", lhsStr, rhsStr);
+        auto r = std::format("{} - {}", lhsStr, rhsStr);
+        if (kPrecAdd < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
     if (auto op = dyn_cast<arith::MulIOp>(defOp)) {
-        auto lhsStr = formatExpression(op.getLhs());
-        auto rhsStr = formatExpression(op.getRhs());
-        
+        auto lhsStr = formatExpressionWithPrec(op.getLhs(), kPrecMul);
+        auto rhsStr = formatExpressionWithPrec(op.getRhs(), kPrecMul + 1);
+
         // ─── Hash Function Inlining ─────────────────────────────────────
         if (rhsStr == "0x8001" || rhsStr == "32769") {
             std::string x = lhsStr;
@@ -4019,33 +4197,53 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             else if (x.starts_with("(uint64_t)(")) x = x.substr(11, x.size() - 12);
             return std::format("HASH({})", x);
         }
-        
-        return std::format("({} * {})", lhsStr, rhsStr);
+
+        auto r = std::format("{} * {}", lhsStr, rhsStr);
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
-    if (auto op = dyn_cast<arith::DivSIOp>(defOp))
-        return std::format("({} / {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::DivSIOp>(defOp)) {
+        auto r = std::format("{} / {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecMul), formatExpressionWithPrec(op.getRhs(), kPrecMul + 1));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::DivUIOp>(defOp))
-        return std::format("((uint64_t){} / (uint64_t){})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::DivUIOp>(defOp)) {
+        auto r = std::format("(uint64_t){} / (uint64_t){}",
+            formatExpressionWithPrec(op.getLhs(), kPrecUnary), formatExpressionWithPrec(op.getRhs(), kPrecUnary));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::RemSIOp>(defOp))
-        return std::format("({} % {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::RemSIOp>(defOp)) {
+        auto r = std::format("{} % {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecMul), formatExpressionWithPrec(op.getRhs(), kPrecMul + 1));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::RemUIOp>(defOp))
-        return std::format("((uint64_t){} % (uint64_t){})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::RemUIOp>(defOp)) {
+        auto r = std::format("(uint64_t){} % (uint64_t){}",
+            formatExpressionWithPrec(op.getLhs(), kPrecUnary), formatExpressionWithPrec(op.getRhs(), kPrecUnary));
+        if (kPrecMul < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::AndIOp>(defOp))
-        return std::format("({} & {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::AndIOp>(defOp)) {
+        auto r = std::format("{} & {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecBitAnd), formatExpressionWithPrec(op.getRhs(), kPrecBitAnd + 1));
+        if (kPrecBitAnd < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::OrIOp>(defOp))
-        return std::format("({} | {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::OrIOp>(defOp)) {
+        auto r = std::format("{} | {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecBitOr), formatExpressionWithPrec(op.getRhs(), kPrecBitOr + 1));
+        if (kPrecBitOr < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     if (auto op = dyn_cast<arith::XOrIOp>(defOp)) {
         auto lhsSrc = findFlagSource(op.getLhs());
@@ -4065,32 +4263,50 @@ std::string PseudoCEmitter::formatExpression(Value val) {
             }
         }
 
-        if (isLogicalNegationConstant(op.getLhs()))
-            return std::format("!({})", formatExpression(op.getRhs()));
-        if (isLogicalNegationConstant(op.getRhs()))
-            return std::format("!({})", formatExpression(op.getLhs()));
+        if (isLogicalNegationConstant(op.getLhs())) {
+            auto r = std::format("!{}", formatExpressionWithPrec(op.getRhs(), kPrecUnary));
+            if (kPrecUnary < parentPrec) r = "(" + r + ")";
+            return r;
+        }
+        if (isLogicalNegationConstant(op.getRhs())) {
+            auto r = std::format("!{}", formatExpressionWithPrec(op.getLhs(), kPrecUnary));
+            if (kPrecUnary < parentPrec) r = "(" + r + ")";
+            return r;
+        }
 
-        return std::format("({} ^ {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+        auto r = std::format("{} ^ {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecBitXor), formatExpressionWithPrec(op.getRhs(), kPrecBitXor + 1));
+        if (kPrecBitXor < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
-    if (auto op = dyn_cast<arith::ShLIOp>(defOp))
-        return std::format("({} << {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::ShLIOp>(defOp)) {
+        auto r = std::format("{} << {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecShift), formatExpressionWithPrec(op.getRhs(), kPrecShift + 1));
+        if (kPrecShift < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::ShRUIOp>(defOp))
-        return std::format("({} >> {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::ShRUIOp>(defOp)) {
+        auto r = std::format("{} >> {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecShift), formatExpressionWithPrec(op.getRhs(), kPrecShift + 1));
+        if (kPrecShift < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
-    if (auto op = dyn_cast<arith::ShRSIOp>(defOp))
-        return std::format("((int64_t){} >> {})",
-            formatExpression(op.getLhs()), formatExpression(op.getRhs()));
+    if (auto op = dyn_cast<arith::ShRSIOp>(defOp)) {
+        auto r = std::format("(int64_t){} >> {}",
+            formatExpressionWithPrec(op.getLhs(), kPrecUnary), formatExpressionWithPrec(op.getRhs(), kPrecShift + 1));
+        if (kPrecShift < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     if (auto icmp = dyn_cast<arith::CmpIOp>(defOp)) {
         std::string cmpStr;
+        int cmpPrec = kPrecRelational;
         switch (icmp.getPredicate()) {
-        case arith::CmpIPredicate::eq:  cmpStr = "=="; break;
-        case arith::CmpIPredicate::ne:  cmpStr = "!="; break;
+        case arith::CmpIPredicate::eq:  cmpStr = "=="; cmpPrec = kPrecEqual; break;
+        case arith::CmpIPredicate::ne:  cmpStr = "!="; cmpPrec = kPrecEqual; break;
         case arith::CmpIPredicate::slt: cmpStr = "<"; break;
         case arith::CmpIPredicate::sle: cmpStr = "<="; break;
         case arith::CmpIPredicate::sgt: cmpStr = ">"; break;
@@ -4100,31 +4316,46 @@ std::string PseudoCEmitter::formatExpression(Value val) {
         case arith::CmpIPredicate::ugt: cmpStr = ">"; break;
         case arith::CmpIPredicate::uge: cmpStr = ">="; break;
         }
-        return std::format("({} {} {})",
-            formatExpression(icmp.getLhs()), cmpStr,
-            formatExpression(icmp.getRhs()));
+        auto r = std::format("{} {} {}",
+            formatExpressionWithPrec(icmp.getLhs(), cmpPrec),
+            cmpStr,
+            formatExpressionWithPrec(icmp.getRhs(), cmpPrec + 1));
+        if (cmpPrec < parentPrec) r = "(" + r + ")";
+        return r;
     }
 
-    if (auto op = dyn_cast<arith::ExtUIOp>(defOp))
-        return std::format("({})({})",
+    if (auto op = dyn_cast<arith::ExtUIOp>(defOp)) {
+        auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
-            formatExpression(op.getIn()));
+            formatExpressionWithPrec(op.getIn(), 0));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
+    }
 
-    if (auto op = dyn_cast<arith::ExtSIOp>(defOp))
-        return std::format("({})({})",
+    if (auto op = dyn_cast<arith::ExtSIOp>(defOp)) {
+        auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
-            formatExpression(op.getIn()));
+            formatExpressionWithPrec(op.getIn(), 0));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
+    }
 
-    if (auto op = dyn_cast<arith::TruncIOp>(defOp))
-        return std::format("({})({})",
+    if (auto op = dyn_cast<arith::TruncIOp>(defOp)) {
+        auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
-            formatExpression(op.getIn()));
+            formatExpressionWithPrec(op.getIn(), 0));
+        if (kPrecUnary < parentPrec) castR = "(" + castR + ")";
+        return castR;
+    }
 
-    if (auto sel = dyn_cast<arith::SelectOp>(defOp))
-        return std::format("({} ? {} : {})",
-            formatExpression(sel.getCondition()),
-            formatExpression(sel.getTrueValue()),
-            formatExpression(sel.getFalseValue()));
+    if (auto sel = dyn_cast<arith::SelectOp>(defOp)) {
+        auto r = std::format("{} ? {} : {}",
+            formatExpressionWithPrec(sel.getCondition(), kPrecTernary + 1),
+            formatExpressionWithPrec(sel.getTrueValue(), 0),
+            formatExpressionWithPrec(sel.getFalseValue(), kPrecTernary));
+        if (kPrecTernary < parentPrec) r = "(" + r + ")";
+        return r;
+    }
 
     // ═════════════════════════════════════════════════════════════════════
     // Fallback: show the MLIR op name and its operand expressions
@@ -4133,7 +4364,7 @@ std::string PseudoCEmitter::formatExpression(Value val) {
     std::string fallback = "/* " + defOp->getName().getStringRef().str();
     for (unsigned i = 0; i < defOp->getNumOperands() && i < 4; i++) {
         fallback += (i == 0 ? " " : ", ");
-        fallback += formatExpression(defOp->getOperand(i));
+        fallback += formatExpressionWithPrec(defOp->getOperand(i), 0);
     }
     if (defOp->getNumOperands() > 4)
         fallback += ", ...";

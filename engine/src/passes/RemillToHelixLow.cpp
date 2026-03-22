@@ -232,6 +232,73 @@ struct RegisterTracker {
                     break;
             }
 
+            if (!looksLikePc) {
+                // ── Fallback heuristic for constant-store Remill IR ─────
+                // When Remill uses direct constant stores instead of the
+                // load→add→store pattern, the alloca that receives constant
+                // stores paired with NEXT_PC constant stores is the PC.
+                //
+                // Pattern: for some instruction at address A with size S,
+                //   store i64 A,   ptr %PC
+                //   store i64 A+S, ptr %NEXT_PC
+                //
+                // We check: does this alloca receive constant stores whose
+                // values are each (NEXT_PC_const - small_delta) for a
+                // corresponding NEXT_PC store in the same block?
+                llvm::SmallVector<int64_t, 8> pcCandidates;
+                llvm::SmallVector<int64_t, 8> nextPcValues;
+
+                // Collect constant stores to this alloca.
+                for (Operation* user : alloca->getUsers()) {
+                    auto store = dyn_cast<LLVM::StoreOp>(user);
+                    if (!store || store.getAddr() != alloca.getResult())
+                        continue;
+                    if (auto constOp = store.getValue().getDefiningOp<LLVM::ConstantOp>()) {
+                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                            pcCandidates.push_back(intAttr.getValue().getSExtValue());
+                    }
+                }
+
+                if (pcCandidates.size() >= 2) {
+                    // Collect constant stores to the NEXT_PC alloca.
+                    Value nextPcPtr;
+                    for (auto& [ptr, name] : gep_to_reg) {
+                        if (name == "NEXT_PC") {
+                            nextPcPtr = ptr;
+                            break;
+                        }
+                    }
+                    if (nextPcPtr) {
+                        for (Operation* user : nextPcPtr.getDefiningOp()->getUsers()) {
+                            auto store = dyn_cast<LLVM::StoreOp>(user);
+                            if (!store || store.getAddr() != nextPcPtr)
+                                continue;
+                            if (auto constOp = store.getValue().getDefiningOp<LLVM::ConstantOp>()) {
+                                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                                    nextPcValues.push_back(intAttr.getValue().getSExtValue());
+                            }
+                        }
+                    }
+
+                    // Check correlation: for each PC candidate, is there
+                    // a NEXT_PC value that's PC + [1..15]?
+                    unsigned matches = 0;
+                    for (auto pc : pcCandidates) {
+                        for (auto npc : nextPcValues) {
+                            auto delta = npc - pc;
+                            if (delta >= 1 && delta <= 15) {
+                                matches++;
+                                break;
+                            }
+                        }
+                    }
+
+                    // If at least 2 PC values correlate with NEXT_PC, this is PC.
+                    if (matches >= 2)
+                        looksLikePc = true;
+                }
+            }
+
             if (!looksLikePc)
                 return;
 
@@ -288,6 +355,22 @@ struct RegisterTracker {
     /// Check if a value is a known register GEP pointer.
     bool isRegisterPtr(Value val) const {
         return gep_to_reg.count(val) > 0;
+    }
+
+    /// Check if a named register has been identified.
+    bool isRegisterPtr(llvm::StringRef regName) const {
+        for (auto& [val, name] : gep_to_reg)
+            if (name == regName)
+                return true;
+        return false;
+    }
+
+    /// Explicitly register an alloca as the PC register.
+    /// Used when the heuristic scan fails but we can identify
+    /// the PC alloca by other means (e.g., it stores the entry address).
+    void registerPcAlloca(Value allocaResult) {
+        gep_to_reg.try_emplace(allocaResult, "PC");
+        reg_widths["PC"] = 64;
     }
 
     static std::optional<std::string> extractRegisterNameFromValue(Value val) {
@@ -398,6 +481,14 @@ struct PCTracker {
     /// Last known concrete values for bookkeeping slots such as PC/NEXT_PC.
     llvm::StringMap<int64_t> trackedValues;
 
+    /// Cache of evaluated SSA Values within the current block.
+    /// Prevents re-evaluation from seeing mutated trackedValues,
+    /// which violates SSA semantics (a Value's meaning is fixed at its def).
+    mutable llvm::DenseMap<Value, int64_t> evalCache;
+
+    /// Clear the eval cache at block boundaries.
+    void clearEvalCache() { evalCache.clear(); }
+
     std::optional<int64_t> tryEvaluate(Value value,
                                        const RegisterTracker& regs) const {
         llvm::SmallPtrSet<Operation*, 16> visiting;
@@ -428,13 +519,12 @@ struct PCTracker {
             return;
         }
 
-        // NEXT_PC is the most useful base for RIP-relative reconstruction.
-        // Keep tracking it as the active address so later arithmetic over
-        // synthetic temporaries can still collapse to concrete targets.
-        if (*destReg == "NEXT_PC") {
-            current_pc = static_cast<uint64_t>(*evaluated);
-            has_pc = true;
-        }
+        // NEXT_PC is tracked in trackedValues for RIP-relative resolution
+        // but must NOT overwrite current_pc — otherwise operations following
+        // a `store NEXT_PC` get the wrong instruction address (the return
+        // address of a CALL, not the CALL's own address).  The RIP-relative
+        // helpers use trackedValues["NEXT_PC"] directly.
+        // (no current_pc update for NEXT_PC)
     }
 
     /// Get an optional address attribute for the current PC.
@@ -448,6 +538,25 @@ private:
         llvm::SmallPtrSetImpl<Operation*>& visiting) const {
         if (!value)
             return std::nullopt;
+
+        // Check the per-block evaluation cache first.
+        // This ensures SSA Values are evaluated consistently — once a
+        // Value is evaluated, the result is reused even if trackedValues
+        // has changed (e.g., NEXT_PC was updated between two uses of
+        // the same SSA value).
+        if (auto cached = evalCache.find(value); cached != evalCache.end())
+            return cached->second;
+
+        auto result = tryEvaluateUncached(value, regs, visiting);
+        if (result)
+            evalCache[value] = *result;
+        return result;
+    }
+
+    /// Core evaluation logic (without cache check).
+    std::optional<int64_t> tryEvaluateUncached(
+        Value value, const RegisterTracker& regs,
+        llvm::SmallPtrSetImpl<Operation*>& visiting) const {
 
         auto* defOp = value.getDefiningOp();
         if (!defOp)
@@ -478,7 +587,7 @@ private:
                     it != trackedValues.end()) {
                     return it->second;
                 }
-                if ((*srcReg == "PC" || *srcReg == "NEXT_PC") && has_pc)
+                if (*srcReg == "PC" && has_pc)
                     return static_cast<int64_t>(current_pc);
             }
             return std::nullopt;
@@ -596,6 +705,39 @@ private:
         RegisterTracker regs;
         regs.scan(llvmFunc);
 
+        // ── Post-scan: Ensure the PC alloca was identified ──────────────
+        // Some Remill IR uses direct constant stores (store i64 ADDR, ptr %PC)
+        // instead of the load→add→store pattern that the primary heuristic
+        // expects.  If PC was NOT found, brute-force search all allocas by
+        // correlating their constant stores with the known entry address.
+        if (!regs.isRegisterPtr("PC") && entryAddr != 0) {
+            llvmFunc.walk([&](LLVM::AllocaOp alloca) {
+                if (regs.isRegisterPtr(alloca.getResult()))
+                    return;
+
+                // Check if this alloca receives a store of the entry address.
+                bool storesEntryAddr = false;
+                for (auto* user : alloca.getResult().getUsers()) {
+                    auto store = dyn_cast<LLVM::StoreOp>(user);
+                    if (!store || store.getAddr() != alloca.getResult())
+                        continue;
+                    if (auto constOp =
+                            store.getValue().getDefiningOp<LLVM::ConstantOp>()) {
+                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+                            if (static_cast<uint64_t>(intAttr.getValue().getZExtValue()) == entryAddr) {
+                                storesEntryAddr = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (storesEntryAddr) {
+                    regs.registerPcAlloca(alloca.getResult());
+                }
+            });
+        }
+
         // Create the HelixLow function.
         auto funcName = std::format("sub_{:x}", entryAddr);
         auto helixFunc = builder.create<helix::low::FuncOp>(
@@ -666,6 +808,7 @@ private:
         builder.create<helix::low::RetOp>(llvmFunc.getLoc(), IntegerAttr{});
 
         PCTracker pcTracker;
+        Value inferredPcAlloca;   // Fallback: alloca identified as PC by address heuristic
         llvm::SmallVector<Operation*, 16> opsToErase;
 
         // Walk the function and convert operations in-place.
@@ -682,6 +825,12 @@ private:
             // A structure to hold a deferred terminator creation.
             std::function<void(OpBuilder&, IntegerAttr)> deferredTerminator = nullptr;
 
+            // Clear the SSA evaluation cache at block boundaries.
+            // Within a block, the cache ensures that re-evaluating the same
+            // SSA Value returns a consistent result even after trackedValues
+            // has been mutated by intervening stores.
+            pcTracker.clearEvalCache();
+
             for (auto it = block->begin(), e = block->end(); it != e; ) {
                 Operation* op = &*it;
                 it++;
@@ -689,6 +838,48 @@ private:
                 // Track PC updates.
                 if (auto store = dyn_cast<LLVM::StoreOp>(op)) {
                     pcTracker.trackStore(store, regs);
+
+                    // ── Robust PC fallback ───────────────────────────
+                    // If the RegisterTracker didn't identify the PC alloca,
+                    // detect PC stores by checking for constants near the
+                    // entry address.  Once the PC alloca is found, keep
+                    // tracking all stores to it.
+                    if (entryAddr != 0) {
+                        auto storeAddr = store.getAddr();
+                        bool isPcStore = false;
+
+                        // If we already identified the PC alloca, check this store.
+                        if (inferredPcAlloca && storeAddr == inferredPcAlloca) {
+                            isPcStore = true;
+                        }
+
+                        // First time: detect by entry address match.
+                        if (!inferredPcAlloca) {
+                            if (auto constOp =
+                                    store.getValue().getDefiningOp<LLVM::ConstantOp>()) {
+                                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+                                    auto val = static_cast<uint64_t>(
+                                        intAttr.getValue().getZExtValue());
+                                    if (val == entryAddr) {
+                                        inferredPcAlloca = storeAddr;
+                                        isPcStore = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (isPcStore) {
+                            // Use tryEvaluate to handle constants, loads,
+                            // add/sub chains (e.g. load NEXT_PC → store PC).
+                            auto evaluated = pcTracker.tryEvaluate(
+                                store.getValue(), regs);
+                            if (evaluated) {
+                                pcTracker.current_pc =
+                                    static_cast<uint64_t>(*evaluated);
+                                pcTracker.has_pc = true;
+                            }
+                        }
+                    }
                 }
 
                 builder.setInsertionPoint(op);
@@ -1429,6 +1620,85 @@ private:
         return candidate;
     }
 
+    // ─── Flag Value Search (same-block + predecessor walk) ────────────
+    //
+    // Used by the JCC condition synthesis to find the most recent RegWriteOp
+    // for a given flag name (ZF, CF, SF, OF).  The search starts in the
+    // current block and, if not found, walks predecessor blocks using cycle
+    // detection and consensus checking (all predecessors must agree on the
+    // same SSA value).
+    //
+    // This fixes the critical bug where CMP/TEST in a predecessor block
+    // would cause flag synthesis to fall back to `constant true`.
+
+    /// Search backwards in a single block for a RegWriteOp to the named flag.
+    static Value findFlagValueInBlock(
+        Block* block, Block::iterator endIt, llvm::StringRef flagName) {
+        if (!block)
+            return nullptr;
+
+        for (auto it = Block::reverse_iterator(endIt);
+             it != block->rend(); ++it) {
+            if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(*it)) {
+                if (regWrite.getRegName() == flagName) {
+                    return regWrite.getValue();
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    /// Recursively search predecessor blocks for a RegWriteOp to the named
+    /// flag.  Returns nullptr if not found, if depth is exhausted, or if
+    /// multiple predecessors disagree (provide different SSA values).
+    static Value findFlagValueInPredecessors(
+        Block* block, llvm::StringRef flagName,
+        unsigned depth, llvm::DenseSet<Block*>& visiting) {
+        if (!block || depth == 0 || !visiting.insert(block).second)
+            return nullptr;
+
+        Value candidate = nullptr;
+        for (Block* pred : block->getPredecessors()) {
+            Value value = findFlagValueInBlock(pred, pred->end(), flagName);
+            if (!value) {
+                value = findFlagValueInPredecessors(
+                    pred, flagName, depth - 1, visiting);
+            }
+            if (!value) {
+                // Predecessor has no flag write — ambiguous, bail out.
+                visiting.erase(block);
+                return nullptr;
+            }
+            if (candidate && candidate != value) {
+                // Multiple predecessors provide different values — ambiguous.
+                visiting.erase(block);
+                return nullptr;
+            }
+            candidate = value;
+        }
+
+        visiting.erase(block);
+        return candidate;
+    }
+
+    /// Find the most recent flag-producing operation (CmpOp, BinOp, TestOp)
+    /// in the current block.  Used for JP/JNP parity flag computation.
+    static Operation* findFlagProducerInBlock(
+        Block* block, Block::iterator endIt) {
+        if (!block)
+            return nullptr;
+
+        for (auto it = Block::reverse_iterator(endIt);
+             it != block->rend(); ++it) {
+            if (isa<helix::low::CmpOp>(*it) ||
+                isa<helix::low::BinOp>(*it) ||
+                isa<helix::low::TestOp>(*it)) {
+                return &*it;
+            }
+        }
+        return nullptr;
+    }
+
     /// Convert a recognized Remill semantic function call to HelixLow ops.
     void convertSemantic(LLVM::CallOp call, OpBuilder& builder,
                          const RegisterTracker& regs,
@@ -1436,7 +1706,7 @@ private:
                          IntegerAttr addrAttr, Location loc,
                          Block* dummyBlock,
                          std::function<void(OpBuilder&, IntegerAttr)>& deferredTerminator,
-                         const PCTracker& pcTracker = {}) {
+                         const PCTracker& pcTracker) {
         auto semantic = semInfo.semantic;
 
         // Determine the working integer type (default 64-bit for x86_64).
@@ -1580,16 +1850,31 @@ private:
         case RemillSemantic::CMP: {
             // Remill CMP layout: (mem, state, lhs, rhs) — variable positions
             if (call.getNumOperands() >= 3) {
+                auto lhsVal = safeGetOperand(call, 2, builder, loc);
+                auto rhsVal = safeGetOperand(call, 3, builder, loc);
+
+                // When the first operand is a memory reference (CMP [addr], imm),
+                // Remill passes the ADDRESS — we must emit a MemRead to load
+                // the actual value before comparing.
+                if (semInfo.has_memory_src && semInfo.src_width != 0) {
+                    unsigned readWidth = semInfo.src_width;
+                    auto readTy = builder.getIntegerType(readWidth);
+                    auto memRead = builder.create<helix::low::MemReadOp>(
+                        loc, readTy,
+                        ensureInt64(lhsVal, builder, loc, &regs, &pcTracker),
+                        builder.getUI32IntegerAttr(readWidth),
+                        addrAttr);
+                    lhsVal = memRead.getResult();
+                }
+
                 auto cmpOp = builder.create<helix::low::CmpOp>(
                     loc,
                     /*carry_flag=*/i1Ty,
                     /*zero_flag=*/i1Ty,
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
-                    ensureInt64(safeGetOperand(call, 2, builder, loc), builder, loc,
-                                &regs, &pcTracker),
-                    ensureInt64(safeGetOperand(call, 3, builder, loc), builder, loc,
-                                &regs, &pcTracker),
+                    ensureInt64(lhsVal, builder, loc, &regs, &pcTracker),
+                    ensureInt64(rhsVal, builder, loc, &regs, &pcTracker),
                     addrAttr);
                 
                 builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
@@ -1605,6 +1890,18 @@ private:
             if (call.getNumOperands() >= 3) {
                 auto lhs = safeGetOperand(call, 2, builder, loc);
                 auto rhs = safeGetOperand(call, 3, builder, loc);
+
+                // Memory source: TEST [addr], imm → load value first
+                if (semInfo.has_memory_src && semInfo.src_width != 0) {
+                    unsigned readWidth = semInfo.src_width;
+                    auto readTy = builder.getIntegerType(readWidth);
+                    auto memRead = builder.create<helix::low::MemReadOp>(
+                        loc, readTy,
+                        ensureInt64(lhs, builder, loc, &regs, &pcTracker),
+                        builder.getUI32IntegerAttr(readWidth),
+                        addrAttr);
+                    lhs = memRead.getResult();
+                }
 
                 // ─── Idiom: TEST reg, reg → CMP reg, 0 ─────────────────
                 // When both operands are the same register, TEST reg, reg
@@ -2005,20 +2302,18 @@ private:
             //   JP/JNP    → PF (not tracked, use fallback)
 
             auto findFlagValue = [&](llvm::StringRef flagName) -> Value {
-                // Walk backwards from current insertion point
                 Block* block = builder.getInsertionBlock();
                 if (!block) return nullptr;
-                
-                // Search backwards from the current position
-                for (auto it = Block::reverse_iterator(builder.getInsertionPoint());
-                     it != block->rend(); ++it) {
-                    if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(*it)) {
-                        if (regWrite.getRegName() == flagName) {
-                            return regWrite.getValue();
-                        }
-                    }
-                }
-                return nullptr;
+
+                // Step 1: Search current block (fast path, covers 95%+ of cases)
+                Value result = findFlagValueInBlock(
+                    block, builder.getInsertionPoint(), flagName);
+                if (result) return result;
+
+                // Step 2: Search predecessor blocks (handles cross-block CMP→JCC)
+                llvm::DenseSet<Block*> visiting;
+                return findFlagValueInPredecessors(
+                    block, flagName, /*depth=*/3, visiting);
             };
 
             Value condValue = nullptr;
@@ -2156,21 +2451,111 @@ private:
                 }
                 break;
             }
+            case RemillSemantic::JP: {
+                // PF: even parity of low byte of last arithmetic result.
+                // Find the most recent flag-producing op and compute PF.
+                auto* producer = findFlagProducerInBlock(
+                    builder.getInsertionBlock(), builder.getInsertionPoint());
+                if (producer) {
+                    Value resultVal = nullptr;
+                    if (auto binOp = dyn_cast<helix::low::BinOp>(producer)) {
+                        resultVal = binOp.getResult();
+                    } else if (auto cmpOp = dyn_cast<helix::low::CmpOp>(producer)) {
+                        // CMP computes (lhs - rhs); PF is based on that result.
+                        resultVal = builder.create<arith::SubIOp>(
+                            loc, cmpOp.getLhs(), cmpOp.getRhs()).getResult();
+                    } else if (auto testOp = dyn_cast<helix::low::TestOp>(producer)) {
+                        // TEST computes (lhs & rhs); PF is based on that result.
+                        resultVal = builder.create<arith::AndIOp>(
+                            loc, testOp.getLhs(), testOp.getRhs()).getResult();
+                    }
+                    if (resultVal) {
+                        // PF = !(popcount(low_byte) & 1)
+                        auto i8Ty = builder.getIntegerType(8);
+                        auto lowByte = builder.create<arith::TruncIOp>(
+                            loc, i8Ty, resultVal);
+                        // XOR-fold to single parity bit: b ^= b>>4; b ^= b>>2; b ^= b>>1; PF = !(b&1)
+                        auto four = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(4));
+                        auto shr4 = builder.create<arith::ShRUIOp>(loc, lowByte, four);
+                        auto x1 = builder.create<arith::XOrIOp>(loc, lowByte, shr4);
+                        auto two = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(2));
+                        auto shr2 = builder.create<arith::ShRUIOp>(loc, x1, two);
+                        auto x2 = builder.create<arith::XOrIOp>(loc, x1, shr2);
+                        auto one8 = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(1));
+                        auto shr1 = builder.create<arith::ShRUIOp>(loc, x2, one8);
+                        auto x3 = builder.create<arith::XOrIOp>(loc, x2, shr1);
+                        auto lsb = builder.create<arith::AndIOp>(loc, x3, one8);
+                        auto zero8 = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(0));
+                        // PF = (lsb == 0)  →  even parity
+                        condValue = builder.create<arith::CmpIOp>(
+                            loc, arith::CmpIPredicate::eq, lsb, zero8).getResult();
+                    }
+                }
+                break;
+            }
+            case RemillSemantic::JNP: {
+                // JNP = !PF (odd parity) — same as JP but negated.
+                auto* producer = findFlagProducerInBlock(
+                    builder.getInsertionBlock(), builder.getInsertionPoint());
+                if (producer) {
+                    Value resultVal = nullptr;
+                    if (auto binOp = dyn_cast<helix::low::BinOp>(producer)) {
+                        resultVal = binOp.getResult();
+                    } else if (auto cmpOp = dyn_cast<helix::low::CmpOp>(producer)) {
+                        resultVal = builder.create<arith::SubIOp>(
+                            loc, cmpOp.getLhs(), cmpOp.getRhs()).getResult();
+                    } else if (auto testOp = dyn_cast<helix::low::TestOp>(producer)) {
+                        resultVal = builder.create<arith::AndIOp>(
+                            loc, testOp.getLhs(), testOp.getRhs()).getResult();
+                    }
+                    if (resultVal) {
+                        auto i8Ty = builder.getIntegerType(8);
+                        auto lowByte = builder.create<arith::TruncIOp>(
+                            loc, i8Ty, resultVal);
+                        auto four = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(4));
+                        auto shr4 = builder.create<arith::ShRUIOp>(loc, lowByte, four);
+                        auto x1 = builder.create<arith::XOrIOp>(loc, lowByte, shr4);
+                        auto two = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(2));
+                        auto shr2 = builder.create<arith::ShRUIOp>(loc, x1, two);
+                        auto x2 = builder.create<arith::XOrIOp>(loc, x1, shr2);
+                        auto one8 = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(1));
+                        auto shr1 = builder.create<arith::ShRUIOp>(loc, x2, one8);
+                        auto x3 = builder.create<arith::XOrIOp>(loc, x2, shr1);
+                        auto lsb = builder.create<arith::AndIOp>(loc, x3, one8);
+                        auto zero8 = builder.create<arith::ConstantOp>(
+                            loc, i8Ty, builder.getI8IntegerAttr(0));
+                        // JNP = (lsb != 0)  →  odd parity
+                        condValue = builder.create<arith::CmpIOp>(
+                            loc, arith::CmpIPredicate::ne, lsb, zero8).getResult();
+                    }
+                }
+                break;
+            }
             default:
                 break;
             }
 
-            // Fallback: use constant true if flag not found
+            // Fallback: use constant true if flag not found.
+            // Also attach a diagnostic attribute to the JccOp so downstream
+            // passes and the emitter can detect and report this.
+            bool flagSynthesisFailed = false;
             if (!condValue) {
                 llvm::errs() << "[Helix] WARNING: Flag synthesis failed for "
-                             << *condStr << " — no flag values found in block. "
-                             << "Block has " << std::distance(builder.getInsertionBlock()->begin(),
-                                                               builder.getInsertionBlock()->end())
+                             << *condStr << " — no flag values found in block "
+                             << "or predecessors. Block has "
+                             << std::distance(builder.getInsertionBlock()->begin(),
+                                              builder.getInsertionBlock()->end())
                              << " ops\n";
                 condValue = builder.create<LLVM::ConstantOp>(
                     loc, i1Ty, builder.getBoolAttr(true)).getResult();
-            } else {
-                llvm::errs() << "[Helix] OK: Synthesized condition for " << *condStr << "\n";
+                flagSynthesisFailed = true;
             }
 
             // Resolve branch destinations from the LLVM br terminator.
@@ -2199,15 +2584,20 @@ private:
                 }
             }
 
-            deferredTerminator = [loc, condStr, condValue, trueBlock, falseBlock](
+            deferredTerminator = [loc, condStr, condValue, trueBlock, falseBlock,
+                                  flagSynthesisFailed](
                                      OpBuilder& b, IntegerAttr addr) {
-                b.create<helix::low::JccOp>(
+                auto jcc = b.create<helix::low::JccOp>(
                     loc,
                     *condStr,             // condition code string
                     condValue,            // real flag condition (i1)
                     addr,                 // address
                     trueBlock,            // taken destination
                     falseBlock);          // fallthrough destination
+                if (flagSynthesisFailed) {
+                    jcc->setAttr("helix.flag_synthesis_failed",
+                                 b.getUnitAttr());
+                }
             };
             break;
         }

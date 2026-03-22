@@ -34,22 +34,12 @@ export declare class HelixEngine {
    * This is the **primary integration path** for the HexCore IDE.
    * Routes through: LLVM IR → MLIR translation → HelixLow → HelixHigh → Pseudo-C
    *
-   * Falls back to the Rust pipeline if the MLIR engine is unavailable.
+   * Decompile Remill LLVM IR using the C++ MLIR pipeline.
+   *
+   * Since v0.7, the Rust HIR pipeline is no longer used as a fallback.
+   * If the MLIR engine fails, the error is returned directly.
    */
   decompileIr(irText: string): DecompileResult
-  /**
-   * Decompile using the **pure Rust pipeline** (no C++ engine required).
-   *
-   * This is the fallback path and can be called directly for comparison.
-   */
-  decompileIrRust(irText: string): DecompileResult
-  /**
-   * Decompile Remill LLVM IR and return metrics alongside the result.
-   *
-   * Same as `decompile_ir` but also returns pipeline performance data.
-   * Note: Metrics are currently from the Rust pipeline only.
-   */
-  decompileIrWithMetrics(irText: string): [DecompileResult, PipelineMetricsResult]
   /** Release engine resources. The engine cannot be used after this call. */
   dispose(): void
   /** Check if the engine has been disposed. */

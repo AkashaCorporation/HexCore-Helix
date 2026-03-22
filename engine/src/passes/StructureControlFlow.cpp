@@ -52,6 +52,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
@@ -1181,10 +1182,43 @@ static std::optional<std::string> extractConditionCode(Value condValue) {
 
 /// Get an optional address attribute from an operation.
 static uint64_t getOpAddress(Operation* op) {
+    // HelixLow ops use "address" as the attribute name (OptionalAttr<UI64Attr>).
+    if (auto addrAttr = op->getAttrOfType<IntegerAttr>("address")) {
+        return addrAttr.getUInt();
+    }
+    // Fallback: some passes may use "addr" instead.
     if (auto addrAttr = op->getAttrOfType<IntegerAttr>("addr")) {
         return addrAttr.getUInt();
     }
     return 0;
+}
+
+/// Get the address of the first addressable operation in a block.
+/// Skips over HelixHigh ops (VarDeclOp, LabelOp) that may have been
+/// inserted at the start of blocks during earlier structuring phases.
+static uint64_t getBlockAddress(Block* block) {
+    if (!block || block->empty())
+        return 0;
+    for (auto& op : *block) {
+        uint64_t addr = getOpAddress(&op);
+        if (addr != 0)
+            return addr;
+    }
+    return 0;
+}
+
+/// Pre-scan all blocks in a region and cache their addresses.
+/// Must be called BEFORE structuring moves ops into nested regions,
+/// which would make the addresses unreachable by getBlockAddress().
+static llvm::DenseMap<Block*, uint64_t>
+collectBlockAddresses(Region& region) {
+    llvm::DenseMap<Block*, uint64_t> map;
+    for (auto& block : region) {
+        uint64_t addr = getBlockAddress(&block);
+        if (addr != 0)
+            map[&block] = addr;
+    }
+    return map;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1272,6 +1306,37 @@ struct StructureControlFlowPass
 private:
     // ─── Per-function Structuring ─────────────────────────────────────────
 
+    /// Cached block → address mapping, populated before structuring begins.
+    /// After structuring, ops move into nested regions and getBlockAddress()
+    /// can no longer find the original addresses.
+    llvm::DenseMap<Block*, uint64_t> blockAddrCache_;
+
+    /// Tracks all label names emitted within the current function to
+    /// prevent duplicates when multiple blocks share the same address.
+    llvm::StringSet<> usedLabelNames_;
+
+    /// Generate a unique label name from a base name, deduplicating against
+    /// usedLabelNames_.  If the name already exists, appends _2, _3, etc.
+    /// The final name is inserted into usedLabelNames_ before returning.
+    std::string makeUniqueLabelName(const std::string& baseName) {
+        if (usedLabelNames_.insert(baseName).second)
+            return baseName;  // First use — no suffix needed.
+        // Name collision: find a free suffix.
+        for (unsigned suffix = 2; ; ++suffix) {
+            std::string candidate = std::format("{}_{}", baseName, suffix);
+            if (usedLabelNames_.insert(candidate).second)
+                return candidate;
+        }
+    }
+
+    /// Resolve a block's address using the pre-scan cache, falling back to
+    /// live getBlockAddress() if the block was created during structuring.
+    uint64_t resolveBlockAddr(Block* block) {
+        if (auto it = blockAddrCache_.find(block); it != blockAddrCache_.end())
+            return it->second;
+        return getBlockAddress(block);
+    }
+
     /// Structure the control flow within a single function.
     ///
     /// Performs structuring in phases:
@@ -1286,6 +1351,12 @@ private:
             return success();
 
         OpBuilder builder(func->getContext());
+
+        // Pre-scan: Cache block addresses BEFORE any structuring.
+        // After structuring, ops may be moved into nested regions (IfOp, WhileOp),
+        // making their addresses unreachable by getBlockAddress().
+        blockAddrCache_ = collectBlockAddresses(funcBody);
+        usedLabelNames_.clear();
 
         // Phase 1: Convert CMOV operations to ternary expressions.
         // This is always safe — it replaces ops in-place without moving blocks.
@@ -1321,7 +1392,7 @@ private:
             uint64_t srcAddr = edge.source->empty()
                 ? 0 : getOpAddress(&edge.source->back());
             uint64_t tgtAddr = edge.target->empty()
-                ? 0 : getOpAddress(&edge.target->front());
+                ? 0 : resolveBlockAddr(edge.target);
 
             // Skip edges with unknown addresses.
             if (srcAddr == 0 || tgtAddr == 0)
@@ -1478,16 +1549,19 @@ private:
                 if (labeledBlocks.count(succ))
                     continue;  // Already has a label.
                 // Emit a LabelOp at the start of the target block.
-                std::string labelName;
-                if (!succ->empty()) {
-                    uint64_t addr = getOpAddress(&succ->front());
+                std::string baseName;
+                {
+                    uint64_t addr = resolveBlockAddr(succ);
                     if (addr != 0)
-                        labelName = std::format("loc_{:x}", addr);
+                        baseName = std::format("loc_{:x}", addr);
                 }
-                if (labelName.empty()) {
+                if (baseName.empty()) {
                     static unsigned globalLabelCounter = 100;
-                    labelName = std::format("loc_irr_{}", globalLabelCounter++);
+                    baseName = std::format("loc_irr_{}", globalLabelCounter++);
                 }
+                // Deduplicate: multiple blocks at the same address get
+                // distinct label names (loc_X, loc_X_2, loc_X_3, ...).
+                std::string labelName = makeUniqueLabelName(baseName);
                 builder.setInsertionPointToStart(succ);
                 auto labelLoc = succ->empty()
                     ? builder.getUnknownLoc()
@@ -1499,6 +1573,53 @@ private:
                 labeledBlocks.insert(succ);
             }
         });
+
+        // Phase 4.6: Trivial goto elimination.
+        //
+        // If a block ends with a GotoOp whose target label is the LabelOp
+        // at the start of the immediately-next block, the goto is a natural
+        // fallthrough and can be removed.  This cleans up noisy output
+        // produced by Phase 4/4.5 without affecting correctness.
+        {
+            llvm::SmallVector<helix::high::GotoOp, 8> trivialGotos;
+            auto& body = func.getBody();
+            for (auto it = body.begin(), end = body.end(); it != end; ++it) {
+                auto next = std::next(it);
+                if (next == end)
+                    continue;
+
+                Block& curBlock = *it;
+                Block& nextBlock = *next;
+
+                // Current block must end with a GotoOp.
+                if (curBlock.empty())
+                    continue;
+                auto gotoOp = dyn_cast<helix::high::GotoOp>(
+                    &curBlock.back());
+                if (!gotoOp)
+                    continue;
+
+                // Next block must start with a LabelOp whose name matches.
+                if (nextBlock.empty())
+                    continue;
+                auto labelOp = dyn_cast<helix::high::LabelOp>(
+                    &nextBlock.front());
+                if (!labelOp)
+                    continue;
+
+                if (gotoOp.getLabel() == labelOp.getName()) {
+                    trivialGotos.push_back(gotoOp);
+                }
+            }
+            for (auto gotoOp : trivialGotos) {
+                LLVM_DEBUG({
+                    llvm::dbgs() << "  Eliminated trivial goto -> '"
+                                 << gotoOp.getLabel() << "'\n";
+                });
+                gotoOp.erase();
+                ++NumGotosEliminated;
+            }
+        }
 
         return success();
     }
@@ -2140,7 +2261,7 @@ private:
                 uint64_t srcAddr = edge.source->empty()
                     ? 0 : getOpAddress(&edge.source->back());
                 uint64_t tgtAddr = edge.target->empty()
-                    ? 0 : getOpAddress(&edge.target->front());
+                    ? 0 : resolveBlockAddr(edge.target);
 
                 if (srcAddr == 0 || tgtAddr == 0 || tgtAddr > srcAddr)
                     continue;
@@ -2201,32 +2322,33 @@ private:
                        helix::low::FuncOp func,
                        OpBuilder& builder) {
         // Generate a label name from the target block's address.
-        std::string labelName;
-        if (!edge.target->empty()) {
-            uint64_t addr = getOpAddress(&edge.target->front());
+        // Uses the pre-scan cache (blockAddrCache_) which was populated
+        // before structuring moved ops into nested regions.
+        std::string baseName;
+        {
+            uint64_t addr = resolveBlockAddr(edge.target);
             if (addr != 0) {
-                labelName = std::format("loc_{:x}", addr);
+                baseName = std::format("loc_{:x}", addr);
             }
         }
-        if (labelName.empty()) {
+        if (baseName.empty()) {
             static unsigned gotoCounter = 0;
-            labelName = std::format("loc_irr_{}", gotoCounter++);
+            baseName = std::format("loc_irr_{}", gotoCounter++);
         }
 
-        // Check if the target block already has a label with this name
-        // (avoid duplicate labels for multiple gotos to the same target).
-        bool hasLabel = false;
+        // Check if the target block already has ANY label — if so, reuse
+        // that name for the goto (avoid duplicate LabelOps on one block).
+        std::string labelName;
         for (auto& op : *edge.target) {
             if (auto existingLabel = dyn_cast<helix::high::LabelOp>(&op)) {
-                if (existingLabel.getName() == labelName) {
-                    hasLabel = true;
-                    break;
-                }
+                labelName = existingLabel.getName().str();
+                break;
             }
         }
 
-        // Insert the label at the beginning of the target block.
-        if (!hasLabel) {
+        // No existing label — deduplicate and create one.
+        if (labelName.empty()) {
+            labelName = makeUniqueLabelName(baseName);
             builder.setInsertionPointToStart(edge.target);
             auto labelLoc = edge.target->empty()
                 ? builder.getUnknownLoc()

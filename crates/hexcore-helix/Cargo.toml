@@ -13,5 +13,9 @@ napi = { workspace = true }
 napi-derive = { workspace = true }
 helix-core = { workspace = true }
 
+[features]
+default = []
+rust-pipeline = []
+
 [build-dependencies]
 napi-build = "2"

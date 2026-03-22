@@ -87,6 +87,11 @@ public:
     std::string formatExpression(mlir::Value val);
 private:
 
+    /// Format an expression with operator-precedence context so that
+    /// parentheses are only emitted when the sub-expression's own precedence
+    /// is lower than the surrounding context.
+    std::string formatExpressionWithPrec(mlir::Value val, int parentPrec);
+
     /// Apply current per-function identifier aliases (e.g. param_1 -> this).
     std::string applyNameAliases(std::string name) const;
 
