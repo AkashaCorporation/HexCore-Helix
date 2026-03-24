@@ -60,7 +60,7 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 // ─── API ───────────────────────────────────────────────────────────────────────
 
 const char* Engine::version() noexcept {
-    return "0.6.1";
+    return "0.7.0";
 }
 
 HelixStatus Engine::decompile(
