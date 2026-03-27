@@ -90,6 +90,11 @@ public:
         size_t* out_len
     );
 
+    /// Set whether to skip optimization passes in the pipeline.
+    /// Must be called BEFORE the first decompile call (pipeline is lazily built).
+    /// Controls Tier 2.5 passes (magic division, devirtualization).
+    void setSkipOptimization(bool skip);
+
     /// Get the last error message. Returns nullptr if no error.
     [[nodiscard]] const char* lastError() const noexcept;
 
@@ -161,6 +166,9 @@ int helix_engine_decompile_ir_text(
     char* out_buf,
     size_t* out_len
 );
+
+/// Set whether to skip optimization passes. Call before first decompile.
+void helix_engine_set_skip_optimization(HelixEngineHandle* engine, int skip);
 
 /// Get the last error message. Returns nullptr if no error.
 const char* helix_engine_last_error(HelixEngineHandle* engine);

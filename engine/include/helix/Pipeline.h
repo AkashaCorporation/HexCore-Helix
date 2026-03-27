@@ -49,7 +49,11 @@ struct DecompileOutput {
 class Pipeline {
 public:
     /// Construct a pipeline for the given target architecture.
-    explicit Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch);
+    /// @param skip_optimization  If true, skip Tier 2/3 optimization passes
+    ///                           (HelixLow→Mid→High conversions are still run,
+    ///                           but semantic optimizations are skipped).
+    explicit Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch,
+                      bool skip_optimization = false);
     ~Pipeline();
 
     // No copy, move only.
@@ -137,6 +141,9 @@ private:
     /// MLIR pass manager (lazily built on first use).
     std::unique_ptr<mlir::PassManager> pass_manager_;
     bool pipeline_built_ = false;
+
+    /// When true, skip optimization passes (Tier 2.5 optimizations).
+    bool skip_optimization_ = false;
 
     /// Build the pass manager if not already built.
     void ensurePipelineBuilt();

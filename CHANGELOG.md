@@ -4,6 +4,20 @@ All notable changes to HexCore Helix are documented here.
 
 ---
 
+## [v0.7.1] — 2026-03-26
+
+### Critical Fix
+
+- **Liveness Assertion Crash (Block Arguments)** — `detectEscapingValues` now also scans **block arguments** (MLIR phi values), not just operation results. Block arguments defined inside loop bodies with uses outside the region were previously missed, causing the fatal `"Use leaves the current parent region"` assertion. The v0.6.1 fix handled operation results; this completes the fix for the phi-node case that appears in functions with deep loops and backward branches to entry blocks.
+
+### Added
+
+- **`setSkipOptimization` API** — New method exposed through the full chain: C++ Pipeline → Engine → C API → Rust FFI → NAPI-RS. Allows skipping Tier 2.5 optimization passes (magic division recovery, devirtualization) at runtime. JS wrapper: `engine.setSkipOptimization(true)`.
+- **Confidence Score Penalties** — `PseudoCEmitter::analyzeFunction` now penalizes: stub functions with < 5 statements (-40 points), short functions < 10 statements (-15), and undecomposed native opcode calls (-3 each, max -30).
+- **x64 Opcode Decomposition** — 30+ native x64 opcodes mapped to C expressions in `decomposeNativeOpcode()`: SSE conversions (CVTPS2PD → `(double)`), memory moves (MOVSD_MEM → `*(double*)addr`), min/max (MINSS → `fminf()`), sign extension (CWDE → `(int32_t)(int16_t)`), SSE arithmetic (MULSS → `*`), and more.
+
+---
+
 ## [v0.6.1] — 2026-03-21
 
 ### Bug Fixes

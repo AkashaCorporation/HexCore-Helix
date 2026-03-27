@@ -132,6 +132,18 @@ impl HelixEngine {
         })
     }
 
+    /// Set whether to skip optimization passes in the MLIR pipeline.
+    /// When true, Tier 2.5 passes (magic division, devirtualization) are skipped.
+    /// Must be called before the first decompile call.
+    #[napi]
+    pub fn set_skip_optimization(&mut self, skip: bool) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        handle.set_skip_optimization(skip);
+        Ok(())
+    }
+
     /// Get the engine version string.
     #[napi]
     pub fn version(&self) -> String {

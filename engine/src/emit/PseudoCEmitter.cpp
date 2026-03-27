@@ -859,6 +859,96 @@ void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
     os << "\n";
 }
 
+/// FEAT-HELIX-005: Map known native x64 opcode names to C expressions.
+/// Returns the C expression string, or nullopt if the opcode is unknown.
+static std::optional<std::string>
+decomposeNativeOpcode(std::string_view opcode,
+                      const llvm::SmallVector<std::string, 4>& args) {
+    auto arg = [&](size_t i) -> std::string_view {
+        return i < args.size() ? std::string_view(args[i]) : "?";
+    };
+
+    // SSE/SIMD float conversions
+    if (opcode == "CVTPS2PD" && args.size() >= 1)
+        return std::format("(double)({})", arg(0));
+    if (opcode == "CVTPD2PS" && args.size() >= 1)
+        return std::format("(float)({})", arg(0));
+    if (opcode == "CVTSI2SS" && args.size() >= 1)
+        return std::format("(float)({})", arg(0));
+    if (opcode == "CVTSI2SD" && args.size() >= 1)
+        return std::format("(double)({})", arg(0));
+    if (opcode == "CVTSS2SD" && args.size() >= 1)
+        return std::format("(double)({})", arg(0));
+    if (opcode == "CVTSD2SS" && args.size() >= 1)
+        return std::format("(float)({})", arg(0));
+    if ((opcode == "CVTTSS2SI" || opcode == "CVTTSD2SI") && args.size() >= 1)
+        return std::format("(int64_t)({})", arg(0));
+
+    // SSE memory moves
+    if (opcode == "MOVSD_MEM" && args.size() >= 2)
+        return std::format("*(double*){} = {}", arg(0), arg(1));
+    if (opcode == "MOVSS_MEM" && args.size() >= 2)
+        return std::format("*(float*){} = {}", arg(0), arg(1));
+
+    // SSE min/max
+    if (opcode == "MINSS" && args.size() >= 2)
+        return std::format("fminf({}, {})", arg(0), arg(1));
+    if (opcode == "MAXSS" && args.size() >= 2)
+        return std::format("fmaxf({}, {})", arg(0), arg(1));
+    if (opcode == "MINSD" && args.size() >= 2)
+        return std::format("fmin({}, {})", arg(0), arg(1));
+    if (opcode == "MAXSD" && args.size() >= 2)
+        return std::format("fmax({}, {})", arg(0), arg(1));
+    if (opcode == "MINPS" && args.size() >= 2)
+        return std::format("_mm_min_ps({}, {})", arg(0), arg(1));
+    if (opcode == "MAXPS" && args.size() >= 2)
+        return std::format("_mm_max_ps({}, {})", arg(0), arg(1));
+
+    // Sign extension
+    if (opcode == "CWDE_AX" || opcode == "CWDE")
+        return args.size() >= 1 ? std::format("(int32_t)(int16_t)({})", arg(0)) : std::string("(int32_t)(int16_t)ax");
+    if (opcode == "CDQE" || opcode == "CDQE_EAX")
+        return args.size() >= 1 ? std::format("(int64_t)(int32_t)({})", arg(0)) : std::string("(int64_t)(int32_t)eax");
+    if (opcode == "CBW")
+        return args.size() >= 1 ? std::format("(int16_t)(int8_t)({})", arg(0)) : std::string("(int16_t)(int8_t)al");
+
+    // SSE arithmetic
+    if (opcode == "MULSS" && args.size() >= 2)
+        return std::format("{} * {}", arg(0), arg(1));
+    if (opcode == "MULSD" && args.size() >= 2)
+        return std::format("{} * {}", arg(0), arg(1));
+    if (opcode == "ADDSS" && args.size() >= 2)
+        return std::format("{} + {}", arg(0), arg(1));
+    if (opcode == "ADDSD" && args.size() >= 2)
+        return std::format("{} + {}", arg(0), arg(1));
+    if (opcode == "SUBSS" && args.size() >= 2)
+        return std::format("{} - {}", arg(0), arg(1));
+    if (opcode == "SUBSD" && args.size() >= 2)
+        return std::format("{} - {}", arg(0), arg(1));
+    if (opcode == "DIVSS" && args.size() >= 2)
+        return std::format("{} / {}", arg(0), arg(1));
+    if (opcode == "DIVSD" && args.size() >= 2)
+        return std::format("{} / {}", arg(0), arg(1));
+    if (opcode == "SQRTSS" && args.size() >= 1)
+        return std::format("sqrtf({})", arg(0));
+    if (opcode == "SQRTSD" && args.size() >= 1)
+        return std::format("sqrt({})", arg(0));
+
+    // Integer with carry
+    if (opcode == "ADC" && args.size() >= 2)
+        return std::format("{} + {} + CF", arg(0), arg(1));
+
+    // Stack frame
+    if (opcode == "ENTER" && args.size() >= 1)
+        return std::format("/* ENTER {} — stack frame setup */", arg(0));
+
+    // Loop
+    if (opcode == "LOOPNE" && args.size() >= 1)
+        return std::format("/* LOOPNE {} — decrement ECX, jump if ECX!=0 && ZF==0 */", arg(0));
+
+    return std::nullopt;
+}
+
 PseudoCEmitter::FunctionStats PseudoCEmitter::analyzeFunction(Operation* op) {
     FunctionStats stats;
     auto func = cast<helix::low::FuncOp>(op);
@@ -914,7 +1004,45 @@ PseudoCEmitter::FunctionStats PseudoCEmitter::analyzeFunction(Operation* op) {
     // Base score 100
     // Deduct for bad patterns
     double deduction = (double)stats.badPatterns * 2.0;
-    
+
+    // Penalize stub functions with very few statements (FEAT-HELIX-004)
+    if (stats.instructionCount < 5) {
+        deduction += 40.0;  // Stubs with < 5 ops are very low quality
+        stats.issues.push_back("Stub function (< 5 statements)");
+    } else if (stats.instructionCount < 10) {
+        deduction += 15.0;
+        stats.issues.push_back("Very short function (< 10 statements)");
+    }
+
+    // Count native opcode calls that weren't decomposed (FEAT-HELIX-005)
+    // These appear as CallOps with names like CVTPS2PD, MOVSD_MEM, etc.
+    int nativeOpcodeCalls = 0;
+    func.walk([&](Operation* inst) {
+        if (auto call = dyn_cast<helix::low::CallOp>(inst)) {
+            if (auto name = call.getTargetName()) {
+                auto nameStr = name->str();
+                // Native opcodes are ALL_CAPS with underscores
+                bool allUpper = !nameStr.empty();
+                for (char c : nameStr) {
+                    if (!std::isupper(c) && c != '_' && !std::isdigit(c)) {
+                        allUpper = false;
+                        break;
+                    }
+                }
+                if (allUpper && nameStr.size() >= 3) {
+                    nativeOpcodeCalls++;
+                }
+            }
+        }
+    });
+    if (nativeOpcodeCalls > 0) {
+        // Each undecomposed opcode call reduces quality
+        double opcodePenalty = std::min(30.0, (double)nativeOpcodeCalls * 3.0);
+        deduction += opcodePenalty;
+        stats.issues.push_back(
+            std::format("{} native opcode call(s) not decomposed", nativeOpcodeCalls));
+    }
+
     // Deduct for complexity if very large
     if (stats.instructionCount > 1000) {
         deduction += (stats.instructionCount - 1000) * 0.01;
@@ -2106,8 +2234,15 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
                 return targetName == currentFunctionName_;
             };
         if (auto name = call.getTargetName()) {
-            os << name->str();
-            isRecursive = matchesCurrentFunction(name->str());
+            // FEAT-HELIX-005: Decompose known x64 opcodes into C expressions
+            auto nameStr = name->str();
+            if (auto decomposed = decomposeNativeOpcode(nameStr, inferredArgs)) {
+                os << *decomposed;
+                os << ";\n";
+                return;
+            }
+            os << nameStr;
+            isRecursive = matchesCurrentFunction(nameStr);
         } else if (auto recoveredTarget =
                        tryResolveSyntheticRelativeCallTarget(call)) {
             auto addrExpr = std::format("0x{:x}", *recoveredTarget);

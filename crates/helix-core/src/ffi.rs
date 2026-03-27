@@ -72,6 +72,10 @@ extern "C" {
         out_len: *mut usize,
     ) -> c_int;
 
+    /// Set whether to skip optimization passes. Call before first decompile.
+    /// skip=1 skips, skip=0 enables (default).
+    pub fn helix_engine_set_skip_optimization(engine: *mut HelixEngineHandle, skip: c_int);
+
     /// Get the last error message from the engine. Returns null if no error.
     /// The returned string is valid until the next engine call.
     pub fn helix_engine_last_error(engine: *mut HelixEngineHandle) -> *const c_char;
@@ -110,6 +114,14 @@ impl EngineHandle {
                 return "unknown".into();
             }
             CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    }
+
+    /// Set whether to skip optimization passes in the MLIR pipeline.
+    /// Must be called before the first decompile call.
+    pub fn set_skip_optimization(&mut self, skip: bool) {
+        unsafe {
+            helix_engine_set_skip_optimization(self.handle, if skip { 1 } else { 0 });
         }
     }
 

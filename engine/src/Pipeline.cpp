@@ -122,10 +122,12 @@ private:
 //  Construction / destruction / move
 // ============================================================================
 
-Pipeline::Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch)
+Pipeline::Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch,
+                   bool skip_optimization)
     : mlir_ctx_(mlir_ctx)
     , arch_(arch)
     , llvm_ctx_(std::make_unique<llvm::LLVMContext>())
+    , skip_optimization_(skip_optimization)
 {
     assert(mlir_ctx_ && "MLIRContext must not be null");
 
@@ -315,8 +317,11 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    Semantic optimizations on ISA-agnostic typed SSA:
     //    - Magic number division reversal (mul+shift → div)
     //    - Indirect call devirtualization (vtable DataFlow analysis)
-    pm.addPass(createRecoverMagicDivisionPass());
-    pm.addPass(createDevirtualizeIndirectCallsPass());
+    //    Skipped when skip_optimization_ is true (BUG-HELIX-003).
+    if (!skip_optimization_) {
+        pm.addPass(createRecoverMagicDivisionPass());
+        pm.addPass(createDevirtualizeIndirectCallsPass());
+    }
 
     // ── Tier 3: HelixMid → HelixHigh (v1.0) ───────────────────────────
     //    Applies variable naming, finalizes type annotations, converts

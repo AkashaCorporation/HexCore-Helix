@@ -194,30 +194,46 @@ detectEscapingValues(const llvm::SmallSetVector<Block*, 8>& regionBlocks,
     llvm::SmallPtrSet<Block*, 8> regionBlockSet(regionBlocks.begin(),
                                                  regionBlocks.end());
 
+    // Helper lambda to check if a value has external uses and collect them.
+    auto checkValue = [&](Value val, Operation* defOp) {
+        EscapingValue ev;
+        ev.value = val;
+        ev.definingOp = defOp;
+
+        for (auto& use : val.getUses()) {
+            Block* userBlock = use.getOwner()->getBlock();
+
+            // Skip uses within the region.
+            if (regionBlockSet.count(userBlock))
+                continue;
+
+            // Skip uses in the excluded block (the block we're
+            // inserting the structured op into).
+            if (excludeBlock && userBlock == excludeBlock)
+                continue;
+
+            ev.externalUses.push_back(&use);
+        }
+
+        if (!ev.externalUses.empty())
+            escaping.push_back(std::move(ev));
+    };
+
     for (Block* block : regionBlocks) {
+        // Check block arguments (phi values) — these were previously missed,
+        // causing "Use leaves the current parent region" assertions when
+        // block args defined inside a loop had uses outside it.
+        for (auto arg : block->getArguments()) {
+            // Block args don't have a single defining op; use the block's
+            // first operation as a proxy for insertion ordering.
+            Operation* proxyOp = block->empty() ? nullptr : &block->front();
+            checkValue(arg, proxyOp);
+        }
+
+        // Check operation results.
         for (auto& op : *block) {
             for (auto result : op.getResults()) {
-                EscapingValue ev;
-                ev.value = result;
-                ev.definingOp = &op;
-
-                for (auto& use : result.getUses()) {
-                    Block* userBlock = use.getOwner()->getBlock();
-
-                    // Skip uses within the region.
-                    if (regionBlockSet.count(userBlock))
-                        continue;
-
-                    // Skip uses in the excluded block (the block we're
-                    // inserting the structured op into).
-                    if (excludeBlock && userBlock == excludeBlock)
-                        continue;
-
-                    ev.externalUses.push_back(&use);
-                }
-
-                if (!ev.externalUses.empty())
-                    escaping.push_back(std::move(ev));
+                checkValue(result, &op);
             }
         }
     }
@@ -264,7 +280,9 @@ static unsigned promoteEscapingValues(
         std::string varName = std::format("_promoted_{}", promotedVarCounter++);
         uint32_t varId = promotedVarCounter;
 
-        auto loc = ev.definingOp->getLoc();
+        // For block arguments, definingOp may be null — use insertion point's loc.
+        auto loc = ev.definingOp ? ev.definingOp->getLoc()
+                                  : insertionPoint->getLoc();
         auto valueType = ev.value.getType();
 
         // 1. Create var.decl BEFORE the structured region.
@@ -278,8 +296,16 @@ static unsigned promoteEscapingValues(
             /*init=*/Value{},
             /*address=*/IntegerAttr{});
 
-        // 2. AFTER the defining op, assign the value to the variable.
-        builder.setInsertionPointAfter(ev.definingOp);
+        // 2. AFTER the defining op (or at block start for block args),
+        //    assign the value to the variable.
+        if (ev.definingOp) {
+            builder.setInsertionPointAfter(ev.definingOp);
+        } else {
+            // Block argument: insert assign at the start of the block
+            // that owns the argument.
+            Block* argBlock = ev.value.cast<BlockArgument>().getOwner();
+            builder.setInsertionPointToStart(argBlock);
+        }
         auto assignTarget = builder.create<helix::high::VarRefOp>(
             loc,
             valueType,

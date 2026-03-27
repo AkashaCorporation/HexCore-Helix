@@ -50,7 +50,13 @@ Engine::Engine(HelixArch arch)
     registerHelixPasses();
 
     // Create the decompilation pipeline.
-    pipeline_ = std::make_unique<Pipeline>(mlir_context_.get(), arch);
+    pipeline_ = std::make_unique<Pipeline>(mlir_context_.get(), arch, /*skip_optimization=*/false);
+}
+
+void Engine::setSkipOptimization(bool skip) {
+    // Recreate pipeline with new optimization flag.
+    // Safe to call before first decompile (pipeline is lazily built).
+    pipeline_ = std::make_unique<Pipeline>(mlir_context_.get(), arch_, skip);
 }
 
 Engine::~Engine() = default;

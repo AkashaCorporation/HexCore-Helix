@@ -104,6 +104,12 @@ int helix_engine_decompile_ir_text(
     ));
 }
 
+void helix_engine_set_skip_optimization(HelixEngineHandle* handle, int skip) {
+    if (handle) {
+        to_engine(handle)->setSkipOptimization(skip != 0);
+    }
+}
+
 const char* helix_engine_last_error(HelixEngineHandle* handle) {
     if (!handle) {
         return nullptr;
