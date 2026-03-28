@@ -4,6 +4,28 @@ All notable changes to HexCore Helix are documented here.
 
 ---
 
+## [v0.8.0-nightly] — 2026-03-28 (UNRELEASED)
+
+> **Nightly build** — 14 Ghidra-inspired features merged. Not for production.
+> Will become v3.7.4 after stabilization and testing.
+
+### Added
+- Pattern Rewrite Engine (HelixLow + HelixMid simplify passes)
+- Switch/Jump Table Recovery, Struct Recovery, Escape Analysis
+- Type Lattice, Calling Convention Database, Sub-Register SSA
+- 6 new arithmetic patterns (DoubleShift, De Morgan, AndDistribute, etc.)
+- In-place operators (`x += 5`, `x++`, `x--`)
+- Cast elimination (10 emission sites, 4 scenarios)
+- Backward type propagation (12 rules: 7 Low + 5 High)
+- Transitive copy propagation + single-use temp elimination
+- `--no-opt` and `--enable-pass=Name` CLI flags for helix_tool
+
+### Fixed
+- HelixMidSimplify/ConstantFolding crash (replaced greedy driver with safe IRRewriter walk)
+- Pointer-typed mid::BinExprOp from Remill IR (cast to i64 in HelixLowToMid)
+
+---
+
 ## [v0.7.1] — 2026-03-26
 
 ### Critical Fix
