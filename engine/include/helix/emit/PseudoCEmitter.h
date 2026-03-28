@@ -108,6 +108,16 @@ private:
     /// Format a C type name (e.g., "int32_t", "void*", "bool").
     std::string formatType(mlir::Type type);
 
+    /// Return true when a cast from srcType to dstType is visually redundant
+    /// in the given usage context and can be elided without changing semantics.
+    /// The cast value's defining operation and its parent operation are inspected
+    /// to decide whether the cast is necessary.
+    bool isCastRedundant(mlir::Type srcType, mlir::Type dstType,
+                         mlir::Value castResult) const;
+
+    /// Return the integer bit width of a type, or 0 if not an integer type.
+    static unsigned getIntBitWidth(mlir::Type type);
+
     /// Format an integer literal (hex for >= 16).
     std::string formatIntLiteral(int64_t value);
 
@@ -135,6 +145,21 @@ private:
 
     /// Tracks the last written expression for each register to eliminate redundant identical assignments.
     std::unordered_map<std::string, std::string> lastRegValue;
+
+    /// Resolve transitive copy chains: if a->b->c, resolving a yields c.
+    /// Includes cycle detection (max 5 hops) to prevent infinite loops.
+    std::string resolveTransitive(const std::string& name) const;
+
+    /// Per-variable use count for the current function, populated by pre-scan.
+    /// Used for single-use temporary elimination (inline the expression).
+    std::unordered_map<std::string, unsigned> varUseCount_;
+
+    /// Reverse map: expression string -> shortest/most meaningful variable name.
+    /// When multiple variables hold the same expression, prefer the better name.
+    std::unordered_map<std::string, std::string> exprToBestName_;
+
+    /// Pre-scan a function to count how many times each variable is referenced.
+    void precomputeVarUseCounts(mlir::Operation* funcOp);
 
     /// Set of operations identified as dead stores by the pre-scan.
     std::unordered_set<mlir::Operation*> deadStoreOps;

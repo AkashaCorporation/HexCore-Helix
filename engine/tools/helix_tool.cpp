@@ -58,7 +58,8 @@ static int detectArch(std::string_view ir_text) {
 
 /// Decompile a single .ll file and return pseudo-C text.
 /// Uses helix_engine_decompile_ir_text() — the text API.
-static std::string decompileFile(const fs::path& input_path) {
+static std::string decompileFile(const fs::path& input_path, bool skip_opt = false,
+                                  const std::vector<std::string>& enabled_passes = {}) {
     std::string ir_text = readFile(input_path);
     if (ir_text.empty())
         return {};
@@ -70,6 +71,16 @@ static std::string decompileFile(const fs::path& input_path) {
     if (!handle) {
         std::cerr << "error: failed to create engine\n";
         return {};
+    }
+
+    // Apply skip_optimization if requested (--no-opt flag)
+    if (skip_opt) {
+        helix_engine_set_skip_optimization(handle, 1);
+    }
+
+    // Enable specific passes if requested (--enable-pass=Name)
+    for (const auto& pass : enabled_passes) {
+        helix_engine_enable_pass(handle, pass.c_str());
     }
 
     // Allocate output buffer (start with 256KB, grow if needed)
@@ -134,7 +145,27 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string_view arg1 = argv[1];
+    // Parse flags
+    bool skip_opt = false;
+    std::vector<std::string> enabled_passes;
+    std::vector<std::string_view> positional;
+    for (int i = 1; i < argc; i++) {
+        std::string_view a = argv[i];
+        if (a == "--no-opt" || a == "--skip-optimization") {
+            skip_opt = true;
+        } else if (a.starts_with("--enable-pass=")) {
+            enabled_passes.emplace_back(a.substr(14));
+        } else {
+            positional.push_back(a);
+        }
+    }
+
+    if (positional.empty()) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    std::string_view arg1 = positional[0];
 
     // --version
     if (arg1 == "--version" || arg1 == "-v") {
@@ -143,8 +174,8 @@ int main(int argc, char* argv[]) {
     }
 
     // --dir <folder>: process all .ll files in a directory
-    if (arg1 == "--dir" && argc >= 3) {
-        fs::path dir_path = argv[2];
+    if (arg1 == "--dir" && positional.size() >= 2) {
+        fs::path dir_path{positional[1]};
         if (!fs::is_directory(dir_path)) {
             std::cerr << "error: not a directory: " << dir_path << "\n";
             return 1;
@@ -162,7 +193,7 @@ int main(int argc, char* argv[]) {
 
             std::cerr << "  " << entry.path().filename() << " ... ";
 
-            std::string result = decompileFile(entry.path());
+            std::string result = decompileFile(entry.path(), skip_opt, enabled_passes);
             if (result.empty()) {
                 std::cerr << "FAILED\n";
                 failed++;
@@ -181,23 +212,23 @@ int main(int argc, char* argv[]) {
     }
 
     // Single file mode
-    fs::path input_path = argv[1];
+    fs::path input_path{arg1};
     if (!fs::exists(input_path)) {
         std::cerr << "error: file not found: " << input_path << "\n";
         return 1;
     }
 
-    std::string result = decompileFile(input_path);
+    std::string result = decompileFile(input_path, skip_opt, enabled_passes);
     if (result.empty())
         return 1;
 
     // Output to file or stdout
-    if (argc >= 3) {
+    if (positional.size() >= 2) {
         fs::path out_path;
-        if (std::string(argv[2]) == "-o" && argc >= 4) {
-            out_path = argv[3];
+        if (positional[1] == "-o" && positional.size() >= 3) {
+            out_path = positional[2];
         } else {
-            out_path = argv[2];
+            out_path = positional[1];
         }
         std::ofstream ofs(out_path);
         if (!ofs) {

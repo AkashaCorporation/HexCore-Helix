@@ -202,27 +202,45 @@ struct BinOpToBinExpr : public OpConversionPattern<low::BinOp> {
         ConversionPatternRewriter &rewriter) const override
     {
         auto mid_kind = mapBinOpKind(op.getKind());
+        auto loc = op.getLoc();
         auto result_type = op.getResult().getType();
 
+        // Ensure arithmetic operates on integer types, not pointers.
+        // Pointer-typed BinOps (from address arithmetic in Remill IR)
+        // must be cast to i64 to avoid crashes in downstream patterns.
+        auto i64Type = rewriter.getI64Type();
+        auto arith_type = isa<IntegerType>(result_type) ? result_type : i64Type;
+
+        auto lhs = adaptor.getLhs();
+        auto rhs = adaptor.getRhs();
+        if (!isa<IntegerType>(lhs.getType()))
+            lhs = rewriter.create<mid::CastOp>(loc, arith_type, lhs, IntegerAttr{}).getResult();
+        if (!isa<IntegerType>(rhs.getType()))
+            rhs = rewriter.create<mid::CastOp>(loc, arith_type, rhs, IntegerAttr{}).getResult();
+
         auto new_op = rewriter.create<mid::BinExprOp>(
-            op.getLoc(),
-            result_type,
+            loc,
+            arith_type,
             mid::BinExprKindAttr::get(rewriter.getContext(), mid_kind),
-            adaptor.getLhs(),
-            adaptor.getRhs(),
+            lhs, rhs,
             op.getAddressAttr()
         );
 
-        // Replace the value result.  Flag results (carry, zero, sign, overflow)
-        // need to be resolved to comparisons before this pattern runs.
-        // For now, replace them with constant false (dead flags are eliminated
-        // by DCE).
+        // Cast back to original type if it was pointer
+        Value result_val = new_op.getResult();
+        if (result_type != arith_type) {
+            result_val = rewriter.create<mid::CastOp>(
+                loc, result_type, result_val, IntegerAttr{}).getResult();
+        }
+
+        // Replace the value result.  Flag results are constant false
+        // (dead flags eliminated by DCE).
         auto i1_type = rewriter.getI1Type();
         auto false_val = rewriter.create<mlir::arith::ConstantOp>(
-            op.getLoc(), i1_type, rewriter.getBoolAttr(false));
+            loc, i1_type, rewriter.getBoolAttr(false));
 
         rewriter.replaceOp(op, {
-            new_op.getResult(),
+            result_val,
             false_val, false_val, false_val, false_val
         });
         return success();
@@ -292,17 +310,27 @@ struct TestToComparison : public OpConversionPattern<low::TestOp> {
         auto loc = op.getLoc();
 
         // TEST lhs, rhs → AND without storing.  ZF = (lhs & rhs) == 0
+        // Use i64 for arithmetic if operands are pointer-typed
+        auto operand_type = adaptor.getLhs().getType();
+        auto arith_type = isa<IntegerType>(operand_type) ? operand_type : rewriter.getI64Type();
+
+        auto lhs = adaptor.getLhs();
+        auto rhs = adaptor.getRhs();
+        if (!isa<IntegerType>(lhs.getType()))
+            lhs = rewriter.create<mid::CastOp>(loc, arith_type, lhs, IntegerAttr{}).getResult();
+        if (!isa<IntegerType>(rhs.getType()))
+            rhs = rewriter.create<mid::CastOp>(loc, arith_type, rhs, IntegerAttr{}).getResult();
+
         auto and_result = rewriter.create<mid::BinExprOp>(
-            loc, adaptor.getLhs().getType(),
+            loc, arith_type,
             mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::BitAnd),
-            adaptor.getLhs(), adaptor.getRhs(),
+            lhs, rhs,
             op.getAddressAttr()
         );
 
-        // Create a zero constant for comparison
         auto zero = rewriter.create<mid::ConstantOp>(
-            loc, adaptor.getLhs().getType(),
-            rewriter.getI64IntegerAttr(0),
+            loc, arith_type,
+            rewriter.getIntegerAttr(arith_type, 0),
             /*address=*/mlir::IntegerAttr{}
         );
 
@@ -501,45 +529,64 @@ struct LeaToBinExpr : public OpConversionPattern<low::LeaOp> {
         auto loc = op.getLoc();
         auto result_type = op.getResult().getType();
 
+        // LEA produces addresses — use i64 for all arithmetic to avoid
+        // pointer-typed mid::BinExprOp/ConstantOp (crashes Mid patterns).
+        auto i64Type = rewriter.getI64Type();
+        auto arith_type = isa<IntegerType>(result_type) ? result_type : i64Type;
+
+        // Cast operands to integer if they're pointer-typed
+        auto base = adaptor.getBase();
+        auto index = adaptor.getIndex();
+        if (!isa<IntegerType>(base.getType()))
+            base = rewriter.create<mid::CastOp>(loc, arith_type, base, IntegerAttr{}).getResult();
+        if (!isa<IntegerType>(index.getType()))
+            index = rewriter.create<mid::CastOp>(loc, arith_type, index, IntegerAttr{}).getResult();
+
         // LEA: base + index * scale + displacement
-        // First: index * scale
         auto scale_val = rewriter.create<mid::ConstantOp>(
-            loc, result_type,
-            rewriter.getI64IntegerAttr(op.getScale()),
+            loc, arith_type,
+            rewriter.getIntegerAttr(arith_type, op.getScale()),
             /*address=*/mlir::IntegerAttr{}
         );
         auto scaled_index = rewriter.create<mid::BinExprOp>(
-            loc, result_type,
+            loc, arith_type,
             mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::Mul),
-            adaptor.getIndex(), scale_val.getResult(),
+            index, scale_val.getResult(),
             /*address=*/mlir::IntegerAttr{}
         );
 
-        // base + scaled_index
         auto base_plus_index = rewriter.create<mid::BinExprOp>(
-            loc, result_type,
+            loc, arith_type,
             mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::Add),
-            adaptor.getBase(), scaled_index.getResult(),
+            base, scaled_index.getResult(),
             /*address=*/mlir::IntegerAttr{}
         );
 
-        // + displacement
+        Value final_result;
         if (op.getDisplacement() != 0) {
             auto disp_val = rewriter.create<mid::ConstantOp>(
-                loc, result_type,
-                rewriter.getI64IntegerAttr(op.getDisplacement()),
+                loc, arith_type,
+                rewriter.getIntegerAttr(arith_type, op.getDisplacement()),
                 /*address=*/mlir::IntegerAttr{}
             );
-            auto final_val = rewriter.create<mid::BinExprOp>(
-                loc, result_type,
+            auto sum = rewriter.create<mid::BinExprOp>(
+                loc, arith_type,
                 mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::Add),
                 base_plus_index.getResult(), disp_val.getResult(),
                 op.getAddressAttr()
             );
-            rewriter.replaceOp(op, final_val.getResult());
+            final_result = sum.getResult();
         } else {
-            rewriter.replaceOp(op, base_plus_index.getResult());
+            final_result = base_plus_index.getResult();
         }
+
+        // Cast back to original type if it was pointer
+        if (result_type != arith_type) {
+            final_result = rewriter.create<mid::CastOp>(
+                loc, result_type, final_result, IntegerAttr{}).getResult();
+        }
+
+        rewriter.replaceOp(op, final_result);
         return success();
     }
 };
@@ -663,22 +710,35 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
         // Inc/Dec → BinExpr(Add/Sub, operand, 1)
         if (op.getKind() == low::UnaryOpKind::Inc ||
             op.getKind() == low::UnaryOpKind::Dec) {
+            // Use integer type for arithmetic (pointer Inc/Dec = pointer + 1)
+            auto arith_type = isa<IntegerType>(result_type) ? result_type : rewriter.getI64Type();
             auto one = rewriter.create<mid::ConstantOp>(
-                loc, result_type,
-                rewriter.getI64IntegerAttr(1),
+                loc, arith_type,
+                rewriter.getIntegerAttr(arith_type, 1),
                 /*address=*/mlir::IntegerAttr{}
             );
             auto bin_kind = (op.getKind() == low::UnaryOpKind::Inc)
                 ? mid::BinExprKind::Add
                 : mid::BinExprKind::Sub;
+            // Cast operand to integer if pointer-typed
+            auto operand = adaptor.getOperand();
+            if (!isa<IntegerType>(operand.getType()))
+                operand = rewriter.create<mid::CastOp>(loc, arith_type, operand, IntegerAttr{}).getResult();
+
             auto new_op = rewriter.create<mid::BinExprOp>(
-                loc, result_type,
+                loc, arith_type,
                 mid::BinExprKindAttr::get(rewriter.getContext(), bin_kind),
-                adaptor.getOperand(), one.getResult(),
+                operand, one.getResult(),
                 op.getAddressAttr()
             );
+
+            // Cast back if original was pointer
+            Value inc_result = new_op.getResult();
+            if (result_type != arith_type)
+                inc_result = rewriter.create<mid::CastOp>(loc, result_type, inc_result, IntegerAttr{}).getResult();
+
             rewriter.replaceOp(op, {
-                new_op.getResult(), false_val, false_val
+                inc_result, false_val, false_val
             });
             return success();
         }
@@ -691,15 +751,25 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
         default:                       mid_kind = mid::UnExprKind::Neg; break;
         }
 
+        // Cast operand to integer if pointer-typed
+        auto unary_type = isa<IntegerType>(result_type) ? result_type : rewriter.getI64Type();
+        auto unary_operand = adaptor.getOperand();
+        if (!isa<IntegerType>(unary_operand.getType()))
+            unary_operand = rewriter.create<mid::CastOp>(loc, unary_type, unary_operand, IntegerAttr{}).getResult();
+
         auto new_op = rewriter.create<mid::UnExprOp>(
-            loc, result_type,
+            loc, unary_type,
             mid::UnExprKindAttr::get(rewriter.getContext(), mid_kind),
-            adaptor.getOperand(),
+            unary_operand,
             op.getAddressAttr()
         );
 
+        Value unary_result = new_op.getResult();
+        if (result_type != unary_type)
+            unary_result = rewriter.create<mid::CastOp>(loc, result_type, unary_result, IntegerAttr{}).getResult();
+
         rewriter.replaceOp(op, {
-            new_op.getResult(), false_val, false_val
+            unary_result, false_val, false_val
         });
         return success();
     }

@@ -62,6 +62,10 @@ public:
     Pipeline(Pipeline&&) noexcept;
     Pipeline& operator=(Pipeline&&) noexcept;
 
+    /// Enable a specific nightly pass by name (for debugging).
+    /// When any pass is selectively enabled, ONLY those passes run.
+    void enablePass(std::string_view name);
+
     // ─── Stage 1: LLVM IR Parsing ────────────────────────────────────────
 
     /// Parse LLVM IR text into an llvm::Module.
@@ -144,6 +148,17 @@ private:
 
     /// When true, skip optimization passes (Tier 2.5 optimizations).
     bool skip_optimization_ = false;
+
+    /// Per-pass enable flags for nightly debugging.
+    /// When all are false + skip_optimization=false, ALL nightly passes run.
+    /// When any is true, ONLY the enabled passes run (selective mode).
+    bool selective_mode_ = false;
+    bool enable_helix_low_simplify_ = false;
+    bool enable_switch_recovery_ = false;
+    bool enable_helix_mid_simplify_ = false;
+    bool enable_constant_folding_ = false;
+    bool enable_escape_analysis_ = false;
+    bool enable_struct_recovery_ = false;
 
     /// Build the pass manager if not already built.
     void ensurePipelineBuilt();

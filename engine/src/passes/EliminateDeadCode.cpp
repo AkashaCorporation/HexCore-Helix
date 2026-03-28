@@ -38,6 +38,7 @@
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
+#include "helix/dialects/HelixMidOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -48,6 +49,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -81,6 +83,8 @@ STATISTIC(NumDeadCmpTestRemoved,   "Number of dead CMP/TEST ops removed");
 STATISTIC(NumDeadVarsRemoved,      "Number of dead variable decls removed");
 STATISTIC(NumDeadAssignsRemoved,   "Number of dead assignments removed");
 STATISTIC(NumDeadUndefRemoved,     "Number of dead __undef assignments removed");
+STATISTIC(NumEscapeDeadStores,     "Number of dead stores to non-escaping vars removed (P2.10)");
+STATISTIC(NumEscapeDeadAssigns,    "Number of dead assigns to non-escaping vars removed (P2.10)");
 
 namespace {
 
@@ -820,6 +824,7 @@ struct EliminateDeadCodePass
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
         registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<helix::mid::HelixMidDialect>();
     }
 
     void runOnOperation() override {
@@ -836,6 +841,17 @@ struct EliminateDeadCodePass
             signalPassFailure();
             return;
         }
+
+        // ── Enhanced DCE (P2.10): Escape-aware dead store elimination ────
+        //
+        // After the standard HelixLow-level DCE phases, process HelixMid
+        // functions for escape-aware optimizations.  Variables annotated
+        // with "helix.escapes" = false by the EscapeAnalysis pass can be
+        // treated as pure SSA values — stores and assignments to
+        // non-escaping variables that are never read are provably dead.
+        module.walk([&](helix::mid::FuncOp midFunc) {
+            eliminateDeadMidOps(midFunc);
+        });
     }
 
 private:
@@ -1621,6 +1637,252 @@ private:
         }
 
         return {totalVars, totalAssigns, totalUndef};
+    }
+
+    // ─── Enhanced DCE (P2.10): Escape-Aware Dead Store Elimination ────
+    //
+    // This phase operates on HelixMid functions and leverages the
+    // "helix.escapes" attribute set by the EscapeAnalysis pass (P2.8).
+    //
+    // For non-escaping variables:
+    //   - No external code can observe their value through a pointer.
+    //   - Assignments/stores that are overwritten before being read are dead.
+    //   - If a variable is assigned but never read at all, the assign is dead.
+    //
+    // This is more aggressive than the HelixHigh-level Phase 7 because
+    // we can prove the absence of aliasing for non-escaping variables.
+
+    /// Build the set of non-escaping variable slot IDs from var.decl attrs.
+    llvm::DenseSet<uint32_t>
+    collectNonEscapingSlots(Region& body) {
+        llvm::DenseSet<uint32_t> nonEscaping;
+
+        body.walk([&](helix::mid::VarDeclOp declOp) {
+            auto escAttr = declOp->getAttrOfType<BoolAttr>("helix.escapes");
+            if (escAttr && !escAttr.getValue())
+                nonEscaping.insert(declOp.getSlotId());
+        });
+
+        return nonEscaping;
+    }
+
+    /// Check whether a HelixMid slot has any live reads (var.ref ops whose
+    /// results feed into a side-effecting consumer).
+    bool hasMidLiveReads(uint32_t slotId, Region& body) {
+        bool hasLive = false;
+
+        body.walk([&](helix::mid::VarRefOp refOp) {
+            if (hasLive)
+                return;
+            if (refOp.getSlotId() != slotId)
+                return;
+
+            // Check if this var.ref's result is used by anything.
+            for (auto* user : refOp.getResult().getUsers()) {
+                // If used by an assign as the VALUE (RHS), the read is consumed.
+                // If used only as the assign's target-identifying slot_id match,
+                // that's an internal bookkeeping use, not a real read.
+                //
+                // At the mid level, AssignOp takes a slot_id + value, so
+                // var.ref results flowing into calls, binexpr, store, return,
+                // or if-conditions are live reads.
+                if (isa<helix::mid::CallOp>(user) ||
+                    isa<helix::mid::ReturnOp>(user) ||
+                    isa<helix::mid::StoreOp>(user) ||
+                    isa<helix::mid::BinExprOp>(user) ||
+                    isa<helix::mid::UnExprOp>(user) ||
+                    isa<helix::mid::CastOp>(user) ||
+                    isa<helix::mid::SelectOp>(user) ||
+                    isa<helix::mid::IfOp>(user) ||
+                    isa<helix::mid::WhileOp>(user) ||
+                    isa<helix::mid::LoadOp>(user) ||
+                    isa<helix::mid::FieldPtrOp>(user) ||
+                    isa<helix::mid::IndexPtrOp>(user)) {
+                    hasLive = true;
+                    return;
+                }
+
+                // If used by an assign as the value operand, check if the
+                // assigned-to slot is itself live.
+                if (auto assignOp = dyn_cast<helix::mid::AssignOp>(user)) {
+                    // The value operand flows into the assignment RHS.
+                    if (assignOp.getValue() == refOp.getResult()) {
+                        hasLive = true;
+                        return;
+                    }
+                }
+
+                // For any other op with results, trace forward.
+                if (user->getNumResults() > 0) {
+                    for (auto result : user->getResults()) {
+                        if (!result.use_empty()) {
+                            hasLive = true;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        return hasLive;
+    }
+
+    /// Eliminate dead operations in a HelixMid function using escape info.
+    void eliminateDeadMidOps(helix::mid::FuncOp func) {
+        auto& body = func.getBody();
+        if (body.empty())
+            return;
+
+        auto nonEscaping = collectNonEscapingSlots(body);
+        if (nonEscaping.empty())
+            return;
+
+        LLVM_DEBUG(llvm::dbgs() << "Enhanced DCE (P2.10): processing mid::"
+                                << func.getSymName()
+                                << " (" << nonEscaping.size()
+                                << " non-escaping slots)\n");
+
+        unsigned deadStores = 0;
+        unsigned deadAssigns = 0;
+
+        // Iterate to fixed point.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // ── Step 1: Remove dead assigns to non-escaping variables ────
+            //
+            // An assign to a non-escaping variable is dead if:
+            //   (a) The slot has no live reads, OR
+            //   (b) The assign is overwritten by a later assign to the same
+            //       slot before any read (within the same block).
+            {
+                llvm::SmallVector<helix::mid::AssignOp, 16> deadOps;
+
+                body.walk([&](helix::mid::AssignOp assignOp) {
+                    uint32_t slotId = assignOp.getSlotId();
+
+                    // Only optimize non-escaping variables.
+                    if (!nonEscaping.contains(slotId))
+                        return;
+
+                    // Check if the slot has any live reads at all.
+                    if (!hasMidLiveReads(slotId, body)) {
+                        deadOps.push_back(assignOp);
+                        return;
+                    }
+
+                    // Check for a subsequent overwrite in the same block
+                    // before any read of this slot.
+                    Block* block = assignOp->getBlock();
+                    if (!block)
+                        return;
+
+                    bool foundRead = false;
+                    bool foundOverwrite = false;
+
+                    for (auto it = std::next(assignOp->getIterator());
+                         it != block->end(); ++it) {
+                        Operation& op = *it;
+
+                        // Check for a read of the same slot.
+                        if (auto refOp = dyn_cast<helix::mid::VarRefOp>(&op)) {
+                            if (refOp.getSlotId() == slotId) {
+                                foundRead = true;
+                                break;
+                            }
+                        }
+
+                        // Check for an overwrite.
+                        if (auto nextAssign = dyn_cast<helix::mid::AssignOp>(&op)) {
+                            if (nextAssign.getSlotId() == slotId) {
+                                foundOverwrite = true;
+                                break;
+                            }
+                        }
+
+                        // A call might read the variable through a pointer,
+                        // but since we know it's non-escaping, calls cannot
+                        // observe it.  So we do NOT break on calls here.
+                    }
+
+                    if (foundOverwrite && !foundRead)
+                        deadOps.push_back(assignOp);
+                });
+
+                for (auto assignOp : deadOps) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead mid::assign to non-escaping slot "
+                        << assignOp.getSlotId() << "\n");
+
+                    auto* valueDef = assignOp.getValue().getDefiningOp();
+                    assignOp.erase();
+                    ++deadAssigns;
+                    changed = true;
+
+                    // Clean up the now-dead value definition.
+                    if (valueDef && valueDef->use_empty() &&
+                        valueDef->getNumResults() > 0) {
+                        valueDef->erase();
+                    }
+                }
+            }
+
+            // ── Step 2: Remove dead stores through non-escaping pointers ─
+            //
+            // A store to an address derived from a non-escaping variable
+            // (e.g., store to AddrOf(non_escaping_var)) is dead if the
+            // stored value is never loaded.  This is a conservative
+            // approximation — we remove stores where the address is
+            // directly an AddrOf of a non-escaping var with no loads.
+            {
+                llvm::SmallVector<helix::mid::StoreOp, 16> deadOps;
+
+                body.walk([&](helix::mid::StoreOp storeOp) {
+                    // Check if the store address originates from AddrOf
+                    // of a non-escaping variable.
+                    auto unExpr = storeOp.getAddr()
+                                      .getDefiningOp<helix::mid::UnExprOp>();
+                    if (!unExpr ||
+                        unExpr.getKind() != helix::mid::UnExprKind::AddrOf)
+                        return;
+
+                    auto varRef = unExpr.getOperand()
+                                      .getDefiningOp<helix::mid::VarRefOp>();
+                    if (!varRef)
+                        return;
+
+                    uint32_t slotId = varRef.getSlotId();
+                    if (!nonEscaping.contains(slotId))
+                        return;
+
+                    // Check if there are any loads from this slot's address.
+                    // Since the variable is non-escaping, any load of its
+                    // value must go through a var.ref (not through a pointer
+                    // dereference).  If there are no live reads of the slot,
+                    // the store is dead.
+                    if (!hasMidLiveReads(slotId, body))
+                        deadOps.push_back(storeOp);
+                });
+
+                for (auto storeOp : deadOps) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead mid::store to non-escaping var\n");
+
+                    storeOp.erase();
+                    ++deadStores;
+                    changed = true;
+                }
+            }
+        }
+
+        NumEscapeDeadStores  += deadStores;
+        NumEscapeDeadAssigns += deadAssigns;
+
+        LLVM_DEBUG(if (deadStores + deadAssigns > 0)
+            llvm::dbgs() << "  P2.10 summary: " << deadStores
+                         << " dead stores, " << deadAssigns
+                         << " dead assigns removed\n");
     }
 };
 

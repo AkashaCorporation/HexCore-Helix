@@ -281,6 +281,16 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
 //  Stage 3: Pass Pipeline Construction & Execution
 // ============================================================================
 
+void Pipeline::enablePass(std::string_view name) {
+    selective_mode_ = true;
+    if (name == "HelixLowSimplify")   enable_helix_low_simplify_ = true;
+    else if (name == "SwitchRecovery")     enable_switch_recovery_ = true;
+    else if (name == "HelixMidSimplify")   enable_helix_mid_simplify_ = true;
+    else if (name == "ConstantFolding")    enable_constant_folding_ = true;
+    else if (name == "EscapeAnalysis")     enable_escape_analysis_ = true;
+    else if (name == "StructRecovery")     enable_struct_recovery_ = true;
+}
+
 void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     // ═══════════════════════════════════════════════════════════════════════
     // v1.0 Three-Tier Pipeline: Low → Mid → High (→ EmitC optional)
@@ -295,17 +305,47 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    These passes operate on machine-level IR to recover high-level
     //    information while register/flag semantics are still explicit.
     pm.addPass(createRecoverStackLayoutPass());
-    pm.addPass(createRecoverCallingConventionPass());
-    pm.addPass(createPropagateTypesPass());
+    pm.addPass(createRecoverCallingConventionPass());   // [Nightly: uses CC Database]
+
+    // ── Tier 1.5: HelixLow Simplification (Nightly P0.1) ────────────────
+    //    Greedy pattern-based simplification: arithmetic identities,
+    //    dead flag elimination, store-to-load forwarding, redundant casts.
+    //    MLIR analog of Ghidra's Rule/ActionPool architecture.
+    // Helper: should a nightly pass run?
+    //   - skip_optimization_ = true → skip ALL nightly passes
+    //   - selective_mode_ = true → only run passes explicitly enabled
+    //   - otherwise → run all nightly passes
+    auto shouldRun = [&](bool flag) -> bool {
+        if (skip_optimization_) return false;
+        if (selective_mode_) return flag;
+        return true; // default: all run
+    };
+
+    if (shouldRun(enable_helix_low_simplify_)) {
+        pm.addPass(createHelixLowSimplifyPass());
+    }
+
+    // ── Tier 1 Analysis (continued) ──────────────────────────────────────
+    pm.addPass(createPropagateTypesPass());             // [Nightly: TypeLattice + backward prop]
     pm.addPass(createInterProceduralTypePropagationPass());
-    pm.addPass(createStructureControlFlowPass());
-    pm.addPass(createRecoverVariablesPass());
-    pm.addPass(createEliminateDeadCodePass());
 
     // NOTE: Canonicalizer removed — segfaults on multi-block HelixLow
     // functions with LLVM dialect br/condBr terminators crossing regions.
     // NOTE: CSEPass also removed — same crash on complex functions with
     // many basic blocks. Both are unsafe on HelixLow multi-block IR.
+
+    // ── Tier 1.6: Switch/Jump Table Recovery (Nightly P0.2) ──────────────
+    if (shouldRun(enable_switch_recovery_)) {
+        pm.addPass(createRecoverSwitchTablesPass());
+    }
+
+    // ── Tier 1.7: Control Flow Structuring ───────────────────────────────
+    //    [Nightly: enhanced with else detection (P0.3), break/continue
+    //    recovery (P0.4), and switch op consumption from P0.2]
+    pm.addPass(createStructureControlFlowPass());
+
+    pm.addPass(createRecoverVariablesPass());
+    pm.addPass(createEliminateDeadCodePass());          // [Nightly: +liveness-driven DCE]
 
     // ── Tier 2: HelixLow → HelixMid (v1.0) ──────────────────────────────
     //    Converts remaining machine-level ops to ISA-agnostic typed SSA:
@@ -313,11 +353,20 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    raw memory → typed loads/stores, CMOV → select.
     pm.addPass(createHelixLowToMidPass());
 
-    // ── Tier 2.5: HelixMid Optimization Passes (v3.8.0) ────────────────
-    //    Semantic optimizations on ISA-agnostic typed SSA:
-    //    - Magic number division reversal (mul+shift → div)
-    //    - Indirect call devirtualization (vtable DataFlow analysis)
-    //    Skipped when skip_optimization_ is true (BUG-HELIX-003).
+    // ── Tier 2.5: HelixMid Analysis & Optimization ──────────────────────
+    if (shouldRun(enable_helix_mid_simplify_)) {
+        pm.addPass(createHelixMidSimplifyPass());
+    }
+    if (shouldRun(enable_constant_folding_)) {
+        pm.addPass(createConstantFoldingPass());
+    }
+    if (shouldRun(enable_escape_analysis_)) {
+        pm.addPass(createEscapeAnalysisPass());
+    }
+    if (shouldRun(enable_struct_recovery_)) {
+        pm.addPass(createRecoverStructTypesPass());
+    }
+    // v0.7.1 optimization passes (always run unless skip_optimization_)
     if (!skip_optimization_) {
         pm.addPass(createRecoverMagicDivisionPass());
         pm.addPass(createDevirtualizeIndirectCallsPass());

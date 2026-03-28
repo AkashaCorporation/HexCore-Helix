@@ -95,6 +95,10 @@ public:
     /// Controls Tier 2.5 passes (magic division, devirtualization).
     void setSkipOptimization(bool skip);
 
+    /// Enable a specific nightly pass by name (for debugging/testing).
+    /// Call before first decompile. Enables selective mode.
+    void enablePass(const char* name);
+
     /// Get the last error message. Returns nullptr if no error.
     [[nodiscard]] const char* lastError() const noexcept;
 
@@ -170,8 +174,32 @@ int helix_engine_decompile_ir_text(
 /// Set whether to skip optimization passes. Call before first decompile.
 void helix_engine_set_skip_optimization(HelixEngineHandle* engine, int skip);
 
+/// Enable a specific nightly pass by name. Call before first decompile.
+/// Valid names: HelixLowSimplify, SwitchRecovery, HelixMidSimplify,
+///              ConstantFolding, EscapeAnalysis, StructRecovery
+void helix_engine_enable_pass(HelixEngineHandle* engine, const char* name);
+
 /// Get the last error message. Returns nullptr if no error.
 const char* helix_engine_last_error(HelixEngineHandle* engine);
+
+// ─── Helix-Nightly: Data Section Access ──────────────────────────────────────
+
+/// Callback type for reading raw bytes from the binary image.
+/// Returns the number of bytes actually read (may be less than len).
+typedef size_t (*helix_data_reader_fn)(uint64_t addr, uint8_t* buf, size_t len, void* user_data);
+
+/// Set a callback for reading raw bytes from the binary image.
+/// This enables jump table recovery (switch statements) and other
+/// data-dependent analysis passes.
+///
+/// @param engine    Engine handle
+/// @param reader    Callback function
+/// @param user_data Opaque pointer passed to every callback invocation
+void helix_engine_set_data_reader(
+    HelixEngineHandle* engine,
+    helix_data_reader_fn reader,
+    void* user_data
+);
 
 #ifdef __cplusplus
 }

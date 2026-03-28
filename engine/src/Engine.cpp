@@ -59,6 +59,12 @@ void Engine::setSkipOptimization(bool skip) {
     pipeline_ = std::make_unique<Pipeline>(mlir_context_.get(), arch_, skip);
 }
 
+void Engine::enablePass(const char* name) {
+    if (pipeline_ && name) {
+        pipeline_->enablePass(name);
+    }
+}
+
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
@@ -66,7 +72,7 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 // ─── API ───────────────────────────────────────────────────────────────────────
 
 const char* Engine::version() noexcept {
-    return "0.7.0";
+    return "0.8.0-nightly";
 }
 
 HelixStatus Engine::decompile(

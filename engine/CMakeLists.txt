@@ -219,6 +219,17 @@ set(HELIX_SOURCES
     # Analysis
     src/analysis/RemillDemangler.cpp
     src/analysis/SignatureDb.cpp
+    src/analysis/CallingConventionDb.cpp
+
+    # Analysis — Helix-Nightly
+    src/analysis/TypeLattice.cpp               # P1.5 Type lattice
+    src/analysis/JumpTableAnalysis.cpp         # P0.2 Jump table detection
+    src/analysis/DataSectionProvider.cpp       # P0.2 Binary data access
+    src/analysis/StructRecovery.cpp            # P1.6 Struct recovery
+    src/analysis/SubRegisterMap.cpp            # P2.9 Sub-register SSA
+    src/analysis/NonzeroMaskAnalysis.cpp       # P3.13 Nonzero mask
+    src/analysis/IntrinsicModel.cpp            # P3.14 Intrinsic models
+    src/analysis/HelixValueRangeAnalysis.cpp   # P3.12 Value range
 
     # Passes — original v0.5 analysis passes
     src/passes/Passes.cpp
@@ -234,6 +245,20 @@ set(HELIX_SOURCES
     src/passes/RecoverMagicDivision.cpp        # NEW v3.8.0
     src/passes/DevirtualizeIndirectCalls.cpp   # NEW v3.8.0
     src/passes/InterProceduralTypePropagation.cpp  # NEW v3.8.0
+
+    # Passes — Helix-Nightly (Pattern Rewrite Engine + new passes)
+    src/passes/HelixLowSimplify.cpp           # P0.1 Pattern rewrite (HelixLow)
+    src/passes/HelixMidSimplify.cpp           # P0.1 Pattern rewrite (HelixMid)
+    src/passes/patterns/ArithPatterns.cpp     # P0.1 Arithmetic patterns
+    src/passes/patterns/FlagPatterns.cpp      # P0.1 Flag patterns
+    src/passes/patterns/MemoryPatterns.cpp    # P0.1 Memory patterns
+    src/passes/patterns/CastPatterns.cpp      # P0.1 Cast patterns
+    src/passes/patterns/ConstantFoldPatterns.cpp  # P2.11 Constant folding
+    src/passes/RecoverSwitchTables.cpp        # P0.2 Switch/jump table
+    src/passes/EscapeAnalysis.cpp             # P2.8 Escape analysis
+    src/passes/RecoverStructTypes.cpp         # P1.6 Struct recovery
+    src/passes/SubRegisterSSA.cpp             # P2.9 Sub-register refinement
+    src/passes/ConstantFoldingPass.cpp        # P2.11 Constant folding pass
 
     # Passes — v1.0 dialect conversion passes
     src/passes/HelixLowToMid.cpp              # NEW v1.0
@@ -266,6 +291,18 @@ set(HELIX_HEADERS
     include/helix/emit/FlatBufSerializer.h
     include/helix/analysis/RemillDemangler.h
     include/helix/analysis/SignatureDb.h
+    include/helix/analysis/X86RegisterInfo.h
+    # Helix-Nightly headers
+    include/helix/passes/Patterns.h
+    include/helix/analysis/TypeLattice.h
+    include/helix/analysis/JumpTableAnalysis.h
+    include/helix/analysis/DataSectionProvider.h
+    include/helix/analysis/CallingConventionDb.h
+    include/helix/analysis/StructRecovery.h
+    include/helix/analysis/SubRegisterMap.h
+    include/helix/analysis/HelixValueRangeAnalysis.h
+    include/helix/analysis/NonzeroMaskAnalysis.h
+    include/helix/analysis/IntrinsicModel.h
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})

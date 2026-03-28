@@ -91,6 +91,52 @@ std::unique_ptr<mlir::Pass> createDevirtualizeIndirectCallsPass();
 /// the int64_t flood from ABI register-width defaults.
 std::unique_ptr<mlir::Pass> createInterProceduralTypePropagationPass();
 
+// ─── Simplification Passes (Pattern Rewrite Engine) ──────────────────────────
+
+/// Create the HelixLow simplification pass.
+///
+/// Applies greedy pattern rewrites to HelixLow dialect ops: arithmetic
+/// identities (xor x,x → 0), dead flag elimination, store-to-load
+/// forwarding, redundant cast removal.  Runs until fixed point.
+std::unique_ptr<mlir::Pass> createHelixLowSimplifyPass();
+
+/// Create the HelixMid simplification pass.
+///
+/// Applies greedy pattern rewrites to HelixMid dialect ops: arithmetic
+/// identities (sub x,x → 0), redundant cast chains, deref/addrof
+/// cancellation, and constant folding.
+std::unique_ptr<mlir::Pass> createHelixMidSimplifyPass();
+
+// ─── Helix-Nightly: Additional Passes ────────────────────────────────────────
+
+/// Create the switch/jump table recovery pass (Nightly P0.2).
+///
+/// Detects indirect branches that are compiler-generated switch dispatches.
+/// Uses backward slicing + pattern matching to find jump table base,
+/// scale, and bounds. Requires DataSectionProvider to read table entries.
+/// Emits structured switch constructs with case values and targets.
+std::unique_ptr<mlir::Pass> createRecoverSwitchTablesPass();
+
+/// Create the escape analysis pass (Nightly P2.8).
+///
+/// Determines which HelixMid variables have their address taken.
+/// Non-escaping variables are safe for aggressive SSA optimizations.
+/// Sets "helix.escapes" BoolAttr on var.decl ops.
+std::unique_ptr<mlir::Pass> createEscapeAnalysisPass();
+
+/// Create the struct type recovery pass (Nightly P1.6).
+///
+/// Detects struct types from base+offset memory access patterns.
+/// Groups load/store operations by base pointer, infers field layout,
+/// and creates struct type annotations via TypeLattice.
+std::unique_ptr<mlir::Pass> createRecoverStructTypesPass();
+
+/// Create the constant folding pass (Nightly P2.11).
+///
+/// Folds constant arithmetic at the HelixMid level beyond MLIR builtins.
+/// Can run standalone or as patterns within HelixMidSimplify.
+std::unique_ptr<mlir::Pass> createConstantFoldingPass();
+
 // ─── Dialect Conversion Passes (v1.0 3-tier architecture) ────────────────────
 
 /// Create the HelixLow → HelixMid conversion pass.

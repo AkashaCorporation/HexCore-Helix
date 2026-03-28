@@ -208,6 +208,74 @@ static std::optional<int64_t> tryExtractIntegerLiteralFromValue(Value value) {
     return std::nullopt;
 }
 
+// ─── Compound Assignment Helpers ─────────────────────────────────────────────
+
+/// Map a helix::high::BinaryOpKind to its C compound assignment operator string.
+/// Returns nullptr for kinds that don't have a compound form (comparisons, logical).
+static const char* getHighCompoundOp(helix::high::BinaryOpKind kind) {
+    switch (kind) {
+    case helix::high::BinaryOpKind::Add:    return "+=";
+    case helix::high::BinaryOpKind::Sub:    return "-=";
+    case helix::high::BinaryOpKind::Mul:    return "*=";
+    case helix::high::BinaryOpKind::Div:    return "/=";
+    case helix::high::BinaryOpKind::Mod:    return "%=";
+    case helix::high::BinaryOpKind::Shl:    return "<<=";
+    case helix::high::BinaryOpKind::Shr:    return ">>=";
+    case helix::high::BinaryOpKind::Sar:    return ">>=";
+    case helix::high::BinaryOpKind::BitAnd: return "&=";
+    case helix::high::BinaryOpKind::BitOr:  return "|=";
+    case helix::high::BinaryOpKind::BitXor: return "^=";
+    default: return nullptr;
+    }
+}
+
+/// Map a helix::mid::BinExprKind to its C compound assignment operator string.
+static const char* getMidCompoundOp(helix::mid::BinExprKind kind) {
+    switch (kind) {
+    case helix::mid::BinExprKind::Add:    return "+=";
+    case helix::mid::BinExprKind::Sub:    return "-=";
+    case helix::mid::BinExprKind::Mul:    return "*=";
+    case helix::mid::BinExprKind::Div:    return "/=";
+    case helix::mid::BinExprKind::Mod:    return "%=";
+    case helix::mid::BinExprKind::Shl:    return "<<=";
+    case helix::mid::BinExprKind::Shr:    return ">>=";
+    case helix::mid::BinExprKind::Sar:    return ">>=";
+    case helix::mid::BinExprKind::BitAnd: return "&=";
+    case helix::mid::BinExprKind::BitOr:  return "|=";
+    case helix::mid::BinExprKind::BitXor: return "^=";
+    default: return nullptr;
+    }
+}
+
+/// Is this high::BinaryOpKind commutative? (a OP b == b OP a)
+/// For commutative ops we can also match `x = rhs OP x` → `x OP= rhs`.
+static bool isCommutativeHighOp(helix::high::BinaryOpKind kind) {
+    switch (kind) {
+    case helix::high::BinaryOpKind::Add:
+    case helix::high::BinaryOpKind::Mul:
+    case helix::high::BinaryOpKind::BitAnd:
+    case helix::high::BinaryOpKind::BitOr:
+    case helix::high::BinaryOpKind::BitXor:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Is this mid::BinExprKind commutative?
+static bool isCommutativeMidOp(helix::mid::BinExprKind kind) {
+    switch (kind) {
+    case helix::mid::BinExprKind::Add:
+    case helix::mid::BinExprKind::Mul:
+    case helix::mid::BinExprKind::BitAnd:
+    case helix::mid::BinExprKind::BitOr:
+    case helix::mid::BinExprKind::BitXor:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void collectRelativeCallPattern(Value value, int64_t sign,
                                        RelativeCallPattern& pattern) {
     if (!pattern.valid || !value)
@@ -753,6 +821,64 @@ std::string PseudoCEmitter::applyNameAliases(std::string name) const {
     return name;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Transitive Copy Propagation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+std::string PseudoCEmitter::resolveTransitive(const std::string& name) const {
+    std::string current = name;
+    std::unordered_set<std::string> visited;
+    constexpr unsigned kMaxHops = 5;
+    unsigned hops = 0;
+
+    while (hops < kMaxHops) {
+        if (visited.count(current))
+            break; // cycle detected
+        visited.insert(current);
+
+        auto it = lastRegValue.find(current);
+        if (it == lastRegValue.end())
+            break;
+
+        // Don't resolve through self-references
+        if (it->second == current)
+            break;
+
+        // Don't resolve through expressions that contain the variable
+        // (e.g. "rax + 1" should not be followed further)
+        if (it->second.find(current) != std::string::npos &&
+            it->second != current)
+            break;
+
+        // If the mapped value is not itself a synthetic temporary,
+        // take it as the final resolved value
+        if (!isSyntheticTemporaryName(it->second) &&
+            !isSyntheticValueName(it->second)) {
+            current = it->second;
+            break;
+        }
+
+        // Follow the chain
+        current = it->second;
+        ++hops;
+    }
+
+    return current;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Variable Use-Count Pre-scan
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void PseudoCEmitter::precomputeVarUseCounts(Operation* funcOp) {
+    varUseCount_.clear();
+
+    funcOp->walk([&](helix::high::VarRefOp ref) {
+        auto name = applyNameAliases(ref.getVarName().str());
+        ++varUseCount_[name];
+    });
+}
+
 std::optional<unsigned>
 PseudoCEmitter::inferWin64StackParamIndex(Operation* contextOp, Value addr) {
     if (!currentFunctionIsWin64_)
@@ -855,7 +981,7 @@ bool PseudoCEmitter::isNearBlockStart(Operation* op, unsigned budget) {
 
 void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
     os << "// Decompiled by HexCore Helix\n";
-    os << "// Engine version: 0.7.0\n";
+    os << "// Engine version: 0.8.0-nightly\n";
     os << "\n";
 }
 
@@ -1059,6 +1185,8 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
     auto entryAddr = func.getEntryAddress();
 
     lastRegValue.clear(); // Reset copy propagation state for new function
+    varUseCount_.clear();
+    exprToBestName_.clear();
     nameAliases_.clear();
     syntheticCallBaseAddrs_.clear();
     referencedBlocks_.clear();
@@ -1576,6 +1704,9 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
     emitDeclGroup(registerDecls);
     emitDeclGroup(tempDecls);
 
+    // Pre-scan variable use counts for single-use temporary elimination
+    precomputeVarUseCounts(op);
+
     // Body statements
     if (!func.getBody().empty()) {
         emitRegionBody(func.getBody(), os, 1);
@@ -1664,6 +1795,27 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
             return; // Skip identical redundant assignment
         }
 
+        // ─── Transitive Resolution ──────────────────────────────────────────
+        // If exprStr is a synthetic temporary that maps to something else,
+        // resolve the chain transitively: a = b; b = c; → store a = c.
+        if (isSyntheticTemporaryName(exprStr) || isSyntheticValueName(exprStr)) {
+            auto resolved = resolveTransitive(exprStr);
+            if (resolved != exprStr && resolved.find(exprStr) == std::string::npos) {
+                exprStr = resolved;
+            }
+        }
+
+        // ─── Value Equivalence: prefer shorter/more meaningful names ────────
+        // If exprStr is a bare identifier that has a better alias, use it.
+        {
+            auto equivIt = exprToBestName_.find(exprStr);
+            if (equivIt != exprToBestName_.end() &&
+                equivIt->second != targetStr &&
+                equivIt->second != exprStr) {
+                exprStr = equivIt->second;
+            }
+        }
+
         // Invalidate any cached expressions that depend on the newly written target.
         // Also invalidate the target itself before assigning the new value.
         for (auto it = lastRegValue.begin(); it != lastRegValue.end(); ) {
@@ -1673,22 +1825,115 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
                 ++it;
             }
         }
-        
+        // Also invalidate any exprToBestName_ entries that reference the target.
+        for (auto it = exprToBestName_.begin(); it != exprToBestName_.end(); ) {
+            if (it->first == targetStr || it->second == targetStr ||
+                it->first.find(targetStr) != std::string::npos) {
+                it = exprToBestName_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         lastRegValue[targetStr] = exprStr;
+
+        // ─── Value Equivalence Tracking ─────────────────────────────────────
+        // Track which expression maps to the "best" (shortest, most meaningful) name.
+        // Prefer non-synthetic names (param_1, result) over synthetic ones (var_0).
+        // Among equally synthetic names, prefer the shorter one.
+        {
+            auto existingIt = exprToBestName_.find(exprStr);
+            bool shouldUpdate = (existingIt == exprToBestName_.end());
+            if (!shouldUpdate) {
+                const auto& existingName = existingIt->second;
+                bool targetIsSynthetic = isSyntheticTemporaryName(targetStr) ||
+                                         isSyntheticValueName(targetStr);
+                bool existingIsSynthetic = isSyntheticTemporaryName(existingName) ||
+                                           isSyntheticValueName(existingName);
+                // Prefer non-synthetic over synthetic
+                if (existingIsSynthetic && !targetIsSynthetic)
+                    shouldUpdate = true;
+                // Among same category, prefer shorter name
+                else if (existingIsSynthetic == targetIsSynthetic &&
+                         targetStr.size() < existingName.size())
+                    shouldUpdate = true;
+            }
+            if (shouldUpdate)
+                exprToBestName_[exprStr] = targetStr;
+        }
+
+        // ─── Single-Use Temporary Elimination ───────────────────────────────
+        // If the target is a synthetic temporary used only once in the function,
+        // don't emit the assignment — it will be inlined at the use site via
+        // copy propagation. Skip if:
+        //   - The expression is too long (>80 chars) — keeps output readable
+        //   - The expression contains a function call (side effect) — must emit
+        {
+            // Detect function-call patterns: identifier immediately followed by '('
+            // e.g. "sub_140001000(param_1)" or "strlen(buf)"
+            // Skip casts like "(int64_t)(x)" where '(' follows ')' or a type keyword.
+            bool looksLikeCall = false;
+            for (size_t i = 1; i < exprStr.size(); ++i) {
+                if (exprStr[i] == '(') {
+                    char prev = exprStr[i - 1];
+                    if (std::isalnum(static_cast<unsigned char>(prev)) ||
+                        prev == '_') {
+                        looksLikeCall = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isSyntheticTemporaryName(targetStr) &&
+                varUseCount_.count(targetStr) && varUseCount_[targetStr] <= 1 &&
+                exprStr.size() <= 80 && !suppressEmission && !looksLikeCall) {
+                // The value is already stored in lastRegValue — it will be
+                // substituted when the single use site is formatted.
+                return;
+            }
+        }
 
         if (suppressEmission)
             return;
 
-        // ─── Increment/Decrement pattern: x = (x + 1) → x++ ─────────────
+        // ─── Compound Assignment Synthesis: x = x OP y → x OP= y ─────────
+        // Also handles x = x + 1 → x++ and x = x - 1 → x--.
+        // For commutative ops, also matches x = y OP x → x OP= y.
         if (auto highBin = assign.getValue().getDefiningOp<helix::high::BinaryOp>()) {
-            if (highBin.getOp() == helix::high::BinaryOpKind::Add ||
-                highBin.getOp() == helix::high::BinaryOpKind::Sub) {
+            auto kind = highBin.getOp();
+            const char* compoundOp = getHighCompoundOp(kind);
+            if (compoundOp) {
                 auto lhsStr = formatExpression(highBin.getLhs());
-                auto rhsLit = tryExtractIntegerLiteralFromValue(highBin.getRhs());
-                if (lhsStr == targetStr && rhsLit && *rhsLit == 1) {
+                auto rhsStr = formatExpression(highBin.getRhs());
+                bool lhsMatch = (lhsStr == targetStr);
+                bool rhsMatch = !lhsMatch && isCommutativeHighOp(kind) && (rhsStr == targetStr);
+
+                if (lhsMatch || rhsMatch) {
+                    // The "other" operand is the one that isn't the target
+                    const std::string& otherStr = lhsMatch ? rhsStr : lhsStr;
+                    Value otherVal = lhsMatch ? highBin.getRhs() : highBin.getLhs();
+
+                    // Special-case: x = x +/- 1 → x++ / x--
+                    if (lhsMatch &&
+                        (kind == helix::high::BinaryOpKind::Add ||
+                         kind == helix::high::BinaryOpKind::Sub)) {
+                        auto rhsLit = tryExtractIntegerLiteralFromValue(otherVal);
+                        if (rhsLit && *rhsLit == 1) {
+                            indent(os, depth);
+                            os << targetStr
+                               << (kind == helix::high::BinaryOpKind::Add ? "++" : "--");
+                            if (auto addr = assign.getAddress())
+                                os << std::format(";  // 0x{:x}", *addr);
+                            else
+                                os << ";";
+                            os << "\n";
+                            return;
+                        }
+                    }
+
+                    // General compound: x OP= other
                     indent(os, depth);
-                    os << targetStr
-                       << (highBin.getOp() == helix::high::BinaryOpKind::Add ? "++" : "--");
+                    os << targetStr << " " << compoundOp << " " << otherStr;
                     if (auto addr = assign.getAddress())
                         os << std::format(";  // 0x{:x}", *addr);
                     else
@@ -1757,29 +2002,63 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
         auto addrStr = formatExpression(midStore.getAddr());
         auto valStr = formatExpression(midStore.getValue());
 
-        // Detect increment/decrement patterns: store(addr, load(addr) + 1) → (*addr)++
+        // Detect compound assignment: store(addr, load(addr) OP rhs) → (*addr) OP= rhs
+        // Also handles increment/decrement: store(addr, load(addr) + 1) → (*addr)++
+        // For commutative ops, also matches store(addr, rhs OP load(addr)).
         if (auto midBin = midStore.getValue().getDefiningOp<helix::mid::BinExprOp>()) {
-            if (midBin.getKind() == helix::mid::BinExprKind::Add ||
-                midBin.getKind() == helix::mid::BinExprKind::Sub) {
+            auto kind = midBin.getKind();
+            const char* compoundOp = getMidCompoundOp(kind);
+            if (compoundOp) {
+                // Check LHS: load(addr) OP rhs
+                bool lhsMatch = false;
                 if (auto midLoad = midBin.getLhs().getDefiningOp<helix::mid::LoadOp>()) {
-                    auto loadAddrStr = formatExpression(midLoad.getAddr());
-                    auto rhsVal = tryExtractIntegerLiteralFromValue(midBin.getRhs());
-                    if (loadAddrStr == addrStr && rhsVal && *rhsVal == 1) {
-                        std::string locExpr;
-                        if (addrStr.starts_with("&") && addrStr.find("->") != std::string::npos)
-                            locExpr = addrStr.substr(1);
-                        else
-                            locExpr = std::format("(*({}))", addrStr);
-                        indent(os, depth);
-                        os << locExpr
-                           << (midBin.getKind() == helix::mid::BinExprKind::Add ? "++" : "--");
-                        if (auto addr = midStore.getAddressAttr())
-                            os << std::format(";  // 0x{:x}", addr.getUInt());
-                        else
-                            os << ";";
-                        os << "\n";
-                        return;
+                    lhsMatch = (formatExpression(midLoad.getAddr()) == addrStr);
+                }
+                // Check RHS for commutative ops: rhs OP load(addr)
+                bool rhsMatch = false;
+                if (!lhsMatch && isCommutativeMidOp(kind)) {
+                    if (auto midLoad = midBin.getRhs().getDefiningOp<helix::mid::LoadOp>()) {
+                        rhsMatch = (formatExpression(midLoad.getAddr()) == addrStr);
                     }
+                }
+
+                if (lhsMatch || rhsMatch) {
+                    Value otherVal = lhsMatch ? midBin.getRhs() : midBin.getLhs();
+
+                    std::string locExpr;
+                    if (addrStr.starts_with("&") && addrStr.find("->") != std::string::npos)
+                        locExpr = addrStr.substr(1);
+                    else
+                        locExpr = std::format("(*({}))", addrStr);
+
+                    // Special-case: ++/-- for literal 1
+                    if (lhsMatch &&
+                        (kind == helix::mid::BinExprKind::Add ||
+                         kind == helix::mid::BinExprKind::Sub)) {
+                        auto rhsLit = tryExtractIntegerLiteralFromValue(otherVal);
+                        if (rhsLit && *rhsLit == 1) {
+                            indent(os, depth);
+                            os << locExpr
+                               << (kind == helix::mid::BinExprKind::Add ? "++" : "--");
+                            if (auto addr = midStore.getAddressAttr())
+                                os << std::format(";  // 0x{:x}", addr.getUInt());
+                            else
+                                os << ";";
+                            os << "\n";
+                            return;
+                        }
+                    }
+
+                    // General compound: locExpr OP= other
+                    auto otherStr = formatExpression(otherVal);
+                    indent(os, depth);
+                    os << locExpr << " " << compoundOp << " " << otherStr;
+                    if (auto addr = midStore.getAddressAttr())
+                        os << std::format(";  // 0x{:x}", addr.getUInt());
+                    else
+                        os << ";";
+                    os << "\n";
+                    return;
                 }
             }
         }
@@ -1803,6 +2082,59 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     if (auto midAssign = dyn_cast<helix::mid::AssignOp>(op)) {
         auto valStr = formatExpression(midAssign.getValue());
         auto slotName = std::format("slot_{}", midAssign.getSlotId());
+        uint32_t targetSlot = midAssign.getSlotId();
+
+        // Compound assignment synthesis: slot_N = slot_N OP rhs → slot_N OP= rhs
+        if (auto midBin = midAssign.getValue().getDefiningOp<helix::mid::BinExprOp>()) {
+            auto kind = midBin.getKind();
+            const char* compoundOp = getMidCompoundOp(kind);
+            if (compoundOp) {
+                // Check LHS: VarRefOp with same slot
+                bool lhsMatch = false;
+                if (auto lhsRef = midBin.getLhs().getDefiningOp<helix::mid::VarRefOp>())
+                    lhsMatch = (lhsRef.getSlotId() == targetSlot);
+                // Check RHS for commutative ops
+                bool rhsMatch = false;
+                if (!lhsMatch && isCommutativeMidOp(kind)) {
+                    if (auto rhsRef = midBin.getRhs().getDefiningOp<helix::mid::VarRefOp>())
+                        rhsMatch = (rhsRef.getSlotId() == targetSlot);
+                }
+
+                if (lhsMatch || rhsMatch) {
+                    Value otherVal = lhsMatch ? midBin.getRhs() : midBin.getLhs();
+
+                    // Special-case: slot_N++ / slot_N--
+                    if (lhsMatch &&
+                        (kind == helix::mid::BinExprKind::Add ||
+                         kind == helix::mid::BinExprKind::Sub)) {
+                        auto lit = tryExtractIntegerLiteralFromValue(otherVal);
+                        if (lit && *lit == 1) {
+                            indent(os, depth);
+                            os << slotName
+                               << (kind == helix::mid::BinExprKind::Add ? "++" : "--");
+                            if (auto addr = midAssign.getAddressAttr())
+                                os << std::format(";  // 0x{:x}", addr.getUInt());
+                            else
+                                os << ";";
+                            os << "\n";
+                            return;
+                        }
+                    }
+
+                    // General compound: slot_N OP= other
+                    auto otherStr = formatExpression(otherVal);
+                    indent(os, depth);
+                    os << slotName << " " << compoundOp << " " << otherStr;
+                    if (auto addr = midAssign.getAddressAttr())
+                        os << std::format(";  // 0x{:x}", addr.getUInt());
+                    else
+                        os << ";";
+                    os << "\n";
+                    return;
+                }
+            }
+        }
+
         indent(os, depth);
         os << slotName << " = " << valStr;
         if (auto addr = midAssign.getAddressAttr())
@@ -1842,6 +2174,7 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     // ─── If/else ────────────────────────────────────────────────────────
     if (auto ifOp = dyn_cast<helix::high::IfOp>(op)) {
         lastRegValue.clear(); // Control flow branch invalidates sequence
+        exprToBestName_.clear();
         std::function<void(helix::high::IfOp, bool)> emitIfBody;
         emitIfBody =
             [&](helix::high::IfOp nestedIf, bool withIndent) {
@@ -1959,6 +2292,7 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
     // ─── Return ─────────────────────────────────────────────────────────
     if (auto ret = dyn_cast<helix::high::ReturnOp>(op)) {
         lastRegValue.clear();
+        exprToBestName_.clear();
         indent(os, depth);
         if (ret.getValue()) {
             os << "return " << formatExpression(ret.getValue()) << ";\n";
@@ -2220,6 +2554,7 @@ void PseudoCEmitter::emitStatement(Operation* op, llvm::raw_ostream& os,
         }
 
         lastRegValue.clear(); // Call clobbers registers and globals
+        exprToBestName_.clear();
 
         indent(os, depth);
         bool isIndirect = false;
@@ -2975,6 +3310,7 @@ void PseudoCEmitter::emitRegionBody(Region& region, llvm::raw_ostream& os,
             suppressAcrossBlocksUntilLabel = false;
 
         lastRegValue.clear();
+        exprToBestName_.clear();
         bool suppressUntilVisibleLabel = false;
 
         // Emit block label for non-entry blocks in multi-block regions.
@@ -3127,13 +3463,33 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     // ─── Variable reference ─────────────────────────────────────────────
     if (auto varRef = dyn_cast<helix::high::VarRefOp>(defOp)) {
         auto name = applyNameAliases(varRef.getVarName().str());
-        if (isSyntheticTemporaryName(name)) {
+        if (isSyntheticTemporaryName(name) || isSyntheticValueName(name)) {
+            // Transitive copy propagation: resolve through chains
+            auto resolved = resolveTransitive(name);
+            if (resolved != name && resolved.find(name) == std::string::npos) {
+                return resolved;
+            }
+            // Fall back to single-level lookup
             auto it = lastRegValue.find(name);
             if (it != lastRegValue.end() && it->second != name &&
                 it->second.find(name) == std::string::npos) {
                 return it->second;
             }
         }
+
+        // ─── Value Equivalence: prefer shorter/more meaningful names ────
+        // If this variable name is a bare identifier that maps to an expression
+        // which has a better (shorter, non-synthetic) alias, use that alias.
+        {
+            auto equivIt = exprToBestName_.find(name);
+            if (equivIt != exprToBestName_.end() &&
+                equivIt->second != name &&
+                !isSyntheticTemporaryName(equivIt->second) &&
+                equivIt->second.size() <= name.size()) {
+                return equivIt->second;
+            }
+        }
+
         return name;
     }
 
@@ -3295,8 +3651,13 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
 
     // ─── Cast expression ────────────────────────────────────────────────
     if (auto castOp = dyn_cast<helix::high::CastOp>(defOp)) {
-        // Elide identity casts (same type in → out)
+        // Elide identity casts (same type in -> out)
         if (castOp.getInput().getType() == castOp.getResult().getType())
+            return formatExpressionWithPrec(castOp.getInput(), parentPrec);
+        // Elide redundant casts based on context analysis
+        if (isCastRedundant(castOp.getInput().getType(),
+                            castOp.getResult().getType(),
+                            castOp.getResult()))
             return formatExpressionWithPrec(castOp.getInput(), parentPrec);
         auto castResult = std::format("({})({})",
             formatType(castOp.getResult().getType()),
@@ -3424,6 +3785,11 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     if (auto midCast = dyn_cast<helix::mid::CastOp>(defOp)) {
         // Elide identity casts
         if (midCast.getInput().getType() == midCast.getResult().getType())
+            return formatExpressionWithPrec(midCast.getInput(), parentPrec);
+        // Elide redundant casts based on context analysis
+        if (isCastRedundant(midCast.getInput().getType(),
+                            midCast.getResult().getType(),
+                            midCast.getResult()))
             return formatExpressionWithPrec(midCast.getInput(), parentPrec);
         auto castResult = std::format("({})({})",
             formatType(midCast.getResult().getType()),
@@ -3781,7 +4147,16 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
 
     // ─── HelixLow: MovZx/MovSx (zero/sign extend) ──────────────────────
     if (auto movzx = dyn_cast<helix::low::MovZxOp>(defOp)) {
-        auto dstWidth = movzx.getDstWidth();
+        unsigned dstWidth = movzx.getDstWidth();
+        unsigned srcWidth = getIntBitWidth(movzx.getSrc().getType());
+        // Elide identity zero-extend (source already the target width)
+        if (srcWidth == dstWidth)
+            return formatExpressionWithPrec(movzx.getSrc(), parentPrec);
+        // Elide zero-extend consumed only by matching-width stores/assigns
+        if (isCastRedundant(movzx.getSrc().getType(),
+                            movzx.getResult().getType(),
+                            movzx.getResult()))
+            return formatExpressionWithPrec(movzx.getSrc(), parentPrec);
         std::string typeStr;
         switch (dstWidth) {
         case 8:  typeStr = "uint8_t"; break;
@@ -3796,7 +4171,16 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     }
 
     if (auto movsx = dyn_cast<helix::low::MovSxOp>(defOp)) {
-        auto dstWidth = movsx.getDstWidth();
+        unsigned dstWidth = movsx.getDstWidth();
+        unsigned srcWidth = getIntBitWidth(movsx.getSrc().getType());
+        // Elide identity sign-extend (source already the target width)
+        if (srcWidth == dstWidth)
+            return formatExpressionWithPrec(movsx.getSrc(), parentPrec);
+        // Elide sign-extend consumed only by matching-width stores/assigns
+        if (isCastRedundant(movsx.getSrc().getType(),
+                            movsx.getResult().getType(),
+                            movsx.getResult()))
+            return formatExpressionWithPrec(movsx.getSrc(), parentPrec);
         std::string typeStr;
         switch (dstWidth) {
         case 8:  typeStr = "int8_t"; break;
@@ -4040,6 +4424,8 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     if (auto op = dyn_cast<LLVM::ZExtOp>(defOp)) {
         if (op.getArg().getType() == op.getResult().getType())
             return formatExpressionWithPrec(op.getArg(), parentPrec);
+        if (isCastRedundant(op.getArg().getType(), op.getResult().getType(), op.getResult()))
+            return formatExpressionWithPrec(op.getArg(), parentPrec);
         auto inner = formatExpressionWithPrec(op.getArg(), 0);
         auto targetType = formatType(op.getResult().getType());
         // Skip (int64_t) wrapping of memory reads / dereferences — already 64-bit semantically
@@ -4055,6 +4441,8 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     if (auto op = dyn_cast<LLVM::SExtOp>(defOp)) {
         if (op.getArg().getType() == op.getResult().getType())
             return formatExpressionWithPrec(op.getArg(), parentPrec);
+        if (isCastRedundant(op.getArg().getType(), op.getResult().getType(), op.getResult()))
+            return formatExpressionWithPrec(op.getArg(), parentPrec);
         auto inner = formatExpressionWithPrec(op.getArg(), 0);
         auto targetType = formatType(op.getResult().getType());
         if (targetType == "int64_t" &&
@@ -4068,6 +4456,8 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
 
     if (auto op = dyn_cast<LLVM::TruncOp>(defOp)) {
         if (op.getArg().getType() == op.getResult().getType())
+            return formatExpressionWithPrec(op.getArg(), parentPrec);
+        if (isCastRedundant(op.getArg().getType(), op.getResult().getType(), op.getResult()))
             return formatExpressionWithPrec(op.getArg(), parentPrec);
         auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
@@ -4460,6 +4850,8 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     }
 
     if (auto op = dyn_cast<arith::ExtUIOp>(defOp)) {
+        if (isCastRedundant(op.getIn().getType(), op.getResult().getType(), op.getResult()))
+            return formatExpressionWithPrec(op.getIn(), parentPrec);
         auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
             formatExpressionWithPrec(op.getIn(), 0));
@@ -4468,6 +4860,8 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     }
 
     if (auto op = dyn_cast<arith::ExtSIOp>(defOp)) {
+        if (isCastRedundant(op.getIn().getType(), op.getResult().getType(), op.getResult()))
+            return formatExpressionWithPrec(op.getIn(), parentPrec);
         auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
             formatExpressionWithPrec(op.getIn(), 0));
@@ -4476,6 +4870,8 @@ std::string PseudoCEmitter::formatExpressionWithPrec(Value val, int parentPrec) 
     }
 
     if (auto op = dyn_cast<arith::TruncIOp>(defOp)) {
+        if (isCastRedundant(op.getIn().getType(), op.getResult().getType(), op.getResult()))
+            return formatExpressionWithPrec(op.getIn(), parentPrec);
         auto castR = std::format("({})({})",
             formatType(op.getResult().getType()),
             formatExpressionWithPrec(op.getIn(), 0));
@@ -4526,6 +4922,86 @@ std::string PseudoCEmitter::formatType(Type type) {
     if (isa<LLVM::LLVMPointerType>(type))
         return "void*";
     return "void";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cast Elimination Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+unsigned PseudoCEmitter::getIntBitWidth(Type type) {
+    if (auto intTy = dyn_cast<IntegerType>(type))
+        return intTy.getWidth();
+    return 0;
+}
+
+bool PseudoCEmitter::isCastRedundant(Type srcType, Type dstType,
+                                      Value castResult) const {
+    if (isa<LLVM::LLVMPointerType>(srcType) || isa<LLVM::LLVMPointerType>(dstType))
+        return false;
+    if (isa<FloatType>(srcType) != isa<FloatType>(dstType))
+        return false;
+    if (srcType == dstType)
+        return true;
+    unsigned srcWidth = getIntBitWidth(srcType);
+    unsigned dstWidth = getIntBitWidth(dstType);
+    if (srcWidth == 0 || dstWidth == 0)
+        return false;
+
+    // Same-width signedness cast: elide unless used in ordered comparison.
+    if (srcWidth == dstWidth) {
+        for (auto* user : castResult.getUsers()) {
+            if (auto binOp = dyn_cast<helix::high::BinaryOp>(user)) {
+                auto kind = binOp.getOp();
+                if (kind == helix::high::BinaryOpKind::Lt || kind == helix::high::BinaryOpKind::Le ||
+                    kind == helix::high::BinaryOpKind::Gt || kind == helix::high::BinaryOpKind::Ge)
+                    return false;
+            }
+            if (auto midBin = dyn_cast<helix::mid::BinExprOp>(user)) {
+                auto kind = midBin.getKind();
+                if (kind == helix::mid::BinExprKind::Lt || kind == helix::mid::BinExprKind::Le ||
+                    kind == helix::mid::BinExprKind::Gt || kind == helix::mid::BinExprKind::Ge)
+                    return false;
+            }
+            if (isa<helix::low::CmpOp>(user))
+                return false;
+        }
+        return true;
+    }
+
+    // Widening cast consumed only by matching-width stores/assigns.
+    if (dstWidth > srcWidth) {
+        bool allMatch = true, hasUsers = false;
+        for (auto* user : castResult.getUsers()) {
+            hasUsers = true;
+            if (auto a = dyn_cast<helix::high::AssignOp>(user))
+                { if (getIntBitWidth(a.getTarget().getType()) != dstWidth) { allMatch = false; break; } continue; }
+            if (auto a = dyn_cast<helix::mid::AssignOp>(user))
+                { if (getIntBitWidth(a.getValue().getType()) != dstWidth) { allMatch = false; break; } continue; }
+            if (auto s = dyn_cast<helix::mid::StoreOp>(user))
+                { if (getIntBitWidth(s.getValue().getType()) != dstWidth) { allMatch = false; break; } continue; }
+            if (isa<helix::low::RegWriteOp>(user)) continue;
+            allMatch = false; break;
+        }
+        if (hasUsers && allMatch) return true;
+    }
+
+    // Narrowing cast consumed only by matching-width stores/assigns.
+    if (dstWidth < srcWidth) {
+        bool allMatch = true, hasUsers = false;
+        for (auto* user : castResult.getUsers()) {
+            hasUsers = true;
+            if (auto a = dyn_cast<helix::high::AssignOp>(user))
+                { if (getIntBitWidth(a.getTarget().getType()) != dstWidth) { allMatch = false; break; } continue; }
+            if (auto s = dyn_cast<helix::mid::StoreOp>(user))
+                { if (getIntBitWidth(s.getValue().getType()) != dstWidth) { allMatch = false; break; } continue; }
+            if (auto a = dyn_cast<helix::mid::AssignOp>(user))
+                { if (getIntBitWidth(a.getValue().getType()) != dstWidth) { allMatch = false; break; } continue; }
+            allMatch = false; break;
+        }
+        if (hasUsers && allMatch) return true;
+    }
+
+    return false;
 }
 
 std::string PseudoCEmitter::formatIntLiteral(int64_t value) {

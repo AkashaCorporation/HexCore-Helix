@@ -1,13 +1,24 @@
 /// @file PropagateTypes.cpp
 /// @brief Type propagation pass: iteratively infer C types from usage patterns.
 ///
-/// Implements a fixed-point iteration (max 16 rounds) that refines Unknown types
-/// to concrete C types based on:
+/// Implements a two-phase fixed-point iteration (max 16 rounds each) that
+/// refines Unknown types to concrete C types.
+///
+/// Phase 1 — Forward (def→use): propagates types from definitions to uses:
 ///   - Access widths (8-bit → int8_t, 32-bit → int32_t, etc.)
 ///   - API function signatures (known return types and parameter types)
 ///   - Binary operation semantics (comparison → bool, shift → same type)
 ///   - Pointer arithmetic patterns (base + offset → pointer)
 ///   - Sign extension/zero extension (movsx → signed, movzx → unsigned)
+///
+/// Phase 2 — Backward (use→def): infers types from how values are USED back
+/// to their definitions:
+///   - CMP/TEST backward: if one comparison operand is typed, the other matches
+///   - MOVSX backward: sign-extended source must be signed int at source width
+///   - MOVZX backward: zero-extended source must be unsigned int at source width
+///   - Store backward: stored value type matches the store target type
+///   - Call argument backward: argument types match known parameter types
+///   - Return backward: returned value type matches function return type
 
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
@@ -343,6 +354,156 @@ private:
                 break;
         }
 
+        // ─── Phase 2: Backward propagation (use→def) ────────────────────────
+        //
+        // Walk each operation's results and examine their USES to propagate
+        // type constraints backward from consumers to producers.
+        for (unsigned backIter = 0; backIter < kMaxIterations; backIter++) {
+            bool changed = false;
+
+            func.walk([&](Operation* op) {
+                // Backward Rule B1: CMP — both operands should have the same
+                // type. If one operand's type is known, propagate to the other.
+                if (auto cmp = dyn_cast<helix::low::CmpOp>(op)) {
+                    auto lhsType = typeEnv[cmp.getLhs()];
+                    auto rhsType = typeEnv[cmp.getRhs()];
+                    if (lhsType.isResolved() && !rhsType.isResolved()) {
+                        if (typeEnv[cmp.getRhs()].mergeFrom(lhsType))
+                            changed = true;
+                    } else if (rhsType.isResolved() && !lhsType.isResolved()) {
+                        if (typeEnv[cmp.getLhs()].mergeFrom(rhsType))
+                            changed = true;
+                    }
+                    return;
+                }
+
+                // Backward Rule B2: TEST — both operands should have the same
+                // type (bitwise AND for flag setting).
+                if (auto test = dyn_cast<helix::low::TestOp>(op)) {
+                    auto lhsType = typeEnv[test.getLhs()];
+                    auto rhsType = typeEnv[test.getRhs()];
+                    if (lhsType.isResolved() && !rhsType.isResolved()) {
+                        if (typeEnv[test.getRhs()].mergeFrom(lhsType))
+                            changed = true;
+                    } else if (rhsType.isResolved() && !lhsType.isResolved()) {
+                        if (typeEnv[test.getLhs()].mergeFrom(rhsType))
+                            changed = true;
+                    }
+                    return;
+                }
+
+                // Backward Rule B3: MOVSX — if the result of a sign extension
+                // is used, the source must be a signed integer at the source
+                // bit width (reinforces forward rule, catches cases where the
+                // source was previously Unknown).
+                if (auto movsx = dyn_cast<helix::low::MovSxOp>(op)) {
+                    unsigned srcWidth =
+                        movsx.getSrc().getType().getIntOrFloatBitWidth();
+                    CTypeInfo srcInferred =
+                        CTypeInfo::makeInt(srcWidth, /*signed=*/true);
+                    if (typeEnv[movsx.getSrc()].mergeFrom(srcInferred))
+                        changed = true;
+
+                    // Also: if the destination type is known and signed, the
+                    // source must be signed too.
+                    auto dstType = typeEnv[movsx.getResult()];
+                    if (dstType.isResolved() && dstType.is_signed) {
+                        if (typeEnv[movsx.getSrc()].mergeFrom(
+                                CTypeInfo::makeInt(srcWidth, /*signed=*/true)))
+                            changed = true;
+                    }
+                    return;
+                }
+
+                // Backward Rule B4: MOVZX — the source must be an unsigned
+                // integer at the source bit width.
+                if (auto movzx = dyn_cast<helix::low::MovZxOp>(op)) {
+                    unsigned srcWidth =
+                        movzx.getSrc().getType().getIntOrFloatBitWidth();
+                    CTypeInfo srcInferred =
+                        CTypeInfo::makeInt(srcWidth, /*signed=*/false);
+                    if (typeEnv[movzx.getSrc()].mergeFrom(srcInferred))
+                        changed = true;
+
+                    // If the destination type is known and unsigned, reinforce
+                    // unsigned on the source.
+                    auto dstType = typeEnv[movzx.getResult()];
+                    if (dstType.isResolved() && !dstType.is_signed &&
+                        (dstType.kind == CTypeInfo::UInt ||
+                         dstType.kind == CTypeInfo::Int)) {
+                        if (typeEnv[movzx.getSrc()].mergeFrom(
+                                CTypeInfo::makeInt(srcWidth, /*signed=*/false)))
+                            changed = true;
+                    }
+                    return;
+                }
+
+                // Backward Rule B5: MemWrite (store) — if the value being
+                // stored has a known type, propagate it to the address as a
+                // pointer. If the stored value's bit width is known from the
+                // store's bit_width attribute, infer the value's integer type.
+                if (auto memWrite = dyn_cast<helix::low::MemWriteOp>(op)) {
+                    unsigned storeWidth = memWrite.getBitWidth();
+                    Value storedValue = memWrite.getValue();
+                    auto valueType = typeEnv[storedValue];
+
+                    // The address operand is always a pointer.
+                    CTypeInfo ptrType = CTypeInfo::makePointer();
+                    if (typeEnv[memWrite.getAddr()].mergeFrom(ptrType))
+                        changed = true;
+
+                    // If the stored value has no type, infer from store width.
+                    if (!valueType.isResolved()) {
+                        CTypeInfo inferred = CTypeInfo::makeInt(storeWidth);
+                        if (typeEnv[storedValue].mergeFrom(inferred))
+                            changed = true;
+                    }
+                    return;
+                }
+
+                // Backward Rule B6: Call argument — if a value is passed as an
+                // argument to a known function, its type should match the
+                // parameter type from SignatureDb.
+                if (auto call = dyn_cast<helix::low::CallOp>(op)) {
+                    if (auto targetName = call.getTargetName()) {
+                        auto sig = helix::lookupSignature(*targetName);
+                        if (sig) {
+                            auto args = call.getArgs();
+                            for (unsigned i = 0;
+                                 i < args.size() && i < sig->param_types.size();
+                                 i++) {
+                                CTypeInfo paramType =
+                                    typeFromSignatureStr(sig->param_types[i]);
+                                if (paramType.isResolved()) {
+                                    if (typeEnv[args[i]].mergeFrom(paramType))
+                                        changed = true;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Backward Rule B7: BinOp — if the result type is known,
+                // propagate it back to the operands (for non-pointer cases).
+                if (auto binop = dyn_cast<helix::low::BinOp>(op)) {
+                    auto resultType = typeEnv[binop.getResult()];
+                    if (resultType.isResolved() &&
+                        resultType.kind != CTypeInfo::Pointer) {
+                        if (typeEnv[binop.getLhs()].mergeFrom(resultType))
+                            changed = true;
+                        if (typeEnv[binop.getRhs()].mergeFrom(resultType))
+                            changed = true;
+                    }
+                    return;
+                }
+            });
+
+            // Fixed point reached — no more backward changes.
+            if (!changed)
+                break;
+        }
+
         // Store the resolved types as attributes on the operations.
         for (auto& [val, typeInfo] : typeEnv) {
             if (!typeInfo.isResolved())
@@ -553,6 +714,207 @@ private:
             });
 
             // Fixed point reached — no more changes.
+            if (!changed)
+                break;
+        }
+
+        // ─── Phase 2: Backward propagation (use→def) for HelixHigh ──────────
+        //
+        // Walk operations and propagate type constraints from uses back to
+        // definitions. This catches cases the forward pass missed because the
+        // type information only becomes available from the consumer side.
+        for (unsigned backIter = 0; backIter < kMaxIterations; backIter++) {
+            bool changed = false;
+
+            func.walk([&](Operation* op) {
+                // Backward Rule HB1: BinaryOp comparison — for comparison
+                // operators (Eq, Ne, Lt, Le, Gt, Ge), both operands should have
+                // the same type. If one is known, propagate to the other.
+                if (auto binop = dyn_cast<helix::high::BinaryOp>(op)) {
+                    auto opKind = binop.getOp();
+                    if (opKind == helix::high::BinaryOpKind::Eq ||
+                        opKind == helix::high::BinaryOpKind::Ne ||
+                        opKind == helix::high::BinaryOpKind::Lt ||
+                        opKind == helix::high::BinaryOpKind::Le ||
+                        opKind == helix::high::BinaryOpKind::Gt ||
+                        opKind == helix::high::BinaryOpKind::Ge) {
+                        auto lhsType = typeEnv[binop.getLhs()];
+                        auto rhsType = typeEnv[binop.getRhs()];
+                        if (lhsType.isResolved() && !rhsType.isResolved()) {
+                            if (typeEnv[binop.getRhs()].mergeFrom(lhsType))
+                                changed = true;
+                        } else if (rhsType.isResolved() &&
+                                   !lhsType.isResolved()) {
+                            if (typeEnv[binop.getLhs()].mergeFrom(rhsType))
+                                changed = true;
+                        }
+                    }
+
+                    // For arithmetic ops: if the result type is known,
+                    // propagate back to operands.
+                    if (opKind == helix::high::BinaryOpKind::Add ||
+                        opKind == helix::high::BinaryOpKind::Sub ||
+                        opKind == helix::high::BinaryOpKind::Mul ||
+                        opKind == helix::high::BinaryOpKind::BitAnd ||
+                        opKind == helix::high::BinaryOpKind::BitOr ||
+                        opKind == helix::high::BinaryOpKind::BitXor) {
+                        auto resultType = typeEnv[binop.getResult()];
+                        if (resultType.isResolved() &&
+                            resultType.kind != CTypeInfo::Pointer) {
+                            if (typeEnv[binop.getLhs()].mergeFrom(resultType))
+                                changed = true;
+                            if (typeEnv[binop.getRhs()].mergeFrom(resultType))
+                                changed = true;
+                        }
+                    }
+                    return;
+                }
+
+                // Backward Rule HB2: Call argument — propagate known parameter
+                // types back to the argument-producing definitions, and
+                // propagate function return type to values that USE the call
+                // result.
+                if (auto call = dyn_cast<helix::high::CallOp>(op)) {
+                    auto targetName = call.getTargetName();
+                    auto sig = helix::lookupSignature(targetName);
+                    if (sig) {
+                        // Backward: parameter types → argument definitions
+                        for (unsigned i = 0;
+                             i < call.getArgs().size() &&
+                             i < sig->param_types.size();
+                             i++) {
+                            CTypeInfo paramType =
+                                typeFromSignatureStr(sig->param_types[i]);
+                            if (paramType.isResolved()) {
+                                if (typeEnv[call.getArgs()[i]].mergeFrom(
+                                        paramType))
+                                    changed = true;
+
+                                // Also propagate to variable type map if the
+                                // argument comes from a var.ref.
+                                if (auto varRef =
+                                        call.getArgs()[i]
+                                            .getDefiningOp<
+                                                helix::high::VarRefOp>()) {
+                                    uint32_t varId = varRef.getVarId();
+                                    if (varTypes[varId].mergeFrom(paramType))
+                                        changed = true;
+                                }
+                            }
+                        }
+
+                        // Backward: if the return type is known and the call
+                        // has a result, propagate to the result.
+                        CTypeInfo retType =
+                            typeFromSignatureStr(sig->return_type);
+                        if (retType.isResolved() && call.getResult()) {
+                            if (typeEnv[call.getResult()].mergeFrom(retType))
+                                changed = true;
+                        }
+                    }
+                    return;
+                }
+
+                // Backward Rule HB3: Return — if the function has a known
+                // return type (from SignatureDb or from an attribute), propagate
+                // it to the returned value.
+                if (auto ret = dyn_cast<helix::high::ReturnOp>(op)) {
+                    if (ret.getValue()) {
+                        Value retVal = ret.getValue();
+                        // Check if the enclosing function has a known signature
+                        auto funcName = func.getSymName();
+                        auto sig = helix::lookupSignature(funcName);
+                        if (sig) {
+                            CTypeInfo retType =
+                                typeFromSignatureStr(sig->return_type);
+                            if (retType.isResolved()) {
+                                if (typeEnv[retVal].mergeFrom(retType))
+                                    changed = true;
+
+                                // Propagate to variable type map if returning
+                                // a var.ref.
+                                if (auto varRef =
+                                        retVal.getDefiningOp<
+                                            helix::high::VarRefOp>()) {
+                                    uint32_t varId = varRef.getVarId();
+                                    if (varTypes[varId].mergeFrom(retType))
+                                        changed = true;
+                                }
+                            }
+                        }
+
+                        // Also check if the function has an "inferred_return_type"
+                        // attribute set by an earlier pass.
+                        if (auto retTypeAttr =
+                                func->getAttrOfType<StringAttr>(
+                                    "inferred_return_type")) {
+                            CTypeInfo retType =
+                                typeFromSignatureStr(retTypeAttr.getValue());
+                            if (retType.isResolved()) {
+                                if (typeEnv[retVal].mergeFrom(retType))
+                                    changed = true;
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Backward Rule HB4: Assign — if the target variable has a
+                // type (from earlier forward or backward rules), propagate it
+                // back to the source value's definition.
+                if (auto assign = dyn_cast<helix::high::AssignOp>(op)) {
+                    Value target = assign.getTarget();
+                    Value value = assign.getValue();
+
+                    // If target is a var.ref, use the variable type map.
+                    if (auto varRef =
+                            target.getDefiningOp<helix::high::VarRefOp>()) {
+                        uint32_t varId = varRef.getVarId();
+                        auto varType = varTypes[varId];
+                        if (varType.isResolved()) {
+                            if (typeEnv[value].mergeFrom(varType))
+                                changed = true;
+                        }
+                    }
+
+                    // If the assigned value type is known, propagate to target.
+                    auto valueType = typeEnv[value];
+                    auto targetType = typeEnv[target];
+                    if (valueType.isResolved() && !targetType.isResolved()) {
+                        if (typeEnv[target].mergeFrom(valueType))
+                            changed = true;
+                    }
+                    if (targetType.isResolved() && !valueType.isResolved()) {
+                        if (typeEnv[value].mergeFrom(targetType))
+                            changed = true;
+                    }
+                    return;
+                }
+
+                // Backward Rule HB5: CastOp — if the result type is known,
+                // and the cast is a sign/zero extension, propagate signedness
+                // back to the input.
+                if (auto cast = dyn_cast<helix::high::CastOp>(op)) {
+                    auto resultType = typeEnv[cast.getResult()];
+                    auto inputType = typeEnv[cast.getInput()];
+                    if (resultType.isResolved() && !inputType.isResolved()) {
+                        unsigned inputWidth = 0;
+                        if (auto intTy =
+                                dyn_cast<IntegerType>(
+                                    cast.getInput().getType()))
+                            inputWidth = intTy.getWidth();
+                        if (inputWidth > 0) {
+                            CTypeInfo inferred = CTypeInfo::makeInt(
+                                inputWidth, resultType.is_signed);
+                            if (typeEnv[cast.getInput()].mergeFrom(inferred))
+                                changed = true;
+                        }
+                    }
+                    return;
+                }
+            });
+
+            // Fixed point reached — no more backward changes.
             if (!changed)
                 break;
         }
