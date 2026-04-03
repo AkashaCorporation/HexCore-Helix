@@ -66,6 +66,25 @@ public:
     /// When any pass is selectively enabled, ONLY those passes run.
     void enablePass(std::string_view name);
 
+    /// Enable the C AST layer for emission (Phase 4d).
+    /// When true, uses CAstBuilder → CAstOptimizer → CAstPrinter
+    /// instead of PseudoCEmitter.
+    void setUseCastLayer(bool use) { use_cast_layer_ = use; }
+
+    /// Add a variable rename mapping (old_name → new_name).
+    /// Applied during the C AST phase to all CVarRefExpr nodes.
+    /// Call before decompile(). Multiple renames can be added.
+    void addVariableRename(std::string_view old_name, std::string_view new_name) {
+        variable_renames_[std::string(old_name)] = std::string(new_name);
+    }
+
+    /// Clear all variable renames (call between decompile invocations).
+    void clearVariableRenames() { variable_renames_.clear(); }
+
+    /// Get the current rename map (const access for CAstOptimizer).
+    [[nodiscard]] const std::unordered_map<std::string, std::string>&
+    variableRenames() const { return variable_renames_; }
+
     // ─── Stage 1: LLVM IR Parsing ────────────────────────────────────────
 
     /// Parse LLVM IR text into an llvm::Module.
@@ -159,6 +178,13 @@ private:
     bool enable_constant_folding_ = false;
     bool enable_escape_analysis_ = false;
     bool enable_struct_recovery_ = false;
+
+    /// When true, emit via C AST layer instead of PseudoCEmitter.
+    bool use_cast_layer_ = false;
+
+    /// Variable rename map: original name → user-chosen name.
+    /// Populated by setVariableRename(), consumed by CAstOptimizer.
+    std::unordered_map<std::string, std::string> variable_renames_;
 
     /// Build the pass manager if not already built.
     void ensurePipelineBuilt();

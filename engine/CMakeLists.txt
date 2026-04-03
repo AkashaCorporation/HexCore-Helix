@@ -239,6 +239,7 @@ set(HELIX_SOURCES
     src/passes/PropagateTypes.cpp
     src/passes/StructureControlFlow.cpp
     src/passes/RecoverVariables.cpp
+    src/passes/RecoverVariablesFactory.cpp
     src/passes/EliminateDeadCode.cpp
 
     # Passes — v3.8.0 optimization passes
@@ -266,6 +267,13 @@ set(HELIX_SOURCES
     # Emitters
     src/emit/PseudoCEmitter.cpp
     src/emit/FlatBufSerializer.cpp
+
+    # C AST Layer — Phase 4
+    src/cast/CType.cpp
+    src/cast/CAstNode.cpp
+    src/cast/CAstPrinter.cpp
+    src/cast/CAstBuilder.cpp
+    src/cast/CAstOptimizer.cpp
 )
 
 set(HELIX_HEADERS
@@ -303,6 +311,17 @@ set(HELIX_HEADERS
     include/helix/analysis/HelixValueRangeAnalysis.h
     include/helix/analysis/NonzeroMaskAnalysis.h
     include/helix/analysis/IntrinsicModel.h
+
+    # C AST Layer — Phase 4
+    include/helix/cast/CAstNode.h
+    include/helix/cast/CType.h
+    include/helix/cast/CExpr.h
+    include/helix/cast/CStmt.h
+    include/helix/cast/CDecl.h
+    include/helix/cast/CAstVisitor.h
+    include/helix/cast/CAstPrinter.h
+    include/helix/cast/CAstBuilder.h
+    include/helix/cast/CAstOptimizer.h
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})

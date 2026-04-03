@@ -79,6 +79,23 @@ extern "C" {
     /// Get the last error message from the engine. Returns null if no error.
     /// The returned string is valid until the next engine call.
     pub fn helix_engine_last_error(engine: *mut HelixEngineHandle) -> *const c_char;
+
+    /// Enable the C AST layer for emission. Call before first decompile.
+    /// When enabled, uses CAstBuilder + CAstOptimizer + CAstPrinter
+    /// and produces a full HAST FlatBuffer instead of the stub.
+    pub fn helix_engine_set_use_cast_layer(engine: *mut HelixEngineHandle, use_: c_int);
+
+    /// Add a variable rename mapping. Call before decompile.
+    /// When the C AST layer is active, all variable references matching
+    /// old_name will be replaced with new_name in the decompiled output.
+    pub fn helix_engine_add_variable_rename(
+        engine: *mut HelixEngineHandle,
+        old_name: *const c_char,
+        new_name: *const c_char,
+    );
+
+    /// Clear all variable renames.
+    pub fn helix_engine_clear_variable_renames(engine: *mut HelixEngineHandle);
 }
 
 // ─── Safe Rust Wrapper ─────────────────────────────────────────────────────────
@@ -122,6 +139,35 @@ impl EngineHandle {
     pub fn set_skip_optimization(&mut self, skip: bool) {
         unsafe {
             helix_engine_set_skip_optimization(self.handle, if skip { 1 } else { 0 });
+        }
+    }
+
+    /// Enable the C AST layer for emission.
+    /// When enabled, the pipeline uses CAstBuilder → CAstOptimizer → CAstPrinter
+    /// and produces a full HAST FlatBuffer (instead of the MLIR stub).
+    /// Must be called before the first decompile call.
+    pub fn set_use_cast_layer(&mut self, use_: bool) {
+        unsafe {
+            helix_engine_set_use_cast_layer(self.handle, if use_ { 1 } else { 0 });
+        }
+    }
+
+    /// Add a variable rename mapping (old_name → new_name).
+    /// When the C AST layer is active, all CVarRefExpr nodes matching
+    /// old_name will be renamed to new_name in the decompiled output.
+    /// Call before decompile. Multiple renames accumulate.
+    pub fn add_variable_rename(&mut self, old_name: &str, new_name: &str) {
+        let old_c = std::ffi::CString::new(old_name).unwrap_or_default();
+        let new_c = std::ffi::CString::new(new_name).unwrap_or_default();
+        unsafe {
+            helix_engine_add_variable_rename(self.handle, old_c.as_ptr(), new_c.as_ptr());
+        }
+    }
+
+    /// Clear all variable renames.
+    pub fn clear_variable_renames(&mut self) {
+        unsafe {
+            helix_engine_clear_variable_renames(self.handle);
         }
     }
 

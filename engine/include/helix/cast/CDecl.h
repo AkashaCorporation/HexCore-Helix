@@ -1,0 +1,126 @@
+#pragma once
+
+#include "helix/cast/CAstNode.h"
+#include "helix/cast/CType.h"
+#include "helix/cast/CExpr.h"
+#include "helix/cast/CStmt.h"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace helix::cast {
+
+// ── Base declaration node ───────────────────────────────────────────────────
+
+/// Base class for all C declaration nodes.
+class CDecl : public CAstNode {
+public:
+    explicit CDecl(NodeKind kind, uint64_t address = 0)
+        : CAstNode(kind, address) {}
+
+    static bool classof(const CAstNode* n) {
+        return n->getKind() >= NodeKind::VarDecl &&
+               n->getKind() <= NodeKind::StructDecl;
+    }
+};
+
+// ── Concrete declaration nodes ──────────────────────────────────────────────
+
+/// Variable declaration: int32_t var_42 = 0;
+class CVarDecl : public CDecl {
+public:
+    uint32_t varId;
+    std::string varName;
+    CTypePtr type;
+    StorageKind storage;
+    std::optional<int64_t> stackOffset;
+    ExprPtr initExpr; // nullable
+
+    CVarDecl(uint32_t varId, std::string varName, CTypePtr type,
+             StorageKind storage = StorageKind::Stack,
+             std::optional<int64_t> stackOffset = std::nullopt,
+             ExprPtr initExpr = nullptr, uint64_t address = 0)
+        : CDecl(NodeKind::VarDecl, address),
+          varId(varId), varName(std::move(varName)), type(std::move(type)),
+          storage(storage), stackOffset(stackOffset),
+          initExpr(std::move(initExpr)) {}
+
+    static bool classof(const CAstNode* n) {
+        return n->getKind() == NodeKind::VarDecl;
+    }
+};
+
+/// Parameter declaration: int32_t param0
+class CParamDecl : public CDecl {
+public:
+    std::string name;
+    CTypePtr type;
+    unsigned index;
+
+    CParamDecl(std::string name, CTypePtr type, unsigned index,
+               uint64_t address = 0)
+        : CDecl(NodeKind::ParamDecl, address),
+          name(std::move(name)), type(std::move(type)), index(index) {}
+
+    static bool classof(const CAstNode* n) {
+        return n->getKind() == NodeKind::ParamDecl;
+    }
+};
+
+/// Function declaration: returnType name(params) { body }
+class CFuncDecl : public CDecl {
+public:
+    std::string name;
+    uint64_t entryAddr;
+    CTypePtr returnType;
+    std::vector<CParamDecl> params;
+    bool isVariadic;
+    std::vector<StmtPtr> body;
+    std::vector<CVarDecl> localVars;
+    std::string callingConvention;
+
+    CFuncDecl(std::string name, uint64_t entryAddr, CTypePtr returnType,
+              std::vector<CParamDecl> params = {},
+              bool isVariadic = false,
+              std::vector<StmtPtr> body = {},
+              std::vector<CVarDecl> localVars = {},
+              std::string callingConvention = "",
+              uint64_t address = 0)
+        : CDecl(NodeKind::FuncDecl, address),
+          name(std::move(name)), entryAddr(entryAddr),
+          returnType(std::move(returnType)), params(std::move(params)),
+          isVariadic(isVariadic), body(std::move(body)),
+          localVars(std::move(localVars)),
+          callingConvention(std::move(callingConvention)) {}
+
+    static bool classof(const CAstNode* n) {
+        return n->getKind() == NodeKind::FuncDecl;
+    }
+};
+
+/// Struct declaration: struct Name { fields };
+class CStructDecl : public CDecl {
+public:
+    struct StructField {
+        std::string name;
+        CTypePtr type;
+        uint64_t offset;
+    };
+
+    std::string name;
+    std::vector<StructField> fields;
+
+    CStructDecl(std::string name, std::vector<StructField> fields = {},
+                uint64_t address = 0)
+        : CDecl(NodeKind::StructDecl, address),
+          name(std::move(name)), fields(std::move(fields)) {}
+
+    static bool classof(const CAstNode* n) {
+        return n->getKind() == NodeKind::StructDecl;
+    }
+};
+
+} // namespace helix::cast

@@ -144,6 +144,43 @@ impl HelixEngine {
         Ok(())
     }
 
+    /// Enable the C AST layer for emission (--use-cast-layer).
+    /// When enabled, uses CAstBuilder → CAstOptimizer → CAstPrinter
+    /// and produces a full HAST FlatBuffer (ast_buffer) instead of the stub.
+    /// Must be called before the first decompile call.
+    #[napi]
+    pub fn set_use_cast_layer(&mut self, use_cast: bool) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        handle.set_use_cast_layer(use_cast);
+        Ok(())
+    }
+
+    /// Add a variable rename mapping (old_name → new_name).
+    /// When the C AST layer is active, all variable references matching
+    /// old_name will be replaced with new_name in the decompiled output.
+    /// Call before decompileIr(). Multiple renames accumulate.
+    #[napi]
+    pub fn add_variable_rename(&mut self, old_name: String, new_name: String) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        handle.add_variable_rename(&old_name, &new_name);
+        Ok(())
+    }
+
+    /// Clear all variable renames. Call between decompile invocations
+    /// if the rename set changes.
+    #[napi]
+    pub fn clear_variable_renames(&mut self) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        handle.clear_variable_renames();
+        Ok(())
+    }
+
     /// Get the engine version string.
     #[napi]
     pub fn version(&self) -> String {
@@ -267,6 +304,14 @@ impl HelixEngine {
             .decompile_ir_text(&ir_text)
             .map_err(|e| Error::from_reason(format!("MLIR pipeline failed: {}", e)))?;
 
+        // Retrieve the HAST FlatBuffer (runs pipeline a second time).
+        // The C++ engine produces both pseudo-C and FlatBuffer in each run;
+        // a future optimisation can add a combined C API to avoid the double run.
+        let ast_buffer = handle
+            .decompile_ir(&ir_text)
+            .ok()
+            .map(Buffer::from);
+
         Ok(DecompileResult {
             source,
             function_name: "mlir_decompiled".to_string(),
@@ -274,7 +319,7 @@ impl HelixEngine {
             block_count: 0,
             instruction_count: 0,
             cfg_buffer: None,
-            ast_buffer: None,
+            ast_buffer,
             pipeline: "mlir".to_string(),
         })
     }

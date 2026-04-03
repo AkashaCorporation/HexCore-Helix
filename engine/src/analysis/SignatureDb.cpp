@@ -174,6 +174,35 @@ void helix::resolveCallTargets(mlir::ModuleOp module) {
         addrToName[addr] = symName;
     });
 
+    // Phase 1b: Build relocation map from __hxreloc__ function declarations.
+    // These are emitted by the hexcore-disassembler when lifting ET_REL (.ko)
+    // files. Format: @__hxreloc__<16-hex-addr>__<symbol_name>
+    // The hex addr is the CALL instruction address in .text.
+    llvm::DenseMap<uint64_t, std::string> relocMap;
+
+    module.walk([&](mlir::LLVM::LLVMFuncOp func) {
+        auto name = func.getSymName();
+        if (!name.starts_with("__hxreloc__"))
+            return;
+        // Parse: skip "__hxreloc__" (11 chars), read 16 hex digits, skip "__", rest is symbol
+        auto rest = name.drop_front(11); // after "__hxreloc__"
+        if (rest.size() < 19) // 16 hex + "__" + at least 1 char
+            return;
+        auto hexPart = rest.take_front(16);
+        auto symPart = rest.drop_front(18); // skip 16 hex + "__"
+        if (symPart.empty())
+            return;
+        uint64_t instrAddr = 0;
+        if (hexPart.getAsInteger(16, instrAddr))
+            return; // parse failed
+        relocMap[instrAddr] = symPart.str();
+    });
+
+    if (!relocMap.empty()) {
+        llvm::errs() << "[Helix] resolveCallTargets: loaded " << relocMap.size()
+                     << " relocation entries from __hxreloc__ declarations\n";
+    }
+
     // Phase 2: Walk all CallOps and resolve target addresses.
     module.walk([&](helix::low::CallOp call) {
         // Skip if already resolved.
@@ -211,10 +240,6 @@ void helix::resolveCallTargets(mlir::ModuleOp module) {
         auto it = addrToName.find(targetAddr);
         if (it != addrToName.end()) {
             auto funcName = it->second;
-
-            // If the function name matches a known signature, prefer the
-            // canonical signature name (handles cases where the binary's
-            // symbol table has a decorated name but we know the real API).
             auto sig = lookupSignature(funcName);
             if (sig) {
                 call.setTargetNameAttr(
@@ -222,6 +247,43 @@ void helix::resolveCallTargets(mlir::ModuleOp module) {
             } else {
                 call.setTargetNameAttr(
                     mlir::StringAttr::get(call->getContext(), funcName));
+            }
+        } else if (!relocMap.empty()) {
+            // Phase 2b: Check relocation map.
+            // For unresolved ET_REL calls, the target is often callAddr+5
+            // (rel32=0 → call to next instruction). The relocation map is
+            // keyed by the CALL instruction address. Try both:
+            //   1. CallOp's address attribute (instruction address directly)
+            //   2. targetAddr - 5 (infer instruction address from target)
+            std::string relocName;
+            bool relocFound = false;
+
+            // Method 1: Use the CallOp's own address attribute
+            if (auto addrAttr = call.getAddressAttr()) {
+                uint64_t instrAddr = addrAttr.getValue().getZExtValue();
+                auto rit = relocMap.find(instrAddr);
+                if (rit != relocMap.end()) {
+                    relocName = rit->second;
+                    relocFound = true;
+                }
+            }
+
+            // Method 2: Infer from target = instrAddr + 5 (for call rel32=0)
+            if (!relocFound && targetAddr >= 5) {
+                auto rit = relocMap.find(targetAddr - 5);
+                if (rit != relocMap.end()) {
+                    relocName = rit->second;
+                    relocFound = true;
+                }
+            }
+
+            if (relocFound) {
+                call.setTargetNameAttr(
+                    mlir::StringAttr::get(call->getContext(), relocName));
+            } else {
+                auto name = std::format("sub_{:x}", targetAddr);
+                call.setTargetNameAttr(
+                    mlir::StringAttr::get(call->getContext(), name));
             }
         } else {
             // Address not in module's function table — format as sub_<hex>.

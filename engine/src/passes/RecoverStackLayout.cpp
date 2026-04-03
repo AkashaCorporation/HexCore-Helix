@@ -423,6 +423,13 @@ private:
                 /*init=*/Value{},
                 /*address=*/IntegerAttr{});
 
+            // Set inferred_type from the access width so the emitter
+            // can display proper C types instead of generic int64_t.
+            if (!slot.c_type.empty()) {
+                declOp->setAttr("inferred_type",
+                    builder.getStringAttr(slot.c_type));
+            }
+
             offsetToVar[key] = {varId, declOp.getVarName().str()};
             varId++;
         }

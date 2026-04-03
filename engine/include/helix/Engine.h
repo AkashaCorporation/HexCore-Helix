@@ -99,6 +99,20 @@ public:
     /// Call before first decompile. Enables selective mode.
     void enablePass(const char* name);
 
+    /// Enable the C AST layer for emission (--use-cast-layer).
+    /// When true, uses CAstBuilder → CAstOptimizer → CAstPrinter
+    /// instead of PseudoCEmitter.
+    void setUseCastLayer(bool use);
+
+    /// Add a variable rename mapping (old_name → new_name).
+    /// When the C AST layer is active, all CVarRefExpr nodes matching
+    /// old_name will be renamed to new_name in the output.
+    /// Call before decompile. Multiple renames can be added.
+    void addVariableRename(const char* old_name, const char* new_name);
+
+    /// Clear all variable renames.
+    void clearVariableRenames();
+
     /// Get the last error message. Returns nullptr if no error.
     [[nodiscard]] const char* lastError() const noexcept;
 
@@ -181,6 +195,25 @@ void helix_engine_enable_pass(HelixEngineHandle* engine, const char* name);
 
 /// Get the last error message. Returns nullptr if no error.
 const char* helix_engine_last_error(HelixEngineHandle* engine);
+
+/// Enable the C AST layer for emission. Call before first decompile.
+/// When enabled, uses CAstBuilder + CAstOptimizer + CAstPrinter
+/// instead of PseudoCEmitter.
+void helix_engine_set_use_cast_layer(HelixEngineHandle* engine, int use);
+
+/// Add a variable rename mapping. Call before decompile.
+/// When the C AST layer is active, all variable references matching
+/// old_name will be replaced with new_name in the decompiled output.
+/// Multiple renames can be added; they accumulate until cleared.
+void helix_engine_add_variable_rename(
+    HelixEngineHandle* engine,
+    const char* old_name,
+    const char* new_name
+);
+
+/// Clear all variable renames. Call between decompile invocations
+/// if the rename set changes.
+void helix_engine_clear_variable_renames(HelixEngineHandle* engine);
 
 // ─── Helix-Nightly: Data Section Access ──────────────────────────────────────
 

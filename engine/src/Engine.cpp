@@ -65,6 +65,24 @@ void Engine::enablePass(const char* name) {
     }
 }
 
+void Engine::setUseCastLayer(bool use) {
+    if (pipeline_) {
+        pipeline_->setUseCastLayer(use);
+    }
+}
+
+void Engine::addVariableRename(const char* old_name, const char* new_name) {
+    if (pipeline_ && old_name && new_name) {
+        pipeline_->addVariableRename(old_name, new_name);
+    }
+}
+
+void Engine::clearVariableRenames() {
+    if (pipeline_) {
+        pipeline_->clearVariableRenames();
+    }
+}
+
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;

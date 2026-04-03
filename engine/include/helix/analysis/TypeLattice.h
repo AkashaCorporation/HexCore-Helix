@@ -174,6 +174,30 @@ public:
     /// which type to prefer when both are valid.
     unsigned specificity() const;
 
+    // ─── Pointer Arithmetic Semantics ─────────────────────────────────
+
+    /// Compute the result type of pointer + integer arithmetic.
+    /// ptr + int → ptr (same pointee), int + ptr → ptr (same pointee).
+    /// Returns Unknown if neither operand is a pointer.
+    static HelixTypeInfo pointerArithResult(const HelixTypeInfo& lhs,
+                                             const HelixTypeInfo& rhs);
+
+    /// Compute the result type of pointer - pointer subtraction.
+    /// ptr - ptr → signed int64 (ptrdiff_t).
+    /// Returns Unknown if both operands are not pointers.
+    static HelixTypeInfo pointerDiffResult(const HelixTypeInfo& lhs,
+                                            const HelixTypeInfo& rhs);
+
+    /// Compute the result type of loading through a pointer.
+    /// If the pointer has a known pointee type, returns the pointee.
+    /// Otherwise returns Unknown.
+    static HelixTypeInfo loadThroughPointer(const HelixTypeInfo& ptrType);
+
+    /// Create a pointer to a given type, inferring the pointee from a
+    /// store value type. Used for backward inference: if we store T
+    /// through an address, that address must be T*.
+    static HelixTypeInfo pointerToType(const HelixTypeInfo& valueType);
+
     // ─── Formatting ───────────────────────────────────────────────────
 
     /// Format as a C-style type string (e.g., "int32_t", "void*", "bool").

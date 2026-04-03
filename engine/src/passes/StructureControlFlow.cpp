@@ -79,6 +79,7 @@ STATISTIC(NumGotoEmitted,       "Number of goto/label pairs emitted (irreducible
 STATISTIC(NumNodesSplit,        "Number of nodes split to break irreducible regions");
 STATISTIC(NumGotosEliminated,   "Number of sequential goto/labels eliminated");
 STATISTIC(NumValuesPromoted,    "Number of escaping values promoted to variables");
+STATISTIC(NumRepairPromoted,   "Number of escaping values fixed in final repair pass");
 
 namespace {
 
@@ -1330,6 +1331,58 @@ struct StructureControlFlowPass
     }
 
 private:
+    // ─── Final Escape Repair ─────────────────────────────────────────────
+    //
+    // Safety net: after ALL structuring phases complete, walk every nested
+    // region (IfOp, WhileOp, DoWhileOp) and verify that no SSA values
+    // escape their containing region.  Nested structuring (if inside while,
+    // if inside if, etc.) can leave orphaned cross-region references that
+    // per-region escape detection misses.
+    //
+    // This prevents the "Use leaves the current parent region" assertion
+    // in MLIR's Liveness analysis (called by EliminateDeadCode).
+
+    unsigned repairRegionEscapes(Region& region, OpBuilder& builder) {
+        unsigned totalRepaired = 0;
+
+        for (Block& block : region) {
+            for (Operation& op : block) {
+                // Recurse into nested regions.
+                for (Region& nested : op.getRegions()) {
+                    totalRepaired += repairRegionEscapes(nested, builder);
+
+                    // After repairing inner regions, check if any value
+                    // defined INSIDE this nested region escapes to its
+                    // parent (our current region).
+                    llvm::SmallSetVector<Block*, 8> nestedBlocks;
+                    for (Block& nb : nested)
+                        nestedBlocks.insert(&nb);
+
+                    auto escaping = detectEscapingValues(nestedBlocks);
+                    if (escaping.empty())
+                        continue;
+
+                    // Insert var.decl BEFORE the operation that contains
+                    // the nested region (e.g., before the IfOp/WhileOp).
+                    unsigned promoted = promoteEscapingValues(
+                        escaping, &op, builder);
+                    totalRepaired += promoted;
+                    NumRepairPromoted += promoted;
+
+                    LLVM_DEBUG({
+                        if (promoted > 0) {
+                            llvm::dbgs()
+                                << "  [Repair] Promoted " << promoted
+                                << " escaping value(s) from nested region in "
+                                << op.getName() << "\n";
+                        }
+                    });
+                }
+            }
+        }
+
+        return totalRepaired;
+    }
     // ─── Per-function Structuring ─────────────────────────────────────────
 
     /// Cached block → address mapping, populated before structuring begins.
@@ -1645,6 +1698,22 @@ private:
                 gotoOp.erase();
                 ++NumGotosEliminated;
             }
+        }
+
+        // Phase 5: Final escape-value repair.
+        //
+        // Safety net after all structuring: walk every nested region and
+        // promote any values that still escape their containing region.
+        // This catches edge cases from nested structuring (if inside while,
+        // if inside if, etc.) that per-region detection misses.
+        {
+            unsigned repaired = repairRegionEscapes(funcBody, builder);
+            LLVM_DEBUG({
+                if (repaired > 0) {
+                    llvm::dbgs() << "  Phase 5: repaired " << repaired
+                                 << " escaping values across nested regions\n";
+                }
+            });
         }
 
         return success();

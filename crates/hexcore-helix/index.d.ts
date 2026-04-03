@@ -16,6 +16,31 @@
 export declare class HelixEngine {
   /** Create a new Helix engine instance for the specified architecture. */
   constructor(arch: Architecture)
+  /**
+   * Set whether to skip optimization passes in the MLIR pipeline.
+   * When true, Tier 2.5 passes (magic division, devirtualization) are skipped.
+   * Must be called before the first decompile call.
+   */
+  setSkipOptimization(skip: boolean): void
+  /**
+   * Enable the C AST layer for emission (--use-cast-layer).
+   * When enabled, uses CAstBuilder → CAstOptimizer → CAstPrinter
+   * and produces a full HAST FlatBuffer (ast_buffer) instead of the stub.
+   * Must be called before the first decompile call.
+   */
+  setUseCastLayer(useCast: boolean): void
+  /**
+   * Add a variable rename mapping (old_name → new_name).
+   * When the C AST layer is active, all variable references matching
+   * old_name will be replaced with new_name in the decompiled output.
+   * Call before decompileIr(). Multiple renames accumulate.
+   */
+  addVariableRename(oldName: string, newName: string): void
+  /**
+   * Clear all variable renames. Call between decompile invocations
+   * if the rename set changes.
+   */
+  clearVariableRenames(): void
   /** Get the engine version string. */
   version(): string
   /** Get the target architecture name. */

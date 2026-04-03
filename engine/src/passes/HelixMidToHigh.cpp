@@ -201,7 +201,7 @@ struct MidVarDeclToHighVarDecl : public OpConversionPattern<mid::VarDeclOp> {
             break;
         }
 
-        rewriter.create<high::VarDeclOp>(
+        auto highDecl = rewriter.create<high::VarDeclOp>(
             op.getLoc(),
             rewriter.getUI32IntegerAttr(slot_id),
             rewriter.getStringAttr(name),
@@ -210,6 +210,16 @@ struct MidVarDeclToHighVarDecl : public OpConversionPattern<mid::VarDeclOp> {
             adaptor.getInit(),
             op.getAddressAttr()
         );
+
+        // Propagate struct recovery attributes from Mid → High.
+        // These are set by RecoverStructTypes and consumed by
+        // PropagateTypes (High) to seed pointer-to-struct types.
+        for (auto attrName : {"helix.struct_name", "helix.struct_size",
+                               "helix.struct_align", "helix.struct_field_count",
+                               "helix.is_union_candidate"}) {
+            if (auto attr = op->getAttr(attrName))
+                highDecl->setAttr(attrName, attr);
+        }
 
         rewriter.eraseOp(op);
         return success();

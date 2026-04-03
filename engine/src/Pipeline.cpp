@@ -11,6 +11,9 @@
 #include "helix/passes/Passes.h"
 #include "helix/emit/PseudoCEmitter.h"
 #include "helix/emit/FlatBufSerializer.h"
+#include "helix/cast/CAstBuilder.h"
+#include "helix/cast/CAstOptimizer.h"
+#include "helix/cast/CAstPrinter.h"
 #include "helix/dialects/HelixLowDialect.h"
 #include "helix/dialects/HelixMidDialect.h"
 #include "helix/dialects/HelixHighDialect.h"
@@ -435,8 +438,31 @@ PipelineResult<std::string> Pipeline::emitPseudoC(mlir::ModuleOp module) {
     }
 
     try {
-        PseudoCEmitter emitter;
-        std::string code = emitter.emit(module);
+        std::string code;
+
+        if (use_cast_layer_) {
+            // NEW PATH: C AST layer (Phase 4d)
+            // CAstBuilder → CAstOptimizer → CAstPrinter
+            cast::CAstBuilder builder;
+            auto funcs = builder.buildModule(module);
+
+            cast::CAstOptimizer optimizer;
+            cast::CAstPrinter printer;
+
+            for (auto& func : funcs) {
+                optimizer.optimize(*func);
+                // Apply user-defined variable renames (P3: hydrateHAST).
+                if (!variable_renames_.empty()) {
+                    optimizer.applyVariableRenames(*func, variable_renames_);
+                }
+                code += printer.print(*func);
+                code += "\n";
+            }
+        } else {
+            // EXISTING PATH: PseudoCEmitter (default)
+            PseudoCEmitter emitter;
+            code = emitter.emit(module);
+        }
 
         if (code.empty()) {
             return std::unexpected(
@@ -461,7 +487,28 @@ Pipeline::emitFlatBuffer(mlir::ModuleOp module) {
 
     try {
         FlatBufSerializer serializer;
-        std::vector<uint8_t> buf = serializer.serialize(module);
+        std::vector<uint8_t> buf;
+
+        if (use_cast_layer_) {
+            // C AST path: build the C AST tree and serialize it directly.
+            // This produces a complete HAST with all node types.
+            cast::CAstBuilder builder;
+            auto funcs = builder.buildModule(module);
+
+            cast::CAstOptimizer optimizer;
+            for (auto& func : funcs) {
+                optimizer.optimize(*func);
+                // Apply user-defined variable renames (P3: hydrateHAST).
+                if (!variable_renames_.empty()) {
+                    optimizer.applyVariableRenames(*func, variable_renames_);
+                }
+            }
+
+            buf = serializer.serialize(funcs);
+        } else {
+            // MLIR path: stub serializer (walks HelixHigh ops)
+            buf = serializer.serialize(module);
+        }
 
         if (buf.empty()) {
             return std::unexpected(

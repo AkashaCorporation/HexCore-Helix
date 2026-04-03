@@ -222,6 +222,39 @@ RemillSemantic classifySemantic(std::string_view name) {
         if (suffix.starts_with("SCAS"))  return RemillSemantic::REP_SCAS;
     }
 
+    // ---- Do<INSTR> prefix (Remill alternative semantic naming) --------
+    // Remill sometimes emits semantics as "DoSTOSD", "DoLAHF", etc.
+    // Strip the "Do" prefix and try again recursively.
+    if (name.size() > 2 && name.starts_with("Do")) {
+        auto inner = name.substr(2);
+        auto innerResult = classifySemantic(inner);
+        if (innerResult != RemillSemantic::Unknown)
+            return innerResult;
+        // Common instructions that appear with Do prefix in kernel code:
+        if (inner == "STOSD" || inner == "STOSB" || inner == "STOSW" ||
+            inner == "STOSQ")
+            return RemillSemantic::REP_STOS;
+        if (inner == "MOVSB" || inner == "MOVSW" || inner == "MOVSD_STR" ||
+            inner == "MOVSQ")
+            return RemillSemantic::REP_MOVS;
+        if (inner == "SCASB" || inner == "SCASW" || inner == "SCASD" ||
+            inner == "SCASQ")
+            return RemillSemantic::REP_SCAS;
+        if (inner == "CMPSB" || inner == "CMPSW" || inner == "CMPSD_STR" ||
+            inner == "CMPSQ")
+            return RemillSemantic::REP_CMPS;
+    }
+
+    // ---- Bare string ops without REP prefix (kernel code) ---------------
+    if (name == "STOSD" || name == "STOSB" || name == "STOSW" ||
+        name == "STOSQ")
+        return RemillSemantic::REP_STOS;
+    if (name == "LAHF")  return RemillSemantic::NOP;   // flags→AH (no semantic effect for decompiler)
+    if (name == "SAHF")  return RemillSemantic::NOP;   // AH→flags (no semantic effect for decompiler)
+    if (name == "CLC" || name == "STC" || name == "CMC" ||
+        name == "CLD" || name == "STD" || name == "STI" || name == "CLI")
+        return RemillSemantic::NOP;   // flag manipulation (no semantic effect)
+
     // Exchange and add (XADD) -- present in the Rust reference but not as a
     // dedicated enum value in the C++ header, so map to Unknown.  If the header
     // is later extended, this can be updated.

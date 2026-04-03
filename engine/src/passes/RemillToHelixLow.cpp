@@ -67,6 +67,25 @@ struct RegisterTracker {
         {33, "RIP"},
     };
 
+    /// x86-64 XMM/Vector register index mapping.
+    /// Remill State → X86State → VectorReg array at struct index 1.
+    /// [32 x %union.VectorReg] — index 0-15 = XMM0-XMM15
+    static constexpr std::pair<int, const char*> kXmmIndexMap[] = {
+        {0, "XMM0"}, {1, "XMM1"}, {2, "XMM2"}, {3, "XMM3"},
+        {4, "XMM4"}, {5, "XMM5"}, {6, "XMM6"}, {7, "XMM7"},
+        {8, "XMM8"}, {9, "XMM9"}, {10, "XMM10"}, {11, "XMM11"},
+        {12, "XMM12"}, {13, "XMM13"}, {14, "XMM14"}, {15, "XMM15"},
+    };
+
+    /// x86-64 ArithFlags field mapping.
+    /// Remill State → X86State → ArithFlags at struct index 2.
+    /// %struct.ArithFlags = type { i8 x 16 }
+    /// Fields: CF, PF, AF, ZF, SF, DF, OF, ... (flag order per Remill)
+    static constexpr std::pair<int, const char*> kFlagIndexMap[] = {
+        {0, "CF"}, {1, "PF"}, {2, "AF"}, {3, "ZF"},
+        {4, "SF"}, {5, "DF"}, {6, "OF"},
+    };
+
     /// Strip pointer-preserving wrappers so bookkeeping allocas are still
     /// recognized after import adds bitcasts or no-op GEPs.
     static Value stripPointerAliases(Value val) {
@@ -117,27 +136,154 @@ struct RegisterTracker {
             }
 
             // Strategy 3: Structural analysis of GEP indices into the State struct.
-            // Remill pattern: gep %state, 0, 0, 6, <gpr_field_index>, 0, 0
-            // where the indices are: State→X86State→GPR→<field>→Reg→union→i64
+            // Remill State layout (X86State):
+            //   [0] ArchState (16 bytes)
+            //   [1] VectorReg[32] — XMM/YMM/ZMM registers
+            //   [2] ArithFlags — CF, PF, AF, ZF, SF, DF, OF
+            //   [6] GPR — RAX, RBX, RCX, RDX, RSI, RDI, RSP, RBP, R8-R15, RIP
             auto indices = gep.getIndices();
             if (indices.size() >= 4) {
-                // Check for the GPR struct access pattern:
-                // First 3 constant indices should be 0, 0, 6 (State → X86State → GPR)
                 if (auto constIndices = extractConstantGEPIndices(gep)) {
                     if (constIndices->size() >= 4 &&
                         (*constIndices)[0] == 0 &&
-                        (*constIndices)[1] == 0 &&
-                        (*constIndices)[2] == 6) {
-                        int gprIdx = (*constIndices)[3];
-                        for (auto [idx, name] : kGprIndexMap) {
-                            if (idx == gprIdx) {
-                                gep_to_reg[gep.getResult()] = name;
-                                reg_widths[name] = inferRegWidth(name);
-                                return;
+                        (*constIndices)[1] == 0) {
+
+                        int structField = (*constIndices)[2];
+                        int subIdx = (*constIndices)[3];
+
+                        // GPR: gep %state, 0, 0, 6, <gpr_field_index>, ...
+                        if (structField == 6) {
+                            for (auto [idx, name] : kGprIndexMap) {
+                                if (idx == subIdx) {
+                                    gep_to_reg[gep.getResult()] = name;
+                                    reg_widths[name] = inferRegWidth(name);
+                                    return;
+                                }
+                            }
+                        }
+
+                        // XMM: gep %state, 0, 0, 1, <xmm_index>, ...
+                        // VectorReg array at index 1, element index = XMM number
+                        if (structField == 1) {
+                            for (auto [idx, name] : kXmmIndexMap) {
+                                if (idx == subIdx) {
+                                    gep_to_reg[gep.getResult()] = name;
+                                    reg_widths[name] = 128; // XMM = 128-bit
+                                    return;
+                                }
+                            }
+                        }
+
+                        // ArithFlags: gep %state, 0, 0, 2, <flag_index>
+                        if (structField == 2) {
+                            for (auto [idx, name] : kFlagIndexMap) {
+                                if (idx == subIdx) {
+                                    gep_to_reg[gep.getResult()] = name;
+                                    reg_widths[name] = 8; // flags are i8
+                                    return;
+                                }
                             }
                         }
                     }
                 }
+            }
+
+            // Strategy 3b: Handle shorter GEP chains (3 indices).
+            // Some GEPs only index into the top-level struct field:
+            //   gep %state, 0, 0, 1  — pointer to entire VectorReg array
+            //   gep %state, 0, 0, 2  — pointer to ArithFlags struct
+            //   gep %state, 0, 0, 6  — pointer to GPR struct
+            if (indices.size() >= 3) {
+                if (auto constIndices = extractConstantGEPIndices(gep)) {
+                    if (constIndices->size() == 3 &&
+                        (*constIndices)[0] == 0 &&
+                        (*constIndices)[1] == 0) {
+                        int structField = (*constIndices)[2];
+                        // Mark the base array/struct pointer so downstream
+                        // GEPs that index further can be resolved.
+                        if (structField == 1) {
+                            gep_to_reg[gep.getResult()] = "__VEC_BASE";
+                            return;
+                        }
+                        if (structField == 2) {
+                            gep_to_reg[gep.getResult()] = "__FLAGS_BASE";
+                            return;
+                        }
+                        if (structField == 6) {
+                            gep_to_reg[gep.getResult()] = "__GPR_BASE";
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Second pass: resolve chained GEPs where the base is a known
+        // __VEC_BASE, __FLAGS_BASE, or __GPR_BASE.
+        // Pattern: gep <base_ptr>, <element_index>, ...
+        //   where base_ptr was tagged as __VEC_BASE → XMM<element_index>
+        func.walk([&](LLVM::GEPOp gep) {
+            // Skip if already resolved
+            if (gep_to_reg.count(gep.getResult()))
+                return;
+
+            // Check if base is a known base pointer
+            Value base = stripPointerAliases(gep.getBase());
+            auto baseIt = gep_to_reg.find(base);
+            if (baseIt == gep_to_reg.end())
+                return;
+
+            auto constIndices = extractConstantGEPIndices(gep);
+            if (!constIndices || constIndices->empty())
+                return;
+
+            const std::string& baseName = baseIt->second;
+
+            if (baseName == "__VEC_BASE") {
+                // gep __VEC_BASE, <xmm_index>, ... → XMM<N>
+                int xmmIdx = (*constIndices)[0];
+                for (auto [idx, name] : kXmmIndexMap) {
+                    if (idx == xmmIdx) {
+                        gep_to_reg[gep.getResult()] = name;
+                        reg_widths[name] = 128;
+                        return;
+                    }
+                }
+                // Out of range but still vector — name generically
+                if (xmmIdx >= 0 && xmmIdx < 32) {
+                    std::string regName = "YMM" + std::to_string(xmmIdx);
+                    gep_to_reg[gep.getResult()] = regName;
+                    reg_widths[regName] = 256;
+                }
+            } else if (baseName == "__FLAGS_BASE") {
+                // gep __FLAGS_BASE, <flag_index> → CF/PF/AF/ZF/SF/DF/OF
+                int flagIdx = (*constIndices)[0];
+                for (auto [idx, name] : kFlagIndexMap) {
+                    if (idx == flagIdx) {
+                        gep_to_reg[gep.getResult()] = name;
+                        reg_widths[name] = 8;
+                        return;
+                    }
+                }
+            } else if (baseName == "__GPR_BASE") {
+                // gep __GPR_BASE, <gpr_field_index>, ... → RAX/RBX/...
+                int gprIdx = (*constIndices)[0];
+                for (auto [idx, name] : kGprIndexMap) {
+                    if (idx == gprIdx) {
+                        gep_to_reg[gep.getResult()] = name;
+                        reg_widths[name] = inferRegWidth(name);
+                        return;
+                    }
+                }
+            }
+
+            // Also handle sub-GEPs within a known XMM register.
+            // gep <XMM0_ptr>, 0, 0, 0, 0  → still XMM0
+            // gep <XMM0_ptr>, 0, 0, 0, <lane> → XMM0 (lane access)
+            if (baseName.starts_with("XMM") || baseName.starts_with("YMM")) {
+                gep_to_reg[gep.getResult()] = baseName;
+                reg_widths[baseName] = reg_widths.count(baseName)
+                    ? reg_widths[baseName] : 128;
             }
         });
 
@@ -332,6 +478,15 @@ struct RegisterTracker {
 
     /// Infer register bit width from its name.
     static unsigned inferRegWidth(llvm::StringRef name) {
+        // XMM: 128-bit
+        if (name.starts_with("XMM"))
+            return 128;
+        // YMM: 256-bit
+        if (name.starts_with("YMM"))
+            return 256;
+        // ZMM: 512-bit
+        if (name.starts_with("ZMM"))
+            return 512;
         // 64-bit: RAX, RBX, RCX, RDX, RSI, RDI, RSP, RBP, R8-R15, RIP
         if (name.starts_with("R") || name == "RIP")
             return 64;
@@ -342,8 +497,12 @@ struct RegisterTracker {
         if (name.size() == 2 && (name.ends_with("X") || name.ends_with("I") ||
                                   name.ends_with("P")))
             return 16;
-        // 8-bit: AL, AH, BL, BH, CL, CH, DL, DH
+        // 8-bit: AL, AH, BL, BH, CL, CH, DL, DH, flags
         if (name.size() == 2 && (name.ends_with("L") || name.ends_with("H")))
+            return 8;
+        // Flags: 8-bit each
+        if (name == "CF" || name == "PF" || name == "AF" ||
+            name == "ZF" || name == "SF" || name == "DF" || name == "OF")
             return 8;
         // Special: flags, segments, PC
         if (name == "PC" || name == "NEXT_PC")
@@ -1098,10 +1257,6 @@ private:
         // ─── Pattern: Call to Remill semantic or intrinsic ───────────────
         if (auto call = dyn_cast<LLVM::CallOp>(op)) {
             auto callee = call.getCallee();
-            if (!callee)
-                return;
-
-            auto calleeName = callee->str();
 
             // Helper: break the Memory* use-def chain for any Remill call
             // and mark it for erasure. This MUST be called on every code path
@@ -1117,6 +1272,60 @@ private:
                 }
                 opsToErase.push_back(op);
             };
+
+            // ── Handle indirect calls (function pointer calls) ──────────
+            // These occur in ELF .ko (vtable dispatch, callback invocations)
+            // and in PE binaries (IAT calls through register).
+            // Previously these were silently dropped, causing function body
+            // collapse ("stub" output).
+            if (!callee) {
+                // Build the target address value from the callee operand.
+                // For indirect LLVM::CallOp, operand(0) may be the function
+                // pointer when the Remill memory token isn't the first arg.
+                Value targetVal;
+                unsigned numOps = call.getNumOperands();
+
+                // Heuristic: In Remill-lifted IR, indirect calls through
+                // computed addresses often have the target in a register.
+                // Try to find a ptr/i64 operand that isn't the memory token.
+                for (unsigned i = 0; i < numOps; ++i) {
+                    auto opVal = call.getOperand(i);
+                    auto ty = opVal.getType();
+                    if (ty.isInteger(64)) {
+                        targetVal = opVal;
+                        break;
+                    }
+                }
+
+                if (!targetVal && numOps > 0) {
+                    // Fallback: use PtrToInt on the first operand.
+                    auto firstOp = call.getOperand(0);
+                    if (isa<LLVM::LLVMPointerType>(firstOp.getType())) {
+                        targetVal = builder.create<LLVM::PtrToIntOp>(
+                            loc, builder.getI64Type(), firstOp);
+                    } else {
+                        // Last resort: zero constant.
+                        targetVal = builder.create<LLVM::ConstantOp>(
+                            loc, builder.getI64Type(),
+                            builder.getI64IntegerAttr(0));
+                    }
+                }
+
+                if (targetVal) {
+                    auto callArgs = collectCallArgs(op);
+                    builder.create<helix::low::CallOp>(
+                        loc,
+                        targetVal,
+                        callArgs,
+                        /*target_name=*/StringAttr{},
+                        addrAttr);
+                }
+
+                eraseRemillCall();
+                return;
+            }
+
+            auto calleeName = callee->str();
 
             // Check for Remill memory intrinsics.
             if (calleeName.starts_with("__remill_read_memory_")) {
@@ -1175,13 +1384,19 @@ private:
                 // Use a zero constant as placeholder target address.
                 auto zero = builder.create<LLVM::ConstantOp>(
                     loc, builder.getI64Type(), builder.getI64IntegerAttr(0));
+
+                // Collect arguments from the calling convention registers
+                // so the external call carries its actual parameter values
+                // (e.g., kmalloc(size, flags) → RDI=size, RSI=flags on SysV).
+                auto callArgs = collectCallArgs(op);
+
                 builder.create<helix::low::CallOp>(
                     loc,
                     zero,
-                    mlir::ValueRange{},
+                    callArgs,
                     builder.getStringAttr(calleeName),
                     addrAttr);
-                
+
                 // Break the use-def chain and mark for erasure to ensure
                 // Memory* tokens don't leak into variable recovery.
                 eraseRemillCall();
@@ -1486,6 +1701,70 @@ private:
         }
 
         return args;
+    }
+
+    /// Collect arguments for SysV AMD64 ABI (Linux/ELF).
+    /// Register order: RDI, RSI, RDX, RCX, R8, R9.
+    llvm::SmallVector<Value, 6> collectSysVCallArgs(
+        Operation* beforeOp, unsigned predecessorDepth = 2) {
+        static constexpr std::array<std::string_view, 6> kSysVArgRegs = {
+            "RDI", "RSI", "RDX", "RCX", "R8", "R9"
+        };
+
+        auto* block = beforeOp ? beforeOp->getBlock() : nullptr;
+        if (!block)
+            return {};
+
+        llvm::DenseMap<llvm::StringRef, Value> regState;
+        for (auto& op : block->getOperations()) {
+            if (&op == beforeOp)
+                break;
+            if (auto regWrite = dyn_cast<helix::low::RegWriteOp>(&op)) {
+                llvm::StringRef lookup =
+                    helix::analysis::getCanonicalX86Register(regWrite.getRegName());
+                if (lookup.empty())
+                    lookup = regWrite.getRegName();
+                regState[lookup] = regWrite.getValue();
+            }
+        }
+
+        llvm::SmallVector<Value, 6> args;
+        for (auto argReg : kSysVArgRegs) {
+            llvm::StringRef key(argReg.data(), argReg.size());
+            auto it = regState.find(key);
+            if (it == regState.end()) {
+                llvm::DenseSet<Block*> visiting;
+                auto fromPreds = findLatestRegWriteInPredecessors(
+                    block, key, predecessorDepth, visiting);
+                if (!fromPreds)
+                    break;
+                regState[key] = *fromPreds;
+                it = regState.find(key);
+            }
+            args.push_back(it->second);
+        }
+
+        return args;
+    }
+
+    /// Collect call arguments using the appropriate ABI.
+    /// Detects Win64 vs SysV based on the module's target triple.
+    llvm::SmallVector<Value, 6> collectCallArgs(Operation* beforeOp) {
+        // Walk up to the parent module and check the target triple.
+        auto parentModule = beforeOp->getParentOfType<ModuleOp>();
+        bool isSysV = false;
+        if (parentModule) {
+            if (auto tripleAttr = parentModule->getAttrOfType<StringAttr>(
+                    "llvm.target_triple")) {
+                auto triple = tripleAttr.getValue();
+                isSysV = triple.contains("linux") || triple.contains("elf") ||
+                         triple.contains("gnu") || triple.contains("freebsd") ||
+                         triple.contains("apple") || triple.contains("darwin");
+            }
+        }
+        if (isSysV)
+            return collectSysVCallArgs(beforeOp);
+        return collectWin64CallArgs(beforeOp);
     }
 
     std::optional<LLVM::StoreOp> findLatestStoreToPointerInBlock(
@@ -2227,9 +2506,10 @@ private:
                     call->emitRemark("unresolved call target address");
                 }
 
-                // Recover Win64 register arguments across the current block
-                // boundary when the call setup is split by short branches.
-                auto callArgs = collectWin64CallArgs(call.getOperation());
+                // Recover calling-convention register arguments across the
+                // current block boundary. Uses Win64 or SysV ABI depending
+                // on the module's target triple.
+                auto callArgs = collectCallArgs(call.getOperation());
 
                 builder.create<helix::low::CallOp>(
                     loc,
@@ -2547,12 +2827,31 @@ private:
             // passes and the emitter can detect and report this.
             bool flagSynthesisFailed = false;
             if (!condValue) {
-                llvm::errs() << "[Helix] WARNING: Flag synthesis failed for "
-                             << *condStr << " — no flag values found in block "
-                             << "or predecessors. Block has "
-                             << std::distance(builder.getInsertionBlock()->begin(),
-                                              builder.getInsertionBlock()->end())
-                             << " ops\n";
+                // Floating-point comparison patterns (UCOMISS/COMISS via Remill)
+                // often fail flag synthesis because the flags are set by SSE
+                // instructions rather than integer CMP/TEST. These are expected
+                // failures — suppress the noisy warning for known FP-related
+                // condition codes (b, nb, be, nbe, p, np).
+                static const llvm::StringRef kFpConditions[] = {
+                    "b", "nb", "be", "nbe", "p", "np"
+                };
+                bool isFpCondition = false;
+                for (auto fc : kFpConditions) {
+                    if (*condStr == fc) {
+                        isFpCondition = true;
+                        break;
+                    }
+                }
+                if (!isFpCondition) {
+                    llvm::errs() << "[Helix] WARNING: Flag synthesis failed for "
+                                 << *condStr << " — no flag values found in block "
+                                 << "or predecessors. Block has "
+                                 << std::distance(builder.getInsertionBlock()->begin(),
+                                                  builder.getInsertionBlock()->end())
+                                 << " ops\n";
+                }
+                // For FP conditions, silence is intentional — these are
+                // expected failures from SSE UCOMISS/COMISS lowering.
                 condValue = builder.create<LLVM::ConstantOp>(
                     loc, i1Ty, builder.getBoolAttr(true)).getResult();
                 flagSynthesisFailed = true;
@@ -3048,16 +3347,18 @@ private:
         // ─── Unhandled / Future ──────────────────────────────────────────
         default:
             // Emit a warning for unhandled semantics so the user knows
-            // something was skipped. Preserve the call as a generic call op.
+            // something was skipped. Preserve the call as a generic call op
+            // with ABI-correct arguments.
             call->emitWarning("unhandled Remill semantic: ")
                 << semInfo.raw_name;
             {
                 auto zero = builder.create<LLVM::ConstantOp>(
                     loc, i64Ty, builder.getI64IntegerAttr(0));
+                auto callArgs = collectCallArgs(call.getOperation());
                 builder.create<helix::low::CallOp>(
                     loc,
                     zero,
-                    mlir::ValueRange{},
+                    callArgs,
                     builder.getStringAttr(semInfo.raw_name),
                     addrAttr);
             }

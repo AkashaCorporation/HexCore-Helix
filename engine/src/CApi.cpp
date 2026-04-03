@@ -123,4 +123,24 @@ const char* helix_engine_last_error(HelixEngineHandle* handle) {
     return to_engine(handle)->lastError();
 }
 
+void helix_engine_set_use_cast_layer(HelixEngineHandle* handle, int use) {
+    if (handle) {
+        to_engine(handle)->setUseCastLayer(use != 0);
+    }
+}
+
+void helix_engine_add_variable_rename(HelixEngineHandle* handle,
+                                       const char* old_name,
+                                       const char* new_name) {
+    if (handle && old_name && new_name) {
+        to_engine(handle)->addVariableRename(old_name, new_name);
+    }
+}
+
+void helix_engine_clear_variable_renames(HelixEngineHandle* handle) {
+    if (handle) {
+        to_engine(handle)->clearVariableRenames();
+    }
+}
+
 } // extern "C"

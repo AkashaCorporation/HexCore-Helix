@@ -85,6 +85,7 @@ STATISTIC(NumDeadAssignsRemoved,   "Number of dead assignments removed");
 STATISTIC(NumDeadUndefRemoved,     "Number of dead __undef assignments removed");
 STATISTIC(NumEscapeDeadStores,     "Number of dead stores to non-escaping vars removed (P2.10)");
 STATISTIC(NumEscapeDeadAssigns,    "Number of dead assigns to non-escaping vars removed (P2.10)");
+STATISTIC(NumInfraOpsRemoved,      "Number of infrastructure ops removed (Phase 0)");
 
 namespace {
 
@@ -875,6 +876,22 @@ private:
         LLVM_DEBUG(llvm::dbgs() << "EliminateDeadCode: processing '"
                                 << func.getSymName() << "'\n");
 
+        // ── Phase 0: Remove infrastructure ops ──────────────────────────
+        //
+        // PropagateTypes marks PC/NEXT_PC/RETURN_PC tracking, flag-only
+        // computations, and transitive infrastructure chains with the
+        // "helix.infrastructure" attribute.  Remove these ops bottom-up:
+        // first ops whose ALL result users are also infrastructure, then
+        // iterate until no more can be removed.  RegWriteOps to infra
+        // registers are always removable.
+
+        unsigned infraRemoved = removeInfrastructureOps(funcBody);
+        NumInfraOpsRemoved += infraRemoved;
+
+        LLVM_DEBUG(if (infraRemoved > 0)
+            llvm::dbgs() << "  Phase 0: removed " << infraRemoved
+                         << " infrastructure ops\n");
+
         // ── Phase 1: Remove NOP and INT3 markers ────────────────────────
 
         unsigned nopsRemoved  = removeNopsAndInt3(funcBody);
@@ -978,7 +995,8 @@ private:
                          << " dead __undef assigns\n");
 
         LLVM_DEBUG(llvm::dbgs() << "  Total removed: "
-                                << (nopsRemoved + prologueRemoved +
+                                << (infraRemoved +
+                                    nopsRemoved + prologueRemoved +
                                     frameOpsRemoved + stackAdjRemoved +
                                     deadWritesRemoved +
                                     deadFlagsRemoved + deadCmpTestRemoved +
@@ -988,6 +1006,67 @@ private:
                                 << "\n");
 
         return success();
+    }
+
+    // ─── Phase 0: Infrastructure Removal ────────────────────────────────────
+    //
+    // Removes operations tagged with "helix.infrastructure" by PropagateTypes.
+    // These are PC/NEXT_PC tracking chains, flag-only computations, and their
+    // transitive dependents that serve no purpose in decompiled output.
+    //
+    // Strategy: iterate until fixed point.  On each pass, remove an infra op
+    // if ALL of its result's users are also infra-marked (or the op has no
+    // results, like a RegWriteOp).  Removing downstream consumers first
+    // naturally frees upstream producers for removal.
+
+    unsigned removeInfrastructureOps(Region& funcBody) {
+        unsigned totalRemoved = 0;
+        bool changed = true;
+
+        while (changed) {
+            changed = false;
+            llvm::SmallVector<Operation*, 16> toErase;
+
+            funcBody.walk([&](Operation* op) {
+                if (!op->hasAttr("helix.infrastructure"))
+                    return;
+
+                // RegWriteOps with infra marker: always safe to remove.
+                // The register write is bookkeeping, not meaningful output.
+                if (isa<helix::low::RegWriteOp>(op)) {
+                    toErase.push_back(op);
+                    return;
+                }
+
+                // For value-producing ops: only remove if ALL users of
+                // ALL results are also infrastructure-marked.
+                bool canRemove = true;
+                for (Value result : op->getResults()) {
+                    for (auto* user : result.getUsers()) {
+                        if (!user->hasAttr("helix.infrastructure")) {
+                            canRemove = false;
+                            break;
+                        }
+                    }
+                    if (!canRemove)
+                        break;
+                }
+
+                if (canRemove)
+                    toErase.push_back(op);
+            });
+
+            for (Operation* op : toErase) {
+                // Drop all uses before erasing to avoid dangling references.
+                for (Value result : op->getResults())
+                    result.dropAllUses();
+                op->erase();
+                ++totalRemoved;
+                changed = true;
+            }
+        }
+
+        return totalRemoved;
     }
 
     // ─── Phase 1: NOP / INT3 Removal ─────────────────────────────────────
@@ -1511,6 +1590,33 @@ private:
         bool changed = true;
         while (changed) {
             changed = false;
+
+            // ── Step 0: Remove infrastructure-marked assignments ────────
+            //
+            // AssignOps tagged with "helix.infrastructure" by
+            // RecoverVariables (propagated from PropagateTypes) represent
+            // PC tracking, flag bookkeeping, etc.  Safe to remove.
+            {
+                llvm::SmallVector<helix::high::AssignOp, 16> infraAssigns;
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    if (assignOp->hasAttr("helix.infrastructure"))
+                        infraAssigns.push_back(assignOp);
+                });
+
+                for (auto assignOp : infraAssigns) {
+                    auto* rhsDef = assignOp.getValue().getDefiningOp();
+                    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+
+                    assignOp.erase();
+                    ++totalAssigns;
+                    changed = true;
+
+                    if (rhsDef && rhsDef->use_empty())
+                        rhsDef->erase();
+                    if (lhsDef && lhsDef->use_empty())
+                        lhsDef->erase();
+                }
+            }
 
             // ── Step 1: Remove dead __undef assignments ─────────────────
             {

@@ -380,6 +380,53 @@ bool HelixTypeInfo::mergeFrom(const HelixTypeInfo& other) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// HelixTypeInfo — Pointer arithmetic semantics
+// ═══════════════════════════════════════════════════════════════════════════
+
+HelixTypeInfo HelixTypeInfo::pointerArithResult(const HelixTypeInfo& lhs,
+                                                 const HelixTypeInfo& rhs) {
+    // ptr + int → ptr (preserve pointee type from the pointer operand)
+    if (lhs.isPointer() && (rhs.isInteger() || rhs.isTop())) {
+        return lhs; // Preserve full pointer type including pointee
+    }
+    // int + ptr → ptr (commutative)
+    if (rhs.isPointer() && (lhs.isInteger() || lhs.isTop())) {
+        return rhs;
+    }
+    // ptr + ptr is not valid arithmetic — return Unknown (don't conflict)
+    return makeUnknown();
+}
+
+HelixTypeInfo HelixTypeInfo::pointerDiffResult(const HelixTypeInfo& lhs,
+                                                const HelixTypeInfo& rhs) {
+    // ptr - ptr → ptrdiff_t (signed 64-bit integer)
+    if (lhs.isPointer() && rhs.isPointer()) {
+        return makeInt(64, /*isSigned=*/true); // ptrdiff_t
+    }
+    // ptr - int → ptr (still valid: pointer offset backward)
+    if (lhs.isPointer() && (rhs.isInteger() || rhs.isTop())) {
+        return lhs; // Preserve pointer type
+    }
+    return makeUnknown();
+}
+
+HelixTypeInfo HelixTypeInfo::loadThroughPointer(const HelixTypeInfo& ptrType) {
+    if (!ptrType.isPointer())
+        return makeUnknown();
+    // If we have a known pointee type, loading gives us that type
+    if (ptrType.pointee())
+        return *ptrType.pointee();
+    // Loading through void* gives us Unknown — we can't determine the type
+    return makeUnknown();
+}
+
+HelixTypeInfo HelixTypeInfo::pointerToType(const HelixTypeInfo& valueType) {
+    if (valueType.isTop() || valueType.isConflict())
+        return makePointer(); // void* — no pointee info
+    return makePointer(valueType);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // HelixTypeInfo — Comparison & formatting
 // ═══════════════════════════════════════════════════════════════════════════
 

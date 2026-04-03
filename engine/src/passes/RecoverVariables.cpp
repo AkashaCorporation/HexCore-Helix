@@ -31,6 +31,15 @@
 ///   - Rust implementation: crates/helix-core/src/analysis/data_flow.rs
 ///   - Hex-Rays naming conventions (de facto industry standard)
 
+// Standard library includes FIRST (before LLVM/MLIR to avoid namespace conflicts)
+#include <algorithm>
+#include <cstdint>
+#include "llvm/Support/FormatVariadic.h"
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
@@ -46,21 +55,22 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <map>
+#include <set>
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
-#include <algorithm>
-#include <cstdint>
-#include <format>
-#include <optional>
-#include <string>
-#include <string_view>
-
 #define DEBUG_TYPE "recover-variables"
 
 using namespace mlir;
-using namespace helix;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Forward declaration — factory defined after anonymous namespace
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// (moved to end of file)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Statistics
@@ -76,6 +86,8 @@ STATISTIC(NumParamsNamed,      "Number of argument registers renamed to param_N"
 STATISTIC(NumReturnVarsNamed,  "Number of RAX refs renamed to result");
 STATISTIC(NumMultiDefVars,     "Number of separate vars for multi-write registers");
 STATISTIC(NumUndefReplaced,    "Number of __undef references replaced with defaults");
+STATISTIC(NumVarsMerged,       "Number of variables eliminated by cover-based merging");
+STATISTIC(NumTempsInlined,     "Number of single-use temporaries inlined");
 
 namespace {
 
@@ -219,7 +231,7 @@ struct VariableTracker {
         // Check if this is an argument register.
         auto argIt = argRegPositions.find(canonicalReg);
         if (argIt != argRegPositions.end()) {
-            std::string name = std::format("param_{}", argIt->second);
+            std::string name = llvm::formatv("param_{0}", argIt->second);
             return {name, helix::high::StorageKind::Parameter};
         }
 
@@ -299,7 +311,7 @@ struct VariableTracker {
         // We use the absolute value for readability: var_20 instead of var_-20.
         uint64_t absOffset = static_cast<uint64_t>(
             offset < 0 ? -offset : offset);
-        std::string varName = std::format("var_{:x}", absOffset);
+        std::string varName = llvm::formatv("var_{0:x}", absOffset);
 
         auto declOp = builder.create<helix::high::VarDeclOp>(
             loc,
@@ -328,7 +340,7 @@ struct VariableTracker {
     /// @return         The var.decl operation.
     Operation* declareTemp(Type type, OpBuilder& builder, Location loc) {
         (void)type;  // type is implicit from init/usage in the new API
-        std::string varName = std::format("v{}", tempCounter++);
+        std::string varName = llvm::formatv("v{0}", tempCounter++);
 
         auto declOp = builder.create<helix::high::VarDeclOp>(
             loc,
@@ -588,6 +600,14 @@ private:
                     tempTyped.getVarId(),
                     tempTyped.getVarName(),
                     mlir::IntegerAttr{});
+                // Propagate infrastructure marker to the replacement ops
+                // so downstream passes (DCE, emitter) can identify them.
+                if (readOp->hasAttr("helix.infrastructure")) {
+                    varRef->setAttr("helix.infrastructure",
+                        builder.getUnitAttr());
+                    tempTyped->setAttr("helix.infrastructure",
+                        builder.getUnitAttr());
+                }
                 readOp.getResult().replaceAllUsesWith(varRef.getResult());
                 readOp.erase();
                 ++NumReadsReplaced;
@@ -606,6 +626,13 @@ private:
             // Read the full-width variable.
             auto i64Ty = builder.getIntegerType(64);
             auto varDeclTyped = llvm::cast<helix::high::VarDeclOp>(varDecl);
+
+            // Propagate inferred_type from the RegReadOp to the VarDeclOp.
+            // This makes the type visible in the emitter's variable declarations.
+            if (auto inferredType = readOp->getAttrOfType<StringAttr>("inferred_type")) {
+                if (!varDeclTyped->hasAttr("inferred_type"))
+                    varDeclTyped->setAttr("inferred_type", inferredType);
+            }
 
             // Track param naming statistics.
             if (tracker.argRegPositions.count(subReg.parent))
@@ -636,6 +663,11 @@ private:
                                              builder, readOp.getLoc());
                 ++NumAliasesResolved;
             }
+
+            // Propagate infrastructure marker for known-register reads.
+            if (readOp->hasAttr("helix.infrastructure"))
+                varRef->setAttr("helix.infrastructure",
+                    builder.getUnitAttr());
 
             readOp.getResult().replaceAllUsesWith(result);
             readOp.erase();
@@ -668,11 +700,18 @@ private:
                     tempTyped2.getVarId(),
                     tempTyped2.getVarName(),
                     mlir::IntegerAttr{});
-                builder.create<helix::high::AssignOp>(
+                auto assignOp = builder.create<helix::high::AssignOp>(
                     writeOp.getLoc(),
                     tempRef.getResult(),
                     writeOp.getValue(),
                     mlir::IntegerAttr{});
+                // Propagate infrastructure marker to replacement ops.
+                if (writeOp->hasAttr("helix.infrastructure")) {
+                    assignOp->setAttr("helix.infrastructure",
+                        builder.getUnitAttr());
+                    tempTyped2->setAttr("helix.infrastructure",
+                        builder.getUnitAttr());
+                }
                 writeOp.erase();
                 ++NumWritesReplaced;
                 continue;
@@ -691,6 +730,24 @@ private:
                 subReg.parent, declBuilder, funcLoc, writeOp);
 
             builder.setInsertionPoint(writeOp);
+
+            // Propagate inferred_type from the written value to the VarDeclOp.
+            // The type comes from PropagateTypes running on the HelixLow IR.
+            {
+                auto varDeclForType = llvm::cast<helix::high::VarDeclOp>(varDecl);
+                if (!varDeclForType->hasAttr("inferred_type")) {
+                    // Check the value being written
+                    if (auto* valDef = writeOp.getValue().getDefiningOp()) {
+                        if (auto inferredType = valDef->getAttrOfType<StringAttr>("inferred_type"))
+                            varDeclForType->setAttr("inferred_type", inferredType);
+                    }
+                    // Also check the RegWriteOp itself
+                    if (!varDeclForType->hasAttr("inferred_type")) {
+                        if (auto inferredType = writeOp->getAttrOfType<StringAttr>("inferred_type"))
+                            varDeclForType->setAttr("inferred_type", inferredType);
+                    }
+                }
+            }
 
             Value valueToStore;
             if (subReg.width == 64 && subReg.bitOffset == 0) {
@@ -721,11 +778,22 @@ private:
                 varDeclTyped3.getVarId(),
                 varDeclTyped3.getVarName(),
                 mlir::IntegerAttr{});
-            builder.create<helix::high::AssignOp>(
+            auto assignOp2 = builder.create<helix::high::AssignOp>(
                 writeOp.getLoc(),
                 targetRef.getResult(),
                 valueToStore,
                 mlir::IntegerAttr{});
+
+            // Propagate infrastructure marker to the assignment.
+            // For known-register writes, we also check if the VALUE being
+            // written is infrastructure (e.g., writing a PC-derived value
+            // to RAX).  The written value's defining op carries the marker.
+            if (writeOp->hasAttr("helix.infrastructure") ||
+                (writeOp.getValue().getDefiningOp() &&
+                 writeOp.getValue().getDefiningOp()->hasAttr("helix.infrastructure"))) {
+                assignOp2->setAttr("helix.infrastructure",
+                    builder.getUnitAttr());
+            }
 
             writeOp.erase();
             ++NumWritesReplaced;
@@ -923,6 +991,396 @@ private:
                          << tracker.tempCounter << " temps\n";
         });
 
+        // ── Phase 4: Cover-based variable merging ─────────────────────────
+        //
+        // Reduce variable count by merging variables whose live ranges do
+        // not overlap.  A "live range" is approximated as the set of basic
+        // blocks in which the variable is referenced (via VarRefOp).
+        //
+        // Invariants:
+        //   - Parameters are never merged with locals.
+        //   - Variables with an inferred_type attribute are only merged if
+        //     the attribute values match (conservative type safety).
+        //   - We do not merge across function-call boundaries within a
+        //     single block — if two variables are both live in a block
+        //     that contains a CallOp, they are considered overlapping.
+        //   - Maximum 3 merge iterations to guarantee termination.
+        //
+        // After merging, single-use temporaries (assigned once, read once,
+        // both in the same block) are inlined away.
+
+        LLVM_DEBUG(llvm::dbgs() << "  Phase 4: cover-based variable merging\n");
+
+        // ---------- Helper: collect variable info for merging ----------
+
+        /// Per-variable bookkeeping for the merge pass.
+        struct VarInfo {
+            helix::high::VarDeclOp decl;
+            std::vector<helix::high::VarRefOp> refs;
+            std::set<Block*> liveBlocks;
+            bool touchesCallBlock = false;
+        };
+
+        auto buildVarInfoMap = [&](Region& body)
+            -> std::map<uint32_t, VarInfo>
+        {
+            std::map<uint32_t, VarInfo> infoMap;
+
+            // 1. Collect declarations.
+            body.walk([&](helix::high::VarDeclOp decl) {
+                auto id = decl.getVarId();
+                infoMap[id].decl = decl;
+            });
+
+            // 2. Collect references and live blocks.
+            body.walk([&](helix::high::VarRefOp ref) {
+                auto id = ref.getVarId();
+                auto it = infoMap.find(id);
+                if (it == infoMap.end())
+                    return;  // orphan ref — skip
+                it->second.refs.push_back(ref);
+                if (auto* blk = ref->getBlock())
+                    it->second.liveBlocks.insert(blk);
+            });
+
+            // 3. Mark variables that appear in blocks containing calls.
+            std::set<Block*> callBlocks;
+            body.walk([&](Operation* op) {
+                if (isa<helix::high::CallOp>(op) ||
+                    isa<helix::low::CallOp>(op)) {
+                    if (auto* blk = op->getBlock())
+                        callBlocks.insert(blk);
+                }
+            });
+
+            for (auto& [id, info] : infoMap) {
+                for (auto* blk : info.liveBlocks) {
+                    if (callBlocks.contains(blk)) {
+                        info.touchesCallBlock = true;
+                        break;
+                    }
+                }
+            }
+
+            return infoMap;
+        };
+
+        // ---------- Helper: check type compatibility ----------
+
+        auto areTypesCompatible = [&](helix::high::VarDeclOp a,
+                                      helix::high::VarDeclOp b) -> bool {
+            // Check inferred_type attributes — if present, they must match.
+            auto aType = a->getAttrOfType<StringAttr>("inferred_type");
+            auto bType = b->getAttrOfType<StringAttr>("inferred_type");
+            if (aType && bType && aType.getValue() != bType.getValue())
+                return false;
+            // If one has an inferred type and the other doesn't, be
+            // conservative and refuse.
+            if ((aType && !bType) || (!aType && bType))
+                return false;
+            return true;
+        };
+
+        // ---------- Helper: check if live ranges overlap ----------
+
+        auto rangesOverlap = [](const VarInfo& a,
+                                const VarInfo& b) -> bool {
+            for (auto* blk : a.liveBlocks) {
+                if (b.liveBlocks.contains(blk))
+                    return true;
+            }
+            return false;
+        };
+
+        // ---------- Helper: prefer non-synthetic names ----------
+
+        auto isSyntheticName = [](llvm::StringRef name) -> bool {
+            // _promoted_N, spill_N, vN patterns
+            if (name.starts_with("_promoted_"))  return true;
+            if (name.starts_with("spill_"))      return true;
+            // "vN" where N is all digits
+            if (name.size() >= 2 && name[0] == 'v') {
+                bool allDigits = true;
+                for (size_t i = 1; i < name.size(); ++i) {
+                    if (!isdigit(static_cast<unsigned char>(name[i]))) {
+                        allDigits = false;
+                        break;
+                    }
+                }
+                if (allDigits) return true;
+            }
+            return false;
+        };
+
+        // ---------- Run merge iterations ----------
+
+        constexpr unsigned kMaxMergeIterations = 3;
+        unsigned totalMerged = 0;
+
+        for (unsigned iter = 0; iter < kMaxMergeIterations; ++iter) {
+            auto infoMap = buildVarInfoMap(funcBody);
+
+            // Build a list of candidate variable IDs (non-parameters, with refs).
+            std::vector<uint32_t> candidates;
+            for (auto& [id, info] : infoMap) {
+                if (!info.decl)
+                    continue;
+                // Skip parameters.
+                if (info.decl.getStorage() ==
+                    helix::high::StorageKind::Parameter)
+                    continue;
+                // Skip variables with no references (dead — separate cleanup).
+                if (info.refs.empty())
+                    continue;
+                candidates.push_back(id);
+            }
+
+            // Sort for deterministic iteration.
+            std::sort(candidates.begin(), candidates.end());
+
+            unsigned mergedThisIter = 0;
+            std::vector<Operation*> erased;
+            auto isErased = [&](Operation* op) {
+                return std::find(erased.begin(), erased.end(), op) != erased.end();
+            };
+
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                auto idA = candidates[i];
+                auto& infoA = infoMap[idA];
+                if (!infoA.decl || isErased(infoA.decl.getOperation()))
+                    continue;
+
+                for (size_t j = i + 1; j < candidates.size(); ++j) {
+                    auto idB = candidates[j];
+                    auto& infoB = infoMap[idB];
+                    if (!infoB.decl || isErased(infoB.decl.getOperation()))
+                        continue;
+
+                    // Don't merge if either touches a call block — the
+                    // function call may clobber registers, making it unsafe
+                    // to assume non-interference.
+                    if (infoA.touchesCallBlock && infoB.touchesCallBlock)
+                        continue;
+
+                    // Types must be compatible.
+                    if (!areTypesCompatible(infoA.decl, infoB.decl))
+                        continue;
+
+                    // Live ranges must not overlap.
+                    if (rangesOverlap(infoA, infoB))
+                        continue;
+
+                    // Pick the canonical variable — prefer non-synthetic
+                    // names. If both are synthetic or both are semantic,
+                    // keep the one with the smaller ID (declared first).
+                    bool aSynthetic = isSyntheticName(
+                        infoA.decl.getVarName());
+                    bool bSynthetic = isSyntheticName(
+                        infoB.decl.getVarName());
+
+                    // canonical = the one we keep; victim = the one we erase
+                    uint32_t canonId, victimId;
+                    if (aSynthetic && !bSynthetic) {
+                        canonId = idB;
+                        victimId = idA;
+                    } else if (!aSynthetic && bSynthetic) {
+                        canonId = idA;
+                        victimId = idB;
+                    } else {
+                        // Both same kind — keep smaller ID.
+                        canonId = idA;
+                        victimId = idB;
+                    }
+
+                    auto& canonInfo = infoMap[canonId];
+                    auto& victimInfo = infoMap[victimId];
+
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "    Merging var '"
+                        << victimInfo.decl.getVarName()
+                        << "' (id=" << victimId
+                        << ") into '"
+                        << canonInfo.decl.getVarName()
+                        << "' (id=" << canonId << ")\n");
+
+                    // Rewrite all VarRefOps of the victim to point to canon.
+                    auto canonName = canonInfo.decl.getVarName();
+                    for (auto ref : victimInfo.refs) {
+                        ref.setVarId(canonId);
+                        ref.setVarName(canonName);
+                    }
+
+                    // Absorb victim's live blocks into canon.
+                    for (auto* blk : victimInfo.liveBlocks)
+                        canonInfo.liveBlocks.insert(blk);
+
+                    // Move victim's refs to canon's list.
+                    for (auto ref : victimInfo.refs)
+                        canonInfo.refs.push_back(ref);
+
+                    // Erase the victim declaration.
+                    erased.push_back(victimInfo.decl.getOperation());
+                    victimInfo.decl.erase();
+                    victimInfo.decl = nullptr;
+
+                    ++mergedThisIter;
+                    ++NumVarsMerged;
+
+                    // If A was the victim, stop trying to merge A.
+                    if (victimId == idA)
+                        break;
+                }
+            }
+
+            totalMerged += mergedThisIter;
+            LLVM_DEBUG(llvm::dbgs()
+                << "    Iteration " << iter
+                << ": merged " << mergedThisIter << " variables\n");
+
+            // If no merges happened, further iterations are pointless.
+            if (mergedThisIter == 0)
+                break;
+        }
+
+        // ── Phase 5: Single-use temporary elimination ─────────────────────
+        //
+        // If a variable is:
+        //   - Assigned exactly once
+        //   - Referenced exactly once (beyond the assignment's target ref)
+        //   - Both assignment and use are in the same block
+        //   - The assigned value is not "too complex" (no nested calls)
+        //
+        // Then we inline the assigned value directly into the use site,
+        // removing the variable, its declaration, the assignment, and the
+        // target VarRefOp.
+
+        LLVM_DEBUG(llvm::dbgs() << "  Phase 5: single-use temporary inlining\n");
+
+        {
+            // Rebuild info after merging.
+            auto infoMap = buildVarInfoMap(funcBody);
+
+            // For each variable, find its AssignOps (where it's the target).
+            // An AssignOp has two operands: target (VarRefOp result) and value.
+            // We identify assigns by looking at uses of VarRefOp results.
+
+            struct TempCandidate {
+                helix::high::VarDeclOp decl;
+                helix::high::AssignOp assign;
+                helix::high::VarRefOp assignTargetRef;
+                helix::high::VarRefOp useRef;
+            };
+
+            llvm::SmallVector<TempCandidate, 8> tempCandidates;
+
+            for (auto& [id, info] : infoMap) {
+                if (!info.decl)
+                    continue;
+                // Only consider temporaries and registers (not params/stack).
+                auto storage = info.decl.getStorage();
+                if (storage == helix::high::StorageKind::Parameter)
+                    continue;
+
+                // Separate refs into "assign targets" and "value reads".
+                llvm::SmallVector<helix::high::VarRefOp, 4> assignTargets;
+                llvm::SmallVector<helix::high::VarRefOp, 4> valueReads;
+
+                for (auto ref : info.refs) {
+                    Value refResult = ref.getResult();
+                    bool isAssignTarget = false;
+                    for (auto& use : refResult.getUses()) {
+                        if (auto assignOp = dyn_cast<helix::high::AssignOp>(
+                                use.getOwner())) {
+                            // Check if this ref is the target (operand 0).
+                            if (use.getOperandNumber() == 0) {
+                                isAssignTarget = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (isAssignTarget)
+                        assignTargets.push_back(ref);
+                    else
+                        valueReads.push_back(ref);
+                }
+
+                // Must have exactly 1 assignment and exactly 1 read.
+                if (assignTargets.size() != 1 || valueReads.size() != 1)
+                    continue;
+
+                auto targetRef = assignTargets[0];
+                auto useRef = valueReads[0];
+
+                // Both must be in the same block.
+                if (targetRef->getBlock() != useRef->getBlock())
+                    continue;
+
+                // Find the AssignOp.
+                helix::high::AssignOp theAssign;
+                for (auto& use : targetRef.getResult().getUses()) {
+                    if (auto aOp = dyn_cast<helix::high::AssignOp>(
+                            use.getOwner())) {
+                        if (use.getOperandNumber() == 0) {
+                            theAssign = aOp;
+                            break;
+                        }
+                    }
+                }
+                if (!theAssign)
+                    continue;
+
+                // The assigned value must not be defined by a call (too
+                // complex to inline — may have side effects).
+                Value assignedVal = theAssign.getValue();
+                if (auto* defOp = assignedVal.getDefiningOp()) {
+                    if (isa<helix::high::CallOp>(defOp) ||
+                        isa<helix::low::CallOp>(defOp))
+                        continue;
+                }
+
+                // The assignment must come before the use in block order.
+                bool assignBeforeUse = false;
+                for (auto it2 = Block::iterator(theAssign),
+                     end = targetRef->getBlock()->end();
+                     it2 != end; ++it2) {
+                    if (&*it2 == useRef.getOperation()) {
+                        assignBeforeUse = true;
+                        break;
+                    }
+                }
+                if (!assignBeforeUse)
+                    continue;
+
+                tempCandidates.push_back(
+                    {info.decl, theAssign, targetRef, useRef});
+            }
+
+            // Apply inlining.
+            for (auto& cand : tempCandidates) {
+                Value assignedVal = cand.assign.getValue();
+
+                LLVM_DEBUG(llvm::dbgs()
+                    << "    Inlining single-use temp: '"
+                    << cand.decl.getVarName() << "'\n");
+
+                // Replace the use-site VarRefOp result with the assigned value.
+                cand.useRef.getResult().replaceAllUsesWith(assignedVal);
+
+                // Erase: use ref, assign op, target ref, declaration.
+                cand.useRef.erase();
+                cand.assign.erase();
+                cand.assignTargetRef.erase();
+                cand.decl.erase();
+
+                ++NumTempsInlined;
+            }
+        }
+
+        LLVM_DEBUG(llvm::dbgs()
+            << "  Phase 4+5 summary: merged " << totalMerged
+            << " variables, inlined " << NumTempsInlined
+            << " temporaries\n");
+
         return success();
     }
 };
@@ -930,9 +1388,9 @@ private:
 } // anonymous namespace
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Pass Factory
+// Pass Factory (exposed via C-linkage helper to avoid MSVC C2888)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<mlir::Pass> helix::createRecoverVariablesPass() {
-    return std::make_unique<RecoverVariablesPass>();
+void* helix_createRecoverVariablesPass_impl() {
+    return new RecoverVariablesPass();
 }

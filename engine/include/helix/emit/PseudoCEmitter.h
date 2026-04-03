@@ -214,6 +214,41 @@ private:
     /// Learnt base addresses for synthetic call-target temporaries (v0, v1, ...).
     std::unordered_map<std::string, int64_t> syntheticCallBaseAddrs_;
 
+    // ─── Struct Field Name Recovery ─────────────────────────────────────
+    // Recovered field names for struct accesses.  Populated by a pre-scan
+    // that walks FieldAccessOp / FieldPtrOp / MemReadOp / MemWriteOp and
+    // infers meaningful names from usage context (vtable slots, comparison
+    // operands, stored constants, function pointers, etc.).
+    //
+    // Conservative: only renames when confidence is high; keeps the
+    // generic `field_0xNN` / `field_NN` as fallback.
+
+    /// Information about a recovered struct field name.
+    struct StructFieldInfo {
+        std::string name;       ///< Recovered meaningful name
+        std::string typeName;   ///< Optional inferred type hint (may be empty)
+    };
+
+    /// Map: (base_expression, field_offset) → recovered field info.
+    /// base_expression is the formatted (alias-resolved) expression for the
+    /// struct pointer (e.g. "this", "param_1", "local_var").
+    std::unordered_map<std::string,
+        std::unordered_map<uint64_t, StructFieldInfo>> recoveredStructFields_;
+
+    /// Pre-scan a function to collect struct field access patterns and infer
+    /// meaningful field names from usage context.
+    void prescanStructFieldNames(mlir::Operation* funcOp);
+
+    /// Look up a recovered field name for the given base expression and offset.
+    /// Returns the recovered name, or empty string if no recovery was made.
+    std::string getRecoveredFieldName(const std::string& baseExpr,
+                                      uint64_t offset) const;
+
+    /// Check whether a field name looks like a generic auto-generated name
+    /// (field_XX, field_0xNN) that is safe to replace.  Returns false for
+    /// names that appear user-annotated or already meaningful.
+    static bool isGenericFieldName(std::string_view name);
+
 #ifndef NDEBUG
     /// Validate that the emitted output does not contain forbidden patterns
     /// such as __undef, __carry, __overflow, raw register names outside
