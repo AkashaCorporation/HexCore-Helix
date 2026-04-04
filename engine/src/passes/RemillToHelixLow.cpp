@@ -2518,8 +2518,32 @@ private:
                 if (addrResolved) {
                     auto name = std::format("sub_{:x}", targetAddr);
                     targetName = builder.getStringAttr(name);
-                } else {
-                    // Unresolvable address — emit info diagnostic.
+                }
+
+                // If the address wasn't resolved, try to extract a symbol
+                // name from llvm.mlir.addressof.  This covers the Remill
+                // pattern for external calls in ET_REL (.ko) files where
+                // the target operand is `ptrtoint(@symbol_name)`.
+                // The chain is: addressof @sym → ptrtoint → CALL operand.
+                if (!targetName) {
+                    Value lookThrough = targetVal;
+                    // Look through ptrtoint wrapper
+                    if (auto ptrToInt = lookThrough.getDefiningOp<LLVM::PtrToIntOp>())
+                        lookThrough = ptrToInt.getArg();
+
+                    if (auto addressOf = lookThrough.getDefiningOp<LLVM::AddressOfOp>()) {
+                        auto symName = addressOf.getGlobalName();
+                        if (!symName.starts_with("__remill_") &&
+                            !symName.starts_with("llvm.") &&
+                            !symName.starts_with("_ZN")) {
+                            targetName = builder.getStringAttr(symName);
+                            llvm::errs() << "[P0-DEBUG] CALL addressof resolved: "
+                                         << symName << "\n";
+                        }
+                    }
+                }
+
+                if (!targetName) {
                     call->emitRemark("unresolved call target address");
                 }
 

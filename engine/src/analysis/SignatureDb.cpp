@@ -292,4 +292,38 @@ void helix::resolveCallTargets(mlir::ModuleOp module) {
                 mlir::StringAttr::get(call->getContext(), name));
         }
     });
+
+    // Phase 3: Resolve remaining nameless CallOps via llvm.mlir.addressof.
+    // In fresh Remill output for ET_REL files, the target operand of external
+    // calls is `ptrtoint(@symbol)` which becomes `llvm.mlir.addressof @symbol`.
+    // Phase 2 may have missed these because the constant address extraction
+    // failed (addressof is not a constant integer).
+    module.walk([&](helix::low::CallOp call) {
+        if (call.getTargetName())
+            return; // already resolved
+
+        auto targetVal = call.getTargetAddr();
+        auto* defOp = targetVal.getDefiningOp();
+        if (!defOp)
+            return;
+
+        // Look through ptrtoint wrapper: addressof @sym → ptrtoint → target
+        mlir::Value lookThrough = targetVal;
+        if (auto ptrToInt = mlir::dyn_cast<mlir::LLVM::PtrToIntOp>(defOp))
+            lookThrough = ptrToInt.getArg();
+
+        auto* innerDef = lookThrough.getDefiningOp();
+        if (!innerDef)
+            return;
+
+        if (auto addrOf = mlir::dyn_cast<mlir::LLVM::AddressOfOp>(innerDef)) {
+            auto symName = addrOf.getGlobalName();
+            if (!symName.starts_with("__remill_") &&
+                !symName.starts_with("llvm.") &&
+                !symName.starts_with("_ZN")) {
+                call.setTargetNameAttr(
+                    mlir::StringAttr::get(call->getContext(), symName));
+            }
+        }
+    });
 }
