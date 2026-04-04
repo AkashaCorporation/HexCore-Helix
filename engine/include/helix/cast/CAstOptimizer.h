@@ -144,7 +144,8 @@ private:
         ExprPtr expr,
         const std::unordered_map<std::string, const CExpr*>& defs,
         const std::unordered_map<std::string, unsigned>& refCounts,
-        std::unordered_set<std::string>& inlined);
+        std::unordered_set<std::string>& inlined,
+        unsigned contextDepth = 0);
 
     /// Simplify an expression inside a statement (helper that owns the expr slot).
     static void simplifyExprInStmt(ExprPtr& slot);

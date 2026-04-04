@@ -938,9 +938,18 @@ ExprPtr CAstOptimizer::substituteVarRefs(
     ExprPtr expr,
     const std::unordered_map<std::string, const CExpr*>& defs,
     const std::unordered_map<std::string, unsigned>& refCounts,
-    std::unordered_set<std::string>& inlined) {
+    std::unordered_set<std::string>& inlined,
+    unsigned contextDepth) {
 
     if (!expr) return nullptr;
+
+    // Maximum total expression depth after inlining.
+    // A chain of N simple binops (each depth 1-2) would cascade into
+    // depth N without this limit.  Value 6 allows 2-3 levels of inlining
+    // from a top-level assignment (depth 1) while keeping expressions
+    // readable.  Matches IDA Pro's behavior (Cao et al. ISSTA 2024:
+    // fewest long expressions among all tested decompilers).
+    constexpr unsigned kMaxTotalDepth = 8;
 
     // If this is a VarRefExpr, check if we should inline its definition.
     if (expr->getKind() == NodeKind::VarRefExpr) {
@@ -952,61 +961,70 @@ ExprPtr CAstOptimizer::substituteVarRefs(
                 (rit != refCounts.end() && rit->second == 1);
             if (singleUse && isSyntheticName(v.varName) &&
                 isSimpleExpr(dit->second)) {
-                inlined.insert(v.varName);
-                return cloneExpr(dit->second);
+                // Check that inlining won't exceed total depth limit.
+                unsigned defDepth = exprDepth(dit->second);
+                if (contextDepth + defDepth <= kMaxTotalDepth) {
+                    inlined.insert(v.varName);
+                    return cloneExpr(dit->second);
+                }
             }
         }
         return expr;
     }
 
-    // Recurse into sub-expressions.
+    // Recurse into sub-expressions, incrementing context depth.
+    unsigned childDepth = contextDepth + 1;
+
     switch (expr->getKind()) {
     case NodeKind::BinaryExpr: {
         auto& b = static_cast<CBinaryExpr&>(*expr);
-        b.lhs = substituteVarRefs(std::move(b.lhs), defs, refCounts, inlined);
-        b.rhs = substituteVarRefs(std::move(b.rhs), defs, refCounts, inlined);
+        b.lhs = substituteVarRefs(std::move(b.lhs), defs, refCounts,
+                                  inlined, childDepth);
+        b.rhs = substituteVarRefs(std::move(b.rhs), defs, refCounts,
+                                  inlined, childDepth);
         return expr;
     }
     case NodeKind::UnaryExpr: {
         auto& u = static_cast<CUnaryExpr&>(*expr);
-        u.operand =
-            substituteVarRefs(std::move(u.operand), defs, refCounts, inlined);
+        u.operand = substituteVarRefs(std::move(u.operand), defs, refCounts,
+                                      inlined, childDepth);
         return expr;
     }
     case NodeKind::CastExpr: {
         auto& c = static_cast<CCastExpr&>(*expr);
-        c.operand =
-            substituteVarRefs(std::move(c.operand), defs, refCounts, inlined);
+        c.operand = substituteVarRefs(std::move(c.operand), defs, refCounts,
+                                      inlined, childDepth);
         return expr;
     }
     case NodeKind::CallExpr: {
         auto& c = static_cast<CCallExpr&>(*expr);
         for (auto& a : c.args)
-            a = substituteVarRefs(std::move(a), defs, refCounts, inlined);
+            a = substituteVarRefs(std::move(a), defs, refCounts,
+                                  inlined, childDepth);
         return expr;
     }
     case NodeKind::TernaryExpr: {
         auto& t = static_cast<CTernaryExpr&>(*expr);
-        t.cond =
-            substituteVarRefs(std::move(t.cond), defs, refCounts, inlined);
-        t.trueVal =
-            substituteVarRefs(std::move(t.trueVal), defs, refCounts, inlined);
+        t.cond = substituteVarRefs(std::move(t.cond), defs, refCounts,
+                                   inlined, childDepth);
+        t.trueVal = substituteVarRefs(std::move(t.trueVal), defs, refCounts,
+                                      inlined, childDepth);
         t.falseVal = substituteVarRefs(std::move(t.falseVal), defs, refCounts,
-                                       inlined);
+                                       inlined, childDepth);
         return expr;
     }
     case NodeKind::SubscriptExpr: {
         auto& s = static_cast<CSubscriptExpr&>(*expr);
-        s.base =
-            substituteVarRefs(std::move(s.base), defs, refCounts, inlined);
-        s.index =
-            substituteVarRefs(std::move(s.index), defs, refCounts, inlined);
+        s.base = substituteVarRefs(std::move(s.base), defs, refCounts,
+                                   inlined, childDepth);
+        s.index = substituteVarRefs(std::move(s.index), defs, refCounts,
+                                    inlined, childDepth);
         return expr;
     }
     case NodeKind::FieldAccessExpr: {
         auto& f = static_cast<CFieldAccessExpr&>(*expr);
-        f.base =
-            substituteVarRefs(std::move(f.base), defs, refCounts, inlined);
+        f.base = substituteVarRefs(std::move(f.base), defs, refCounts,
+                                   inlined, childDepth);
         return expr;
     }
     default:

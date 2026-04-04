@@ -95,6 +95,7 @@ STATISTIC(NumAliasesResolved,  "Number of sub-register aliases resolved");
 STATISTIC(NumParamsNamed,      "Number of argument registers renamed to param_N");
 STATISTIC(NumReturnVarsNamed,  "Number of RAX refs renamed to result");
 STATISTIC(NumSSAVersions,      "Number of SSA variable versions created");
+STATISTIC(NumDeadFlagWrites,   "Number of dead flag/RIP RegWrites eliminated");
 STATISTIC(NumUndefReplaced,    "Number of __undef references replaced with defaults");
 STATISTIC(NumVarsMerged,       "Number of variables eliminated by cover-based merging");
 STATISTIC(NumTempsInlined,     "Number of single-use temporaries inlined");
@@ -662,6 +663,38 @@ private:
                                 << (isWin64 ? "win64" : "sysv")
                                 << ", hasReturn="
                                 << tracker.hasReturnValue << ")\n");
+
+        // ── Phase 0: Eliminate dead flag/RIP RegWrites ──────────────────
+        //
+        // Flag registers (CF, ZF, SF, OF, PF, AF, DF) and RIP are consumed
+        // as direct SSA operands by JccOp/CMovOp during flag synthesis in
+        // RemillToHelixLow.  By the time RecoverVariables runs, the RegWrite
+        // ops to these registers are dead side-effects.  Erasing them
+        // prevents creation of hundreds of useless temp variables.
+        //
+        // All production decompilers (IDA, Ghidra, RetDec, SAILR/angr)
+        // eliminate flag writes before variable recovery.
+
+        {
+            auto isDeadFlagOrRIP = [](llvm::StringRef regName) -> bool {
+                return regName == "CF" || regName == "ZF" ||
+                       regName == "SF" || regName == "OF" ||
+                       regName == "PF" || regName == "AF" ||
+                       regName == "DF" || regName == "RIP";
+            };
+
+            // Collect first, then erase (avoid iterator invalidation).
+            llvm::SmallVector<helix::low::RegWriteOp, 32> deadFlagOps;
+            funcBody.walk([&](helix::low::RegWriteOp writeOp) {
+                if (isDeadFlagOrRIP(writeOp.getRegName()))
+                    deadFlagOps.push_back(writeOp);
+            });
+
+            for (auto writeOp : deadFlagOps) {
+                writeOp.erase();
+                ++NumDeadFlagWrites;
+            }
+        }
 
         // ── Phase 1+2 (unified): Program-order SSA walk ────────────────
         //
