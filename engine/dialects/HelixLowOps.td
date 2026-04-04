@@ -80,7 +80,7 @@ def HelixLow_RegReadOp : HelixLow_Op<"reg.read", [Pure]> {
   }];
 }
 
-def HelixLow_RegWriteOp : HelixLow_Op<"reg.write", []> {
+def HelixLow_RegWriteOp : HelixLow_Op<"reg.write", [MemoryEffects<[MemWrite]>]> {
   let summary = "Write a value to a CPU register";
   let description = [{
     Writes a value to a CPU register. Generated from Remill's `store` to a
@@ -102,7 +102,7 @@ def HelixLow_RegWriteOp : HelixLow_Op<"reg.write", []> {
 
 // ─── Memory Operations ───────────────────────────────────────────────────────
 
-def HelixLow_MemReadOp : HelixLow_Op<"mem.read", []> {
+def HelixLow_MemReadOp : HelixLow_Op<"mem.read", [MemoryEffects<[MemRead]>]> {
   let summary = "Read from memory at an address";
   let description = [{
     Reads a value from memory at the given virtual address. Generated from
@@ -122,7 +122,7 @@ def HelixLow_MemReadOp : HelixLow_Op<"mem.read", []> {
   }];
 }
 
-def HelixLow_MemWriteOp : HelixLow_Op<"mem.write", []> {
+def HelixLow_MemWriteOp : HelixLow_Op<"mem.write", [MemoryEffects<[MemWrite]>]> {
   let summary = "Write to memory at an address";
   let description = [{
     Writes a value to memory at the given virtual address. Generated from
@@ -247,7 +247,7 @@ def HelixLow_TestOp : HelixLow_Op<"test", []> {
 
 // ─── Control Flow Operations ─────────────────────────────────────────────────
 
-def HelixLow_CallOp : HelixLow_Op<"call", []> {
+def HelixLow_CallOp : HelixLow_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "Function call (direct or indirect)";
   let description = [{
     Calls a function at the given target address. The target_name is set if
@@ -328,7 +328,7 @@ def HelixLow_JccOp : HelixLow_Op<"jcc", [Terminator]> {
 
 // ─── Stack Operations ────────────────────────────────────────────────────────
 
-def HelixLow_PushOp : HelixLow_Op<"push", []> {
+def HelixLow_PushOp : HelixLow_Op<"push", [MemoryEffects<[MemWrite]>]> {
   let summary = "Push value onto the stack";
   let description = [{
     Pushes a value onto the stack (decrements RSP and stores). Generated from
@@ -345,7 +345,7 @@ def HelixLow_PushOp : HelixLow_Op<"push", []> {
   }];
 }
 
-def HelixLow_PopOp : HelixLow_Op<"pop", []> {
+def HelixLow_PopOp : HelixLow_Op<"pop", [MemoryEffects<[MemRead]>]> {
   let summary = "Pop value from the stack";
   let description = [{
     Pops a value from the stack (loads from RSP and increments). Generated from
@@ -474,7 +474,7 @@ def HelixLow_LeaOp : HelixLow_Op<"lea", [Pure]> {
 
 // ─── REP String Operations ───────────────────────────────────────────────────
 
-def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", []> {
+def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "REP MOVS — block memory copy (promoted to memcpy)";
   let description = [{
     Repeating string move operation. Copies RCX bytes from RSI to RDI.
@@ -496,7 +496,7 @@ def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", []> {
   }];
 }
 
-def HelixLow_RepStosOp : HelixLow_Op<"rep.stos", []> {
+def HelixLow_RepStosOp : HelixLow_Op<"rep.stos", [MemoryEffects<[MemWrite]>]> {
   let summary = "REP STOS — block memory fill (promoted to memset)";
   let description = [{
     Repeating string store operation. Fills RCX elements at RDI with AL/AX/EAX.

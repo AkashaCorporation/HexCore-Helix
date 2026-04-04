@@ -2971,27 +2971,38 @@ CAstBuilder::precomputeDeadStores(Block& block) {
             bool hasSideEffects =
                 valueDef && isa<helix::high::CallOp>(valueDef);
 
+            // Check RHS for reads of tracked variables FIRST —
+            // even if this assignment will be marked dead, its RHS reads
+            // keep earlier definitions alive.  This prevents the cascade:
+            //   rax = rax + rbx;  ← killed (rax overwritten)
+            //   rax = rax & 0xff; ← killed (rax overwritten)
+            //   rax = rax | rcx;  ← survives (final write)
+            // Fix: rax reads in RHS of ② keep ① alive, reads in ③ keep ② alive.
+            bool rhsReadsSelf = false;
+            if (valueDef) {
+                std::vector<std::string> toRemove;
+                valueDef->walk([&](helix::high::VarRefOp ref) {
+                    auto refName = applyNameAliases(ref.getVarName().str());
+                    if (refName == targetStr) {
+                        rhsReadsSelf = true;
+                    }
+                    if (writtenNotRead.count(refName))
+                        toRemove.push_back(refName);
+                });
+                for (auto& r : toRemove)
+                    writtenNotRead.erase(r);
+            }
+
             if (!hasSideEffects) {
-                if (writtenNotRead.count(targetStr)) {
+                if (writtenNotRead.count(targetStr) && !rhsReadsSelf) {
+                    // True dead store: target overwritten AND RHS doesn't
+                    // read the target (e.g., rax = 0; rax = rbx;)
                     deadOps.insert(op);
                     continue;
                 }
                 writtenNotRead.insert(targetStr);
             } else {
                 writtenNotRead.erase(targetStr);
-            }
-
-            // Check RHS for reads of tracked variables
-            if (valueDef) {
-                std::vector<std::string> toRemove;
-                valueDef->walk([&](helix::high::VarRefOp ref) {
-                    auto refName = applyNameAliases(ref.getVarName().str());
-                    if (refName != targetStr &&
-                        writtenNotRead.count(refName))
-                        toRemove.push_back(refName);
-                });
-                for (auto& r : toRemove)
-                    writtenNotRead.erase(r);
             }
             continue;
         }

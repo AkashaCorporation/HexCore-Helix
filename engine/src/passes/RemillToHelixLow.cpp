@@ -852,8 +852,20 @@ struct RemillToHelixLowPass
     }
 
 private:
+    /// Conversion coverage metrics — logged at the end of each function.
+    struct LiftStats {
+        unsigned totalCalls = 0;
+        unsigned converted = 0;     // successfully dispatched to convertSemantic
+        unsigned memoryOps = 0;     // __remill_read/write_memory → MemRead/MemWrite
+        unsigned helpers = 0;       // __remill_* / llvm.* / is_helper → erased
+        unsigned externalCalls = 0; // unrecognized mangled → generic CallOp
+        unsigned indirectCalls = 0; // function pointer calls
+    };
+    LiftStats liftStats;
+
     /// Convert a single Remill lifted function to HelixLow.
     LogicalResult convertFunction(LLVM::LLVMFuncOp llvmFunc) {
+        liftStats = LiftStats{}; // reset per-function
         OpBuilder builder(llvmFunc->getContext());
         builder.setInsertionPointAfter(llvmFunc);
 
@@ -1093,6 +1105,16 @@ private:
             dummyBlock->erase();
         }
 
+        // Log conversion coverage metrics.
+        llvm::errs() << "[LIFT-STATS] " << name
+                     << ": total=" << liftStats.totalCalls
+                     << " converted=" << liftStats.converted
+                     << " memOps=" << liftStats.memoryOps
+                     << " helpers=" << liftStats.helpers
+                     << " external=" << liftStats.externalCalls
+                     << " indirect=" << liftStats.indirectCalls
+                     << "\n";
+
         // We can now safely erase the original LLVM function.
         llvmFunc.erase();
 
@@ -1265,6 +1287,7 @@ private:
         // ─── Pattern: Call to Remill semantic or intrinsic ───────────────
         if (auto call = dyn_cast<LLVM::CallOp>(op)) {
             auto callee = call.getCallee();
+            ++liftStats.totalCalls;
 
             // Helper: break the Memory* use-def chain for any Remill call
             // and mark it for erasure. This MUST be called on every code path
@@ -1282,11 +1305,8 @@ private:
             };
 
             // ── Handle indirect calls (function pointer calls) ──────────
-            // These occur in ELF .ko (vtable dispatch, callback invocations)
-            // and in PE binaries (IAT calls through register).
-            // Previously these were silently dropped, causing function body
-            // collapse ("stub" output).
             if (!callee) {
+                ++liftStats.indirectCalls;
                 // Build the target address value from the callee operand.
                 // For indirect LLVM::CallOp, operand(0) may be the function
                 // pointer when the Remill memory token isn't the first arg.
@@ -1341,6 +1361,7 @@ private:
 
             // Check for Remill memory intrinsics.
             if (calleeName.starts_with("__remill_read_memory_")) {
+                ++liftStats.memoryOps;
                 unsigned width = extractRemillMemoryWidth(calleeName);
                 if (width == 0) return;
 
@@ -1360,6 +1381,7 @@ private:
             }
 
             if (calleeName.starts_with("__remill_write_memory_")) {
+                ++liftStats.memoryOps;
                 unsigned width = extractRemillMemoryWidth(calleeName);
                 if (width == 0) return;
 
@@ -1379,6 +1401,7 @@ private:
             // Skip other Remill helpers (flag computations, etc.)
             if (calleeName.starts_with("__remill_") ||
                 calleeName.starts_with("llvm.")) {
+                ++liftStats.helpers;
                 eraseRemillCall();
                 return;
             }
@@ -1386,6 +1409,7 @@ private:
             // Try to demangle as a Remill semantic function.
             auto semInfo = demangleRemillSemantic(calleeName);
             if (!semInfo) {
+                ++liftStats.externalCalls;
                 // Unrecognized mangled name — preserve the call and emit warning.
                 // This ensures we don't silently drop calls that might be
                 // important for the decompiled output.
@@ -1421,10 +1445,12 @@ private:
             }
 
             if (semInfo->is_helper) {
+                ++liftStats.helpers;
                 eraseRemillCall();
                 return;
             }
 
+            ++liftStats.converted;
             convertSemantic(call, builder, regs, *semInfo, addrAttr, loc, dummyBlock, deferredTerminator, pcTracker);
 
             // Break the use-def chain and mark for erasure.

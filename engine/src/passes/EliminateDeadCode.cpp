@@ -708,13 +708,38 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp) {
         helix::analysis::isX86VectorRegister(regName))
         return false;
 
-    // Check if the written value has any uses at all.  In SSA form, a
-    // RegWriteOp is a side-effecting op that doesn't produce an SSA result
-    // (it writes to the register file, which is modeled as memory).
+    // ── Safety net: SSA value-awareness (Option A from academic analysis) ──
     //
-    // Since HelixLow models register writes as side effects, we need to scan
-    // forward for reads of the same register.  If we find another write to
-    // the same register before any read, the current write is dead.
+    // In Remill-lifted IR, State struct loads may become MemReadOps instead
+    // of RegReadOps when GEP chain resolution fails.  This causes the
+    // register-level forward scan to see no reads between consecutive
+    // RegWrites, falsely killing the computation.
+    //
+    // Fix: if the VALUE being written has OTHER SSA users (beyond this
+    // RegWriteOp), the computation that produces it is live and must be
+    // preserved.  The value flows through SSA even if the register-file
+    // model doesn't see the read.
+    //
+    // Also: if the value is produced by a BinOp whose FLAG results have
+    // users (e.g., flags feed into comparisons), the computation is live.
+    {
+        Value writtenValue = writeOp.getValue();
+        if (!writtenValue.hasOneUse()) {
+            // Value has consumers beyond this RegWrite → computation is live
+            return false;
+        }
+        if (auto* defOp = writtenValue.getDefiningOp()) {
+            // Check if any OTHER result of the producing op has users
+            // (e.g., BinOp flag results: carry, zero, sign, overflow)
+            for (auto result : defOp->getResults()) {
+                if (result == writtenValue) continue;
+                if (!result.use_empty()) return false;
+            }
+        }
+    }
+
+    // Forward scan: check if the register is read or overwritten within
+    // the same basic block.
 
     Block* block = writeOp->getBlock();
     if (!block)
@@ -1568,6 +1593,15 @@ private:
 
                 // PushOp and PopOp are side-effecting.
                 if (isa<helix::low::PushOp>(op) || isa<helix::low::PopOp>(op))
+                    return;
+
+                // BinOp represents a source-level computation (ADD, SUB, etc.)
+                // from a Remill semantic conversion.  Even if all SSA users have
+                // been removed (cascading from RegWrite elimination), these are
+                // real computations that should survive until the C emitter can
+                // decide whether they're observable.  Prevents the cascade:
+                //   RegWrite killed → BinOp killed → entire computation lost.
+                if (isa<helix::low::BinOp>(op))
                     return;
 
                 if (allResultsUnused && op->getNumResults() > 0) {

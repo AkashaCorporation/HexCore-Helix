@@ -321,32 +321,66 @@ struct CallOpCountInstrumentation : public mlir::PassInstrumentation {
         auto module = mlir::dyn_cast<mlir::ModuleOp>(op);
         if (!module) return;
         unsigned lowCalls = 0, midCalls = 0, highCalls = 0;
+        unsigned binOps = 0, regWrites = 0, regReads = 0, memReads = 0;
+        unsigned midBinExpr = 0, midAssign = 0, highAssign = 0, totalOps = 0;
         module.walk([&](mlir::Operation* inner) {
+            ++totalOps;
             if (mlir::isa<helix::low::CallOp>(inner)) ++lowCalls;
             else if (mlir::isa<helix::mid::CallOp>(inner)) ++midCalls;
             else if (mlir::isa<helix::high::CallOp>(inner)) ++highCalls;
+            else if (mlir::isa<helix::low::BinOp>(inner)) ++binOps;
+            else if (mlir::isa<helix::low::RegWriteOp>(inner)) ++regWrites;
+            else if (mlir::isa<helix::low::RegReadOp>(inner)) ++regReads;
+            else if (mlir::isa<helix::low::MemReadOp>(inner)) ++memReads;
+            if (mlir::isa<helix::mid::BinExprOp>(inner)) ++midBinExpr;
+            if (mlir::isa<helix::mid::AssignOp>(inner)) ++midAssign;
+            if (mlir::isa<helix::high::AssignOp>(inner)) ++highAssign;
         });
-        if (lowCalls + midCalls + highCalls > 0 || true) {
-            llvm::errs() << "[P0-TRACE] BEFORE " << pass->getName()
-                         << ": low.call=" << lowCalls
-                         << " mid.call=" << midCalls
-                         << " high.call=" << highCalls << "\n";
-        }
+        llvm::errs() << "[P0-TRACE] BEFORE " << pass->getName()
+                     << ": low.call=" << lowCalls
+                     << " mid.call=" << midCalls
+                     << " high.call=" << highCalls
+                     << " binop=" << binOps
+                     << " rw=" << regWrites
+                     << " rr=" << regReads
+                     << " mr=" << memReads
+                     << " m.bin=" << midBinExpr
+                     << " m.asgn=" << midAssign
+                     << " h.asgn=" << highAssign
+                     << " total=" << totalOps << "\n";
     }
 
     void runAfterPass(mlir::Pass* pass, mlir::Operation* op) override {
         auto module = mlir::dyn_cast<mlir::ModuleOp>(op);
         if (!module) return;
         unsigned lowCalls = 0, midCalls = 0, highCalls = 0;
+        unsigned binOps = 0, regWrites = 0, regReads = 0, memReads = 0;
+        unsigned midBinExpr = 0, midAssign = 0, highAssign = 0, totalOps = 0;
         module.walk([&](mlir::Operation* inner) {
+            ++totalOps;
             if (mlir::isa<helix::low::CallOp>(inner)) ++lowCalls;
             else if (mlir::isa<helix::mid::CallOp>(inner)) ++midCalls;
             else if (mlir::isa<helix::high::CallOp>(inner)) ++highCalls;
+            else if (mlir::isa<helix::low::BinOp>(inner)) ++binOps;
+            else if (mlir::isa<helix::low::RegWriteOp>(inner)) ++regWrites;
+            else if (mlir::isa<helix::low::RegReadOp>(inner)) ++regReads;
+            else if (mlir::isa<helix::low::MemReadOp>(inner)) ++memReads;
+            if (mlir::isa<helix::mid::BinExprOp>(inner)) ++midBinExpr;
+            if (mlir::isa<helix::mid::AssignOp>(inner)) ++midAssign;
+            if (mlir::isa<helix::high::AssignOp>(inner)) ++highAssign;
         });
         llvm::errs() << "[P0-TRACE] AFTER  " << pass->getName()
                      << ": low.call=" << lowCalls
                      << " mid.call=" << midCalls
-                     << " high.call=" << highCalls << "\n";
+                     << " high.call=" << highCalls
+                     << " binop=" << binOps
+                     << " rw=" << regWrites
+                     << " rr=" << regReads
+                     << " mr=" << memReads
+                     << " m.bin=" << midBinExpr
+                     << " m.asgn=" << midAssign
+                     << " h.asgn=" << highAssign
+                     << " total=" << totalOps << "\n";
     }
 
     void runAfterPassFailed(mlir::Pass* pass, mlir::Operation* op) override {
