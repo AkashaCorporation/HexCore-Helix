@@ -549,14 +549,29 @@ static bool isLiveConsumer(Operation* op) {
            isa<helix::low::MemWriteOp>(op);
 }
 
+/// Map from var_id to all VarRefOps that reference it.
+/// Pre-built once per function to avoid repeated walks during liveness analysis.
+using VarRefMap = llvm::DenseMap<uint32_t,
+                                 llvm::SmallVector<helix::high::VarRefOp, 4>>;
+
 /// Check whether a Value is consumed (directly or transitively) by a live
 /// operation.  Walks the use-chain forward, stopping at live consumers.
 ///
+/// When a VarRefMap is provided, the function can cross assignment
+/// boundaries: if a value flows into an AssignOp whose target is
+/// VarRef(var_id=N), ALL other VarRefs with var_id=N are checked for
+/// liveness.  This is critical for SSA-split variables where each
+/// definition gets a unique var_id — without the map, the chain breaks
+/// at every assignment because the target VarRef's only SSA user is
+/// the AssignOp itself.
+///
 /// @param value     The SSA value to check.
 /// @param visited   Set of already-visited operations (cycle protection).
+/// @param refMap    Optional pre-built map from var_id to all VarRefOps.
 /// @return          True if the value reaches a live consumer.
 static bool isValueLive(Value value,
-                        llvm::SmallPtrSetImpl<Operation*>& visited) {
+                        llvm::SmallPtrSetImpl<Operation*>& visited,
+                        const VarRefMap* refMap = nullptr) {
     for (auto* user : value.getUsers()) {
         if (!visited.insert(user).second)
             continue;  // already visited — avoid infinite loops
@@ -565,27 +580,54 @@ static bool isValueLive(Value value,
         if (isLiveConsumer(user))
             return true;
 
-        // helix_high.assign: the value is live if the assignment target
-        // (LHS) is itself live.  The LHS is a var.ref whose var_id we
-        // need to trace further.  For simplicity, if the value appears as
-        // the RHS of an assign, check whether the assign's target feeds
-        // into something live.
+        // helix_high.assign: the value is live if the target VARIABLE
+        // has any live reads.  With SSA-split variables, each definition
+        // gets a unique var_id.  We need to check all VarRefs with the
+        // target's var_id (not just the target VarRef's SSA users).
         if (auto assignOp = dyn_cast<helix::high::AssignOp>(user)) {
-            // The assign itself is a side effect — if the target var is
-            // live, this assign is live.  We check the target operand.
-            if (isValueLive(assignOp.getTarget(), visited))
-                return true;
+            if (refMap) {
+                // SSA-aware path: look up all refs for the target variable.
+                if (auto targetRef = assignOp.getTarget()
+                        .getDefiningOp<helix::high::VarRefOp>()) {
+                    uint32_t targetVarId = targetRef.getVarId();
+                    auto it = refMap->find(targetVarId);
+                    if (it != refMap->end()) {
+                        for (auto refOp : it->second) {
+                            // Skip the target ref itself.
+                            if (refOp.getOperation() ==
+                                targetRef.getOperation())
+                                continue;
+                            if (isValueLive(refOp.getResult(), visited,
+                                            refMap))
+                                return true;
+                        }
+                    }
+                }
+            } else {
+                // Legacy path: trace the target's SSA value.
+                if (isValueLive(assignOp.getTarget(), visited))
+                    return true;
+            }
             continue;
         }
 
         // For any other operation that produces results, check if those
         // results are live.
         for (auto result : user->getResults()) {
-            if (isValueLive(result, visited))
+            if (isValueLive(result, visited, refMap))
                 return true;
         }
     }
     return false;
+}
+
+/// Build a VarRefMap for all VarRefOps in a function body.
+static VarRefMap buildVarRefMap(Region& funcBody) {
+    VarRefMap refMap;
+    funcBody.walk([&](helix::high::VarRefOp refOp) {
+        refMap[refOp.getVarId()].push_back(refOp);
+    });
+    return refMap;
 }
 
 /// Determine whether a helix_high.var.decl is dead.
@@ -596,8 +638,10 @@ static bool isValueLive(Value value,
 ///
 /// @param declOp   The var.decl operation.
 /// @param funcBody The function's region (to scan for var.ref ops).
+/// @param refMap   Pre-built map from var_id to all VarRefOps.
 /// @return         True if the variable is dead and can be removed.
-static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody) {
+static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody,
+                          const VarRefMap* refMap = nullptr) {
     auto varId = declOp.getVarId();
     auto varName = declOp.getVarName();
 
@@ -606,12 +650,19 @@ static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody) {
     if (varName.starts_with("XMM") || varName.starts_with("YMM") || varName.starts_with("ZMM") ||
         varName.starts_with("xmm") || varName.starts_with("ymm") || varName.starts_with("zmm"))
         return false;
-    // Collect all var.ref operations that reference this variable.
+
+    // Use the pre-built map if available, otherwise walk.
     llvm::SmallVector<helix::high::VarRefOp, 8> refs;
-    funcBody.walk([&](helix::high::VarRefOp refOp) {
-        if (refOp.getVarId() == varId)
-            refs.push_back(refOp);
-    });
+    if (refMap) {
+        auto it = refMap->find(varId);
+        if (it != refMap->end())
+            refs.assign(it->second.begin(), it->second.end());
+    } else {
+        funcBody.walk([&](helix::high::VarRefOp refOp) {
+            if (refOp.getVarId() == varId)
+                refs.push_back(refOp);
+        });
+    }
 
     // If no references at all, the variable is dead.
     if (refs.empty())
@@ -620,7 +671,7 @@ static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody) {
     // Check if any reference is consumed by a live operation.
     for (auto refOp : refs) {
         llvm::SmallPtrSet<Operation*, 16> visited;
-        if (isValueLive(refOp.getResult(), visited))
+        if (isValueLive(refOp.getResult(), visited, refMap))
             return false;  // at least one live use — variable is alive
     }
 
@@ -635,9 +686,11 @@ static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody) {
 ///
 /// @param assignOp  The assign operation to check.
 /// @param funcBody  The function's region.
+/// @param refMap    Pre-built map from var_id to all VarRefOps.
 /// @return          True if this is a dead __undef assignment.
 static bool isDeadUndefAssign(helix::high::AssignOp assignOp,
-                              Region& funcBody) {
+                              Region& funcBody,
+                              const VarRefMap* refMap = nullptr) {
     // Check if the RHS is a var.ref to __undef.
     auto* rhsDef = assignOp.getValue().getDefiningOp();
     if (!rhsDef)
@@ -659,18 +712,31 @@ static bool isDeadUndefAssign(helix::high::AssignOp assignOp,
     if (auto targetRef = dyn_cast<helix::high::VarRefOp>(lhsDef)) {
         auto targetId = targetRef.getVarId();
 
+        // Gather refs for this variable (use map if available).
+        llvm::SmallVector<helix::high::VarRefOp, 8> otherRefs;
+        if (refMap) {
+            auto it = refMap->find(targetId);
+            if (it != refMap->end()) {
+                for (auto ref : it->second) {
+                    if (ref.getOperation() != targetRef.getOperation())
+                        otherRefs.push_back(ref);
+                }
+            }
+        } else {
+            funcBody.walk([&](helix::high::VarRefOp otherRef) {
+                if (otherRef == targetRef) return;
+                if (otherRef.getVarId() != targetId) return;
+                otherRefs.push_back(otherRef);
+            });
+        }
+
         // Check if any OTHER reference to this variable is live.
         bool anyLive = false;
-        funcBody.walk([&](helix::high::VarRefOp otherRef) {
-            if (otherRef == targetRef)
-                return;  // skip the LHS reference itself
-            if (otherRef.getVarId() != targetId)
-                return;
-
+        for (auto otherRef : otherRefs) {
             llvm::SmallPtrSet<Operation*, 16> visited;
-            if (isValueLive(otherRef.getResult(), visited))
+            if (isValueLive(otherRef.getResult(), visited, refMap))
                 anyLive = true;
-        });
+        }
 
         return !anyLive;
     }
@@ -1644,6 +1710,11 @@ private:
         while (changed) {
             changed = false;
 
+            // Build the VarRefMap once per iteration for SSA-aware
+            // liveness analysis.  This is rebuilt after each iteration
+            // because erasing ops invalidates the map.
+            VarRefMap refMap = buildVarRefMap(funcBody);
+
             // ── Step 0: Remove infrastructure-marked assignments ────────
             //
             // AssignOps tagged with "helix.infrastructure" by
@@ -1676,7 +1747,7 @@ private:
                 llvm::SmallVector<helix::high::AssignOp, 16> deadUndefs;
 
                 funcBody.walk([&](helix::high::AssignOp assignOp) {
-                    if (isDeadUndefAssign(assignOp, funcBody))
+                    if (isDeadUndefAssign(assignOp, funcBody, &refMap))
                         deadUndefs.push_back(assignOp);
                 });
 
@@ -1735,19 +1806,24 @@ private:
 
                     // Check if the target variable has any live consumers
                     // (excluding this assignment's own LHS reference).
+                    // Use the refMap to avoid re-walking the function body.
                     bool anyLive = false;
-                    funcBody.walk([&](helix::high::VarRefOp refOp) {
-                        if (anyLive)
-                            return;
-                        if (refOp == targetRef)
-                            return;
-                        if (refOp.getVarId() != targetId)
-                            return;
+                    {
+                        auto mapIt = refMap.find(targetId);
+                        if (mapIt != refMap.end()) {
+                            for (auto refOp : mapIt->second) {
+                                if (anyLive) break;
+                                if (refOp.getOperation() ==
+                                    targetRef.getOperation())
+                                    continue;
 
-                        llvm::SmallPtrSet<Operation*, 16> visited;
-                        if (isValueLive(refOp.getResult(), visited))
-                            anyLive = true;
-                    });
+                                llvm::SmallPtrSet<Operation*, 16> visited;
+                                if (isValueLive(refOp.getResult(), visited,
+                                                &refMap))
+                                    anyLive = true;
+                            }
+                        }
+                    }
 
                     if (!anyLive) {
                         auto* rhsDef = assignOp.getValue().getDefiningOp();
@@ -1771,7 +1847,7 @@ private:
                 llvm::SmallVector<helix::high::VarDeclOp, 16> deadDecls;
 
                 funcBody.walk([&](helix::high::VarDeclOp declOp) {
-                    if (isDeadVarDecl(declOp, funcBody))
+                    if (isDeadVarDecl(declOp, funcBody, &refMap))
                         deadDecls.push_back(declOp);
                 });
 

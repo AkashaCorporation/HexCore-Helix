@@ -2,9 +2,17 @@
 /// @brief MLIR pass: replaces register references with named variables.
 ///
 /// This pass operates after stack layout recovery and control flow structuring.
-/// It scans all remaining `helix_low.reg.read` and `helix_low.reg.write`
-/// operations and replaces them with `helix_high.var.ref` / `helix_high.assign`
-/// operations that reference named, typed variables.
+/// It walks all remaining `helix_low.reg.read` and `helix_low.reg.write`
+/// operations in PROGRAM ORDER and replaces them with `helix_high.var.ref` /
+/// `helix_high.assign` operations that reference named, typed variables.
+///
+/// ## SSA Variable Splitting (v0.8.0)
+///
+/// Each RegWrite creates a NEW variable version (rax, rax_1, rax_2, ...),
+/// ensuring unique var_ids per definition.  This prevents the DCE from
+/// collapsing all assignments to the same register into a single live
+/// variable.  This is the standard approach used by IDA Pro, Ghidra, and
+/// Binary Ninja (see SAILR Section 4.1.1, Osprey Section VII, ReSym 3.2.1).
 ///
 /// ## Register Alias Handling
 ///
@@ -21,15 +29,17 @@
 ///
 /// ## Naming Conventions
 ///
-///   - Register variables : lowercase of the canonical 64-bit name
-///                          (rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp, r8..r15)
+///   - Register variables : `rax`, `rax_1`, `rax_2`, ... (SSA versioned)
+///   - Parameters         : `param_1`, `param_2`, ... (calling convention)
 ///   - Stack variables    : `var_<hex_offset>` (e.g., `var_20` for [RBP-0x20])
 ///   - Temporaries        : `v<N>` with a monotonically increasing counter
 ///
 /// ## References
 ///
+///   - SAILR Section 4.1.1 — AIL variables unique per definition
+///   - Osprey Section VII — one variable per definition point
+///   - ReSym Section 3.2.1 — unique variable IDs per definition
 ///   - Rust implementation: crates/helix-core/src/analysis/data_flow.rs
-///   - Hex-Rays naming conventions (de facto industry standard)
 
 // Standard library includes FIRST (before LLVM/MLIR to avoid namespace conflicts)
 #include <algorithm>
@@ -84,7 +94,7 @@ STATISTIC(NumWritesReplaced,   "Number of reg.write ops replaced with assign");
 STATISTIC(NumAliasesResolved,  "Number of sub-register aliases resolved");
 STATISTIC(NumParamsNamed,      "Number of argument registers renamed to param_N");
 STATISTIC(NumReturnVarsNamed,  "Number of RAX refs renamed to result");
-STATISTIC(NumMultiDefVars,     "Number of separate vars for multi-write registers");
+STATISTIC(NumSSAVersions,      "Number of SSA variable versions created");
 STATISTIC(NumUndefReplaced,    "Number of __undef references replaced with defaults");
 STATISTIC(NumVarsMerged,       "Number of variables eliminated by cover-based merging");
 STATISTIC(NumTempsInlined,     "Number of single-use temporaries inlined");
@@ -147,15 +157,6 @@ struct VariableTracker {
     /// Win64: RCX→1, RDX→2, R8→3, R9→4
     /// SysV:  RDI→1, RSI→2, RDX→3, RCX→4, R8→5, R9→6
     llvm::StringMap<unsigned> argRegPositions;
-
-    /// Tracks how many times each canonical register has been written to
-    /// across distinct execution paths (basic blocks). Used to create
-    /// separate variables for multiple definitions of the same register.
-    llvm::StringMap<unsigned> regWriteCount;
-
-    /// Maps (canonical register, block pointer) to the var.decl for that
-    /// specific definition. Enables separate variables per write site.
-    llvm::DenseMap<std::pair<llvm::StringRef, Block*>, Operation*> regBlockDecl;
 
     /// Whether the function has a return value (set by RecoverCallingConvention).
     bool hasReturnValue = false;
@@ -357,6 +358,95 @@ struct VariableTracker {
                                 << "\n");
 
         return declOp;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SSA Version Tracker
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracks per-register SSA versions during the program-order walk.
+///
+/// Each RegWrite creates a new variable version (rax, rax_1, rax_2, ...),
+/// giving every definition a unique var_id.  RegReads reference the MOST
+/// RECENT version of the target register.  This prevents the DCE from
+/// treating all writes to the same register as stores to a single variable.
+///
+/// Industry reference: SAILR, Osprey, ReSym, LLM4Decompile all create
+/// one variable per definition point.
+struct SSAVersionTracker {
+    /// Information about a single SSA version of a register.
+    struct Version {
+        Operation* decl;      ///< The VarDeclOp for this version.
+        uint32_t varId;       ///< Unique var_id.
+        std::string varName;  ///< e.g., "rax", "rax_1", "rax_2"
+    };
+
+    /// Current (most recent) version for each canonical register.
+    llvm::StringMap<Version> current;
+
+    /// Counter for creating unique names per register (rax→0, rax→1, ...).
+    llvm::StringMap<unsigned> versionCounters;
+
+    /// Reference to the shared var_id counter (owned by VariableTracker).
+    uint32_t& varIdCounter;
+
+    explicit SSAVersionTracker(uint32_t& idCounter) : varIdCounter(idCounter) {}
+
+    /// Create a new version for a register write.
+    ///
+    /// Version 0 uses the semantic name from the VariableTracker (param_1,
+    /// rax, result, etc.).  Subsequent versions append _N suffix.
+    ///
+    /// @param canonReg    The canonical 64-bit register (e.g., "RAX").
+    /// @param declBuilder OpBuilder positioned at function entry.
+    /// @param loc         Source location.
+    /// @param tracker     The VariableTracker (for semantic names).
+    /// @param contextOp   Operation context (for return detection).
+    /// @return            The new VarDeclOp.
+    Operation* createNewVersion(llvm::StringRef canonReg,
+                                OpBuilder& declBuilder,
+                                Location loc,
+                                VariableTracker& tracker,
+                                Operation* contextOp = nullptr) {
+        unsigned ver = versionCounters[canonReg]++;
+        auto [baseName, storage] = tracker.getSemanticName(canonReg, contextOp);
+
+        std::string varName;
+        if (ver == 0) {
+            varName = baseName;
+        } else {
+            varName = llvm::formatv("{0}_{1}", baseName, ver).str();
+        }
+
+        auto declOp = declBuilder.create<helix::high::VarDeclOp>(
+            loc,
+            /*var_id=*/varIdCounter++,
+            /*var_name=*/varName,
+            /*storage=*/storage,
+            /*stack_offset=*/IntegerAttr{},
+            /*init=*/Value{},
+            /*address=*/IntegerAttr{});
+
+        uint32_t newId = declOp.getVarId();
+        current[canonReg] = {declOp, newId, varName};
+
+        ++NumRegVarsCreated;
+        ++NumSSAVersions;
+
+        LLVM_DEBUG(llvm::dbgs() << "  SSA version: " << varName
+                                << " (var_id=" << newId
+                                << ", ver=" << ver
+                                << " for " << canonReg << ")\n");
+
+        return declOp;
+    }
+
+    /// Get the current version for a register read.
+    /// @return  Pointer to the current version, or nullptr if none yet.
+    const Version* getCurrentVersion(llvm::StringRef canonReg) const {
+        auto it = current.find(canonReg);
+        return (it != current.end()) ? &it->second : nullptr;
     }
 };
 
@@ -573,230 +663,274 @@ private:
                                 << ", hasReturn="
                                 << tracker.hasReturnValue << ")\n");
 
-        // ── Phase 1: Replace RegRead operations ──────────────────────────
+        // ── Phase 1+2 (unified): Program-order SSA walk ────────────────
+        //
+        // Instead of processing all reads then all writes (which forces a
+        // single VarDeclOp per register), we walk operations in PROGRAM
+        // ORDER within each block.  Each RegWrite creates a NEW variable
+        // version (rax, rax_1, rax_2, ...) and each RegRead references
+        // the MOST RECENT version.
+        //
+        // This gives every definition a unique var_id, which prevents the
+        // EliminateDeadCode Phase 7 from collapsing all assignments to
+        // the same register into one (the root cause of the 367/368 kill).
+        //
+        // Industry standard: SAILR, Osprey, ReSym, Ghidra, IDA Pro all
+        // create one variable per definition point.
 
-        // Collect all RegRead ops first (walk + erase pattern).
-        llvm::SmallVector<helix::low::RegReadOp, 16> regReads;
-        funcBody.walk([&](helix::low::RegReadOp readOp) {
-            regReads.push_back(readOp);
-        });
+        SSAVersionTracker ssaTracker(tracker.varIdCounter);
 
-        for (auto readOp : regReads) {
-            auto regName = readOp.getRegName();
-
-            // Resolve sub-register alias.
-            auto subRegOpt = getSubRegInfo(regName);
-            if (!subRegOpt) {
-                // Unknown register — emit as a temporary variable.
-                LLVM_DEBUG(llvm::dbgs() << "  Unknown register: "
-                                        << regName << " -> temp\n");
-                builder.setInsertionPoint(readOp);
-                auto* tempDecl = tracker.declareTemp(
-                    readOp.getResult().getType(), declBuilder, funcLoc);
-                auto tempTyped = llvm::cast<helix::high::VarDeclOp>(tempDecl);
-                auto varRef = builder.create<helix::high::VarRefOp>(
-                    readOp.getLoc(),
-                    readOp.getResult().getType(),
-                    tempTyped.getVarId(),
-                    tempTyped.getVarName(),
-                    mlir::IntegerAttr{});
-                // Propagate infrastructure marker to the replacement ops
-                // so downstream passes (DCE, emitter) can identify them.
-                if (readOp->hasAttr("helix.infrastructure")) {
-                    varRef->setAttr("helix.infrastructure",
-                        builder.getUnitAttr());
-                    tempTyped->setAttr("helix.infrastructure",
-                        builder.getUnitAttr());
-                }
-                readOp.getResult().replaceAllUsesWith(varRef.getResult());
-                readOp.erase();
-                ++NumReadsReplaced;
-                continue;
-            }
-
-            auto& subReg = *subRegOpt;
-
-            // Ensure the canonical variable is declared.
-            // Pass the readOp as context for return-context detection.
-            auto* varDecl = tracker.getOrDeclareRegVar(
-                subReg.parent, declBuilder, funcLoc, readOp);
-
-            builder.setInsertionPoint(readOp);
-
-            // Read the full-width variable.
-            auto i64Ty = builder.getIntegerType(64);
-            auto varDeclTyped = llvm::cast<helix::high::VarDeclOp>(varDecl);
-
-            // Propagate inferred_type from the RegReadOp to the VarDeclOp.
-            // This makes the type visible in the emitter's variable declarations.
-            if (auto inferredType = readOp->getAttrOfType<StringAttr>("inferred_type")) {
-                if (!varDeclTyped->hasAttr("inferred_type"))
-                    varDeclTyped->setAttr("inferred_type", inferredType);
-            }
-
-            // Track param naming statistics.
-            if (tracker.argRegPositions.count(subReg.parent))
-                ++NumParamsNamed;
-            if (subReg.parent == "RAX" && tracker.hasReturnValue &&
-                VariableTracker::isReturnContext(readOp, subReg.parent))
-                ++NumReturnVarsNamed;
-            auto varRef = builder.create<helix::high::VarRefOp>(
-                readOp.getLoc(),
-                i64Ty,
-                varDeclTyped.getVarId(),
-                varDeclTyped.getVarName(),
-                mlir::IntegerAttr{});
-
-            Value result;
-            if (subReg.width == 64 && subReg.bitOffset == 0) {
-                // Full-width read — no cast needed.
-                result = varRef.getResult();
-            } else if (subReg.bitOffset == 0) {
-                // Low sub-register read — simple truncation.
-                result = emitTruncation(varRef.getResult(), subReg.width,
-                                        builder, readOp.getLoc());
-                ++NumAliasesResolved;
-            } else {
-                // High-byte read (AH, BH, CH, DH) — shift + truncate.
-                result = emitHighByteExtract(varRef.getResult(),
-                                             subReg.bitOffset, subReg.width,
-                                             builder, readOp.getLoc());
-                ++NumAliasesResolved;
-            }
-
-            // Propagate infrastructure marker for known-register reads.
-            if (readOp->hasAttr("helix.infrastructure"))
-                varRef->setAttr("helix.infrastructure",
-                    builder.getUnitAttr());
-
-            readOp.getResult().replaceAllUsesWith(result);
-            readOp.erase();
-            ++NumReadsReplaced;
+        // Initialize parameter registers with version 0 so that reads
+        // before any write see the parameter variable.
+        for (auto& [regName, paramIdx] : tracker.argRegPositions) {
+            ssaTracker.createNewVersion(regName, declBuilder, funcLoc,
+                                        tracker, /*contextOp=*/nullptr);
+            LLVM_DEBUG(llvm::dbgs() << "  Initialized param register: "
+                                    << regName << " as param_" << paramIdx
+                                    << "\n");
         }
 
-        // ── Phase 2: Replace RegWrite operations ─────────────────────────
+        // Walk ALL operations in program order (per block).
+        for (auto& block : funcBody) {
+            for (auto& op : llvm::make_early_inc_range(block)) {
 
-        llvm::SmallVector<helix::low::RegWriteOp, 16> regWrites;
-        funcBody.walk([&](helix::low::RegWriteOp writeOp) {
-            regWrites.push_back(writeOp);
-        });
+                // ── Handle RegRead ──────────────────────────────────────
+                if (auto readOp = dyn_cast<helix::low::RegReadOp>(&op)) {
+                    auto regName = readOp.getRegName();
 
-        for (auto writeOp : regWrites) {
-            auto regName = writeOp.getRegName();
-
-            // Resolve sub-register alias.
-            auto subRegOpt = getSubRegInfo(regName);
-            if (!subRegOpt) {
-                // Unknown register — emit as temporary assignment.
-                LLVM_DEBUG(llvm::dbgs() << "  Unknown register write: "
-                                        << regName << " -> temp assign\n");
-                builder.setInsertionPoint(writeOp);
-                auto* tempDecl = tracker.declareTemp(
-                    writeOp.getValue().getType(), declBuilder, funcLoc);
-                auto tempTyped2 = llvm::cast<helix::high::VarDeclOp>(tempDecl);
-                auto tempRef = builder.create<helix::high::VarRefOp>(
-                    writeOp.getLoc(),
-                    writeOp.getValue().getType(),
-                    tempTyped2.getVarId(),
-                    tempTyped2.getVarName(),
-                    mlir::IntegerAttr{});
-                auto assignOp = builder.create<helix::high::AssignOp>(
-                    writeOp.getLoc(),
-                    tempRef.getResult(),
-                    writeOp.getValue(),
-                    mlir::IntegerAttr{});
-                // Propagate infrastructure marker to replacement ops.
-                if (writeOp->hasAttr("helix.infrastructure")) {
-                    assignOp->setAttr("helix.infrastructure",
-                        builder.getUnitAttr());
-                    tempTyped2->setAttr("helix.infrastructure",
-                        builder.getUnitAttr());
-                }
-                writeOp.erase();
-                ++NumWritesReplaced;
-                continue;
-            }
-
-            auto& subReg = *subRegOpt;
-
-            // NOTE: Splitting a register into per-block variables is unsafe in
-            // the current pass architecture because reads are rewritten before
-            // writes. A later block-local split can leave existing var.ref ops
-            // pointing at the canonical register variable while assignments are
-            // redirected to a different declaration, creating phantom
-            // uninitialized registers in the output. Prefer one canonical
-            // variable until def-use partitioning is made SSA-aware.
-            Operation* varDecl = tracker.getOrDeclareRegVar(
-                subReg.parent, declBuilder, funcLoc, writeOp);
-
-            builder.setInsertionPoint(writeOp);
-
-            // Propagate inferred_type from the written value to the VarDeclOp.
-            // The type comes from PropagateTypes running on the HelixLow IR.
-            {
-                auto varDeclForType = llvm::cast<helix::high::VarDeclOp>(varDecl);
-                if (!varDeclForType->hasAttr("inferred_type")) {
-                    // Check the value being written
-                    if (auto* valDef = writeOp.getValue().getDefiningOp()) {
-                        if (auto inferredType = valDef->getAttrOfType<StringAttr>("inferred_type"))
-                            varDeclForType->setAttr("inferred_type", inferredType);
+                    // Resolve sub-register alias.
+                    auto subRegOpt = getSubRegInfo(regName);
+                    if (!subRegOpt) {
+                        // Unknown register — emit as a temporary variable.
+                        LLVM_DEBUG(llvm::dbgs() << "  Unknown register: "
+                                                << regName << " -> temp\n");
+                        builder.setInsertionPoint(readOp);
+                        auto* tempDecl = tracker.declareTemp(
+                            readOp.getResult().getType(), declBuilder,
+                            funcLoc);
+                        auto tempTyped =
+                            llvm::cast<helix::high::VarDeclOp>(tempDecl);
+                        auto varRef =
+                            builder.create<helix::high::VarRefOp>(
+                                readOp.getLoc(),
+                                readOp.getResult().getType(),
+                                tempTyped.getVarId(),
+                                tempTyped.getVarName(),
+                                mlir::IntegerAttr{});
+                        if (readOp->hasAttr("helix.infrastructure")) {
+                            varRef->setAttr("helix.infrastructure",
+                                builder.getUnitAttr());
+                            tempTyped->setAttr("helix.infrastructure",
+                                builder.getUnitAttr());
+                        }
+                        readOp.getResult().replaceAllUsesWith(
+                            varRef.getResult());
+                        readOp.erase();
+                        ++NumReadsReplaced;
+                        continue;
                     }
-                    // Also check the RegWriteOp itself
-                    if (!varDeclForType->hasAttr("inferred_type")) {
-                        if (auto inferredType = writeOp->getAttrOfType<StringAttr>("inferred_type"))
-                            varDeclForType->setAttr("inferred_type", inferredType);
+
+                    auto& subReg = *subRegOpt;
+
+                    // Get the current SSA version for this register.
+                    // If no version exists yet (read before any write),
+                    // create an initial version.
+                    auto* ver = ssaTracker.getCurrentVersion(subReg.parent);
+                    if (!ver) {
+                        ssaTracker.createNewVersion(
+                            subReg.parent, declBuilder, funcLoc,
+                            tracker, readOp);
+                        ver = ssaTracker.getCurrentVersion(subReg.parent);
                     }
+
+                    builder.setInsertionPoint(readOp);
+
+                    // Propagate inferred_type to the VarDeclOp.
+                    auto varDeclOp =
+                        llvm::cast<helix::high::VarDeclOp>(ver->decl);
+                    if (auto inferredType =
+                            readOp->getAttrOfType<StringAttr>(
+                                "inferred_type")) {
+                        if (!varDeclOp->hasAttr("inferred_type"))
+                            varDeclOp->setAttr("inferred_type",
+                                               inferredType);
+                    }
+
+                    // Track param naming statistics.
+                    if (tracker.argRegPositions.count(subReg.parent))
+                        ++NumParamsNamed;
+                    if (subReg.parent == "RAX" && tracker.hasReturnValue &&
+                        VariableTracker::isReturnContext(readOp,
+                                                        subReg.parent))
+                        ++NumReturnVarsNamed;
+
+                    // Create VarRef with THIS version's var_id.
+                    auto i64Ty = builder.getIntegerType(64);
+                    auto varRef = builder.create<helix::high::VarRefOp>(
+                        readOp.getLoc(), i64Ty,
+                        ver->varId,
+                        builder.getStringAttr(ver->varName),
+                        mlir::IntegerAttr{});
+
+                    // Handle sub-register truncation.
+                    Value result;
+                    if (subReg.width == 64 && subReg.bitOffset == 0) {
+                        result = varRef.getResult();
+                    } else if (subReg.bitOffset == 0) {
+                        result = emitTruncation(varRef.getResult(),
+                                                subReg.width, builder,
+                                                readOp.getLoc());
+                        ++NumAliasesResolved;
+                    } else {
+                        result = emitHighByteExtract(
+                            varRef.getResult(), subReg.bitOffset,
+                            subReg.width, builder, readOp.getLoc());
+                        ++NumAliasesResolved;
+                    }
+
+                    if (readOp->hasAttr("helix.infrastructure"))
+                        varRef->setAttr("helix.infrastructure",
+                            builder.getUnitAttr());
+
+                    readOp.getResult().replaceAllUsesWith(result);
+                    readOp.erase();
+                    ++NumReadsReplaced;
+                    continue;
+                }
+
+                // ── Handle RegWrite ─────────────────────────────────────
+                if (auto writeOp = dyn_cast<helix::low::RegWriteOp>(&op)) {
+                    auto regName = writeOp.getRegName();
+
+                    // Resolve sub-register alias.
+                    auto subRegOpt = getSubRegInfo(regName);
+                    if (!subRegOpt) {
+                        // Unknown register — emit as temporary assignment.
+                        LLVM_DEBUG(llvm::dbgs()
+                            << "  Unknown register write: "
+                            << regName << " -> temp assign\n");
+                        builder.setInsertionPoint(writeOp);
+                        auto* tempDecl = tracker.declareTemp(
+                            writeOp.getValue().getType(), declBuilder,
+                            funcLoc);
+                        auto tempTyped2 =
+                            llvm::cast<helix::high::VarDeclOp>(tempDecl);
+                        auto tempRef =
+                            builder.create<helix::high::VarRefOp>(
+                                writeOp.getLoc(),
+                                writeOp.getValue().getType(),
+                                tempTyped2.getVarId(),
+                                tempTyped2.getVarName(),
+                                mlir::IntegerAttr{});
+                        auto assignOp =
+                            builder.create<helix::high::AssignOp>(
+                                writeOp.getLoc(),
+                                tempRef.getResult(),
+                                writeOp.getValue(),
+                                mlir::IntegerAttr{});
+                        if (writeOp->hasAttr("helix.infrastructure")) {
+                            assignOp->setAttr("helix.infrastructure",
+                                builder.getUnitAttr());
+                            tempTyped2->setAttr("helix.infrastructure",
+                                builder.getUnitAttr());
+                        }
+                        writeOp.erase();
+                        ++NumWritesReplaced;
+                        continue;
+                    }
+
+                    auto& subReg = *subRegOpt;
+
+                    builder.setInsertionPoint(writeOp);
+
+                    Value valueToStore;
+                    if (subReg.width == 64 && subReg.bitOffset == 0) {
+                        // Full-width write — direct assignment.
+                        valueToStore = writeOp.getValue();
+                    } else {
+                        // Sub-register write — read-modify-write.
+                        // Read the CURRENT version of the parent register.
+                        auto* prevVer =
+                            ssaTracker.getCurrentVersion(subReg.parent);
+                        if (!prevVer) {
+                            // No previous version — create initial one.
+                            ssaTracker.createNewVersion(
+                                subReg.parent, declBuilder, funcLoc,
+                                tracker, writeOp);
+                            prevVer = ssaTracker.getCurrentVersion(
+                                subReg.parent);
+                        }
+
+                        auto i64Ty = builder.getIntegerType(64);
+                        auto currentVar =
+                            builder.create<helix::high::VarRefOp>(
+                                writeOp.getLoc(), i64Ty,
+                                prevVer->varId,
+                                builder.getStringAttr(prevVer->varName),
+                                mlir::IntegerAttr{});
+
+                        valueToStore = emitSubRegInsert(
+                            currentVar.getResult(), writeOp.getValue(),
+                            subReg, builder, writeOp.getLoc());
+                        ++NumAliasesResolved;
+                    }
+
+                    // CREATE NEW VERSION for this write — the core of SSA
+                    // splitting.  Every RegWrite gets a unique var_id.
+                    auto* newDecl = ssaTracker.createNewVersion(
+                        subReg.parent, declBuilder, funcLoc,
+                        tracker, writeOp);
+                    auto newDeclTyped =
+                        llvm::cast<helix::high::VarDeclOp>(newDecl);
+
+                    // Propagate inferred_type from the written value.
+                    if (!newDeclTyped->hasAttr("inferred_type")) {
+                        if (auto* valDef =
+                                writeOp.getValue().getDefiningOp()) {
+                            if (auto inferredType =
+                                    valDef->getAttrOfType<StringAttr>(
+                                        "inferred_type"))
+                                newDeclTyped->setAttr("inferred_type",
+                                                      inferredType);
+                        }
+                        if (!newDeclTyped->hasAttr("inferred_type")) {
+                            if (auto inferredType =
+                                    writeOp->getAttrOfType<StringAttr>(
+                                        "inferred_type"))
+                                newDeclTyped->setAttr("inferred_type",
+                                                      inferredType);
+                        }
+                    }
+
+                    // Emit the assignment to the NEW version.
+                    auto targetRef =
+                        builder.create<helix::high::VarRefOp>(
+                            writeOp.getLoc(),
+                            valueToStore.getType(),
+                            newDeclTyped.getVarId(),
+                            newDeclTyped.getVarName(),
+                            mlir::IntegerAttr{});
+                    auto assignOp2 =
+                        builder.create<helix::high::AssignOp>(
+                            writeOp.getLoc(),
+                            targetRef.getResult(),
+                            valueToStore,
+                            mlir::IntegerAttr{});
+
+                    // Propagate infrastructure marker.
+                    if (writeOp->hasAttr("helix.infrastructure") ||
+                        (writeOp.getValue().getDefiningOp() &&
+                         writeOp.getValue().getDefiningOp()->hasAttr(
+                             "helix.infrastructure"))) {
+                        assignOp2->setAttr("helix.infrastructure",
+                            builder.getUnitAttr());
+                    }
+
+                    writeOp.erase();
+                    ++NumWritesReplaced;
+                    continue;
                 }
             }
-
-            Value valueToStore;
-            if (subReg.width == 64 && subReg.bitOffset == 0) {
-                // Full-width write — direct assignment.
-                valueToStore = writeOp.getValue();
-            } else {
-                // Sub-register write — read-modify-write pattern.
-                auto i64Ty = builder.getIntegerType(64);
-                auto varDeclTyped2 = llvm::cast<helix::high::VarDeclOp>(varDecl);
-                auto currentVar = builder.create<helix::high::VarRefOp>(
-                    writeOp.getLoc(),
-                    i64Ty,
-                    varDeclTyped2.getVarId(),
-                    varDeclTyped2.getVarName(),
-                    mlir::IntegerAttr{});
-
-                valueToStore = emitSubRegInsert(
-                    currentVar.getResult(), writeOp.getValue(),
-                    subReg, builder, writeOp.getLoc());
-                ++NumAliasesResolved;
-            }
-
-            // Emit the assignment to the canonical variable.
-            auto varDeclTyped3 = llvm::cast<helix::high::VarDeclOp>(varDecl);
-            auto targetRef = builder.create<helix::high::VarRefOp>(
-                writeOp.getLoc(),
-                valueToStore.getType(),
-                varDeclTyped3.getVarId(),
-                varDeclTyped3.getVarName(),
-                mlir::IntegerAttr{});
-            auto assignOp2 = builder.create<helix::high::AssignOp>(
-                writeOp.getLoc(),
-                targetRef.getResult(),
-                valueToStore,
-                mlir::IntegerAttr{});
-
-            // Propagate infrastructure marker to the assignment.
-            // For known-register writes, we also check if the VALUE being
-            // written is infrastructure (e.g., writing a PC-derived value
-            // to RAX).  The written value's defining op carries the marker.
-            if (writeOp->hasAttr("helix.infrastructure") ||
-                (writeOp.getValue().getDefiningOp() &&
-                 writeOp.getValue().getDefiningOp()->hasAttr("helix.infrastructure"))) {
-                assignOp2->setAttr("helix.infrastructure",
-                    builder.getUnitAttr());
-            }
-
-            writeOp.erase();
-            ++NumWritesReplaced;
         }
 
         // ── Phase 3: Replace __undef references ─────────────────────────
@@ -986,7 +1120,9 @@ private:
 
         LLVM_DEBUG({
             llvm::dbgs() << "  Summary: "
-                         << tracker.regToDecl.size() << " register vars, "
+                         << ssaTracker.versionCounters.size()
+                         << " registers with "
+                         << NumSSAVersions << " SSA versions, "
                          << tracker.stackOffsetToDecl.size() << " stack vars, "
                          << tracker.tempCounter << " temps\n";
         });
