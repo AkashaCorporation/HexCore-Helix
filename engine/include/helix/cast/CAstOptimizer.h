@@ -40,6 +40,8 @@ public:
     void eliminateNullPtrStores(CFuncDecl& func);
     void cleanupFloatZeros(CFuncDecl& func);
     void collapseMinMaxPatterns(CFuncDecl& func);
+    void foldRedundantReturnAfterElse(CFuncDecl& func);
+    void invertEmptyIfThen(CFuncDecl& func);
 
     /// Apply user-defined variable renames to the entire AST.
     /// Walks all CVarRefExpr nodes and VarDecl names, replacing
@@ -175,6 +177,12 @@ private:
 
     // ── Min/Max collapse helpers ────────────────────────────────────────
     static void collapseMinMaxInList(std::vector<StmtPtr>& stmts);
+
+    // ── Redundant return-after-else folding helpers ─────────────────────
+    static void foldRedundantReturnInList(std::vector<StmtPtr>& stmts);
+
+    // ── Empty if-then inversion helpers ─────────────────────────────────
+    static void invertEmptyIfInList(std::vector<StmtPtr>& stmts);
 };
 
 } // namespace helix::cast

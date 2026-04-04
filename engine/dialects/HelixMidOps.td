@@ -105,7 +105,7 @@ def HelixMid_VarRefOp : HelixMid_Op<"var.ref", [Pure]> {
   }];
 }
 
-def HelixMid_AssignOp : HelixMid_Op<"assign", []> {
+def HelixMid_AssignOp : HelixMid_Op<"assign", [MemoryEffects<[MemWrite]>]> {
   let summary = "Assign a value to a variable slot";
 
   let arguments = (ins
@@ -123,7 +123,7 @@ def HelixMid_AssignOp : HelixMid_Op<"assign", []> {
 // Memory Operations (typed)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-def HelixMid_LoadOp : HelixMid_Op<"load", []> {
+def HelixMid_LoadOp : HelixMid_Op<"load", [MemoryEffects<[MemRead]>]> {
   let summary = "Typed memory load";
   let description = [{
     Loads a typed value from memory at the given address.  Unlike
@@ -142,7 +142,7 @@ def HelixMid_LoadOp : HelixMid_Op<"load", []> {
   }];
 }
 
-def HelixMid_StoreOp : HelixMid_Op<"store", []> {
+def HelixMid_StoreOp : HelixMid_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Typed memory store";
 
   let arguments = (ins
@@ -306,7 +306,7 @@ def HelixMid_IndexPtrOp : HelixMid_Op<"index.ptr", [Pure]> {
 // Call Operation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-def HelixMid_CallOp : HelixMid_Op<"call", []> {
+def HelixMid_CallOp : HelixMid_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "Typed function call with resolved arguments";
   let description = [{
     A function call where arguments have been resolved from register writes

@@ -1,5 +1,5 @@
 /// @file CAstOptimizer.cpp
-/// @brief Six-pass C AST optimizer that rewrites CFuncDecl trees in-place.
+/// @brief Multi-pass C AST optimizer that rewrites CFuncDecl trees in-place.
 ///
 /// Pass order:
 ///   1. removePrologueEpilogue   — strip frame setup/teardown register ops
@@ -164,6 +164,8 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     removeEmptyIfStatements(func);        // MINSS/MAXSS: remove dead empty if-stmts
     cleanupFloatZeros(func);              // (int64_t)(void*)0 → 0.0f for float vars
     collapseMinMaxPatterns(func);         // consecutive if(a cmp b){x=sel} → x = min/max
+    foldRedundantReturnAfterElse(func);    // else{return X}; return X → remove dup
+    invertEmptyIfThen(func);               // if(c){} else{B} → if(!c){B}
     removeDeadCodeAfterReturn(func);      // strip unreachable stmts after return
 }
 
@@ -2676,6 +2678,190 @@ void CAstOptimizer::renameInStmtList(
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass 15: foldRedundantReturnAfterElse
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Fold patterns where an if/else ends with 'return X' in the else branch,
+// followed immediately by 'return X' at the same scope level:
+//
+//   } else {
+//       return result;
+//   }
+//   return result;   // ← redundant, already covered by else
+//
+// This is a CFG-to-AST lowering artifact.
+
+void CAstOptimizer::foldRedundantReturnInList(std::vector<StmtPtr>& stmts) {
+    // Recurse into nested scopes first
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            foldRedundantReturnInList(s.thenBody);
+            foldRedundantReturnInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            foldRedundantReturnInList(static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            foldRedundantReturnInList(static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            foldRedundantReturnInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                foldRedundantReturnInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            foldRedundantReturnInList(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Scan for IfStmt followed by ReturnStmt with matching else-return
+    for (size_t i = 0; i + 1 < stmts.size(); ) {
+        if (!stmts[i] || stmts[i]->getKind() != NodeKind::IfStmt) {
+            ++i;
+            continue;
+        }
+        auto& ifStmt = static_cast<CIfStmt&>(*stmts[i]);
+
+        if (!stmts[i + 1] || stmts[i + 1]->getKind() != NodeKind::ReturnStmt) {
+            ++i;
+            continue;
+        }
+        auto& nextReturn = static_cast<CReturnStmt&>(*stmts[i + 1]);
+
+        // Check: else block must end with a return
+        if (ifStmt.elseBody.empty()) {
+            ++i;
+            continue;
+        }
+        auto* elseReturn = ifStmt.elseBody.back().get();
+        if (!elseReturn || elseReturn->getKind() != NodeKind::ReturnStmt) {
+            ++i;
+            continue;
+        }
+        auto& elseRet = static_cast<CReturnStmt&>(*elseReturn);
+
+        // Both return same expression? (both nullptr = bare return, or equal exprs)
+        bool match = false;
+        if (!elseRet.value && !nextReturn.value) {
+            match = true;
+        } else if (elseRet.value && nextReturn.value) {
+            match = exprEquals(elseRet.value.get(), nextReturn.value.get());
+        }
+
+        if (match) {
+            stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i + 1));
+            // Don't advance i — check this position again in case of chained patterns
+        } else {
+            ++i;
+        }
+    }
+}
+
+void CAstOptimizer::foldRedundantReturnAfterElse(CFuncDecl& func) {
+    foldRedundantReturnInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass 16: invertEmptyIfThen
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Invert if-statements where the then-body is empty but the else-body has content:
+//
+//   if (condition) {
+//       // empty
+//   } else {
+//       return result;
+//   }
+//
+// Becomes:
+//
+//   if (!condition) {
+//       return result;
+//   }
+//
+// For comparison conditions, we flip the operator directly (== → !=, < → >=)
+// instead of wrapping with logical-not, producing cleaner output.
+
+void CAstOptimizer::invertEmptyIfInList(std::vector<StmtPtr>& stmts) {
+    // Recurse into nested scopes first
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            invertEmptyIfInList(s.thenBody);
+            invertEmptyIfInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            invertEmptyIfInList(static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            invertEmptyIfInList(static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            invertEmptyIfInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                invertEmptyIfInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            invertEmptyIfInList(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Invert if-stmts where then is empty and else has content
+    for (auto& sp : stmts) {
+        if (!sp || sp->getKind() != NodeKind::IfStmt)
+            continue;
+        auto& ifStmt = static_cast<CIfStmt&>(*sp);
+
+        if (!ifStmt.thenBody.empty() || ifStmt.elseBody.empty())
+            continue;
+
+        // Negate the condition — prefer flipping comparison operator
+        if (ifStmt.condition &&
+            ifStmt.condition->getKind() == NodeKind::BinaryExpr) {
+            auto& cmp = static_cast<CBinaryExpr&>(*ifStmt.condition);
+            if (isCmpOp(cmp.op)) {
+                cmp.op = flipCmp(cmp.op);
+                // Swap then ← else, else ← empty
+                ifStmt.thenBody = std::move(ifStmt.elseBody);
+                ifStmt.elseBody.clear();
+                continue;
+            }
+        }
+        // Fallback: wrap with logical-not
+        ifStmt.condition = std::make_unique<CUnaryExpr>(
+            UnaryOp::LogNot, std::move(ifStmt.condition),
+            CType::int32());
+        ifStmt.thenBody = std::move(ifStmt.elseBody);
+        ifStmt.elseBody.clear();
+    }
+}
+
+void CAstOptimizer::invertEmptyIfThen(CFuncDecl& func) {
+    invertEmptyIfInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Variable rename support
+// ═══════════════════════════════════════════════════════════════════════════════
 
 void CAstOptimizer::applyVariableRenames(
     CFuncDecl& func,

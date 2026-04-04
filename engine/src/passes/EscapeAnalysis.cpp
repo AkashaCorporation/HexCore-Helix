@@ -45,6 +45,8 @@ using namespace helix;
 STATISTIC(NumVarsAnalyzed,    "Number of variables analyzed");
 STATISTIC(NumVarsEscaping,    "Number of variables that escape");
 STATISTIC(NumVarsNonEscaping, "Number of variables that do not escape");
+STATISTIC(NumPtrArithEscapes, "Number of variables escaping via pointer arithmetic");
+STATISTIC(NumIndirectCallEscapes, "Number of variables escaping due to indirect calls");
 
 namespace {
 
@@ -65,6 +67,48 @@ static std::optional<uint32_t> traceAddrOfToVarSlot(Value val) {
         return std::nullopt;
 
     return varRef.getSlotId();
+}
+
+/// Trace an SSA value through pointer arithmetic (BinExpr Add/Sub with a
+/// var.ref operand) to find the base variable slot ID.  This detects the
+/// common pattern:  var.ref(slot) + constant_offset  (struct field access).
+///
+/// Reference: Osprey/XTRIDE heuristic — pointer arithmetic on function
+/// parameters implies struct manipulation and potential aliasing.
+static std::optional<uint32_t> tracePtrArithToVarSlot(Value val) {
+    // Direct var.ref
+    if (auto varRef = val.getDefiningOp<mid::VarRefOp>())
+        return varRef.getSlotId();
+
+    // BinExpr(Add/Sub, var.ref, constant) — pointer + offset → struct access
+    if (auto binExpr = val.getDefiningOp<mid::BinExprOp>()) {
+        auto kind = binExpr.getKind();
+        if (kind == mid::BinExprKind::Add || kind == mid::BinExprKind::Sub) {
+            // Check LHS for var.ref
+            if (auto lhsRef = binExpr.getLhs().getDefiningOp<mid::VarRefOp>())
+                return lhsRef.getSlotId();
+            // Check RHS for var.ref (commutative Add)
+            if (kind == mid::BinExprKind::Add) {
+                if (auto rhsRef = binExpr.getRhs().getDefiningOp<mid::VarRefOp>())
+                    return rhsRef.getSlotId();
+            }
+            // Recursive: (var.ref + K1) + K2 — nested struct offset
+            auto lhsSlot = tracePtrArithToVarSlot(binExpr.getLhs());
+            if (lhsSlot.has_value())
+                return lhsSlot;
+            if (kind == mid::BinExprKind::Add) {
+                auto rhsSlot = tracePtrArithToVarSlot(binExpr.getRhs());
+                if (rhsSlot.has_value())
+                    return rhsSlot;
+            }
+        }
+    }
+
+    // CastOp wrapping a var.ref or arithmetic — (type)(var.ref + offset)
+    if (auto castOp = val.getDefiningOp<mid::CastOp>())
+        return tracePtrArithToVarSlot(castOp.getInput());
+
+    return std::nullopt;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -159,7 +203,85 @@ private:
             }
         });
 
-        // ── Phase 4: Annotate var.decl ops ───────────────────────────────
+        // ── Phase 4: Pointer arithmetic escape (Osprey heuristic) ───────
+        //
+        // If a store or load uses an address derived from pointer arithmetic
+        // on a variable (var.ref + offset → struct field access), mark that
+        // variable as escaping.  This prevents DCE from eliminating stores
+        // to struct fields accessed through function parameters:
+        //
+        //   store value to (param_2 + 0x68)   ← list_head manipulation
+        //   load (param_1 + 0x30)              ← struct field read
+        //
+        // Without this, DCE treats these as dead stores because it doesn't
+        // understand that the pointed-to memory is externally visible.
+        //
+        // Reference: Osprey/XTRIDE type-based alias analysis.
+        body.walk([&](mid::StoreOp storeOp) {
+            auto slotId = tracePtrArithToVarSlot(storeOp.getAddr());
+            if (slotId.has_value()) {
+                if (escapingSlots.insert(*slotId).second) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Slot " << *slotId
+                        << " escapes via ptr-arith store (struct write)\n");
+                    ++NumPtrArithEscapes;
+                }
+            }
+        });
+        body.walk([&](mid::LoadOp loadOp) {
+            auto slotId = tracePtrArithToVarSlot(loadOp.getAddr());
+            if (slotId.has_value()) {
+                if (escapingSlots.insert(*slotId).second) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Slot " << *slotId
+                        << " escapes via ptr-arith load (struct read)\n");
+                    ++NumPtrArithEscapes;
+                }
+            }
+        });
+
+        // ── Phase 5: Indirect call protection (Anti-DCE blindagem) ──────
+        //
+        // If ANY indirect call exists in the function, the callee is unknown
+        // at decompile time and could read or write any memory reachable
+        // through the function's parameters.  Conservatively mark ALL
+        // parameter-derived variables as escaping.
+        //
+        // Detection: mid::CallOp with "is_indirect" unit attribute.
+        //
+        // This prevents the enhanced DCE (P2.10) from removing stores that
+        // set up arguments for indirect calls or manipulate globally-visible
+        // data structures (linked lists, device registers, etc.).
+        {
+            bool hasIndirectCall = false;
+            body.walk([&](mid::CallOp callOp) {
+                if (callOp->hasAttr("is_indirect"))
+                    hasIndirectCall = true;
+            });
+
+            if (hasIndirectCall) {
+                LLVM_DEBUG(llvm::dbgs()
+                    << "  Function has indirect call(s) — marking all "
+                    << "parameter slots as escaping\n");
+
+                // Collect all VarDeclOp slots that represent function
+                // parameters (typically the first N slots matching ABI).
+                // Heuristic: mark ALL variables as escaping when indirect
+                // calls exist, since the callee could access any reachable
+                // memory through pointer arguments.
+                body.walk([&](mid::VarDeclOp declOp) {
+                    uint32_t slotId = declOp.getSlotId();
+                    if (escapingSlots.insert(slotId).second) {
+                        LLVM_DEBUG(llvm::dbgs()
+                            << "  Slot " << slotId
+                            << " escapes (indirect call protection)\n");
+                        ++NumIndirectCallEscapes;
+                    }
+                });
+            }
+        }
+
+        // ── Phase 6: Annotate var.decl ops ───────────────────────────────
         //
         // Set the "helix.escapes" BoolAttr on each var.decl based on
         // whether the slot was found in the escaping set.

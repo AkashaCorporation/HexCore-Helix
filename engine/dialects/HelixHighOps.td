@@ -198,7 +198,7 @@ def HelixHigh_CastOp : HelixHigh_Op<"cast", [Pure]> {
   }];
 }
 
-def HelixHigh_CallOp : HelixHigh_Op<"call", []> {
+def HelixHigh_CallOp : HelixHigh_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "Function call with recovered arguments";
   let description = [{
     A function call with explicitly recovered arguments (folded from register
@@ -302,7 +302,7 @@ def HelixHigh_VarDeclOp : HelixHigh_Op<"var.decl", []> {
   }];
 }
 
-def HelixHigh_AssignOp : HelixHigh_Op<"assign", []> {
+def HelixHigh_AssignOp : HelixHigh_Op<"assign", [MemoryEffects<[MemWrite]>]> {
   let summary = "Assignment statement: target = value";
 
   let arguments = (ins
@@ -317,7 +317,7 @@ def HelixHigh_AssignOp : HelixHigh_Op<"assign", []> {
   }];
 }
 
-def HelixHigh_ExprStmtOp : HelixHigh_Op<"expr.stmt", []> {
+def HelixHigh_ExprStmtOp : HelixHigh_Op<"expr.stmt", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "Expression statement (discarded value, e.g., void call)";
 
   let arguments = (ins
