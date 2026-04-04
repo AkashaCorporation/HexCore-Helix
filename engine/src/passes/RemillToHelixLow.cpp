@@ -841,6 +841,14 @@ struct RemillToHelixLowPass
         // to function names using the module's own function table and the
         // signature database.
         helix::resolveCallTargets(module);
+
+        // [P0-DEBUG] Count surviving CallOps after full conversion + resolution
+        {
+            unsigned lowCallCount = 0;
+            module.walk([&](helix::low::CallOp) { ++lowCallCount; });
+            llvm::errs() << "[P0-DEBUG] After RemillToHelixLow + resolveCallTargets: "
+                         << lowCallCount << " helix_low.call ops survive\n";
+        }
     }
 
 private:
@@ -1319,6 +1327,10 @@ private:
                         callArgs,
                         /*target_name=*/StringAttr{},
                         addrAttr);
+                    llvm::errs() << "[P0-DEBUG] Indirect call: created CallOp"
+                                 << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
+                                 << " nArgs=" << callArgs.size()
+                                 << "\n";
                 }
 
                 eraseRemillCall();
@@ -1396,6 +1408,11 @@ private:
                     callArgs,
                     builder.getStringAttr(calleeName),
                     addrAttr);
+                llvm::errs() << "[P0-DEBUG] External call: created CallOp"
+                             << " name=" << calleeName
+                             << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
+                             << " nArgs=" << callArgs.size()
+                             << "\n";
 
                 // Break the use-def chain and mark for erasure to ensure
                 // Memory* tokens don't leak into variable recovery.
@@ -2511,12 +2528,20 @@ private:
                 // on the module's target triple.
                 auto callArgs = collectCallArgs(call.getOperation());
 
-                builder.create<helix::low::CallOp>(
+                auto newCallOp = builder.create<helix::low::CallOp>(
                     loc,
                     targetVal,
                     callArgs,
                     targetName,
                     addrAttr);
+
+                llvm::errs() << "[P0-DEBUG] CALL semantic: created CallOp"
+                             << " target=" << (targetName ? targetName.getValue() : "none")
+                             << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
+                             << " resolved=" << addrResolved
+                             << " nArgs=" << callArgs.size()
+                             << "\n";
+                (void)newCallOp;
             }
             break;
         }

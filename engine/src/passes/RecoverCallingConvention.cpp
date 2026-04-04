@@ -220,8 +220,25 @@ struct RecoverCallingConventionPass
 
 private:
     void recoverCC(helix::low::FuncOp func) {
-        // Default to Win64 (user is on Windows). Can be made configurable.
-        CallingConv cc = CallingConv::Win64;
+        // Detect ABI from module's target triple
+        CallingConv cc = CallingConv::Win64; // default fallback
+        auto module = func->getParentOfType<ModuleOp>();
+        if (module) {
+            if (auto triple = module->getAttrOfType<StringAttr>("llvm.target_triple")) {
+                auto t = triple.getValue();
+                llvm::errs() << "[P0-DEBUG] RecoverCC: triple='" << t << "'\n";
+                if (t.contains("linux") || t.contains("elf") || t.contains("gnu") ||
+                    t.contains("freebsd") || t.contains("openbsd"))
+                    cc = CallingConv::SysV;
+                else if (t.contains("darwin") || t.contains("macho"))
+                    cc = CallingConv::SysV; // macOS also uses SysV on x86_64
+            } else {
+                llvm::errs() << "[P0-DEBUG] RecoverCC: NO llvm.target_triple on module\n";
+            }
+        } else {
+            llvm::errs() << "[P0-DEBUG] RecoverCC: FuncOp has no parent ModuleOp!\n";
+        }
+        llvm::errs() << "[P0-DEBUG] RecoverCC: using " << ((cc == CallingConv::Win64) ? "Win64" : "SysV") << "\n";
 
         auto argRegs = (cc == CallingConv::Win64)
             ? llvm::ArrayRef(kWin64IntArgs)

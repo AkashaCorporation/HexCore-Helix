@@ -25,6 +25,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
 
@@ -727,6 +728,61 @@ struct HelixMidToHighPass
         if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
             LLVM_DEBUG(llvm::dbgs() << "HelixMidToHigh: partial conversion "
                                     << "completed with unconverted ops\n");
+        }
+
+        // ── Manual mid::CallOp → high::CallOp for ops inside low::FuncOp ──
+        // Same issue as HelixLowToMid: the conversion framework doesn't
+        // recurse into low::FuncOp regions (unknown dialect = not visited).
+        {
+            llvm::SmallVector<mid::CallOp, 16> callsToConvert;
+            module.walk([&](mid::CallOp call) {
+                callsToConvert.push_back(call);
+            });
+
+            unsigned converted = 0;
+            for (auto midCall : callsToConvert) {
+                OpBuilder builder(midCall);
+
+                std::string callee_name;
+                if (auto name_attr = midCall.getCalleeNameAttr())
+                    callee_name = name_attr.getValue().str();
+                else if (midCall->hasAttr("is_indirect")) {
+                    if (auto vtableAttr = midCall->getAttrOfType<IntegerAttr>("vtable_offset")) {
+                        uint64_t offset = vtableAttr.getValue().getZExtValue();
+                        callee_name = std::format("__vtable_0x{:x}", offset);
+                    } else {
+                        auto addr = midCall.getCalleeAddr();
+                        callee_name = addr != 0
+                            ? std::format("__indirect_{:x}", addr)
+                            : "__indirect_call";
+                    }
+                } else {
+                    auto addr = midCall.getCalleeAddr();
+                    callee_name = addr != 0
+                        ? std::format("sub_{:x}", addr)
+                        : "sub_unknown";
+                }
+
+                builder.create<high::CallOp>(
+                    midCall.getLoc(),
+                    midCall.getResultTypes(),
+                    builder.getI64IntegerAttr(midCall.getCalleeAddr()),
+                    builder.getStringAttr(callee_name),
+                    midCall.getArgs(),
+                    midCall.getAddressAttr()
+                );
+
+                llvm::errs() << "[P0-DEBUG] Manual MidCall→HighCall: "
+                             << callee_name << "\n";
+
+                midCall->erase();
+                ++converted;
+            }
+
+            if (converted > 0) {
+                llvm::errs() << "[P0-DEBUG] HelixMidToHigh: manually converted "
+                             << converted << " mid.call → high.call\n";
+            }
         }
     }
 };

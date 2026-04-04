@@ -873,6 +873,16 @@ private:
         if (funcBody.empty())
             return success();
 
+        // [P0-DEBUG] Count CallOps entering DCE
+        {
+            unsigned callCount = 0;
+            funcBody.walk([&](helix::low::CallOp) { ++callCount; });
+            if (callCount > 0) {
+                llvm::errs() << "[P0-DEBUG] DCE entry '" << func.getSymName()
+                             << "': " << callCount << " low.call ops\n";
+            }
+        }
+
         LLVM_DEBUG(llvm::dbgs() << "EliminateDeadCode: processing '"
                                 << func.getSymName() << "'\n");
 
@@ -1005,6 +1015,14 @@ private:
                                     deadUndefRemoved)
                                 << "\n");
 
+        // [P0-DEBUG] Count CallOps surviving DCE
+        {
+            unsigned callCount = 0;
+            funcBody.walk([&](helix::low::CallOp) { ++callCount; });
+            llvm::errs() << "[P0-DEBUG] DCE exit '" << func.getSymName()
+                         << "': " << callCount << " low.call ops survive\n";
+        }
+
         return success();
     }
 
@@ -1057,6 +1075,11 @@ private:
             });
 
             for (Operation* op : toErase) {
+                // [P0-DEBUG] Catch any CallOp being erased by infra removal
+                if (isa<helix::low::CallOp>(op)) {
+                    llvm::errs() << "[P0-DEBUG] WARNING: Phase 0 erasing a CallOp! "
+                                 << *op << "\n";
+                }
                 // Drop all uses before erasing to avoid dangling references.
                 for (Value result : op->getResults())
                     result.dropAllUses();

@@ -27,6 +27,12 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/PassInstrumentation.h"
+
+// Helix dialect ops for P0 debug counting
+#include "helix/dialects/HelixLowOps.h"
+#include "helix/dialects/HelixMidOps.h"
+#include "helix/dialects/HelixHighOps.h"
 
 // LLVM includes
 #include "llvm/AsmParser/LLParser.h"
@@ -246,6 +252,9 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
         return std::unexpected("translateToMLIR: llvm::Module is null");
     }
 
+    // Capture the target triple before the LLVM module is moved.
+    std::string targetTriple = llvm_module->getTargetTriple();
+
     // Install a diagnostic capture so we can report MLIR-level errors that
     // occur during translation (e.g., unsupported LLVM IR constructs).
     DiagnosticCapture capture(mlir_ctx_);
@@ -263,6 +272,16 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
             std::format("translateToMLIR: LLVM IR to MLIR translation failed: {}",
                         detail)
         );
+    }
+
+    // Preserve the target triple as an attribute on the MLIR ModuleOp.
+    // The MLIR LLVM IR importer does NOT carry this over automatically,
+    // and downstream passes (RecoverCallingConvention, collectCallArgs)
+    // need it to choose the correct ABI (Win64 vs SysV).
+    if (!targetTriple.empty()) {
+        (*mlir_module)->setAttr(
+            "llvm.target_triple",
+            mlir::StringAttr::get(mlir_ctx_, targetTriple));
     }
 
     // Run the MLIR verifier to catch structural problems early (invalid
@@ -293,6 +312,58 @@ void Pipeline::enablePass(std::string_view name) {
     else if (name == "EscapeAnalysis")     enable_escape_analysis_ = true;
     else if (name == "StructRecovery")     enable_struct_recovery_ = true;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [P0-DEBUG] Pass instrumentation that counts CallOps before/after every pass
+// ═══════════════════════════════════════════════════════════════════════════════
+struct CallOpCountInstrumentation : public mlir::PassInstrumentation {
+    void runBeforePass(mlir::Pass* pass, mlir::Operation* op) override {
+        auto module = mlir::dyn_cast<mlir::ModuleOp>(op);
+        if (!module) return;
+        unsigned lowCalls = 0, midCalls = 0, highCalls = 0;
+        module.walk([&](mlir::Operation* inner) {
+            if (mlir::isa<helix::low::CallOp>(inner)) ++lowCalls;
+            else if (mlir::isa<helix::mid::CallOp>(inner)) ++midCalls;
+            else if (mlir::isa<helix::high::CallOp>(inner)) ++highCalls;
+        });
+        if (lowCalls + midCalls + highCalls > 0 || true) {
+            llvm::errs() << "[P0-TRACE] BEFORE " << pass->getName()
+                         << ": low.call=" << lowCalls
+                         << " mid.call=" << midCalls
+                         << " high.call=" << highCalls << "\n";
+        }
+    }
+
+    void runAfterPass(mlir::Pass* pass, mlir::Operation* op) override {
+        auto module = mlir::dyn_cast<mlir::ModuleOp>(op);
+        if (!module) return;
+        unsigned lowCalls = 0, midCalls = 0, highCalls = 0;
+        module.walk([&](mlir::Operation* inner) {
+            if (mlir::isa<helix::low::CallOp>(inner)) ++lowCalls;
+            else if (mlir::isa<helix::mid::CallOp>(inner)) ++midCalls;
+            else if (mlir::isa<helix::high::CallOp>(inner)) ++highCalls;
+        });
+        llvm::errs() << "[P0-TRACE] AFTER  " << pass->getName()
+                     << ": low.call=" << lowCalls
+                     << " mid.call=" << midCalls
+                     << " high.call=" << highCalls << "\n";
+    }
+
+    void runAfterPassFailed(mlir::Pass* pass, mlir::Operation* op) override {
+        auto module = mlir::dyn_cast<mlir::ModuleOp>(op);
+        if (!module) return;
+        unsigned lowCalls = 0, midCalls = 0, highCalls = 0;
+        module.walk([&](mlir::Operation* inner) {
+            if (mlir::isa<helix::low::CallOp>(inner)) ++lowCalls;
+            else if (mlir::isa<helix::mid::CallOp>(inner)) ++midCalls;
+            else if (mlir::isa<helix::high::CallOp>(inner)) ++highCalls;
+        });
+        llvm::errs() << "[P0-TRACE] FAILED " << pass->getName()
+                     << ": low.call=" << lowCalls
+                     << " mid.call=" << midCalls
+                     << " high.call=" << highCalls << "\n";
+    }
+};
 
 void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     // ═══════════════════════════════════════════════════════════════════════
@@ -396,6 +467,10 @@ void Pipeline::ensurePipelineBuilt() {
     // Disable multithreading for deterministic pass execution.
     mlir_ctx_->disableMultithreading();
 
+    // [P0-DEBUG] Register CallOp counting instrumentation
+    pass_manager_->addInstrumentation(
+        std::make_unique<CallOpCountInstrumentation>());
+
     buildPassPipeline(*pass_manager_);
     pipeline_built_ = true;
 }
@@ -410,6 +485,16 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
     // Capture diagnostics so that pass failures produce actionable messages.
     DiagnosticCapture capture(mlir_ctx_);
 
+    // ── Pre-pipeline IR dump: LLVM dialect before any passes ─────────────
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream pre_os("helix_dump_0_before_passes.mlir", ec);
+        if (!ec) {
+            pre_os << "// === HELIX PIPELINE DUMP: Before any passes ===\n";
+            module->print(pre_os);
+        }
+    }
+
     if (mlir::failed(pass_manager_->run(module))) {
         std::string detail = capture.take();
         if (detail.empty())
@@ -418,11 +503,22 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
             std::format("runPasses: MLIR pass pipeline failed: {}", detail)
         );
     }
-    // Dump IR for debugging
-    std::error_code ec;
-    llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec);
-    if (!ec) {
-        module->print(debug_os);
+    // ── Post-pipeline IR dump: HelixHigh after all passes ────────────────
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream post_os("helix_dump_1_after_passes.mlir", ec);
+        if (!ec) {
+            post_os << "// === HELIX PIPELINE DUMP: After all passes ===\n";
+            module->print(post_os);
+        }
+    }
+    // Legacy dump
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec);
+        if (!ec) {
+            module->print(debug_os);
+        }
     }
 
     return {};

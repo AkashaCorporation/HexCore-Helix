@@ -384,6 +384,20 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
         low::CallOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
+        llvm::errs() << "[P0-DEBUG] CallToMidCall: attempting conversion for CallOp"
+                     << " target=" << (op.getTargetNameAttr() ? op.getTargetNameAttr().getValue() : "none")
+                     << " nArgs=" << op.getArgs().size()
+                     << " nAdaptedArgs=" << adaptor.getArgs().size()
+                     << "\n";
+
+        // Check if adapted args are valid
+        for (unsigned i = 0; i < adaptor.getArgs().size(); ++i) {
+            auto arg = adaptor.getArgs()[i];
+            if (!arg) {
+                llvm::errs() << "[P0-DEBUG] CallToMidCall: adapted arg " << i << " is NULL!\n";
+            }
+        }
+
         // Resolve the actual callee address.
         //
         // Priority:
@@ -493,6 +507,11 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
                 midCall->setAttr("vtable_offset",
                     rewriter.getI64IntegerAttr(vtable_offset));
         }
+
+        llvm::errs() << "[P0-DEBUG] CallToMidCall: SUCCESS → mid.call"
+                     << " name=" << (callee_name_attr ? callee_name_attr.getValue() : "none")
+                     << " addr=" << callee_addr
+                     << "\n";
 
         rewriter.eraseOp(op);
         return success();
@@ -798,6 +817,14 @@ struct HelixLowToMidPass
         auto module = getOperation();
         auto *ctx = &getContext();
 
+        // [P0-DEBUG] Count low::CallOps before conversion
+        {
+            unsigned lowCalls = 0;
+            module.walk([&](low::CallOp) { ++lowCalls; });
+            llvm::errs() << "[P0-DEBUG] HelixLowToMid entry: "
+                         << lowCalls << " low.call ops\n";
+        }
+
         // Set up conversion target: HelixMid is legal, HelixLow is illegal
         ConversionTarget target(*ctx);
         target.addLegalDialect<helix::mid::HelixMidDialect>();
@@ -805,14 +832,15 @@ struct HelixLowToMidPass
         target.addLegalDialect<mlir::LLVM::LLVMDialect>();
         target.addIllegalDialect<helix::low::HelixLowDialect>();
 
-        // Allow HelixLow ops that we don't convert yet (JmpOp, JccOp, FuncOp)
+        // Allow HelixLow ops that we don't convert yet (JmpOp, JccOp, etc.)
         // to survive — they'll be handled by subsequent passes.
         target.addLegalOp<low::JmpOp>();
         target.addLegalOp<low::JccOp>();
-        target.addLegalOp<low::FuncOp>();
         target.addLegalOp<low::PushOp>();
         target.addLegalOp<low::PopOp>();
         target.addLegalOp<low::XchgOp>();
+
+        target.addLegalOp<low::FuncOp>();
 
         // Populate patterns
         RewritePatternSet patterns(ctx);
@@ -843,6 +871,104 @@ struct HelixLowToMidPass
                                     << "completed with unconverted ops\n");
             // Don't signal failure — partial conversion is expected during
             // incremental evolution of the pipeline.
+        }
+
+        // ── Manual CallOp conversion for ops inside low::FuncOp ──────────
+        // The dialect conversion framework does not recurse into regions of
+        // ops marked as legal (low::FuncOp).  Any low::CallOps that live
+        // inside a FuncOp region are invisible to applyPartialConversion.
+        // Walk them manually and convert to mid::CallOp in-place.
+        {
+            SmallVector<low::CallOp, 16> callsToConvert;
+            module.walk([&](low::CallOp call) {
+                callsToConvert.push_back(call);
+            });
+
+            unsigned converted = 0;
+            for (auto callOp : callsToConvert) {
+                OpBuilder builder(callOp);
+
+                uint64_t callee_addr = 0;
+                bool is_indirect = false;
+                StringAttr callee_name_attr = callOp.getTargetNameAttr();
+
+                if (callee_name_attr) {
+                    auto name = callee_name_attr.getValue();
+                    if (name.starts_with("sub_")) {
+                        auto hexPart = name.drop_front(4);
+                        uint64_t parsed = 0;
+                        if (!hexPart.getAsInteger(16, parsed))
+                            callee_addr = parsed;
+                    }
+                }
+
+                if (callee_addr == 0) {
+                    auto targetVal = callOp.getTargetAddr();
+                    if (auto constOp = targetVal.getDefiningOp<LLVM::ConstantOp>()) {
+                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                            callee_addr = intAttr.getValue().getZExtValue();
+                    } else if (auto constOp = targetVal.getDefiningOp<arith::ConstantOp>()) {
+                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                            callee_addr = intAttr.getValue().getZExtValue();
+                    }
+                }
+
+                int64_t vtable_offset = -1;
+                if (callee_addr == 0) {
+                    is_indirect = true;
+                    auto targetVal = callOp.getTargetAddr();
+                    if (auto addOp = targetVal.getDefiningOp<LLVM::AddOp>()) {
+                        if (auto rhsConst = addOp.getRhs().getDefiningOp<LLVM::ConstantOp>()) {
+                            if (auto intAttr = dyn_cast<IntegerAttr>(rhsConst.getValue()))
+                                vtable_offset = intAttr.getValue().getSExtValue();
+                        }
+                        if (vtable_offset < 0) {
+                            if (auto lhsConst = addOp.getLhs().getDefiningOp<LLVM::ConstantOp>()) {
+                                if (auto intAttr = dyn_cast<IntegerAttr>(lhsConst.getValue()))
+                                    vtable_offset = intAttr.getValue().getSExtValue();
+                            }
+                        }
+                    }
+                }
+
+                auto midCall = builder.create<mid::CallOp>(
+                    callOp.getLoc(),
+                    TypeRange{},
+                    builder.getI64IntegerAttr(callee_addr),
+                    callee_name_attr,
+                    callOp.getArgs(),
+                    callOp.getAddressAttr()
+                );
+
+                if (is_indirect) {
+                    midCall->setAttr("is_indirect", builder.getUnitAttr());
+                    if (vtable_offset >= 0)
+                        midCall->setAttr("vtable_offset",
+                            builder.getI64IntegerAttr(vtable_offset));
+                }
+
+                llvm::errs() << "[P0-DEBUG] Manual CallOp→MidCall: "
+                             << (callee_name_attr ? callee_name_attr.getValue() : "indirect")
+                             << " addr=" << callee_addr << "\n";
+
+                callOp->erase();
+                ++converted;
+            }
+
+            llvm::errs() << "[P0-DEBUG] HelixLowToMid: manually converted "
+                         << converted << " CallOps\n";
+        }
+
+        // [P0-DEBUG] Final count
+        {
+            unsigned lowCalls = 0, midCalls = 0;
+            module.walk([&](Operation* op) {
+                if (isa<low::CallOp>(op)) ++lowCalls;
+                else if (isa<mid::CallOp>(op)) ++midCalls;
+            });
+            llvm::errs() << "[P0-DEBUG] HelixLowToMid exit: "
+                         << lowCalls << " low.call, "
+                         << midCalls << " mid.call\n";
         }
     }
 };
