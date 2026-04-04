@@ -124,6 +124,36 @@ inline bool areX86RegistersAliased(llvm::StringRef lhs, llvm::StringRef rhs) {
     return !lhsCanonical.empty() && lhsCanonical == rhsCanonical;
 }
 
+/// True if a write to 'writer' fully covers the bit range of 'target'.
+/// E.g. write EAX (0:32) covers AL (0:8), but write AH (8:16) does NOT
+/// cover AL (0:8) because they are non-overlapping byte lanes.
+inline bool doesWriteFullyCover(llvm::StringRef writer, llvm::StringRef target) {
+    auto wInfo = getX86SubRegInfo(writer);
+    auto tInfo = getX86SubRegInfo(target);
+    if (!wInfo || !tInfo || wInfo->parent != tInfo->parent)
+        return false;
+    unsigned wLo = wInfo->bitOffset;
+    unsigned wHi = wLo + wInfo->width;
+    unsigned tLo = tInfo->bitOffset;
+    unsigned tHi = tLo + tInfo->width;
+    return wLo <= tLo && wHi >= tHi;
+}
+
+/// True if a read of 'reader' observes any bit written by 'writer'.
+/// E.g. read AX (0:16) overlaps with write AL (0:8), but read AH (8:16)
+/// does NOT overlap with write AL (0:8).
+inline bool doesReadOverlap(llvm::StringRef reader, llvm::StringRef writer) {
+    auto rInfo = getX86SubRegInfo(reader);
+    auto wInfo = getX86SubRegInfo(writer);
+    if (!rInfo || !wInfo || rInfo->parent != wInfo->parent)
+        return false;
+    unsigned rLo = rInfo->bitOffset;
+    unsigned rHi = rLo + rInfo->width;
+    unsigned wLo = wInfo->bitOffset;
+    unsigned wHi = wLo + wInfo->width;
+    return rLo < wHi && wLo < rHi; // standard range overlap test
+}
+
 inline bool isX86VectorRegister(llvm::StringRef reg) {
     auto upper = reg.upper();
     return upper.starts_with("XMM") || upper.starts_with("YMM") ||

@@ -695,8 +695,7 @@ static bool isDeadUndefAssign(helix::high::AssignOp assignOp,
 /// @param writeOp  The register write operation to check.
 /// @param liveness Precomputed liveness information for the function.
 /// @return         True if the write is dead and can be removed.
-static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
-                                const Liveness& liveness) {
+static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp) {
     auto regName = writeOp.getRegName();
     auto canonicalReg = helix::analysis::getCanonicalX86Register(regName);
     auto normalizedReg = canonicalReg.empty() ? regName : canonicalReg;
@@ -729,21 +728,24 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp,
          it != block->end(); ++it) {
         Operation& op = *it;
 
-        // Check for a read of the same register.
+        // Check for a read that observes bits written by our write.
+        // Uses range-overlap: read AX (0:16) overlaps write AL (0:8),
+        // but read AH (8:16) does NOT overlap write AL (0:8).
         if (auto readOp = dyn_cast<helix::low::RegReadOp>(&op)) {
-            if (helix::analysis::areX86RegistersAliased(readOp.getRegName(),
-                                                        normalizedReg) ||
-                readOp.getRegName() == regName) {
+            if (helix::analysis::doesReadOverlap(readOp.getRegName(),
+                                                 regName)) {
                 foundRead = true;
                 break;
             }
         }
 
-        // Check for an overwrite of the same register.
+        // Check for an overwrite that fully covers our write's bit range.
+        // Write AH (8:16) does NOT overwrite AL (0:8) — they are
+        // non-overlapping byte lanes within RAX.
+        // Write EAX (0:32) DOES overwrite AL (0:8) — it subsumes AL.
         if (auto nextWrite = dyn_cast<helix::low::RegWriteOp>(&op)) {
-            if (helix::analysis::areX86RegistersAliased(nextWrite.getRegName(),
-                                                        normalizedReg) ||
-                nextWrite.getRegName() == regName) {
+            if (helix::analysis::doesWriteFullyCover(nextWrite.getRegName(),
+                                                     regName)) {
                 foundOverwrite = true;
                 break;
             }
@@ -1314,16 +1316,10 @@ private:
         auto& funcBody = func.getBody();
         unsigned removed = 0;
 
-        // Multi-block functions may have LLVM dialect branch ops whose operands
-        // cross block boundaries, causing Liveness analysis to assert.
-        // Skip Liveness-based DCE for multi-block — the emitter-level DSE
-        // (PseudoCEmitter::precomputeDeadStores) handles this independently.
-        if (funcBody.getBlocks().size() > 2) {
-            return 0;
-        }
-
-        // Compute MLIR liveness for the function.
-        Liveness liveness(func);
+        // Previously this bailed out entirely for >2 blocks, causing NO
+        // register DCE on most real-world kernel functions (GAP #3 fix).
+        // isDeadRegisterWrite() uses intra-block forward scanning with
+        // range-overlap semantics — no cross-block Liveness needed.
 
         // Iterate until fixed point: removing a dead write may expose
         // another write as dead.
@@ -1334,7 +1330,7 @@ private:
             llvm::SmallVector<helix::low::RegWriteOp, 16> deadWrites;
 
             funcBody.walk([&](helix::low::RegWriteOp writeOp) {
-                if (isDeadRegisterWrite(writeOp, liveness)) {
+                if (isDeadRegisterWrite(writeOp)) {
                     deadWrites.push_back(writeOp);
                 }
             });

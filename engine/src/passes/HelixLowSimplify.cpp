@@ -52,6 +52,7 @@ struct HelixLowSimplifyPass
         populateHelixLowFlagPatterns(patterns);
         populateHelixLowMemoryPatterns(patterns);
         populateHelixLowCastPatterns(patterns);
+        populateSubRegisterSSAPatterns(patterns);
 
         // Configure: allow non-convergence without signalling failure,
         // since partial simplification is still beneficial.

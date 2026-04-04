@@ -37,6 +37,12 @@ void populateHelixLowMemoryPatterns(mlir::RewritePatternSet &patterns);
 /// Includes: RedundantMovzx, RedundantMovsx.
 void populateHelixLowCastPatterns(mlir::RewritePatternSet &patterns);
 
+/// Populate sub-register SSA resolution patterns for HelixLow ops.
+///
+/// Includes: SubRegReadToTrunc (parent write → sub-reg read = trunc),
+///           SubRegWrite32ToZext (32-bit write → 64-bit zext).
+void populateSubRegisterSSAPatterns(mlir::RewritePatternSet &patterns);
+
 // ─── HelixMid Pattern Groups ─────────────────────────────────────────────────
 
 /// Populate arithmetic identity/simplification patterns for HelixMid ops.
