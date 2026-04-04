@@ -683,13 +683,22 @@ private:
                        regName == "DF" || regName == "RIP";
             };
 
-            // Collect first, then erase (avoid iterator invalidation).
+            // Three-pass collect-then-erase (LLVM Programmer's Manual
+            // pattern — never mutate during walk, even with
+            // make_early_inc_range, because cascade erases can
+            // invalidate future ops in the same block).
+
+            // Pass 1: Collect dead flag/RIP writes.
             llvm::SmallVector<helix::low::RegWriteOp, 32> deadFlagOps;
             funcBody.walk([&](helix::low::RegWriteOp writeOp) {
                 if (isDeadFlagOrRIP(writeOp.getRegName()))
                     deadFlagOps.push_back(writeOp);
             });
 
+            // Pass 2: Erase the collected writes.  Orphaned value
+            // definitions are left for EliminateDeadCode to clean up
+            // (erasing them here risks invalidating ops that the SSA
+            // walk will visit later in this same pass).
             for (auto writeOp : deadFlagOps) {
                 writeOp.erase();
                 ++NumDeadFlagWrites;
