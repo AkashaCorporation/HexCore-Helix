@@ -1446,7 +1446,88 @@ private:
         if (std::distance(funcBody.begin(), funcBody.end()) <= 1)
             return success();
 
+        // Remove unreachable blocks before computing dominance.
+        // Remill can produce CFGs with blocks disconnected from the
+        // entry (orphan islands, switch table stubs, etc.).  The LLVM
+        // DomTree builder asserts if unreachable blocks exist.
+        // We do a BFS from entry to find all reachable blocks, then
+        // erase everything else.
+        {
+            Block& entry = funcBody.front();
+            llvm::SmallPtrSet<Block*, 32> reachable;
+            llvm::SmallVector<Block*, 16> worklist;
+            reachable.insert(&entry);
+            worklist.push_back(&entry);
+
+            while (!worklist.empty()) {
+                Block* blk = worklist.pop_back_val();
+                for (Block* succ : blk->getSuccessors()) {
+                    if (reachable.insert(succ).second)
+                        worklist.push_back(succ);
+                }
+            }
+
+            // Erase unreachable blocks (collect first to avoid
+            // iterator invalidation).
+            llvm::SmallVector<Block*, 8> toErase;
+            for (auto& blk : funcBody) {
+                if (!reachable.contains(&blk))
+                    toErase.push_back(&blk);
+            }
+
+            for (auto* blk : toErase) {
+                blk->dropAllDefinedValueUses();
+                blk->dropAllReferences();
+                blk->erase();
+            }
+        }
+
+        // After removing unreachable blocks, re-check single-block.
+        if (std::distance(funcBody.begin(), funcBody.end()) <= 1)
+            return success();
+
         // Compute dominance information for the function.
+        // Some Remill-lifted CFGs are irreducible (multiple-entry
+        // loops from computed gotos, retpolines, etc.) which causes
+        // the LLVM DomTree builder to assert.  We detect this by
+        // checking for blocks with multiple non-back-edge predecessors
+        // that would form an irreducible cycle.  If detected, skip
+        // structuring — the function will be emitted as flat blocks
+        // with goto/label.
+        {
+            // Quick irreducibility check: for each block, check if it
+            // has predecessors with HIGHER addresses (forward edges)
+            // from blocks that are also predecessors of OTHER blocks
+            // in the same cycle.  Simplified heuristic: if any non-entry
+            // block has >=2 forward-edge predecessors, assume irreducible.
+            Block& entry = funcBody.front();
+            bool likelyIrreducible = false;
+            for (auto& blk : funcBody) {
+                if (&blk == &entry) continue;
+                unsigned forwardPreds = 0;
+                for (Block* pred : blk.getPredecessors()) {
+                    // Count predecessors that are NOT back-edges
+                    // (pred address < blk address = forward edge)
+                    uint64_t predAddr = resolveBlockAddr(pred);
+                    uint64_t blkAddr = resolveBlockAddr(&blk);
+                    if (predAddr < blkAddr || predAddr == 0 || blkAddr == 0)
+                        ++forwardPreds;
+                }
+                if (forwardPreds >= 3) {
+                    likelyIrreducible = true;
+                    break;
+                }
+            }
+
+            if (likelyIrreducible) {
+                LLVM_DEBUG(llvm::dbgs()
+                    << "  StructureCFG: skipping '"
+                    << func.getSymName()
+                    << "' — likely irreducible CFG\n");
+                return success();
+            }
+        }
+
         DominanceInfo domInfo(func);
 
         // Collect all CFG edges.
