@@ -1494,36 +1494,71 @@ private:
         // that would form an irreducible cycle.  If detected, skip
         // structuring — the function will be emitted as flat blocks
         // with goto/label.
+        // Detect irreducible SCCs using Tarjan's algorithm.
+        // An SCC is irreducible if it has multiple entry blocks
+        // (blocks with predecessors from outside the SCC).
+        // Only skip structuring for functions with truly irreducible
+        // loops — reducible CFGs with many predecessors (e.g., switch
+        // merge patterns) proceed normally.
         {
-            // Quick irreducibility check: for each block, check if it
-            // has predecessors with HIGHER addresses (forward edges)
-            // from blocks that are also predecessors of OTHER blocks
-            // in the same cycle.  Simplified heuristic: if any non-entry
-            // block has >=2 forward-edge predecessors, assume irreducible.
-            Block& entry = funcBody.front();
-            bool likelyIrreducible = false;
-            for (auto& blk : funcBody) {
-                if (&blk == &entry) continue;
-                unsigned forwardPreds = 0;
-                for (Block* pred : blk.getPredecessors()) {
-                    // Count predecessors that are NOT back-edges
-                    // (pred address < blk address = forward edge)
-                    uint64_t predAddr = resolveBlockAddr(pred);
-                    uint64_t blkAddr = resolveBlockAddr(&blk);
-                    if (predAddr < blkAddr || predAddr == 0 || blkAddr == 0)
-                        ++forwardPreds;
+            llvm::SmallPtrSet<Block*, 16> emptySet;
+            auto sccs = findSCCLoops(funcBody, emptySet);
+            bool hasIrreducible = false;
+
+            for (auto& scc : sccs) {
+                if (scc.body.size() < 2) continue;
+
+                // Count entries: blocks in the SCC with predecessors
+                // from outside the SCC.
+                llvm::SmallPtrSet<Block*, 8> sccSet(
+                    scc.body.begin(), scc.body.end());
+                unsigned entries = 0;
+                for (Block* blk : scc.body) {
+                    for (Block* pred : blk->getPredecessors()) {
+                        if (!sccSet.contains(pred)) {
+                            ++entries;
+                            break;
+                        }
+                    }
                 }
-                if (forwardPreds >= 3) {
-                    likelyIrreducible = true;
+
+                if (entries > 1) {
+                    hasIrreducible = true;
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  StructureCFG: irreducible SCC with "
+                        << scc.body.size() << " blocks, "
+                        << entries << " entries\n");
                     break;
                 }
             }
 
-            if (likelyIrreducible) {
+            // Safety net: the LLVM DomTree builder can also fail on
+            // certain CFG shapes that are technically reducible but
+            // have unusual block connectivity.  Use the original
+            // forward-edge heuristic as a backup for large functions.
+            if (!hasIrreducible) {
+                Block& entry2 = funcBody.front();
+                for (auto& blk : funcBody) {
+                    if (&blk == &entry2) continue;
+                    unsigned fwdPreds = 0;
+                    for (Block* pred : blk.getPredecessors()) {
+                        uint64_t pAddr = resolveBlockAddr(pred);
+                        uint64_t bAddr = resolveBlockAddr(&blk);
+                        if (pAddr < bAddr || pAddr == 0 || bAddr == 0)
+                            ++fwdPreds;
+                    }
+                    if (fwdPreds >= 3) {
+                        hasIrreducible = true;
+                        break;
+                    }
+                }
+            }
+
+            if (hasIrreducible) {
                 LLVM_DEBUG(llvm::dbgs()
                     << "  StructureCFG: skipping '"
                     << func.getSymName()
-                    << "' — likely irreducible CFG\n");
+                    << "' — irreducible CFG detected by SCC\n");
                 return success();
             }
         }
