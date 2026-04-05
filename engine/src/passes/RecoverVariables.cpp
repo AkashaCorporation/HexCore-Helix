@@ -64,6 +64,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <map>
@@ -71,6 +72,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/IR/Dominance.h"
 
 #define DEBUG_TYPE "recover-variables"
 
@@ -449,6 +451,17 @@ struct SSAVersionTracker {
         auto it = current.find(canonReg);
         return (it != current.end()) ? &it->second : nullptr;
     }
+
+    /// Snapshot type: a copy of the current register→version map.
+    /// Used for multi-block SSA: snapshot at block exit, restore at
+    /// block entry from the immediate dominator's exit state.
+    using Snapshot = llvm::StringMap<Version>;
+
+    /// Take a snapshot of the current SSA state.
+    Snapshot snapshot() const { return current; }
+
+    /// Restore SSA state from a snapshot (typically from idom exit).
+    void restore(const Snapshot& snap) { current = snap; }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -707,18 +720,19 @@ private:
 
         // ── Phase 1+2 (unified): Program-order SSA walk ────────────────
         //
-        // Instead of processing all reads then all writes (which forces a
-        // single VarDeclOp per register), we walk operations in PROGRAM
-        // ORDER within each block.  Each RegWrite creates a NEW variable
-        // version (rax, rax_1, rax_2, ...) and each RegRead references
-        // the MOST RECENT version.
+        // Walks blocks in Reverse Post-Order (RPO) so that dominators
+        // are always visited before the blocks they dominate.  At each
+        // block entry, the SSA state is seeded from the immediate
+        // dominator's exit state.  Join points with conflicting
+        // register versions create fresh merge versions (conservative,
+        // no phi nodes needed — CAstOptimizer inlines single-use vars).
         //
-        // This gives every definition a unique var_id, which prevents the
-        // EliminateDeadCode Phase 7 from collapsing all assignments to
-        // the same register into one (the root cause of the 367/368 kill).
+        // Each RegWrite creates a NEW variable version (rax, rax_1, ...)
+        // and each RegRead references the MOST RECENT version.
         //
         // Industry standard: SAILR, Osprey, ReSym, Ghidra, IDA Pro all
         // create one variable per definition point.
+        // RPO ordering: Braun et al., Section 2.2 (SSA construction).
 
         SSAVersionTracker ssaTracker(tracker.varIdCounter);
 
@@ -732,8 +746,124 @@ private:
                                     << "\n");
         }
 
-        // Walk ALL operations in program order (per block).
-        for (auto& block : funcBody) {
+        // ── Compute block ordering ─────────────────────────────────────
+        //
+        // Try RPO (requires DominanceInfo).  If the CFG is irreducible,
+        // the DominanceInfo constructor may assert — detect this with
+        // the same BFS + forward-edge heuristic used in
+        // StructureControlFlow, and fall back to region-order walk.
+
+        llvm::SmallVector<Block*, 32> blockOrder;
+        bool useRPO = false;
+        DominanceInfo* domInfoPtr = nullptr;
+        std::unique_ptr<DominanceInfo> domInfoOwner;
+
+        // Check for irreducible CFG (same heuristic as StructureControlFlow)
+        {
+            bool likelyIrreducible = false;
+            Block& entry = funcBody.front();
+            for (auto& blk : funcBody) {
+                if (&blk == &entry) continue;
+                unsigned forwardPreds = 0;
+                for (Block* pred : blk.getPredecessors()) {
+                    // Count non-back-edge predecessors
+                    ++forwardPreds;
+                }
+                if (forwardPreds >= 3) {
+                    likelyIrreducible = true;
+                    break;
+                }
+            }
+
+            if (!likelyIrreducible &&
+                std::distance(funcBody.begin(), funcBody.end()) > 1) {
+                // Safe to construct DominanceInfo
+                domInfoOwner = std::make_unique<DominanceInfo>(func);
+                domInfoPtr = domInfoOwner.get();
+                useRPO = true;
+
+                // Compute RPO via post-order DFS + reverse
+                llvm::SmallVector<Block*, 32> postOrder;
+                llvm::SmallPtrSet<Block*, 32> visited;
+                std::function<void(Block*)> postOrderDFS =
+                    [&](Block* blk) {
+                        if (!visited.insert(blk).second) return;
+                        for (Block* succ : blk->getSuccessors())
+                            postOrderDFS(succ);
+                        postOrder.push_back(blk);
+                    };
+                postOrderDFS(&funcBody.front());
+                // Reverse post-order = reverse of post-order
+                for (auto it = postOrder.rbegin(); it != postOrder.rend();
+                     ++it)
+                    blockOrder.push_back(*it);
+
+                LLVM_DEBUG(llvm::dbgs() << "  Using RPO ordering ("
+                                        << blockOrder.size()
+                                        << " blocks)\n");
+            }
+        }
+
+        // If not using RPO, fall back to region order
+        if (!useRPO) {
+            for (auto& blk : funcBody)
+                blockOrder.push_back(&blk);
+            LLVM_DEBUG(llvm::dbgs() << "  Using region-order fallback ("
+                                    << blockOrder.size()
+                                    << " blocks)\n");
+        }
+
+        // Per-block SSA exit state snapshots (for idom seeding)
+        llvm::DenseMap<Block*, SSAVersionTracker::Snapshot> blockExitState;
+
+        // Walk blocks in computed order (RPO or region-order fallback).
+        for (Block* blockPtr : blockOrder) {
+            Block& block = *blockPtr;
+
+            // ── Seed SSA state at block entry ──────────────────────────
+            if (useRPO && &block != &funcBody.front()) {
+                // Restore from immediate dominator's exit state
+                auto* domNode = domInfoPtr->getNode(&block);
+                if (domNode && domNode->getIDom()) {
+                    Block* idom = domNode->getIDom()->getBlock();
+                    auto it = blockExitState.find(idom);
+                    if (it != blockExitState.end()) {
+                        ssaTracker.restore(it->second);
+                    }
+                }
+
+                // Handle join points: if multiple predecessors have
+                // different versions of the same register, create a
+                // fresh merge version (conservative — no phi nodes).
+                unsigned numPreds = std::distance(block.pred_begin(),
+                                                  block.pred_end());
+                if (numPreds > 1) {
+                    llvm::SmallVector<std::string, 4> conflicting;
+                    for (auto& entry : ssaTracker.current) {
+                        llvm::StringRef reg = entry.getKey();
+                        const auto& curVer = entry.getValue();
+                        bool hasConflict = false;
+                        for (Block* pred : block.getPredecessors()) {
+                            auto predIt = blockExitState.find(pred);
+                            if (predIt == blockExitState.end()) continue;
+                            auto predRegIt = predIt->second.find(reg);
+                            if (predRegIt == predIt->second.end()) continue;
+                            if (predRegIt->second.varId != curVer.varId) {
+                                hasConflict = true;
+                                break;
+                            }
+                        }
+                        if (hasConflict)
+                            conflicting.push_back(reg.str());
+                    }
+                    for (auto& reg : conflicting) {
+                        ssaTracker.createNewVersion(
+                            reg, declBuilder, funcLoc, tracker);
+                    }
+                }
+            }
+
+            // ── Process ops in program order within the block ───────
             for (auto& op : llvm::make_early_inc_range(block)) {
 
                 // ── Handle RegRead ──────────────────────────────────────
@@ -972,6 +1102,11 @@ private:
                     ++NumWritesReplaced;
                     continue;
                 }
+            }
+
+            // ── Snapshot block exit state for idom seeding ──────────
+            if (useRPO) {
+                blockExitState[blockPtr] = ssaTracker.snapshot();
             }
         }
 
