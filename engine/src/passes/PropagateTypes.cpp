@@ -1456,6 +1456,20 @@ private:
                         }
                     }
 
+                    // Backward Rule B10b: Pointer arithmetic back-propagation.
+                    // If a BinOp(Add/Sub) result is a pointer, the LHS
+                    // operand is a pointer and the RHS is an integer offset.
+                    // This is the TIE Figure 7 rule: ptr + int → ptr.
+                    if (typeEnv[binop.getResult()].kind == CTypeInfo::Pointer &&
+                        (kind == helix::low::BinOpKind::Add ||
+                         kind == helix::low::BinOpKind::Sub)) {
+                        if (!isTypeLocked(binop.getLhs(), lockedValues)) {
+                            CTypeInfo ptrType = CTypeInfo::makePointer();
+                            if (typeEnv[binop.getLhs()].mergeFrom(ptrType))
+                                changed = true;
+                        }
+                    }
+
                     return;
                 }
 
