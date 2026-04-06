@@ -60,7 +60,7 @@ static int detectArch(std::string_view ir_text) {
 /// Uses helix_engine_decompile_ir_text() — the text API.
 static std::string decompileFile(const fs::path& input_path, bool skip_opt = false,
                                   const std::vector<std::string>& enabled_passes = {},
-                                  bool use_cast_layer = false) {
+                                  bool legacy_emitter = false) {
     std::string ir_text = readFile(input_path);
     if (ir_text.empty())
         return {};
@@ -84,9 +84,9 @@ static std::string decompileFile(const fs::path& input_path, bool skip_opt = fal
         helix_engine_enable_pass(handle, pass.c_str());
     }
 
-    // Enable C AST layer if requested (--use-cast-layer)
-    if (use_cast_layer) {
-        helix_engine_set_use_cast_layer(handle, 1);
+    // C AST layer is default since v0.8.0; --legacy-emitter disables it
+    if (legacy_emitter) {
+        helix_engine_set_use_cast_layer(handle, 0);
     }
 
     // Allocate output buffer (start with 256KB, grow if needed)
@@ -142,12 +142,12 @@ static void printUsage(const char* argv0) {
         << "  " << argv0 << " --version               Show version\n\n"
         << "Flags:\n"
         << "  --no-opt              Skip optimization passes\n"
-        << "  --use-cast-layer      Use C AST layer (experimental)\n"
+        << "  --legacy-emitter      Use legacy PseudoCEmitter instead of C AST\n"
         << "  --enable-pass=Name    Enable a specific pass\n\n"
         << "Examples:\n"
-        << "  " << argv0 << " tests/remill-6/01-name-writing.ll\n"
-        << "  " << argv0 << " --use-cast-layer tests/remill-7/bone_pos_calc.ll\n"
-        << "  " << argv0 << " --dir tests/remill-6/\n";
+        << "  " << argv0 << " function.ll\n"
+        << "  " << argv0 << " --dir tests/\n"
+        << "  " << argv0 << " --legacy-emitter function.ll\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -158,15 +158,18 @@ int main(int argc, char* argv[]) {
 
     // Parse flags
     bool skip_opt = false;
-    bool use_cast_layer = false;
+    bool legacy_emitter = false;
     std::vector<std::string> enabled_passes;
     std::vector<std::string_view> positional;
     for (int i = 1; i < argc; i++) {
         std::string_view a = argv[i];
         if (a == "--no-opt" || a == "--skip-optimization") {
             skip_opt = true;
+        } else if (a == "--legacy-emitter") {
+            legacy_emitter = true;
         } else if (a == "--use-cast-layer") {
-            use_cast_layer = true;
+            // Backwards compat — now the default, silently accept
+            (void)0;
         } else if (a.starts_with("--enable-pass=")) {
             enabled_passes.emplace_back(a.substr(14));
         } else {
@@ -207,7 +210,7 @@ int main(int argc, char* argv[]) {
 
             std::cerr << "  " << entry.path().filename() << " ... ";
 
-            std::string result = decompileFile(entry.path(), skip_opt, enabled_passes, use_cast_layer);
+            std::string result = decompileFile(entry.path(), skip_opt, enabled_passes, legacy_emitter);
             if (result.empty()) {
                 std::cerr << "FAILED\n";
                 failed++;
@@ -232,7 +235,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string result = decompileFile(input_path, skip_opt, enabled_passes, use_cast_layer);
+    std::string result = decompileFile(input_path, skip_opt, enabled_passes, legacy_emitter);
     if (result.empty())
         return 1;
 

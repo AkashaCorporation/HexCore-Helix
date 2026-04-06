@@ -1524,33 +1524,57 @@ private:
 
                 if (entries > 1) {
                     hasIrreducible = true;
-                    LLVM_DEBUG(llvm::dbgs()
-                        << "  StructureCFG: irreducible SCC with "
-                        << scc.body.size() << " blocks, "
-                        << entries << " entries\n");
                     break;
                 }
-            }
 
-            // Safety net: the LLVM DomTree builder can also fail on
-            // certain CFG shapes that are technically reducible but
-            // have unusual block connectivity.  Use the original
-            // forward-edge heuristic as a backup for large functions.
-            if (!hasIrreducible) {
-                Block& entry2 = funcBody.front();
-                for (auto& blk : funcBody) {
-                    if (&blk == &entry2) continue;
-                    unsigned fwdPreds = 0;
-                    for (Block* pred : blk.getPredecessors()) {
-                        uint64_t pAddr = resolveBlockAddr(pred);
-                        uint64_t bAddr = resolveBlockAddr(&blk);
-                        if (pAddr < bAddr || pAddr == 0 || bAddr == 0)
-                            ++fwdPreds;
+                // Guard: check for complex internal back-edge patterns
+                // that confuse LLVM's semi-NCA DomTree builder even when
+                // the SCC is technically single-entry.  If any block
+                // inside the SCC has >=3 predecessors from within the
+                // SCC, the DomTree may assert.
+                for (Block* blk : scc.body) {
+                    unsigned internalPreds = 0;
+                    for (Block* pred : blk->getPredecessors()) {
+                        if (sccSet.contains(pred))
+                            ++internalPreds;
                     }
-                    if (fwdPreds >= 3) {
+                    if (internalPreds >= 3) {
                         hasIrreducible = true;
                         break;
                     }
+                }
+                if (hasIrreducible) break;
+            }
+
+            // Safety net: the old forward-edge heuristic (>= 3 fwd preds)
+            // was removed — it caused false positives on reducible
+            // switch-merge patterns (BattleConductor-inner).  The SCC
+            // check above is the authoritative irreducibility detector.
+            //
+            // For truly irreducible SCCs, we skip structuring of the
+            // entire function.  Phase B (structuring variable, NMG
+            // Section V-A) and Phase C (Ghidra-style goto marking)
+            // will be implemented to handle these without full skip.
+
+            // Also check for unreachable blocks — these cause the
+            // LLVM DomTree builder to assert (Total + 1 != Num).
+            // PlayerAwareness-sub2 has 47 blocks with some unreachable
+            // from entry, which is technically reducible but still
+            // triggers the DomTree assert.
+            if (!hasIrreducible) {
+                llvm::SmallPtrSet<Block*, 32> reachable;
+                llvm::SmallVector<Block*, 32> worklist;
+                worklist.push_back(&funcBody.front());
+                while (!worklist.empty()) {
+                    Block* b = worklist.pop_back_val();
+                    if (!reachable.insert(b).second) continue;
+                    for (Block* succ : b->getSuccessors())
+                        worklist.push_back(succ);
+                }
+                unsigned totalBlocks =
+                    std::distance(funcBody.begin(), funcBody.end());
+                if (reachable.size() < totalBlocks) {
+                    hasIrreducible = true;
                 }
             }
 
@@ -1558,7 +1582,7 @@ private:
                 LLVM_DEBUG(llvm::dbgs()
                     << "  StructureCFG: skipping '"
                     << func.getSymName()
-                    << "' — irreducible CFG detected by SCC\n");
+                    << "' — irreducible/unreachable CFG detected\n");
                 return success();
             }
         }

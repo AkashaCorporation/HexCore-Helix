@@ -179,8 +179,9 @@ private:
     bool enable_escape_analysis_ = false;
     bool enable_struct_recovery_ = false;
 
-    /// When true, emit via C AST layer instead of PseudoCEmitter.
-    bool use_cast_layer_ = false;
+    /// When true, emit via C AST layer (default since v0.8.0).
+    /// When false, emit via legacy PseudoCEmitter (--legacy-emitter).
+    bool use_cast_layer_ = true;
 
     /// Variable rename map: original name → user-chosen name.
     /// Populated by setVariableRename(), consumed by CAstOptimizer.

@@ -182,6 +182,14 @@ struct CTypeInfo {
             return changed;
         }
 
+        // Integer → Pointer promotion: if value is used as a memory address
+        // (Pointer) but was previously typed as Int/UInt, Pointer wins.
+        // This follows TIE's type lattice: ptr(α) ⊂ num_t.
+        if ((kind == Int || kind == UInt) && other.kind == Pointer) {
+            *this = other;
+            return true;
+        }
+
         // Pointer refinement: if both are pointers, refine void* → typed*
         if (kind == Pointer && other.kind == Pointer) {
             if (!pointee && other.pointee) {
@@ -741,12 +749,19 @@ private:
                 }
 
                 // Rule 2: Memory reads — infer type from bit width.
+                // Also: the address operand is always a pointer.
                 if (auto memRead = dyn_cast<helix::low::MemReadOp>(op)) {
                     auto result = memRead.getResult();
                     if (!isTypeLocked(result, lockedValues)) {
                         CTypeInfo inferred =
                             CTypeInfo::makeIntUnknownSign(memRead.getBitWidth());
                         if (typeEnv[result].mergeFrom(inferred))
+                            changed = true;
+                    }
+                    // Rule 2b: MemRead address operand → pointer.
+                    if (!isTypeLocked(memRead.getAddr(), lockedValues)) {
+                        CTypeInfo ptrType = CTypeInfo::makePointer();
+                        if (typeEnv[memRead.getAddr()].mergeFrom(ptrType))
                             changed = true;
                     }
                     return;
@@ -911,6 +926,51 @@ private:
                     if (!isTypeLocked(binop.getOverflowFlag(), lockedValues))
                         if (typeEnv[binop.getOverflowFlag()].mergeFrom(boolType))
                             changed = true;
+                    return;
+                }
+
+                // Rule 3b: arith/LLVM ADD/SUB — pointer arithmetic.
+                // Ghidra TypeOpIntAdd::propagateType: if either input of
+                // ADD is a pointer, the output is a pointer (but not both).
+                // Handles both arith::AddIOp and LLVM::AddOp.
+                {
+                    Value addLhs, addRhs;
+                    Value addResult;
+                    if (auto addOp = dyn_cast<arith::AddIOp>(op)) {
+                        addLhs = addOp.getLhs();
+                        addRhs = addOp.getRhs();
+                        addResult = addOp.getResult();
+                    } else if (auto llvmAdd = dyn_cast<LLVM::AddOp>(op)) {
+                        addLhs = llvmAdd.getLhs();
+                        addRhs = llvmAdd.getRhs();
+                        addResult = llvmAdd.getRes();
+                    }
+                    if (addResult) {
+                        auto lhsType = typeEnv[addLhs];
+                        auto rhsType = typeEnv[addRhs];
+                        bool lhsIsPtr = lhsType.kind == CTypeInfo::Pointer;
+                        bool rhsIsPtr = rhsType.kind == CTypeInfo::Pointer;
+                        if ((lhsIsPtr || rhsIsPtr) &&
+                            !(lhsIsPtr && rhsIsPtr)) {
+                            if (!isTypeLocked(addResult, lockedValues)) {
+                                CTypeInfo ptrType =
+                                    CTypeInfo::makePointer();
+                                if (typeEnv[addResult].mergeFrom(ptrType))
+                                    changed = true;
+                            }
+                        }
+                        return;
+                    }
+                }
+                if (auto subOp = dyn_cast<arith::SubIOp>(op)) {
+                    auto lhsType = typeEnv[subOp.getLhs()];
+                    if (lhsType.kind == CTypeInfo::Pointer) {
+                        if (!isTypeLocked(subOp.getResult(), lockedValues)) {
+                            CTypeInfo ptrType = CTypeInfo::makePointer();
+                            if (typeEnv[subOp.getResult()].mergeFrom(ptrType))
+                                changed = true;
+                        }
+                    }
                     return;
                 }
 
@@ -1473,6 +1533,65 @@ private:
                     return;
                 }
 
+                // Backward Rule B10c: ADD pointer back-propagation.
+                // Ghidra propagateAddIn2Out + propagateAddPointer:
+                // If ADD result is used as MemRead/MemWrite address,
+                // the result is a pointer and the non-constant operand is
+                // the base pointer.
+                // Handles both arith::AddIOp and LLVM::AddOp.
+                {
+                    Value addLhs, addRhs, addResult;
+                    if (auto arithAdd = dyn_cast<arith::AddIOp>(op)) {
+                        addLhs = arithAdd.getLhs();
+                        addRhs = arithAdd.getRhs();
+                        addResult = arithAdd.getResult();
+                    } else if (auto llvmAdd = dyn_cast<LLVM::AddOp>(op)) {
+                        addLhs = llvmAdd.getLhs();
+                        addRhs = llvmAdd.getRhs();
+                        addResult = llvmAdd.getRes();
+                    }
+                    if (addResult) {
+                        // B10 equiv: if result used as memory address → ptr
+                        bool usedAsMem = false;
+                        for (auto* user : addResult.getUsers()) {
+                            if (isa<helix::low::MemReadOp>(user) ||
+                                isa<helix::low::MemWriteOp>(user)) {
+                                usedAsMem = true;
+                                if (!isTypeLocked(addResult, lockedValues)) {
+                                    CTypeInfo ptrType =
+                                        CTypeInfo::makePointer();
+                                    if (typeEnv[addResult].mergeFrom(ptrType))
+                                        changed = true;
+                                }
+                                break;
+                            }
+                        }
+                        // B10b equiv: if result is pointer, back-propagate
+                        // to the non-constant operand (base pointer).
+                        if (typeEnv[addResult].kind == CTypeInfo::Pointer) {
+                            bool rhsIsConst =
+                                tryExtractConstantInt(addRhs).has_value();
+                            bool lhsIsConst =
+                                tryExtractConstantInt(addLhs).has_value();
+                            Value target;
+                            if (rhsIsConst && !lhsIsConst)
+                                target = addLhs;
+                            else if (lhsIsConst && !rhsIsConst)
+                                target = addRhs;
+                            else if (!rhsIsConst && !lhsIsConst)
+                                target = addLhs; // convention: LHS is base
+                            if (target &&
+                                !isTypeLocked(target, lockedValues)) {
+                                CTypeInfo ptrType =
+                                    CTypeInfo::makePointer();
+                                if (typeEnv[target].mergeFrom(ptrType))
+                                    changed = true;
+                            }
+                        }
+                        return;
+                    }
+                }
+
                 // Backward Rule B11: MemReadOp — if the loaded value is
                 // used as a pointer (e.g., passed to another MemReadOp as
                 // an address), propagate pointer type backward to the load.
@@ -1817,13 +1936,18 @@ private:
         }
 
         // Store the resolved types as attributes on the operations.
+        unsigned numTypesSet = 0;
+        unsigned numBlockArgs = 0;
+        unsigned numPtrTypes = 0;
         for (auto& [val, typeInfo] : typeEnv) {
             if (!typeInfo.isResolved())
                 continue;
 
             auto* defOp = val.getDefiningOp();
-            if (!defOp)
+            if (!defOp) {
+                ++numBlockArgs;
                 continue;
+            }
 
             // Encode the type as a string attribute
             std::string typeStr = typeInfo.toCTypeString();
@@ -1832,7 +1956,13 @@ private:
 
             defOp->setAttr("inferred_type",
                 StringAttr::get(defOp->getContext(), typeStr));
+            ++numTypesSet;
+            if (typeInfo.kind == CTypeInfo::Pointer)
+                ++numPtrTypes;
         }
+        LLVM_DEBUG(llvm::dbgs()
+            << "  PropagateTypes: " << numTypesSet << " types ("
+            << numPtrTypes << " ptrs)\n");
     }
 
     /// Propagate types through HelixHigh operations (var.decl, assign, call).

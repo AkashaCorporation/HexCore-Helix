@@ -758,21 +758,94 @@ private:
         DominanceInfo* domInfoPtr = nullptr;
         std::unique_ptr<DominanceInfo> domInfoOwner;
 
-        // Check for irreducible CFG (same heuristic as StructureControlFlow)
+        // Check for irreducible CFG using Tarjan's SCC.
+        // An SCC is irreducible if it has >1 entry block from outside.
+        // The old heuristic (>= 3 predecessors) was removed because it
+        // caused false positives on reducible switch-merge patterns.
         {
             bool likelyIrreducible = false;
-            Block& entry = funcBody.front();
-            for (auto& blk : funcBody) {
-                if (&blk == &entry) continue;
-                unsigned forwardPreds = 0;
-                for (Block* pred : blk.getPredecessors()) {
-                    // Count non-back-edge predecessors
-                    ++forwardPreds;
+            if (std::distance(funcBody.begin(), funcBody.end()) > 1) {
+                // Lightweight SCC scan: collect all SCCs, check entries
+                llvm::SmallVector<Block*, 32> allBlocks;
+                for (auto& blk : funcBody)
+                    allBlocks.push_back(&blk);
+
+                // Simple Tarjan's inline (matches StructureControlFlow)
+                llvm::DenseMap<Block*, unsigned> disc, low;
+                llvm::DenseMap<Block*, bool> onStk;
+                llvm::SmallVector<Block*, 32> stk;
+                unsigned idx = 0;
+
+                std::function<void(Block*)> tarjan = [&](Block* v) {
+                    disc[v] = low[v] = idx++;
+                    stk.push_back(v);
+                    onStk[v] = true;
+                    for (Block* w : v->getSuccessors()) {
+                        if (!disc.count(w)) {
+                            tarjan(w);
+                            low[v] = std::min(low[v], low[w]);
+                        } else if (onStk.lookup(w)) {
+                            low[v] = std::min(low[v], disc[w]);
+                        }
+                    }
+                    if (low[v] == disc[v]) {
+                        llvm::SmallVector<Block*, 8> scc;
+                        Block* w;
+                        do {
+                            w = stk.pop_back_val();
+                            onStk[w] = false;
+                            scc.push_back(w);
+                        } while (w != v);
+                        if (scc.size() >= 2) {
+                            llvm::SmallPtrSet<Block*, 8> sccSet(
+                                scc.begin(), scc.end());
+                            unsigned entries = 0;
+                            for (Block* b : scc) {
+                                for (Block* pred : b->getPredecessors()) {
+                                    if (!sccSet.contains(pred)) {
+                                        ++entries;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (entries > 1)
+                                likelyIrreducible = true;
+                            // Guard: complex internal back-edges
+                            if (!likelyIrreducible) {
+                                for (Block* b : scc) {
+                                    unsigned ip = 0;
+                                    for (Block* p : b->getPredecessors())
+                                        if (sccSet.contains(p)) ++ip;
+                                    if (ip >= 3) {
+                                        likelyIrreducible = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                for (Block* b : allBlocks) {
+                    if (!disc.count(b))
+                        tarjan(b);
                 }
-                if (forwardPreds >= 3) {
+            }
+
+            // Also check for unreachable blocks (DomTree assert guard)
+            if (!likelyIrreducible) {
+                llvm::SmallPtrSet<Block*, 32> reachable;
+                llvm::SmallVector<Block*, 32> wl;
+                wl.push_back(&funcBody.front());
+                while (!wl.empty()) {
+                    Block* b = wl.pop_back_val();
+                    if (!reachable.insert(b).second) continue;
+                    for (Block* s : b->getSuccessors())
+                        wl.push_back(s);
+                }
+                unsigned total =
+                    std::distance(funcBody.begin(), funcBody.end());
+                if (reachable.size() < total)
                     likelyIrreducible = true;
-                    break;
-                }
             }
 
             if (!likelyIrreducible &&
@@ -918,12 +991,24 @@ private:
                     builder.setInsertionPoint(readOp);
 
                     // Propagate inferred_type to the VarDeclOp.
+                    // Pointer types override int types (TIE lattice:
+                    // ptr is more specific than num).
                     auto varDeclOp =
                         llvm::cast<helix::high::VarDeclOp>(ver->decl);
                     if (auto inferredType =
                             readOp->getAttrOfType<StringAttr>(
                                 "inferred_type")) {
-                        if (!varDeclOp->hasAttr("inferred_type"))
+                        bool shouldSet = !varDeclOp->hasAttr("inferred_type");
+                        if (!shouldSet) {
+                            // Pointer overrides int (more specific type)
+                            auto curType = varDeclOp->getAttrOfType<
+                                StringAttr>("inferred_type");
+                            if (curType &&
+                                !curType.getValue().ends_with("*") &&
+                                inferredType.getValue().ends_with("*"))
+                                shouldSet = true;
+                        }
+                        if (shouldSet)
                             varDeclOp->setAttr("inferred_type",
                                                inferredType);
                     }

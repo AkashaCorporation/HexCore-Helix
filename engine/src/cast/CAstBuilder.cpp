@@ -588,12 +588,30 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             paramType = CType::int32();
         else if (info.typeStr == "uint32_t")
             paramType = CType::uint32();
+        else if (info.typeStr == "int16_t")
+            paramType = CType::int16();
+        else if (info.typeStr == "uint16_t")
+            paramType = CType::uint16();
+        else if (info.typeStr == "int8_t")
+            paramType = CType::int8();
+        else if (info.typeStr == "uint8_t")
+            paramType = CType::uint8();
+        else if (info.typeStr == "uint64_t")
+            paramType = CType::uint64();
         else if (info.typeStr == "float")
             paramType = CType::floatTy();
         else if (info.typeStr == "double")
             paramType = CType::doubleTy();
         else if (info.typeStr == "bool")
             paramType = CType::boolTy();
+        else if (info.typeStr.ends_with("*")) {
+            auto pointeeName =
+                info.typeStr.substr(0, info.typeStr.size() - 1);
+            if (!pointeeName.empty() && pointeeName != "void")
+                paramType = CType::pointerTo(CType::structTy(pointeeName));
+            else
+                paramType = CType::voidPtr();
+        }
 
         params.emplace_back(paramName, paramType, index);
     }
@@ -623,7 +641,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         body = buildRegionBody(*bodyRegion);
 
     // ── Assemble CFuncDecl ──────────────────────────────────────────────
-    return std::make_unique<CFuncDecl>(
+    auto funcDecl = std::make_unique<CFuncDecl>(
         funcName,
         entryAddr,
         returnType,
@@ -633,6 +651,11 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         std::move(localVars),
         callingConv,
         entryAddr);
+
+    // ── Confidence analysis ───────────────────────────────────────────
+    analyzeConfidence(*funcDecl, op);
+
+    return funcDecl;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3223,4 +3246,104 @@ void CAstBuilder::prescanStructFieldNames(Operation* funcOp) {
                 StructFieldInfo{std::move(recoveredName), /*typeName=*/""};
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Confidence Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
+    double deduction = 0.0;
+    auto& issues = func.confidenceIssues;
+    auto highFunc = mlir::cast<helix::high::FuncOp>(op);
+
+    // Count total ops for stub detection
+    unsigned opCount = 0;
+    highFunc.walk([&](mlir::Operation*) { opCount++; });
+
+    // ── Stub / very short functions ──────────────────────────────────
+    if (func.body.size() <= 1 && opCount < 5) {
+        deduction += 40.0;
+        issues.push_back("stub function (< 5 ops)");
+    } else if (func.body.size() <= 3 && opCount < 10) {
+        deduction += 15.0;
+        issues.push_back("very short function");
+    }
+
+    // ── Native opcode calls not decomposed ───────────────────────────
+    unsigned nativeOps = 0;
+    highFunc.walk([&](helix::high::CallOp call) {
+        auto name = call.getTargetName().str();
+        bool allUpper = !name.empty();
+        for (char c : name) {
+            if (!std::isupper(c) && c != '_' && !std::isdigit(c)) {
+                allUpper = false;
+                break;
+            }
+        }
+        if (allUpper && name.size() >= 3)
+            nativeOps++;
+    });
+    if (nativeOps > 0) {
+        deduction += std::min(30.0, (double)nativeOps * 3.0);
+        issues.push_back(
+            std::format("{} native opcode(s) not decomposed", nativeOps));
+    }
+
+    // ── Register names as local variables ────────────────────────────
+    static const char* kRegs[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    };
+    unsigned regVars = 0;
+    for (auto& lv : func.localVars) {
+        for (auto* reg : kRegs) {
+            if (lv.varName == reg) { regVars++; break; }
+        }
+    }
+    if (regVars > 0) {
+        deduction += std::min(20.0, (double)regVars * 2.0);
+        issues.push_back(
+            std::format("{} register-named variable(s)", regVars));
+    }
+
+    // ── Goto count ───────────────────────────────────────────────────
+    unsigned gotos = 0;
+    highFunc.walk([&](helix::high::GotoOp) { gotos++; });
+    if (gotos > 3) {
+        deduction += std::min(15.0, (double)(gotos - 3) * 3.0);
+        issues.push_back(
+            std::format("{} goto(s)", gotos));
+    }
+
+    // ── Empty if/else bodies ─────────────────────────────────────────
+    unsigned emptyBodies = 0;
+    highFunc.walk([&](helix::high::IfOp ifOp) {
+        if (ifOp.getThenRegion().empty() ||
+            ifOp.getThenRegion().front().getOperations().size() <= 1)
+            emptyBodies++;
+        if (!ifOp.getElseRegion().empty() &&
+            ifOp.getElseRegion().front().getOperations().size() <= 1)
+            emptyBodies++;
+    });
+    if (emptyBodies > 0) {
+        deduction += (double)emptyBodies * 3.0;
+        issues.push_back(
+            std::format("{} empty if/else block(s)", emptyBodies));
+    }
+
+    // ── Typed parameters (bonus for pointer recovery) ────────────────
+    unsigned typedParams = 0;
+    for (auto& p : func.params) {
+        if (p.type && p.type->format() != "int64_t")
+            typedParams++;
+    }
+    if (typedParams > 0 && !func.params.empty()) {
+        // Bonus: up to +5 for having typed params
+        double bonus = std::min(5.0,
+            (double)typedParams / (double)func.params.size() * 5.0);
+        deduction -= bonus;
+    }
+
+    func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
 }

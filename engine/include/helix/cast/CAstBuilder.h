@@ -57,6 +57,9 @@ public:
     /// Build all functions from a HelixHigh module.
     std::vector<std::unique_ptr<CFuncDecl>> buildModule(mlir::ModuleOp moduleOp);
 
+    /// Analyze function quality and compute confidence score + issues.
+    void analyzeConfidence(CFuncDecl& func, mlir::Operation* op);
+
 private:
     // ── Pre-scans (ported from PseudoCEmitter) ──────────────────────────
 

@@ -4,6 +4,7 @@
 #include "helix/cast/CDecl.h"
 
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Format.h"
 
 #include <cassert>
 #include <sstream>
@@ -23,17 +24,36 @@ std::string CAstPrinter::print(const CFuncDecl& func) {
 void CAstPrinter::print(const CFuncDecl& func, llvm::raw_ostream& os) {
     os_ = &os;
 
-    // Calling convention comment
-    if (!func.callingConvention.empty()) {
-        os << "/* " << func.callingConvention << " */\n";
-    }
-
-    // Entry address comment
+    // ── Function header ──────────────────────────────────────────────
+    os << "// ─────────────────────────────────────────────────────────────\n";
+    os << "// " << func.name;
     if (func.entryAddr != 0) {
-        os << "/* 0x";
+        os << " (0x";
         os.write_hex(func.entryAddr);
-        os << " */\n";
+        os << ")";
     }
+    os << "\n";
+
+    // Confidence score
+    const char* rating =
+        func.confidenceScore > 80.0 ? "High" :
+        func.confidenceScore > 50.0 ? "Medium" : "Low";
+    os << "// Confidence: "
+       << llvm::format("%.1f", func.confidenceScore) << "% ("
+       << rating << ")";
+    if (!func.callingConvention.empty())
+        os << "  |  " << func.callingConvention;
+    os << "\n";
+
+    // Issues
+    if (!func.confidenceIssues.empty()) {
+        os << "// Issues:";
+        for (size_t i = 0; i < func.confidenceIssues.size(); ++i) {
+            os << (i == 0 ? " " : ", ") << func.confidenceIssues[i];
+        }
+        os << "\n";
+    }
+    os << "// ─────────────────────────────────────────────────────────────\n";
 
     // Return type
     if (func.returnType)

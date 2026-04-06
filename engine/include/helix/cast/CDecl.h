@@ -82,6 +82,10 @@ public:
     std::vector<CVarDecl> localVars;
     std::string callingConvention;
 
+    /// Confidence analysis (computed by CAstBuilder::analyzeConfidence).
+    double confidenceScore = 0.0;
+    std::vector<std::string> confidenceIssues;
+
     CFuncDecl(std::string name, uint64_t entryAddr, CTypePtr returnType,
               std::vector<CParamDecl> params = {},
               bool isVariadic = false,
