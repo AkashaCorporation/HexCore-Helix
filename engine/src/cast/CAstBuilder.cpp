@@ -387,6 +387,17 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         referencedLabelNames_.insert(gotoOp.getLabel().str());
     });
 
+    // FIX-053 (Wave 12 REVERT of FIX-051): populating `referencedBlocks_`
+    // from JmpOp/JccOp successors caused label emission for EVERY block
+    // reached by a low-level jump — even those already absorbed by
+    // `helix_high.if` structuring.  Result on live IDE output was
+    // goto-soup: `kbase_context_mmap` gained 73 `block_N:` labels with
+    // raw gotos, regressing the structured form that Helix 0.7.1 had
+    // already produced.  Revert to the pre-FIX-051 state (container
+    // stays declared but empty) until SAILR-style ISD/ISC consolidation
+    // lands in a follow-up wave.  See docs/AgentsNoGit/RESEARCH_HELIX_VS_IDA_GAP.md
+    // §8 for the post-mortem.
+
     // ── Detect return-only labels ───────────────────────────────────────
     op->walk([&](helix::high::LabelOp labelOp) {
         auto* block = labelOp->getBlock();
@@ -841,27 +852,72 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         if (!targetExpr || !valueExpr)
             return nullptr;
 
+        // FIX-047, part 2): guard against malformed lvalue targets.
+        //
+        // `buildExpression` is context-unaware: when it encounters a
+        // `__remill_undefined_{8,16,32,64}` intrinsic (see line ~2429) it
+        // returns a `CIntLitExpr(0)` because 0 is the best static stand-in
+        // for "undefined" in an rvalue position.  When that same intrinsic
+        // drives an assignment TARGET the emitted C is the malformed
+        // `0 = <rhs>;`, observed in SOTR's `HealthData-read.c` line 41
+        // before this fix.
+        //
+        // Skipping an integer-literal target is unambiguously correct:
+        // there is no legal C program in which `42 = x;` parses, so any
+        // IR that produced one is semantically equivalent to "discard this
+        // store" from a decompiled-output standpoint.  The RHS is still
+        // built (above) so any side-effecting call in the value expression
+        // is preserved as a bare ExprStmt.
+        if (targetExpr->getKind() == NodeKind::IntLitExpr) {
+            // If the RHS has observable side effects (a function call,
+            // potentially with useful arguments), keep it as a statement.
+            // Otherwise drop the whole thing.
+            const bool rhsHasSideEffects =
+                valueExpr &&
+                (valueExpr->getKind() == NodeKind::CallExpr);
+            if (rhsHasSideEffects) {
+                return std::make_unique<CExprStmt>(std::move(valueExpr), addr);
+            }
+            return nullptr;
+        }
+
         // Track copy propagation
         std::string targetStr = exprToString(targetExpr.get());
         std::string valueStr = exprToString(valueExpr.get());
 
+        // exprToString uses "__expr" as a placeholder for any expression it
+        // can't represent (BinaryExpr, CallExpr, FieldAccess, etc.).  That
+        // sentinel must NEVER end up in lastRegValue_/exprToBestName_,
+        // because those caches feed back into name resolution
+        // (resolveTransitive at line 1428) and would emit the literal
+        // string "__expr" in the output.
+        const bool valueIsOpaque = (valueStr == "__expr");
+        const bool targetIsOpaque = (targetStr == "__expr");
+
         // Skip redundant identical assignments
-        if (lastRegValue_.count(targetStr) &&
+        if (!targetIsOpaque && !valueIsOpaque &&
+            lastRegValue_.count(targetStr) &&
             lastRegValue_[targetStr] == valueStr)
             return nullptr;
 
         // Invalidate cached entries that depend on the target
-        for (auto it = lastRegValue_.begin(); it != lastRegValue_.end();) {
-            if (it->first == targetStr ||
-                it->second.find(targetStr) != std::string::npos)
-                it = lastRegValue_.erase(it);
-            else
-                ++it;
+        if (!targetIsOpaque) {
+            for (auto it = lastRegValue_.begin(); it != lastRegValue_.end();) {
+                if (it->first == targetStr ||
+                    it->second.find(targetStr) != std::string::npos)
+                    it = lastRegValue_.erase(it);
+                else
+                    ++it;
+            }
+            // Only cache when the value is also representable; storing
+            // "<targetStr> -> __expr" causes downstream substitutions to
+            // emit the placeholder.
+            if (!valueIsOpaque)
+                lastRegValue_[targetStr] = valueStr;
         }
-        lastRegValue_[targetStr] = valueStr;
 
-        // Track value equivalence
-        {
+        // Track value equivalence (skip when either side is opaque)
+        if (!targetIsOpaque && !valueIsOpaque) {
             auto existingIt = exprToBestName_.find(valueStr);
             bool shouldUpdate = (existingIt == exprToBestName_.end());
             if (!shouldUpdate) {
@@ -898,6 +954,30 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 
     // ─── Call as statement ──────────────────────────────────────────────
     if (auto call = dyn_cast<helix::high::CallOp>(op)) {
+        // Suppress standalone emission only when a user's statement will
+        // emit this call as an expression (an AssignOp that prints
+        // `var = call(...)` or a ReturnOp that prints `return call(...)`).
+        // Additional guard: the AssignOp must be in the same block —
+        // otherwise the walker may never reach it in this region's scope
+        // and the call would silently disappear.
+        if (call->getNumResults() > 0) {
+            bool hasReachableEmittingUser = false;
+            Block* callBlock = call->getBlock();
+            for (Operation* user : call->getResult(0).getUsers()) {
+                bool isEmitter = isa<helix::high::AssignOp,
+                                     helix::high::ReturnOp,
+                                     helix::low::RetOp>(user);
+                if (!isEmitter)
+                    continue;
+                if (user->getBlock() == callBlock) {
+                    hasReachableEmittingUser = true;
+                    break;
+                }
+            }
+            if (hasReachableEmittingUser)
+                return nullptr;
+        }
+
         auto calleeName = call.getTargetName().str();
         auto targetAddr = call.getTargetAddr();
 
@@ -1114,6 +1194,27 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 
     // ─── helix_low.call (as statement) ─────────────────────────────────
     if (auto call = dyn_cast<helix::low::CallOp>(op)) {
+        // Same rule as high::CallOp above: only suppress when a same-block
+        // emitting consumer will re-emit the call as an expression.
+        if (call->getNumResults() > 0) {
+            bool hasReachableEmittingUser = false;
+            Block* callBlock = call->getBlock();
+            for (Operation* user : call->getResult(0).getUsers()) {
+                bool isEmitter = isa<helix::low::RegWriteOp,
+                                     helix::high::AssignOp,
+                                     helix::high::ReturnOp,
+                                     helix::low::RetOp>(user);
+                if (!isEmitter)
+                    continue;
+                if (user->getBlock() == callBlock) {
+                    hasReachableEmittingUser = true;
+                    break;
+                }
+            }
+            if (hasReachableEmittingUser)
+                return nullptr;
+        }
+
         std::string calleeName;
         uint64_t targetAddrVal = 0;
         if (auto name = call.getTargetName()) {
@@ -1201,6 +1302,24 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     // ─── helix_low.mem_write ───────────────────────────────────────────
     if (auto memWrite = dyn_cast<helix::low::MemWriteOp>(op)) {
         auto addrExpr = buildExpression(memWrite.getAddr());
+        if (!addrExpr)
+            return nullptr;
+
+        // FIX-047, part 2): if the address resolves to a bare
+        // integer literal (typically 0 from a `__remill_undefined_*`
+        // intrinsic collapse), wrapping it in a Deref and then printing
+        // yields `*0 = rhs` which the CAstOptimizer's `*(T)NULL → 0`
+        // rule later folds to `0 = rhs` — malformed C.  Since the
+        // address is a synthesized "don't know" value, there is no
+        // store to preserve; drop the entire statement, keeping any
+        // side-effecting RHS call as a bare expression statement.
+        if (addrExpr->getKind() == NodeKind::IntLitExpr) {
+            auto value = buildExpression(memWrite.getValue());
+            if (value && value->getKind() == NodeKind::CallExpr)
+                return std::make_unique<CExprStmt>(std::move(value), addr);
+            return nullptr;
+        }
+
         auto target = std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
             CType::int64(), addr);
@@ -1270,10 +1389,26 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     }
 
     // ─── helix_low.jmp ─────────────────────────────────────────────────
+    //
+    // FIX-053 (Wave 12 REVERT of FIX-051): emitting CGotoStmt for
+    // non-fall-through JmpOp regressed live IDE output to goto-soup
+    // (73 `block_N:` labels on `kbase_context_mmap` where 0.7.1 had
+    // structured control flow).  Restore the pre-FIX-051 behaviour of
+    // dropping JmpOp at the C-AST level; StructureControlFlow is
+    // expected to have absorbed every schema-matchable jump.  When
+    // SAILR-style ISD/ISC consolidation lands in a follow-up wave we
+    // can re-introduce a goto fallback that only fires after the
+    // structurer has had its say, rather than in parallel with it.
     if (isa<helix::low::JmpOp>(op))
         return nullptr;
 
     // ─── helix_low.jcc ─────────────────────────────────────────────────
+    //
+    // FIX-053: same revert rationale as JmpOp above.  The conditional
+    // form of FIX-051 emitted `if (cond) goto T; goto F;` for every
+    // unstructured conditional branch, which also contributed to the
+    // goto-soup regression.  Skip at C-AST level until SAILR
+    // consolidation exists.
     if (isa<helix::low::JccOp>(op))
         return nullptr;
 
@@ -1343,6 +1478,23 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     // ─── llvm.store → assignment ───────────────────────────────────────
     if (auto store = dyn_cast<LLVM::StoreOp>(op)) {
         auto addrExpr = buildExpression(store.getAddr());
+        if (!addrExpr)
+            return nullptr;
+
+        // FIX-047, part 2): same lvalue-sanity guard as
+        // helix_low.mem_write.  If the store address is a bare integer
+        // literal (commonly 0, originating from `__remill_undefined_*`
+        // collapse to `CIntLitExpr(0)` via buildExpression), refuse to
+        // build the malformed `*0 = rhs` / `0 = rhs` assignment.
+        // Preserve any call-valued RHS as an ExprStmt so side effects
+        // are retained; otherwise drop.
+        if (addrExpr->getKind() == NodeKind::IntLitExpr) {
+            auto value = buildExpression(store.getValue());
+            if (value && value->getKind() == NodeKind::CallExpr)
+                return std::make_unique<CExprStmt>(std::move(value), addr);
+            return nullptr;
+        }
+
         auto target = std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
             CType::int64(), addr);
@@ -1505,6 +1657,20 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             auto argExpr = buildExpression(arg);
             if (argExpr)
                 callArgs.push_back(std::move(argExpr));
+        }
+
+        // ── RTTI Tier 1: check for class::method resolved name ──────────
+        // DevirtualizeIndirectCalls Phase 4 annotates vtable calls with
+        // "helix.resolved_name" = "ClassName::methodName".  If present,
+        // prefer it over the raw __vtable_0xNN mangling.
+        if (auto resolvedAttr = call->getAttrOfType<mlir::StringAttr>(
+                "helix.resolved_name")) {
+            StringRef resolved = resolvedAttr.getValue();
+            if (!resolved.empty() && resolved.contains("::")) {
+                return std::make_unique<CCallExpr>(
+                    resolved.str(), targetAddr, std::move(callArgs),
+                    returnType, addr);
+            }
         }
 
         // Vtable pattern: __vtable_0xNN → vfunc_0xNN(rest...)
@@ -2552,6 +2718,94 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             convertType(val.getType()), addr);
     }
 
+    // ─── llvm.intr.* (LLVM intrinsics) ─────────────────────────────────
+    //
+    // Generic dispatch for LLVM intrinsics by op name.  Maps the
+    // intrinsic name to a readable C function name and renders as a
+    // CCallExpr with the operands as arguments.
+    {
+        auto opName = defOp->getName().getStringRef();
+        if (opName.starts_with("llvm.intr.")) {
+            auto intrName = opName.drop_front(10).str();  // strip "llvm.intr."
+            // Map common intrinsics to standard C library functions.
+            static const llvm::StringMap<std::string> kIntrMap = {
+                {"fabs",     "fabs"},
+                {"sqrt",     "sqrt"},
+                {"sin",      "sin"},
+                {"cos",      "cos"},
+                {"tan",      "tan"},
+                {"exp",      "exp"},
+                {"exp2",     "exp2"},
+                {"log",      "log"},
+                {"log2",     "log2"},
+                {"log10",    "log10"},
+                {"pow",      "pow"},
+                {"powi",     "pow"},
+                {"trunc",    "trunc"},
+                {"floor",    "floor"},
+                {"ceil",     "ceil"},
+                {"round",    "round"},
+                {"rint",     "rint"},
+                {"nearbyint", "nearbyint"},
+                {"copysign", "copysign"},
+                {"fma",      "fma"},
+                {"fmuladd",  "fma"},
+                {"minnum",   "fmin"},
+                {"maxnum",   "fmax"},
+                {"minimum",  "fmin"},
+                {"maximum",  "fmax"},
+                {"abs",      "abs"},
+                {"smax",     "max"},
+                {"smin",     "min"},
+                {"umax",     "max"},
+                {"umin",     "min"},
+                {"bswap",    "__builtin_bswap"},
+                {"ctpop",    "popcount"},
+                {"cttz",     "count_trailing_zeros"},
+                {"ctlz",     "count_leading_zeros"},
+                {"bitreverse", "bit_reverse"},
+                {"memcpy",   "memcpy"},
+                {"memmove",  "memmove"},
+                {"memset",   "memset"},
+                {"prefetch", "__builtin_prefetch"},
+                {"expect",   "__builtin_expect"},
+                {"assume",   "__builtin_assume"},
+                {"trap",     "__builtin_trap"},
+                {"debugtrap","__builtin_debugtrap"},
+                {"ssub.with.overflow", "__builtin_ssub_overflow"},
+                {"sadd.with.overflow", "__builtin_sadd_overflow"},
+                {"smul.with.overflow", "__builtin_smul_overflow"},
+                {"usub.with.overflow", "__builtin_usub_overflow"},
+                {"uadd.with.overflow", "__builtin_uadd_overflow"},
+                {"umul.with.overflow", "__builtin_umul_overflow"},
+            };
+            std::string callName;
+            auto it = kIntrMap.find(intrName);
+            if (it != kIntrMap.end()) {
+                callName = it->second;
+            } else {
+                // Unknown intrinsic — keep the name with __builtin_ prefix
+                // so it's still recognizable.
+                callName = "__builtin_" + intrName;
+                // Replace dots with underscores for valid C identifier.
+                for (auto& c : callName)
+                    if (c == '.') c = '_';
+            }
+
+            // Build call args from the op's operands.
+            std::vector<ExprPtr> args;
+            for (auto operand : defOp->getOperands())
+                args.push_back(buildExpression(operand));
+
+            return std::make_unique<CCallExpr>(
+                std::move(callName),
+                /*targetAddr=*/0,
+                std::move(args),
+                convertType(val.getType()),
+                addr);
+        }
+    }
+
     // ─── Unknown → fallback ─────────────────────────────────────────────
     return std::make_unique<CVarRefExpr>(
         0, std::format("__unknown_{}", defOp->getName().getStringRef().str()),
@@ -2795,7 +3049,14 @@ bool CAstBuilder::shouldSkip(Operation* op) {
     if (isa<helix::low::NopOp>(op))
         return true;
 
-    // HelixLow block terminators (handled by region walking)
+    // HelixLow block terminators (handled by region walking).
+    // FIX-053 (Wave 12 REVERT of FIX-051): restored the pre-FIX-051
+    // blanket skip.  Forwarding JmpOp/JccOp through buildStatement
+    // emitted gotos in parallel with StructureControlFlow rather than
+    // as a true fallback, regressing live IDE output to goto-soup on
+    // every function with non-trivial CFG.  Reintroduction is gated
+    // on SAILR ISD/ISC consolidation (tracked as Wave 14 plan in
+    // docs/AgentsNoGit/RESEARCH_HELIX_VS_IDA_GAP.md §8).
     if (isa<helix::low::JmpOp>(op) || isa<helix::low::JccOp>(op))
         return true;
 
@@ -2851,6 +3112,13 @@ std::string CAstBuilder::resolveTransitive(const std::string& name) const {
             break;
 
         if (it->second == current)
+            break;
+
+        // Defensive: never resolve to the "__expr" placeholder.  exprToString
+        // emits this when an expression can't be represented as a flat
+        // identifier (binop, call, field access, etc.).  Returning it would
+        // print the literal string "__expr" in the output.
+        if (it->second == "__expr")
             break;
 
         if (it->second.find(current) != std::string::npos &&

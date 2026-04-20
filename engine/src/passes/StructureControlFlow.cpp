@@ -1288,6 +1288,69 @@ static unsigned convertCmovsToTernary(Region& region, OpBuilder& builder) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DominanceInfo Safety Guard
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Check if a region's CFG is irreducible or has unreachable blocks.
+/// Either condition causes LLVM's DominanceInfo constructor to assert
+/// (GenericDomTreeConstruction.h:481: "Everything should have been visited").
+///
+/// Uses SCC-based detection (Tarjan) + BFS reachability.  Must be called
+/// BEFORE any DominanceInfo/PostDominanceInfo construction on the region.
+static bool hasIrreducibleSCCs(Region& funcBody) {
+    llvm::SmallPtrSet<Block*, 16> emptySet;
+    auto sccs = findSCCLoops(funcBody, emptySet);
+
+    for (auto& scc : sccs) {
+        if (scc.body.size() < 2) continue;
+
+        llvm::SmallPtrSet<Block*, 8> sccSet(
+            scc.body.begin(), scc.body.end());
+
+        // Multi-entry SCC = irreducible
+        unsigned entries = 0;
+        for (Block* blk : scc.body) {
+            for (Block* pred : blk->getPredecessors()) {
+                if (!sccSet.contains(pred)) {
+                    ++entries;
+                    break;
+                }
+            }
+        }
+        if (entries > 1)
+            return true;
+
+        // Complex internal back-edge patterns (>=3 SCC-internal preds)
+        for (Block* blk : scc.body) {
+            unsigned internalPreds = 0;
+            for (Block* pred : blk->getPredecessors()) {
+                if (sccSet.contains(pred))
+                    ++internalPreds;
+            }
+            if (internalPreds >= 3)
+                return true;
+        }
+    }
+
+    // Unreachable blocks also cause the DomTree assert.
+    llvm::SmallPtrSet<Block*, 32> reachable;
+    llvm::SmallVector<Block*, 32> worklist;
+    worklist.push_back(&funcBody.front());
+    while (!worklist.empty()) {
+        Block* b = worklist.pop_back_val();
+        if (!reachable.insert(b).second) continue;
+        for (Block* succ : b->getSuccessors())
+            worklist.push_back(succ);
+    }
+    unsigned totalBlocks =
+        std::distance(funcBody.begin(), funcBody.end());
+    if (reachable.size() < totalBlocks)
+        return true;
+
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Pass Implementation
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1701,6 +1764,16 @@ private:
 
         // Phase 4: Emit goto/label for remaining irreducible edges.
         // Re-collect edges since the CFG may have changed.
+        // GUARD: Re-check for irreducible SCCs.  Phase 1-3 may have
+        // partially resolved the CFG but left some irreducible edges.
+        // DominanceInfo construction on an irreducible CFG triggers a
+        // fatal LLVM assert in GenericDomTreeConstruction.h:481.
+        if (hasIrreducibleSCCs(funcBody)) {
+            LLVM_DEBUG(llvm::dbgs()
+                << "  Phase 4: CFG still irreducible after structuring, "
+                << "skipping DominanceInfo-based goto emission\n");
+            return success();
+        }
         DominanceInfo finalDomInfo(func);
         auto remainingEdges = collectCFGEdges(funcBody);
         for (const auto& edge : remainingEdges) {
@@ -1921,6 +1994,89 @@ private:
             OpBuilder bodyBuilder(builder.getContext());
             bodyBuilder.setInsertionPointToEnd(&bodyBlock);
 
+            // Build a set of loop body blocks for fast exit-edge lookup.
+            llvm::SmallPtrSet<Block*, 8> loopBodySet(
+                loop.body.begin(), loop.body.end());
+
+            // ── Break synthesis helper ────────────────────────────────────
+            //
+            // For each block being moved into the do-while body, examine
+            // its terminator.  If it has an exit edge (target outside the
+            // loop), emit an `if (cond) { break; }` or unconditional break.
+            //
+            // This recovers loop exit conditions that would otherwise be
+            // lost when the terminators are discarded — without breaks,
+            // the loop becomes infinite and code after it is unreachable.
+            //
+            // Reference: No More Gotos (Yakdan et al., NDSS 2015) §IV-C2
+            auto emitBreakOnExit = [&](Block* block) {
+                auto* term = block->getTerminator();
+                if (!term) return;
+                auto loc = term->getLoc();
+
+                if (auto jccOp = dyn_cast<helix::low::JccOp>(term)) {
+                    Block* trueDest = jccOp.getTrueDest();
+                    Block* falseDest = jccOp.getFalseDest();
+                    bool trueOutside = !loopBodySet.count(trueDest);
+                    bool falseOutside = !loopBodySet.count(falseDest);
+
+                    // Both inside or both outside — not an exit edge.
+                    if (trueOutside == falseOutside) return;
+
+                    Value condValue = jccOp.getFlagValue();
+                    if (!condValue) return;
+
+                    // The condValue's defining op must already be in the
+                    // body block (we moved it earlier).  If it's defined
+                    // outside or it's a block argument, skip — using it
+                    // would create a region escape.
+                    auto* defOp = condValue.getDefiningOp();
+                    if (!defOp || defOp->getBlock() != &bodyBlock)
+                        return;
+
+                    bodyBuilder.setInsertionPointToEnd(&bodyBlock);
+
+                    // For break-on-true (trueOutside): condition is condValue
+                    // For break-on-false (falseOutside): condition is !condValue
+                    Value finalCond = condValue;
+                    if (falseOutside) {
+                        // Negate using arith.xori with 1.
+                        auto i1Ty = bodyBuilder.getI1Type();
+                        auto trueConst = bodyBuilder.create<arith::ConstantOp>(
+                            loc, i1Ty, bodyBuilder.getBoolAttr(true));
+                        finalCond = bodyBuilder.create<arith::XOrIOp>(
+                            loc, condValue, trueConst.getResult());
+                    }
+
+                    // Create if (finalCond) { break; }
+                    auto ifOp = bodyBuilder.create<helix::high::IfOp>(
+                        loc, finalCond, IntegerAttr{});
+
+                    Region& thenRegion = ifOp.getThenRegion();
+                    if (thenRegion.empty()) {
+                        auto* thenBlock = new Block();
+                        thenRegion.push_back(thenBlock);
+                    }
+                    Block& thenBlock = thenRegion.front();
+
+                    OpBuilder thenBuilder(bodyBuilder.getContext());
+                    thenBuilder.setInsertionPointToEnd(&thenBlock);
+                    thenBuilder.create<helix::high::BreakOp>(
+                        loc, IntegerAttr{});
+
+                    // Reset insertion point for subsequent ops.
+                    bodyBuilder.setInsertionPointToEnd(&bodyBlock);
+                } else if (auto jmpOp = dyn_cast<helix::low::JmpOp>(term)) {
+                    Block* dest = jmpOp.getDest();
+                    if (!loopBodySet.count(dest)) {
+                        // Unconditional jump out of the loop → emit break.
+                        bodyBuilder.setInsertionPointToEnd(&bodyBlock);
+                        bodyBuilder.create<helix::high::BreakOp>(
+                            loc, IntegerAttr{});
+                    }
+                }
+            };
+
             for (Block* block : loop.body) {
                 if (block == loop.header) {
                     // Move header's non-terminator ops into body.
@@ -1930,11 +2086,15 @@ private:
                             continue;
                         op.moveBefore(&bodyBlock, bodyBlock.end());
                     }
-                    continue;
+                } else {
+                    for (auto& op : llvm::make_early_inc_range(block->without_terminator())) {
+                        op.moveBefore(&bodyBlock, bodyBlock.end());
+                    }
                 }
-                for (auto& op : llvm::make_early_inc_range(block->without_terminator())) {
-                    op.moveBefore(&bodyBlock, bodyBlock.end());
-                }
+
+                // After moving ops, examine the terminator and emit break
+                // if it represents an exit edge from the loop.
+                emitBreakOnExit(block);
             }
 
             // Add a yield terminator to the body.
@@ -2036,6 +2196,18 @@ private:
             return success();
 
         while (true) {
+            // GUARD: Skip if the CURRENT region is irreducible.  The
+            // previous check was on `func.getBody()`, which is the wrong
+            // scope when structuring a nested region (e.g. the then-body
+            // of an already-structured high.if): the top-level function
+            // body often looks irreducible after the outer structuring
+            // pass (host block + merge remnant), which triggered an
+            // immediate early exit and left the inner region's 9+ JccOps
+            // completely unstructured — collapsing __scrt_common_main_seh
+            // from 59 IDA lines to a flat 33.  The inner region's own CFG
+            // is what must be analysed here.
+            if (hasIrreducibleSCCs(region))
+                return success();
             DominanceInfo domInfo(func);
             PostDominanceInfo postDomInfo(func);
             llvm::SmallVector<IfRegion, 8> ifRegions;
@@ -2485,6 +2657,9 @@ private:
 
             // After splitting, re-attempt loop and if/else recovery
             // on the modified CFG.
+            // GUARD: Node splitting may leave the CFG irreducible.
+            if (hasIrreducibleSCCs(funcBody))
+                break;
             DominanceInfo postSplitDom(func);
             auto postSplitEdges = collectCFGEdges(funcBody);
 

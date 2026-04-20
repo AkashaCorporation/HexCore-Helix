@@ -86,6 +86,15 @@ public:
     double confidenceScore = 0.0;
     std::vector<std::string> confidenceIssues;
 
+    /// Number of `CVarDecl` entries in `localVars` that were injected by
+    /// `CAstOptimizer::declareUndeclaredVars` (FIX-043) because the body
+    /// referenced a name without a matching declaration.  Kept as a
+    /// separate counter so the confidence analyzer can still penalise
+    /// the smell even after the declarations exist — a function that
+    /// needed synthesised placeholders usually indicates SSA-destruction
+    /// gaps (bug C) or data-as-code lift artefacts (bug J).
+    unsigned synthesizedVarDecls = 0;
+
     CFuncDecl(std::string name, uint64_t entryAddr, CTypePtr returnType,
               std::vector<CParamDecl> params = {},
               bool isVariadic = false,

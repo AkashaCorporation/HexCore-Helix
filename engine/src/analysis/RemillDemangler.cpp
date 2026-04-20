@@ -125,7 +125,12 @@ RemillSemantic classifySemantic(std::string_view name) {
 
     // ---- Control flow (non-conditional) -------------------------------------
     if (name == "CALL"  || name == "CALLI")  return RemillSemantic::CALL;
-    if (name == "RET"   || name == "RETE" || name == "RETN")
+    // `RET_IMM` is `ret imm16` (return + adjust SP by an immediate); `RETE`/`RETN`
+    // are Remill's error/near variants.  All of them terminate the function with
+    // a C `return;` — otherwise the x86 gta-sa corpus leaked `__native_RET_IMM(...)`
+    // calls in the middle of function bodies (bug D).
+    if (name == "RET"     || name == "RETE"    || name == "RETN" ||
+        name == "RET_IMM" || name == "RETI"    || name == "RET_IMM_16")
                                               return RemillSemantic::RET;
     if (name == "JMP"   || name == "JMPI")   return RemillSemantic::JMP;
 

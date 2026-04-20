@@ -60,7 +60,11 @@ constexpr std::array<std::string_view, 5> kSysVCalleeSaved = {
 };
 
 /// Determines ABI convention from context (default to Win64 on Windows).
-enum class CallingConv { Win64, SysV };
+/// `Cdecl32` is the x86 (32-bit) Windows default — all integer arguments on
+/// the stack, no register arg slots.  Used for legacy PE binaries like
+/// GTA San Andreas (`target triple = "i386-unknown-windows-msvc-coff"`).
+/// x86 Linux also defaults to cdecl for the same reason (stack-only args).
+enum class CallingConv { Win64, SysV, Cdecl32 };
 
 static uint32_t getNextAvailableVarId(helix::low::FuncOp func) {
     uint32_t nextId = 0;
@@ -159,10 +163,25 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
         return {};
 
     // Build a map of the most recent register write before beforeOp.
+    // IMPORTANT: Reset state at every call barrier (previous call clobbers
+    // all ABI arg registers per the SysV/Win64 contract).  Without this,
+    // stale RSI/RDX/RCX values from an earlier call bleed into the current
+    // call's arg list, producing spurious extra args like
+    // `mutex_unlock(var_70, _promoted_0, 0xA0D, rsp)` when only the first
+    // arg is real.
     llvm::DenseMap<llvm::StringRef, Value> regState;
     for (auto& op : block->getOperations()) {
         if (&op == beforeOp)
             break;
+
+        // Call barrier: any previous call clobbers caller-saved registers
+        // (which includes every ABI arg register on both Win64 and SysV).
+        // Drop the recorded state so we only collect args written by the
+        // code between the previous call and this one.
+        if (isa<helix::low::CallOp>(&op)) {
+            regState.clear();
+            continue;
+        }
 
         auto regWrite = dyn_cast<helix::low::RegWriteOp>(&op);
         if (!regWrite)
@@ -175,12 +194,23 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
         regState[lookup] = regWrite.getValue();
     }
 
+    // Collect arg values in positional order.  Stop at the first argReg
+    // that wasn't written since the most recent call barrier — positional
+    // ABIs can't have holes (you can't pass arg2 without arg1).
     llvm::SmallVector<Value, 6> argValues;
+    bool anyFromCurrentBlock = !regState.empty();
+
     for (auto argReg : argRegs) {
         llvm::StringRef key(argReg);
         auto it = regState.find(key);
         if (it == regState.end()) {
-            // Not in the current block — check predecessor blocks.
+            if (anyFromCurrentBlock) {
+                // We saw writes to other arg regs in this block after the
+                // last call barrier, but not this one — positional ABI
+                // means further args are also absent.  Stop here.
+                break;
+            }
+            // Empty current-block state: fall back to predecessor scan.
             llvm::DenseSet<Block*> visiting;
             auto fromPreds = findLatestRegWriteInPredecessors(
                 block, key, predecessorDepth, visiting);
@@ -220,29 +250,54 @@ struct RecoverCallingConventionPass
 
 private:
     void recoverCC(helix::low::FuncOp func) {
-        // Detect ABI from module's target triple
+        // Detect ABI from module's target triple.  Detection priority:
+        //   1. 32-bit x86 markers (`i386`/`i686`/`i486`/`i586`) → Cdecl32
+        //      (all args on the stack, no register args).  This catches both
+        //      x86 Windows PE (`i386-unknown-windows-msvc-coff`, e.g. GTA-SA)
+        //      AND x86 Linux/BSD ELF — both use stack-based args by default.
+        //   2. Otherwise, 64-bit Unix-family OSes → SysV.
+        //   3. Otherwise (default for 64-bit Windows and anything else) → Win64.
         CallingConv cc = CallingConv::Win64; // default fallback
         auto module = func->getParentOfType<ModuleOp>();
         if (module) {
             if (auto triple = module->getAttrOfType<StringAttr>("llvm.target_triple")) {
                 auto t = triple.getValue();
                 llvm::errs() << "[P0-DEBUG] RecoverCC: triple='" << t << "'\n";
-                if (t.contains("linux") || t.contains("elf") || t.contains("gnu") ||
-                    t.contains("freebsd") || t.contains("openbsd"))
+                const bool is32BitX86 =
+                    t.contains("i386") || t.contains("i486") ||
+                    t.contains("i586") || t.contains("i686");
+                if (is32BitX86) {
+                    cc = CallingConv::Cdecl32;
+                } else if (t.contains("linux") || t.contains("elf") ||
+                           t.contains("gnu") || t.contains("freebsd") ||
+                           t.contains("openbsd")) {
                     cc = CallingConv::SysV;
-                else if (t.contains("darwin") || t.contains("macho"))
+                } else if (t.contains("darwin") || t.contains("macho")) {
                     cc = CallingConv::SysV; // macOS also uses SysV on x86_64
+                }
             } else {
                 llvm::errs() << "[P0-DEBUG] RecoverCC: NO llvm.target_triple on module\n";
             }
         } else {
             llvm::errs() << "[P0-DEBUG] RecoverCC: FuncOp has no parent ModuleOp!\n";
         }
-        llvm::errs() << "[P0-DEBUG] RecoverCC: using " << ((cc == CallingConv::Win64) ? "Win64" : "SysV") << "\n";
+        const char* ccDebugName =
+            (cc == CallingConv::Win64)   ? "Win64"   :
+            (cc == CallingConv::SysV)    ? "SysV"    :
+            /* Cdecl32 */                  "Cdecl32";
+        llvm::errs() << "[P0-DEBUG] RecoverCC: using " << ccDebugName << "\n";
 
-        auto argRegs = (cc == CallingConv::Win64)
-            ? llvm::ArrayRef(kWin64IntArgs)
-            : llvm::ArrayRef(kSysVIntArgs);
+        // x86 cdecl has zero argument registers — everything is on the stack.
+        // Leaving `argRegs` empty causes Phase 1/Phase 3 register-arg recovery
+        // to find nothing, which is the correct behaviour (stack-frame access
+        // is recovered by RecoverStackLayout instead).
+        static constexpr std::array<std::string_view, 0> kCdecl32IntArgs = {};
+        llvm::ArrayRef<std::string_view> argRegs;
+        switch (cc) {
+        case CallingConv::Win64:   argRegs = kWin64IntArgs;   break;
+        case CallingConv::SysV:    argRegs = kSysVIntArgs;    break;
+        case CallingConv::Cdecl32: argRegs = kCdecl32IntArgs; break;
+        }
 
         // Phase 1: Identify function parameters.
         // Scan from the top for reg.read operations that read argument registers
@@ -313,11 +368,92 @@ private:
             auto targetName = call.getTargetName();
             const bool isDirectNamedCall =
                 targetName.has_value() && targetName->starts_with("sub_");
+
+            // ── Look up signature to clamp arg count for known callees ──
+            // For external named calls (e.g., mutex_unlock, down_read), the
+            // SignatureDb tells us exactly how many args the function takes.
+            // Without this clamp, collectAbiCallArgs bleeds stray register
+            // writes into the arg list, producing calls like:
+            //   mutex_unlock(var_70, _promoted_0, 0xA0D, rsp)   (wrong!)
+            // when the real signature is:
+            //   mutex_unlock(var_70)                              (correct)
+            std::optional<size_t> maxArgs;
+            if (targetName.has_value() && !isDirectNamedCall) {
+                if (auto sig = lookupSignature(*targetName))
+                    maxArgs = sig->param_types.size();
+
+                // Fallback: inline table of common Linux kernel primitives
+                // that SignatureDb doesn't know about.  This prevents
+                // stray register bleeding in kernel-module decompilation.
+                if (!maxArgs.has_value()) {
+                    static const llvm::StringMap<size_t> kKernelArgs = {
+                        // sync primitives (1 arg: lock pointer)
+                        {"mutex_lock",         1},
+                        {"mutex_unlock",       1},
+                        {"mutex_lock_nested",  2},
+                        {"mutex_trylock",      1},
+                        {"down_read",          1},
+                        {"down_write",         1},
+                        {"up_read",            1},
+                        {"up_write",           1},
+                        {"down_read_killable", 1},
+                        {"down_write_killable",1},
+                        {"_raw_spin_lock",         1},
+                        {"_raw_spin_unlock",       1},
+                        {"_raw_spin_lock_irq",     1},
+                        {"_raw_spin_unlock_irq",   1},
+                        {"_raw_spin_lock_bh",      1},
+                        {"_raw_spin_unlock_bh",    1},
+                        {"spin_lock",          1},
+                        {"spin_unlock",        1},
+                        {"raw_spin_lock",      1},
+                        {"raw_spin_unlock",    1},
+                        {"read_lock",          1},
+                        {"read_unlock",        1},
+                        {"write_lock",         1},
+                        {"write_unlock",       1},
+                        // list ops (1-2 args)
+                        {"__list_del_entry_valid_or_report", 1},
+                        {"__list_add_valid_or_report",       3},
+                        // memory (1 arg)
+                        {"kfree",              1},
+                        {"vfree",              1},
+                        {"kmem_cache_free",    2},
+                        // atomics (2-3 args)
+                        {"atomic_inc",         1},
+                        {"atomic_dec",         1},
+                        {"atomic_read",        1},
+                        {"atomic_set",         2},
+                        // barriers / no-arg
+                        {"schedule",           0},
+                        {"cond_resched",       0},
+                        {"might_sleep",        0},
+                    };
+                    auto it = kKernelArgs.find(*targetName);
+                    if (it != kKernelArgs.end())
+                        maxArgs = it->second;
+                }
+            }
+
             auto argValues =
                 collectAbiCallArgs(call.getOperation(), argRegs);
+
+            // Clamp collected args to the known signature length.
+            if (maxArgs.has_value() && argValues.size() > *maxArgs) {
+                argValues.resize(*maxArgs);
+            }
+
             auto existingArgs = call.getArgs();
+
+            // External calls with UNKNOWN signatures: do not materialize
+            // any args.  Trust the downstream emitter to render the call
+            // without args rather than risk stale register state bleeding
+            // through as spurious args.  Direct sub_XXX calls still get
+            // materialization since those have no signature info at all.
             const bool canMaterializeArgs =
-                isDirectNamedCall || existingArgs.empty();
+                isDirectNamedCall ||
+                (maxArgs.has_value() && existingArgs.empty()) ||
+                (existingArgs.empty() && !targetName.has_value());
 
             bool differs = existingArgs.size() != argValues.size();
             if (!differs) {
@@ -337,6 +473,16 @@ private:
                 (existingArgs.empty() || argValues.size() > existingArgs.size()) &&
                 differs) {
                 call.getArgsMutable().assign(argValues);
+                existingArgs = call.getArgs();
+            }
+
+            // Final safety clamp on whatever ended up on the call.
+            if (maxArgs.has_value() && existingArgs.size() > *maxArgs) {
+                llvm::SmallVector<Value, 6> clamped(
+                    existingArgs.begin(),
+                    existingArgs.begin() +
+                        static_cast<ptrdiff_t>(*maxArgs));
+                call.getArgsMutable().assign(clamped);
                 existingArgs = call.getArgs();
             }
 
@@ -385,8 +531,14 @@ private:
             }
         });
 
-        // Set calling convention attribute on the function
-        auto ccStr = (cc == CallingConv::Win64) ? "win64" : "sysv";
+        // Set calling convention attribute on the function.  The string is
+        // read by downstream passes (RecoverVariables, CAstBuilder, emitter,
+        // RecoverStackLayout) to pick arg-register maps, stack layout, and
+        // the `| <cc>` header line in the emitted C output.
+        const char* ccStr =
+            (cc == CallingConv::Win64)   ? "win64"   :
+            (cc == CallingConv::SysV)    ? "sysv"    :
+            /* Cdecl32 */                  "cdecl";
         func->setAttr("calling_convention",
             StringAttr::get(func->getContext(), ccStr));
         if (hasReturnValue) {

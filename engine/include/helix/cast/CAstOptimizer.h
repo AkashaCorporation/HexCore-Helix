@@ -42,6 +42,27 @@ public:
     void collapseMinMaxPatterns(CFuncDecl& func);
     void foldRedundantReturnAfterElse(CFuncDecl& func);
     void invertEmptyIfThen(CFuncDecl& func);
+    void simplifyConditionPolarity(CFuncDecl& func);
+    void foldDegenerateCompounds(CFuncDecl& func);
+    void declareUndeclaredVars(CFuncDecl& func);
+    void downgradeDeadAssignedCalls(CFuncDecl& func);
+    void removeSelfAssignments(CFuncDecl& func);
+    void removeDanglingGotos(CFuncDecl& func);
+    void inferSemanticNames(CFuncDecl& func);
+    void renameRemainingRegisterVars(CFuncDecl& func);
+    void decomposeNativeOpcodes(CFuncDecl& func);
+    void recognizeStackCanary(CFuncDecl& func);
+    void removeUnusedDeclarations(CFuncDecl& func);
+    void unwrapTrivialDoWhile(CFuncDecl& func);
+    void removeDeadStoresBeforeReturn(CFuncDecl& func);
+    void removeAdjacentDuplicateStmts(CFuncDecl& func);
+    void cleanupParameterSSASuffixes(CFuncDecl& func);
+    void narrowVariableTypes(CFuncDecl& func);
+    void resolveFramePointerLeaks(CFuncDecl& func);
+    void splitVariablesByType(CFuncDecl& func);
+    void collapseAssignBeforeReturn(CFuncDecl& func);
+    void initializeReadBeforeWriteVars(CFuncDecl& func);
+    void reanalyzeConfidence(CFuncDecl& func);
 
     /// Apply user-defined variable renames to the entire AST.
     /// Walks all CVarRefExpr nodes and VarDecl names, replacing
@@ -114,7 +135,15 @@ private:
 
     /// Recursively simplify an expression tree; returns the (possibly new)
     /// expression that replaces the input.
-    static ExprPtr simplifyExpr(ExprPtr expr);
+    ///
+    /// @param isLValue  When true, the caller guarantees the expression is
+    ///                  in lvalue position (assignment target, address-of
+    ///                  operand, etc.).  Rewrites that would turn a
+    ///                  designator into a non-lvalue (e.g. FIX-042's
+    ///                  `*(T)NULL → 0` collapse) are suppressed.
+    ///                  Defaults to false for backward compatibility with
+    ///                  all rvalue call sites.
+    static ExprPtr simplifyExpr(ExprPtr expr, bool isLValue = false);
 
     // ── Compound assignment helpers ──────────────────────────────────────────
 
@@ -148,7 +177,8 @@ private:
         unsigned contextDepth = 0);
 
     /// Simplify an expression inside a statement (helper that owns the expr slot).
-    static void simplifyExprInStmt(ExprPtr& slot);
+    /// @param isLValue  See simplifyExpr.
+    static void simplifyExprInStmt(ExprPtr& slot, bool isLValue = false);
 
     // ── Dead code after return helpers ──────────────────────────────────────
     static void removeDeadAfterReturnInList(std::vector<StmtPtr>& stmts);
@@ -184,6 +214,16 @@ private:
 
     // ── Empty if-then inversion helpers ─────────────────────────────────
     static void invertEmptyIfInList(std::vector<StmtPtr>& stmts);
+
+    // ── Condition polarity helpers ──────────────────────────────────────
+    static ExprPtr flattenZeroComparison(ExprPtr condition);
+    static void simplifyConditionPolarityInList(std::vector<StmtPtr>& stmts);
+
+    // ── Degenerate compound-assign helpers ──────────────────────────────
+    static void foldDegenerateCompoundsInList(std::vector<StmtPtr>& stmts);
+
+    // ── Dead-assign-target downgrade helpers ────────────────────────────
+    static void downgradeDeadAssignedCallsInList(std::vector<StmtPtr>& stmts);
 };
 
 } // namespace helix::cast

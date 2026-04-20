@@ -29,6 +29,11 @@ struct AccessPattern {
     unsigned access_width;    ///< Access size in bytes (1, 2, 4, 8)
     bool is_write;            ///< true if store, false if load
     HelixTypeInfo type_hint;  ///< Type hint from context (if available)
+
+    // ── Dynamic array detection (v0.8.1) ───────────────────────────
+    bool is_dynamic_array = false;  ///< True if *(base + index*stride)
+    int64_t stride = 0;            ///< Element size in bytes (from Mul/Shl)
+    uint32_t index_var_id = 0;     ///< Variable used as array index
 };
 
 /// A recovered struct field.

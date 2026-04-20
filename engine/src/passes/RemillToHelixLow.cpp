@@ -824,8 +824,26 @@ struct RemillToHelixLowPass
 
         module.walk([&](LLVM::LLVMFuncOp func) {
             auto name = func.getName();
-            // Remill lifted functions start with "lifted_" or "sub_"
+            // Skip declarations (no body).
+            if (func.isExternal())
+                return;
+            // Skip Remill internal helpers (e.g., __remill_*).
+            if (name.starts_with("__remill_") ||
+                name.starts_with("__hxreloc__") ||
+                name.starts_with("llvm."))
+                return;
+            // Remill lifted functions are recognized by either:
+            //   1. Name prefix "lifted_<decimal>" or "sub_<hex>"
+            //   2. Symbolic name (e.g., "kbase_jit_allocate") with the
+            //      Remill calling convention: 3 args (state, pc, memory).
+            //      HexCore now emits the original symtab name when known.
             if (name.starts_with("lifted_") || name.starts_with("sub_")) {
+                funcsToConvert.push_back(func);
+                return;
+            }
+            // Symbolic name path: check the Remill argument shape.
+            auto funcType = func.getFunctionType();
+            if (funcType.getNumParams() == 3) {
                 funcsToConvert.push_back(func);
             }
         });
@@ -862,6 +880,21 @@ private:
         unsigned indirectCalls = 0; // function pointer calls
     };
     LiftStats liftStats;
+
+    /// Machine-word width for the current function being converted: 32 for
+    /// x86 (i386 PE / i686 ELF), 64 for x86-64.  Set in `convertFunction`
+    /// from the `program_counter` argument width *before* the block args are
+    /// erased, then consulted at every `helix_low.call` creation site so the
+    /// synthetic result / RAX RegWrite matches the native pointer/return
+    /// register width.  Without this, x86 calls ended up with i64 result
+    /// types and downstream emitters sign-extended 32-bit call targets into
+    /// bogus `sub_ffffffffc75c4ad9` names (bug H of the gta-sa stress set).
+    unsigned machineIntWidth_ = 64;
+
+    /// Convenience accessor for the current-function machine integer type.
+    mlir::IntegerType machineIntTy(mlir::OpBuilder& b) const {
+        return b.getIntegerType(machineIntWidth_);
+    }
 
     /// Convert a single Remill lifted function to HelixLow.
     LogicalResult convertFunction(LLVM::LLVMFuncOp llvmFunc) {
@@ -918,7 +951,23 @@ private:
         }
 
         // Create the HelixLow function.
-        auto funcName = std::format("sub_{:x}", entryAddr);
+        //
+        // Name selection:
+        //   - "lifted_<decimal>" → "sub_<hex>" (legacy Remill behavior)
+        //   - "sub_<hex>"        → keep as-is (already in canonical form)
+        //   - symbolic name      → preserve verbatim (HexCore symtab name,
+        //                          e.g. "kbase_jit_allocate", "main")
+        std::string funcName;
+        auto origName = llvmFunc.getName();
+        if (origName.starts_with("lifted_")) {
+            funcName = std::format("sub_{:x}", entryAddr);
+        } else if (origName.starts_with("sub_")) {
+            funcName = origName.str();
+        } else {
+            // Symbolic name from HexCore symtab — preserve it.
+            funcName = origName.str();
+        }
+
         auto helixFunc = builder.create<helix::low::FuncOp>(
             llvmFunc.getLoc(),
             builder.getStringAttr(funcName),
@@ -941,7 +990,7 @@ private:
         //   %memory -> Undef (Memory intrinsics handle this)
         
         Block& entryBlock = helixFunc.getBody().front();
-        
+
         // Ensure we have the expected number of arguments (Remill standard is 3).
         // If optimization passes changed signature, we might need to be careful.
         if (entryBlock.getNumArguments() >= 2) {
@@ -955,11 +1004,17 @@ private:
             auto undefState = builder.create<LLVM::UndefOp>(loc, stateArg.getType());
             stateArg.replaceAllUsesWith(undefState);
 
-            // Arg 1: %pc
-            // Replace with the constant entry address.
+            // Arg 1: %pc — also carries the machine-word width for this
+            // function (i32 on x86, i64 on x86-64).  Capture it before the
+            // args are erased below so convertOperation can pick the right
+            // integer type for synthesized call results / RegWrite widths.
             auto pcArg = entryBlock.getArgument(1);
+            if (auto pcIntTy = dyn_cast<IntegerType>(pcArg.getType()))
+                machineIntWidth_ = pcIntTy.getWidth();
+            else
+                machineIntWidth_ = 64;
             auto pcConst = builder.create<LLVM::ConstantOp>(
-                loc, pcArg.getType(), 
+                loc, pcArg.getType(),
                 builder.getI64IntegerAttr(entryAddr));
             pcArg.replaceAllUsesWith(pcConst);
 
@@ -1315,38 +1370,63 @@ private:
 
                 // Heuristic: In Remill-lifted IR, indirect calls through
                 // computed addresses often have the target in a register.
-                // Try to find a ptr/i64 operand that isn't the memory token.
+                // Try to find an integer operand whose width matches the
+                // machine word (i32 on x86, i64 on x86-64) and that isn't
+                // the memory token.
                 for (unsigned i = 0; i < numOps; ++i) {
                     auto opVal = call.getOperand(i);
                     auto ty = opVal.getType();
-                    if (ty.isInteger(64)) {
+                    if (ty.isInteger(machineIntWidth_)) {
                         targetVal = opVal;
                         break;
                     }
                 }
 
                 if (!targetVal && numOps > 0) {
-                    // Fallback: use PtrToInt on the first operand.
+                    // Fallback: use PtrToInt on the first operand, width
+                    // matching the current function's machine word.
+                    auto machineTy = machineIntTy(builder);
                     auto firstOp = call.getOperand(0);
                     if (isa<LLVM::LLVMPointerType>(firstOp.getType())) {
                         targetVal = builder.create<LLVM::PtrToIntOp>(
-                            loc, builder.getI64Type(), firstOp);
+                            loc, machineTy, firstOp);
                     } else {
                         // Last resort: zero constant.
                         targetVal = builder.create<LLVM::ConstantOp>(
-                            loc, builder.getI64Type(),
+                            loc, machineTy,
                             builder.getI64IntegerAttr(0));
                     }
                 }
 
                 if (targetVal) {
                     auto callArgs = collectCallArgs(op);
-                    builder.create<helix::low::CallOp>(
+                    // Use the target operand's type as the result type — this
+                    // gives i32 on x86 (i386 PE like gta-sa.exe) and i64 on
+                    // x86-64.  Hard-coding i64 here sign-extended 32-bit call
+                    // addresses into forms like `sub_ffffffffc75c4ad9()` on
+                    // x86 output.
+                    auto resultTy = targetVal.getType();
+                    unsigned resultBits =
+                        isa<IntegerType>(resultTy)
+                            ? cast<IntegerType>(resultTy).getWidth() : 64;
+                    auto callOp = builder.create<helix::low::CallOp>(
                         loc,
+                        /*resultTypes=*/TypeRange{resultTy},
                         targetVal,
                         callArgs,
                         /*target_name=*/StringAttr{},
                         addrAttr);
+
+                    // Materialize RAX def (return-value dataflow): the call's
+                    // result becomes the new RAX version so subsequent
+                    // reg.read RAX picks up a distinct SSA value.
+                    builder.create<helix::low::RegWriteOp>(
+                        loc,
+                        callOp.getResult(),
+                        builder.getStringAttr("RAX"),
+                        builder.getUI32IntegerAttr(resultBits),
+                        addrAttr);
+
                     llvm::errs() << "[P0-DEBUG] Indirect call: created CallOp"
                                  << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
                                  << " nArgs=" << callArgs.size()
@@ -1417,21 +1497,34 @@ private:
                     op->emitWarning("unrecognized mangled name: ") << calleeName;
                 }
                 // Emit as a generic call with the original name preserved.
-                // Use a zero constant as placeholder target address.
+                // Use a zero constant as placeholder target address.  Width
+                // matches the current function's machine word (i32 on x86).
+                auto machineTy = machineIntTy(builder);
                 auto zero = builder.create<LLVM::ConstantOp>(
-                    loc, builder.getI64Type(), builder.getI64IntegerAttr(0));
+                    loc, machineTy, builder.getI64IntegerAttr(0));
 
                 // Collect arguments from the calling convention registers
                 // so the external call carries its actual parameter values
                 // (e.g., kmalloc(size, flags) → RDI=size, RSI=flags on SysV).
                 auto callArgs = collectCallArgs(op);
 
-                builder.create<helix::low::CallOp>(
+                auto extCall = builder.create<helix::low::CallOp>(
                     loc,
+                    /*resultTypes=*/TypeRange{machineTy},
                     zero,
                     callArgs,
                     builder.getStringAttr(calleeName),
                     addrAttr);
+
+                // Materialize RAX def with the call's result (return-value
+                // dataflow — see CallOp docs for rationale).
+                builder.create<helix::low::RegWriteOp>(
+                    loc,
+                    extCall.getResult(),
+                    builder.getStringAttr("RAX"),
+                    builder.getUI32IntegerAttr(machineIntWidth_),
+                    addrAttr);
+
                 llvm::errs() << "[P0-DEBUG] External call: created CallOp"
                              << " name=" << calleeName
                              << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
@@ -2578,11 +2671,34 @@ private:
                 // on the module's target triple.
                 auto callArgs = collectCallArgs(call.getOperation());
 
+                // Use the call target's operand type as the result type —
+                // i32 on x86 (i386), i64 on x86-64.  Hard-coding i64 here
+                // sign-extended x86 call addresses into 64-bit names.
+                auto resultTy = targetVal.getType();
+                if (!isa<IntegerType>(resultTy))
+                    resultTy = machineIntTy(builder);
+                unsigned resultBits =
+                    cast<IntegerType>(resultTy).getWidth();
+
                 auto newCallOp = builder.create<helix::low::CallOp>(
                     loc,
+                    /*resultTypes=*/TypeRange{resultTy},
                     targetVal,
                     callArgs,
                     targetName,
+                    addrAttr);
+
+                // Materialize RAX def after the call so that subsequent
+                // reg.read RAX in the caller picks up a distinct SSA version
+                // (the callee's return value).  Without this, the caller's
+                // pre-call RAX flows through unchanged, `if (result == 0)`
+                // becomes a tautology, and StructureControlFlow prunes the
+                // "else" branch — hiding up to half the lifted logic.
+                builder.create<helix::low::RegWriteOp>(
+                    loc,
+                    newCallOp.getResult(),
+                    builder.getStringAttr("RAX"),
+                    builder.getUI32IntegerAttr(resultBits),
                     addrAttr);
 
                 llvm::errs() << "[P0-DEBUG] CALL semantic: created CallOp"
@@ -2591,7 +2707,6 @@ private:
                              << " resolved=" << addrResolved
                              << " nArgs=" << callArgs.size()
                              << "\n";
-                (void)newCallOp;
             }
             break;
         }
@@ -2607,14 +2722,94 @@ private:
             // Remill JMP semantic:
             //   call @JMP(mem, state, target_addr, NEXT_PC_ptr)
             // Operands: [0]=mem, [1]=state, [2]=target, [3]=next_pc_ptr
+            //
+            // When the target folds to a constant, the JMP is almost always
+            // a tail call to another function (MSVC/GCC emit `jmp target`
+            // after stack teardown to hand off control).  Intra-function
+            // direct branches are lifted by Remill as plain `br label %bb_X`
+            // and never reach this case with a constant operand.
+            //
+            // Tail-call lowering: emit low.call + deferred low.ret so the
+            // structurer and emitter see a real call site instead of an
+            // opaque jump into the dummy block (which collapses to a stub).
             if (call.getNumOperands() >= 3) {
-                deferredTerminator = [loc, dummyBlock](OpBuilder& b, IntegerAttr addr) {
-                    b.create<helix::low::JmpOp>(
+                Value targetVal = call.getOperand(2);
+                uint64_t targetAddr = 0;
+                bool addrResolved = false;
+
+                // Tail-call detection is INTENTIONALLY conservative here:
+                // we only treat the JMP as a tail call when the operand is
+                // a *direct* constant (Remill's shape for `jmp <abs_addr>`
+                // / `jmp rel32`).  Computed operands like `add %pc, 22`
+                // that happen to fold through PCTracker are almost always
+                // intra-function branches, jump-table dispatches, or
+                // indirect tail calls — lifting them as ret-terminated
+                // tail calls truncates the function and kills downstream
+                // code (observed as 90+ calls vanishing in kernel code).
+                if (auto constOp =
+                        targetVal.getDefiningOp<LLVM::ConstantOp>()) {
+                    if (auto intAttr =
+                            dyn_cast<IntegerAttr>(constOp.getValue())) {
+                        targetAddr = intAttr.getValue().getZExtValue();
+                        addrResolved = true;
+                    }
+                } else if (auto arithConst =
+                        targetVal.getDefiningOp<arith::ConstantOp>()) {
+                    if (auto intAttr =
+                            dyn_cast<IntegerAttr>(arithConst.getValue())) {
+                        targetAddr = intAttr.getValue().getZExtValue();
+                        addrResolved = true;
+                    }
+                }
+
+                if (addrResolved) {
+                    StringAttr targetName =
+                        builder.getStringAttr(std::format("sub_{:x}", targetAddr));
+
+                    auto callArgs = collectCallArgs(call.getOperation());
+                    auto resultTy = targetVal.getType();
+                    if (!isa<IntegerType>(resultTy))
+                        resultTy = machineIntTy(builder);
+                    unsigned resultBits =
+                        cast<IntegerType>(resultTy).getWidth();
+
+                    auto tailCallOp = builder.create<helix::low::CallOp>(
                         loc,
-                        /*target_addr=*/IntegerAttr{},
-                        /*address=*/addr,
-                        /*dest=*/dummyBlock);
-                };
+                        /*resultTypes=*/TypeRange{resultTy},
+                        targetVal,
+                        callArgs,
+                        targetName,
+                        addrAttr);
+                    tailCallOp->setAttr("is_tail_call", builder.getUnitAttr());
+
+                    // Materialize RAX def with the call's result (same
+                    // rationale as the CALL case).
+                    builder.create<helix::low::RegWriteOp>(
+                        loc,
+                        tailCallOp.getResult(),
+                        builder.getStringAttr("RAX"),
+                        builder.getUI32IntegerAttr(resultBits),
+                        addrAttr);
+
+                    deferredTerminator = [loc](OpBuilder& b, IntegerAttr addr) {
+                        b.create<helix::low::RetOp>(loc, addr);
+                    };
+
+                    llvm::errs() << "[P0-DEBUG] JMP semantic: tail-call to "
+                                 << targetName.getValue()
+                                 << " nArgs=" << callArgs.size() << "\n";
+                } else {
+                    // Indirect jump (jump table, computed goto, indirect tail
+                    // call).  Keep as JmpOp; RecoverSwitchTables / downstream
+                    // passes will try to resolve the real target.
+                    deferredTerminator = [loc, dummyBlock](OpBuilder& b, IntegerAttr addr) {
+                        b.create<helix::low::JmpOp>(
+                            loc,
+                            /*target_addr=*/IntegerAttr{},
+                            /*address=*/addr,
+                            /*dest=*/dummyBlock);
+                    };
+                }
             }
             break;
         }
@@ -3377,7 +3572,9 @@ private:
                 auto zero = builder.create<LLVM::ConstantOp>(
                     loc, i64Ty, builder.getI64IntegerAttr(0));
                 builder.create<helix::low::CallOp>(
-                    loc, zero,
+                    loc,
+                    /*resultTypes=*/TypeRange{},
+                    zero,
                     mlir::ValueRange{},
                     builder.getStringAttr("cmpxchg"),
                     addrAttr);
@@ -3427,14 +3624,22 @@ private:
             call->emitWarning("unhandled Remill semantic: ")
                 << semInfo.raw_name;
             {
+                auto machineTy = machineIntTy(builder);
                 auto zero = builder.create<LLVM::ConstantOp>(
-                    loc, i64Ty, builder.getI64IntegerAttr(0));
+                    loc, machineTy, builder.getI64IntegerAttr(0));
                 auto callArgs = collectCallArgs(call.getOperation());
-                builder.create<helix::low::CallOp>(
+                auto unhandledCall = builder.create<helix::low::CallOp>(
                     loc,
+                    /*resultTypes=*/TypeRange{machineTy},
                     zero,
                     callArgs,
                     builder.getStringAttr(semInfo.raw_name),
+                    addrAttr);
+                builder.create<helix::low::RegWriteOp>(
+                    loc,
+                    unhandledCall.getResult(),
+                    builder.getStringAttr("RAX"),
+                    builder.getUI32IntegerAttr(machineIntWidth_),
                     addrAttr);
             }
             break;

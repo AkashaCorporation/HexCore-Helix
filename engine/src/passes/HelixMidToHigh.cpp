@@ -16,6 +16,7 @@
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/dialects/HelixHighOps.h"
+#include "helix/dialects/HelixLowOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -28,6 +29,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <format>
 #include <string>
@@ -42,6 +44,32 @@ namespace {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Helper: Variable Naming
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Per-function slot → canonical name map.
+/// Populated before pattern conversion and consumed by Mid→High patterns
+/// (MidVarRefToHighVarRef, MidAssignToHighAssign, MidVarDeclToHighVarDecl).
+///
+/// This eliminates the "v{slot_id}" garbage where raw slot_ids (often large
+/// numbers like 50909, 40137) leak into the output.  Instead we assign a
+/// compact sequential name per function (v0, v1, v2, ...).
+static llvm::DenseMap<uint32_t, std::string>& getSlotNameMap() {
+    static llvm::DenseMap<uint32_t, std::string> map;
+    return map;
+}
+
+/// Look up (or lazily generate) a sequential name for a slot_id.
+/// If the slot wasn't pre-registered, returns "v{seq}" using a per-function
+/// counter so that names are stable and small regardless of slot_id magnitude.
+static std::string getSequentialSlotName(uint32_t slot_id) {
+    auto& map = getSlotNameMap();
+    auto it = map.find(slot_id);
+    if (it != map.end())
+        return it->second;
+    // Fallback: generate a sequential name and cache it.
+    std::string name = std::format("v{}", static_cast<unsigned>(map.size()));
+    map[slot_id] = name;
+    return name;
+}
 
 /// Generates human-readable variable names from slot IDs.
 struct VariableNamer {
@@ -116,7 +144,7 @@ struct MidVarRefToHighVarRef : public OpConversionPattern<mid::VarRefOp> {
         ConversionPatternRewriter &rewriter) const override
     {
         uint32_t slot_id = op.getSlotId();
-        std::string name = std::format("v{}", slot_id);
+        std::string name = getSequentialSlotName(slot_id);
 
         auto new_op = rewriter.create<high::VarRefOp>(
             op.getLoc(),
@@ -140,7 +168,7 @@ struct MidAssignToHighAssign : public OpConversionPattern<mid::AssignOp> {
         ConversionPatternRewriter &rewriter) const override
     {
         uint32_t slot_id = op.getSlotId();
-        std::string name = std::format("v{}", slot_id);
+        std::string name = getSequentialSlotName(slot_id);
 
         // Create a var.ref for the target
         auto target_ref = rewriter.create<high::VarRefOp>(
@@ -186,7 +214,7 @@ struct MidVarDeclToHighVarDecl : public OpConversionPattern<mid::VarDeclOp> {
             break;
         case mid::SlotKind::Register:
             storage = high::StorageKind::Register;
-            name = std::format("v{}", slot_id);
+            name = getSequentialSlotName(slot_id);
             break;
         case mid::SlotKind::Param:
             storage = high::StorageKind::Parameter;
@@ -450,6 +478,15 @@ struct MidCallToHighCall : public OpConversionPattern<mid::CallOp> {
             op.getAddressAttr()
         );
 
+        // Propagate helix.* attributes from mid → high, including
+        // resolved_name (set by DevirtualizeIndirectCalls Phase 4 for
+        // RTTI Tier 1 class::method naming).
+        for (auto namedAttr : op->getAttrs()) {
+            StringRef name = namedAttr.getName().strref();
+            if (name.starts_with("helix."))
+                new_op->setAttr(name, namedAttr.getValue());
+        }
+
         if (op.getNumResults() > 0)
             rewriter.replaceOp(op, new_op.getResults());
         else {
@@ -692,6 +729,43 @@ struct HelixMidToHighPass
         auto module = getOperation();
         auto *ctx = &getContext();
 
+        // Clear the global slot→name map from any previous run so that
+        // sequential counters start fresh for this pass invocation.
+        // Then pre-populate it by walking mid::VarDeclOps: stack slots
+        // get "var_<offset>" names, params get "param_<N>", globals get
+        // "g_<addr>", and register slots get sequential "v<N>" names
+        // in declaration order (instead of raw slot_ids).
+        {
+            auto& slotMap = getSlotNameMap();
+            slotMap.clear();
+            unsigned regSeq = 0;
+            module.walk([&](mid::VarDeclOp decl) {
+                uint32_t slot_id = decl.getSlotId();
+                if (slotMap.count(slot_id))
+                    return;
+                switch (decl.getSlotKind()) {
+                case mid::SlotKind::Stack:
+                    if (auto offset = decl.getStackOffset())
+                        slotMap[slot_id] = std::format(
+                            "var_{:X}", std::abs(offset.value()));
+                    else
+                        slotMap[slot_id] = std::format("var_{}", slot_id);
+                    break;
+                case mid::SlotKind::Param:
+                    slotMap[slot_id] = std::format("param_{}", slot_id);
+                    break;
+                case mid::SlotKind::Global:
+                    slotMap[slot_id] = std::format("g_{:X}", slot_id);
+                    break;
+                case mid::SlotKind::Register:
+                case mid::SlotKind::Temp:
+                default:
+                    slotMap[slot_id] = std::format("v{}", regSeq++);
+                    break;
+                }
+            });
+        }
+
         ConversionTarget target(*ctx);
         target.addLegalDialect<helix::high::HelixHighDialect>();
         target.addLegalDialect<mlir::arith::ArithDialect>();
@@ -763,7 +837,7 @@ struct HelixMidToHighPass
                         : "sub_unknown";
                 }
 
-                builder.create<high::CallOp>(
+                auto highCall = builder.create<high::CallOp>(
                     midCall.getLoc(),
                     midCall.getResultTypes(),
                     builder.getI64IntegerAttr(midCall.getCalleeAddr()),
@@ -772,9 +846,26 @@ struct HelixMidToHighPass
                     midCall.getAddressAttr()
                 );
 
+                // Propagate helix.* attributes from mid → high, including
+                // resolved_name (set by DevirtualizeIndirectCalls Phase 4
+                // for RTTI Tier 1 class::method naming).
+                for (auto namedAttr : midCall->getAttrs()) {
+                    StringRef name = namedAttr.getName().strref();
+                    if (name.starts_with("helix."))
+                        highCall->setAttr(name, namedAttr.getValue());
+                }
+
                 llvm::errs() << "[P0-DEBUG] Manual MidCall→HighCall: "
                              << callee_name << "\n";
 
+                // When the mid.call produced a return value (RAX), forward
+                // uses of its result onto high.call's result before erasing.
+                // Without this, any consumer of midCall.getResult() (e.g. the
+                // synthetic RegWrite from RemillToHelixLow) is left dangling.
+                if (midCall->getNumResults() > 0) {
+                    midCall->getResult(0).replaceAllUsesWith(
+                        highCall->getResult(0));
+                }
                 midCall->erase();
                 ++converted;
             }
@@ -783,6 +874,85 @@ struct HelixMidToHighPass
                 llvm::errs() << "[P0-DEBUG] HelixMidToHigh: manually converted "
                              << converted << " mid.call → high.call\n";
             }
+        }
+
+        // ── Post-pass: renumber v<slot_id> names per-function ────────────
+        //
+        // The conversion patterns above use `std::format("v{}", slot_id)`
+        // where slot_id is a module-wide counter.  This produces ugly
+        // identifiers like `v50909`, `v40137`, `v11845` because slot IDs
+        // are assigned sequentially across the entire module.
+        //
+        // Walk each function and build a mapping from raw slot-based
+        // names (v<N>) to compact sequential names (v0, v1, v2, ...).
+        // Skip names that are already short (v0-v99) or semantic
+        // (rax, rbx, param_1, var_20, etc.).
+        {
+            auto isRawSlotName = [](llvm::StringRef name) -> bool {
+                // "v" followed by all digits, and the number is > 99
+                // (smaller numbers are likely intentional temp names).
+                if (name.size() < 4 || name[0] != 'v')
+                    return false;
+                for (size_t i = 1; i < name.size(); ++i) {
+                    if (!std::isdigit(static_cast<unsigned char>(name[i])))
+                        return false;
+                }
+                // Parse the number.
+                uint64_t num = 0;
+                for (size_t i = 1; i < name.size(); ++i)
+                    num = num * 10 + (name[i] - '0');
+                return num >= 100;
+            };
+
+            module.walk([&](helix::low::FuncOp funcOp) {
+                // Collect all raw slot names in order of first appearance.
+                llvm::StringMap<std::string> renames;
+                unsigned nextId = 0;
+
+                // Pre-seed with VarDeclOps for ordering stability.
+                funcOp->walk([&](helix::high::VarDeclOp decl) {
+                    llvm::StringRef curName = decl.getVarName();
+                    if (!isRawSlotName(curName))
+                        return;
+                    if (!renames.contains(curName)) {
+                        renames[curName] =
+                            llvm::formatv("v{0}", nextId++).str();
+                    }
+                });
+
+                // Also pick up VarRefOps whose names weren't in decls.
+                funcOp->walk([&](helix::high::VarRefOp ref) {
+                    llvm::StringRef curName = ref.getVarName();
+                    if (!isRawSlotName(curName))
+                        return;
+                    if (!renames.contains(curName)) {
+                        renames[curName] =
+                            llvm::formatv("v{0}", nextId++).str();
+                    }
+                });
+
+                if (renames.empty())
+                    return;
+
+                // Apply renames.
+                funcOp->walk([&](helix::high::VarDeclOp decl) {
+                    llvm::StringRef curName = decl.getVarName();
+                    auto it = renames.find(curName);
+                    if (it != renames.end())
+                        decl.setVarName(it->second);
+                });
+                funcOp->walk([&](helix::high::VarRefOp ref) {
+                    llvm::StringRef curName = ref.getVarName();
+                    auto it = renames.find(curName);
+                    if (it != renames.end())
+                        ref.setVarName(it->second);
+                });
+
+                LLVM_DEBUG(llvm::dbgs()
+                    << "  HelixMidToHigh: renumbered "
+                    << renames.size() << " v<slot> names in '"
+                    << funcOp.getSymName() << "'\n");
+            });
         }
     }
 };

@@ -490,11 +490,13 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
             }
         }
 
-        // For now, mid.call has no result (void).  Return type recovery
-        // happens in later passes.
+        // Preserve the low.call's result type on mid.call so the callee's
+        // return value remains a distinct SSA edge through the pipeline.
+        // When the low op had no result (e.g. CMPXCHG intrinsic marker),
+        // getResultTypes() is empty and mid.call also becomes resultless.
         auto midCall = rewriter.create<mid::CallOp>(
             op.getLoc(),
-            /*result=*/TypeRange{},
+            /*result=*/op.getResultTypes(),
             rewriter.getI64IntegerAttr(callee_addr),
             callee_name_attr,
             adaptor.getArgs(),
@@ -511,9 +513,17 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
         llvm::errs() << "[P0-DEBUG] CallToMidCall: SUCCESS → mid.call"
                      << " name=" << (callee_name_attr ? callee_name_attr.getValue() : "none")
                      << " addr=" << callee_addr
+                     << " hasResult=" << (op.getNumResults() > 0)
                      << "\n";
 
-        rewriter.eraseOp(op);
+        // replaceOp forwards SSA uses of the old result onto the new one.
+        // eraseOp would leave dangling references for callers that consume
+        // the call's result (e.g. the synthetic RegWrite RAX after CallOp).
+        if (op.getNumResults() > 0) {
+            rewriter.replaceOp(op, midCall->getResults());
+        } else {
+            rewriter.eraseOp(op);
+        }
         return success();
     }
 };
@@ -933,7 +943,7 @@ struct HelixLowToMidPass
 
                 auto midCall = builder.create<mid::CallOp>(
                     callOp.getLoc(),
-                    TypeRange{},
+                    /*result=*/callOp->getResultTypes(),
                     builder.getI64IntegerAttr(callee_addr),
                     callee_name_attr,
                     callOp.getArgs(),
@@ -950,6 +960,16 @@ struct HelixLowToMidPass
                 llvm::errs() << "[P0-DEBUG] Manual CallOp→MidCall: "
                              << (callee_name_attr ? callee_name_attr.getValue() : "indirect")
                              << " addr=" << callee_addr << "\n";
+
+                // Transfer any SSA uses of the low.call's result (e.g. the
+                // synthetic RegWrite RAX from RemillToHelixLow) onto the new
+                // mid.call.  Without this, erase() aborts with "operation
+                // destroyed but still has uses" once the call produces a
+                // value.
+                if (callOp->getNumResults() > 0) {
+                    callOp->getResult(0).replaceAllUsesWith(
+                        midCall->getResult(0));
+                }
 
                 callOp->erase();
                 ++converted;

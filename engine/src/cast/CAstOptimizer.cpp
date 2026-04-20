@@ -17,9 +17,16 @@
 #include "helix/cast/CStmt.h"
 #include "helix/cast/CType.h"
 
+#include "llvm/ADT/StringMap.h"
+
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
+#include <cstring>
+#include <format>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -55,6 +62,48 @@ static std::optional<int64_t> getIntLit(const CExpr* e) {
     if (!e || e->getKind() != NodeKind::IntLitExpr)
         return std::nullopt;
     return static_cast<const CIntLitExpr*>(e)->value;
+}
+
+/// Lightweight structural equality for expression trees.
+///
+/// Used by `simplifyExpr` to fold `x - (x - y) → y` (FIX-041 bug I).
+/// The compound-assignment synthesizer lower in the file has its own
+/// richer `exprEquals` — this one is kept intentionally simple and only
+/// covers the node shapes that actually appear in arithmetic expressions
+/// recovered by Helix (VarRef, IntLit, single-level Unary/Cast, and
+/// BinaryExpr).  That's enough to catch the SBB idiom without tangling
+/// with the other helper's definition.
+static bool isSameExpr(const CExpr* a, const CExpr* b) {
+    if (a == b) return true;
+    if (!a || !b || a->getKind() != b->getKind()) return false;
+    switch (a->getKind()) {
+    case NodeKind::VarRefExpr:
+        return static_cast<const CVarRefExpr*>(a)->varName ==
+               static_cast<const CVarRefExpr*>(b)->varName;
+    case NodeKind::IntLitExpr:
+        return static_cast<const CIntLitExpr*>(a)->value ==
+               static_cast<const CIntLitExpr*>(b)->value;
+    case NodeKind::UnaryExpr: {
+        auto& ua = static_cast<const CUnaryExpr&>(*a);
+        auto& ub = static_cast<const CUnaryExpr&>(*b);
+        return ua.op == ub.op &&
+               isSameExpr(ua.operand.get(), ub.operand.get());
+    }
+    case NodeKind::CastExpr: {
+        auto& ca = static_cast<const CCastExpr&>(*a);
+        auto& cb = static_cast<const CCastExpr&>(*b);
+        return isSameExpr(ca.operand.get(), cb.operand.get());
+    }
+    case NodeKind::BinaryExpr: {
+        auto& ba = static_cast<const CBinaryExpr&>(*a);
+        auto& bb = static_cast<const CBinaryExpr&>(*b);
+        return ba.op == bb.op &&
+               isSameExpr(ba.lhs.get(), bb.lhs.get()) &&
+               isSameExpr(ba.rhs.get(), bb.rhs.get());
+    }
+    default:
+        return false;
+    }
 }
 
 /// True if the name is a general-purpose register name (x86-64).
@@ -153,20 +202,3458 @@ static bool isCommutative(BinaryOp op) {
 void CAstOptimizer::optimize(CFuncDecl& func) {
     removePrologueEpilogue(func);
     eliminateInfrastructure(func);
-    eliminateNullPtrStores(func);         // BUG 3 mitigation: *(type)(void*)0 = ... → remove
+    eliminateNullPtrStores(func);
+    recognizeStackCanary(func);
+    inferSemanticNames(func);
+    renameRemainingRegisterVars(func);
+    decomposeNativeOpcodes(func);
     eliminateDeadStores(func);
     propagateCopies(func);
-    canonicalizeXorPatterns(func);        // x ^ -1 → !x, x == (y ^ -1) → x != y
-    recoverStructFieldAccess(func);       // *(ptr + N) → ptr->field_0xN
+    canonicalizeXorPatterns(func);
+    recoverStructFieldAccess(func);
     simplifyExpressions(func);
     synthesizeCompoundAssign(func);
-    eliminateConstantBranches(func);      // BUG 2: if(0){...}else{B} → B
-    removeEmptyIfStatements(func);        // MINSS/MAXSS: remove dead empty if-stmts
-    cleanupFloatZeros(func);              // (int64_t)(void*)0 → 0.0f for float vars
-    collapseMinMaxPatterns(func);         // consecutive if(a cmp b){x=sel} → x = min/max
-    foldRedundantReturnAfterElse(func);    // else{return X}; return X → remove dup
-    invertEmptyIfThen(func);               // if(c){} else{B} → if(!c){B}
-    removeDeadCodeAfterReturn(func);      // strip unreachable stmts after return
+    eliminateConstantBranches(func);
+    removeEmptyIfStatements(func);
+    cleanupFloatZeros(func);
+    collapseMinMaxPatterns(func);
+    foldRedundantReturnAfterElse(func);
+    invertEmptyIfThen(func);
+    simplifyConditionPolarity(func);
+    foldDegenerateCompounds(func);
+    downgradeDeadAssignedCalls(func);
+    declareUndeclaredVars(func);
+    removeSelfAssignments(func);
+    removeDanglingGotos(func);
+    removeDeadCodeAfterReturn(func);
+    removeEmptyIfStatements(func);
+    unwrapTrivialDoWhile(func);
+    cleanupParameterSSASuffixes(func);
+    resolveFramePointerLeaks(func);
+    removeAdjacentDuplicateStmts(func);
+    removeDeadStoresBeforeReturn(func);
+    collapseAssignBeforeReturn(func);
+    initializeReadBeforeWriteVars(func);
+    removeUnusedDeclarations(func);
+    reanalyzeConfidence(func);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeSelfAssignments — drop statements of the form "x = x;"
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// These arise from:
+//   - Remill lifting patterns where a register reads its own value through
+//     an identity operation (CMOV with always-true cond, MOV reg,reg).
+//   - SSA versions coalesced to the same variable name by Phase 3.5 of
+//     RecoverVariables — the AssignOp becomes "x = x".
+//
+// We compare by name only (not var_id) because the CAstBuilder may have
+// built the target and value as separate CVarRefExpr instances with
+// different IDs even when they reference the same logical variable after
+// coalescing.
+
+static void removeSelfAssignsInList(std::vector<StmtPtr>& stmts) {
+    // First recurse into nested scopes.
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            removeSelfAssignsInList(s.thenBody);
+            removeSelfAssignsInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            removeSelfAssignsInList(
+                static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            removeSelfAssignsInList(
+                static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            removeSelfAssignsInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                removeSelfAssignsInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            removeSelfAssignsInList(
+                static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Now remove self-assigns at this level.
+    stmts.erase(
+        std::remove_if(stmts.begin(), stmts.end(),
+            [](const StmtPtr& sp) {
+                if (!sp || sp->getKind() != NodeKind::AssignStmt)
+                    return false;
+                const auto& a = static_cast<const CAssignStmt&>(*sp);
+                // Only plain "=" (not compound +=, -=, etc.)
+                if (!a.compoundOp.empty())
+                    return false;
+                if (!a.target || !a.value)
+                    return false;
+                if (a.target->getKind() != NodeKind::VarRefExpr ||
+                    a.value->getKind() != NodeKind::VarRefExpr)
+                    return false;
+                const auto& t =
+                    static_cast<const CVarRefExpr&>(*a.target);
+                const auto& v =
+                    static_cast<const CVarRefExpr&>(*a.value);
+                return t.varName == v.varName && !t.varName.empty();
+            }),
+        stmts.end());
+}
+
+void CAstOptimizer::removeSelfAssignments(CFuncDecl& func) {
+    removeSelfAssignsInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeDanglingGotos — drop `goto L;` when no label L is defined
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When irreducible SCC handling in StructureControlFlow emits a goto to an
+// irreducible edge target, the label may later be eliminated by other
+// structuring passes (loop recovery, if/else detection).  The orphaned
+// goto points to nothing, so we drop it.
+//
+// Also drops a trailing `goto L;` at the very end of the function body
+// when the label exists but is unreachable from the goto's position (the
+// goto can only "fall through" to end-of-function, which is the same as
+// plain return — and the goto is effectively no-op dead code).
+
+static void collectLabels(const std::vector<StmtPtr>& stmts,
+                          std::unordered_set<std::string>& out) {
+    for (const auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::LabelStmt: {
+            const auto& l = static_cast<const CLabelStmt&>(*sp);
+            out.insert(l.name);
+            break;
+        }
+        case NodeKind::IfStmt: {
+            const auto& s = static_cast<const CIfStmt&>(*sp);
+            collectLabels(s.thenBody, out);
+            collectLabels(s.elseBody, out);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            collectLabels(
+                static_cast<const CWhileStmt&>(*sp).body, out);
+            break;
+        case NodeKind::DoWhileStmt:
+            collectLabels(
+                static_cast<const CDoWhileStmt&>(*sp).body, out);
+            break;
+        case NodeKind::ForStmt:
+            collectLabels(
+                static_cast<const CForStmt&>(*sp).body, out);
+            break;
+        case NodeKind::SwitchStmt:
+            for (const auto& c : static_cast<const CSwitchStmt&>(*sp).cases)
+                collectLabels(c.body, out);
+            break;
+        case NodeKind::BlockStmt:
+            collectLabels(
+                static_cast<const CBlockStmt&>(*sp).stmts, out);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void dropDanglingGotosInList(
+    std::vector<StmtPtr>& stmts,
+    const std::unordered_set<std::string>& definedLabels) {
+    // Recurse first
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            dropDanglingGotosInList(s.thenBody, definedLabels);
+            dropDanglingGotosInList(s.elseBody, definedLabels);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            dropDanglingGotosInList(
+                static_cast<CWhileStmt&>(*sp).body, definedLabels);
+            break;
+        case NodeKind::DoWhileStmt:
+            dropDanglingGotosInList(
+                static_cast<CDoWhileStmt&>(*sp).body, definedLabels);
+            break;
+        case NodeKind::ForStmt:
+            dropDanglingGotosInList(
+                static_cast<CForStmt&>(*sp).body, definedLabels);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                dropDanglingGotosInList(c.body, definedLabels);
+            break;
+        case NodeKind::BlockStmt:
+            dropDanglingGotosInList(
+                static_cast<CBlockStmt&>(*sp).stmts, definedLabels);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Drop gotos to undefined labels at this level.
+    stmts.erase(
+        std::remove_if(stmts.begin(), stmts.end(),
+            [&](const StmtPtr& sp) {
+                if (!sp || sp->getKind() != NodeKind::GotoStmt)
+                    return false;
+                const auto& g = static_cast<const CGotoStmt&>(*sp);
+                return definedLabels.find(g.label) == definedLabels.end();
+            }),
+        stmts.end());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: inferSemanticNames — rename register vars from call context
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When a register-named variable (rax, rbx, r14, etc.) appears as:
+//   - LHS of a call assignment: `rax = kmalloc(...)` → rename rax → "alloc"
+//   - Argument to a known function: `mutex_lock(r14)` → rename r14 → "lock"
+//
+// Only renames if:
+//   - The variable has a plain register name (no param_, result, var_ prefix)
+//   - The call target is in the known semantic table
+//   - No conflicting renames exist (first rename wins)
+
+static bool isPlainRegisterName(std::string_view name) {
+    // rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8-r15, xmm0-xmm15
+    if (name.starts_with("rax") || name.starts_with("rbx") ||
+        name.starts_with("rcx") || name.starts_with("rdx") ||
+        name.starts_with("rsi") || name.starts_with("rdi") ||
+        name.starts_with("rbp") || name.starts_with("rsp") ||
+        name.starts_with("r8")  || name.starts_with("r9")  ||
+        name.starts_with("r10") || name.starts_with("r11") ||
+        name.starts_with("r12") || name.starts_with("r13") ||
+        name.starts_with("r14") || name.starts_with("r15") ||
+        name.starts_with("xmm") ||
+        // 32-bit sub-register aliases
+        name.starts_with("eax") || name.starts_with("ebx") ||
+        name.starts_with("ecx") || name.starts_with("edx") ||
+        name.starts_with("esi") || name.starts_with("edi") ||
+        name.starts_with("ebp") || name.starts_with("esp"))
+        return true;
+    return false;
+}
+
+/// Apply a rename to all CVarRefExpr and CVarDecl nodes in a stmt list.
+static void applyRenameInStmts(std::vector<StmtPtr>& stmts,
+                                const std::string& oldName,
+                                const std::string& newName);
+
+static void applyRenameInExpr(CExpr* e,
+                               const std::string& oldName,
+                               const std::string& newName) {
+    if (!e) return;
+    switch (e->getKind()) {
+    case NodeKind::VarRefExpr: {
+        auto& v = static_cast<CVarRefExpr&>(*e);
+        if (v.varName == oldName) v.varName = newName;
+        break;
+    }
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<CBinaryExpr&>(*e);
+        applyRenameInExpr(b.lhs.get(), oldName, newName);
+        applyRenameInExpr(b.rhs.get(), oldName, newName);
+        break;
+    }
+    case NodeKind::UnaryExpr:
+        applyRenameInExpr(
+            static_cast<CUnaryExpr&>(*e).operand.get(), oldName, newName);
+        break;
+    case NodeKind::CastExpr:
+        applyRenameInExpr(
+            static_cast<CCastExpr&>(*e).operand.get(), oldName, newName);
+        break;
+    case NodeKind::CallExpr: {
+        auto& c = static_cast<CCallExpr&>(*e);
+        for (auto& arg : c.args)
+            applyRenameInExpr(arg.get(), oldName, newName);
+        break;
+    }
+    case NodeKind::FieldAccessExpr:
+        applyRenameInExpr(
+            static_cast<CFieldAccessExpr&>(*e).base.get(), oldName, newName);
+        break;
+    case NodeKind::SubscriptExpr: {
+        auto& s = static_cast<CSubscriptExpr&>(*e);
+        applyRenameInExpr(s.base.get(), oldName, newName);
+        applyRenameInExpr(s.index.get(), oldName, newName);
+        break;
+    }
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<CTernaryExpr&>(*e);
+        applyRenameInExpr(t.cond.get(), oldName, newName);
+        applyRenameInExpr(t.trueVal.get(), oldName, newName);
+        applyRenameInExpr(t.falseVal.get(), oldName, newName);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void applyRenameInStmts(std::vector<StmtPtr>& stmts,
+                                const std::string& oldName,
+                                const std::string& newName) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::AssignStmt: {
+            auto& a = static_cast<CAssignStmt&>(*sp);
+            applyRenameInExpr(a.target.get(), oldName, newName);
+            applyRenameInExpr(a.value.get(), oldName, newName);
+            break;
+        }
+        case NodeKind::ExprStmt:
+            applyRenameInExpr(
+                static_cast<CExprStmt&>(*sp).expr.get(), oldName, newName);
+            break;
+        case NodeKind::ReturnStmt:
+            applyRenameInExpr(
+                static_cast<CReturnStmt&>(*sp).value.get(), oldName, newName);
+            break;
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            applyRenameInExpr(s.condition.get(), oldName, newName);
+            applyRenameInStmts(s.thenBody, oldName, newName);
+            applyRenameInStmts(s.elseBody, oldName, newName);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            auto& s = static_cast<CWhileStmt&>(*sp);
+            applyRenameInExpr(s.condition.get(), oldName, newName);
+            applyRenameInStmts(s.body, oldName, newName);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& s = static_cast<CDoWhileStmt&>(*sp);
+            applyRenameInExpr(s.condition.get(), oldName, newName);
+            applyRenameInStmts(s.body, oldName, newName);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            auto& s = static_cast<CForStmt&>(*sp);
+            applyRenameInExpr(s.condition.get(), oldName, newName);
+            applyRenameInStmts(s.body, oldName, newName);
+            break;
+        }
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                applyRenameInStmts(c.body, oldName, newName);
+            break;
+        case NodeKind::BlockStmt:
+            applyRenameInStmts(
+                static_cast<CBlockStmt&>(*sp).stmts, oldName, newName);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void CAstOptimizer::inferSemanticNames(CFuncDecl& func) {
+    // Table: call target → return value semantic name
+    static const llvm::StringMap<std::string> kReturnNames = {
+        {"malloc",       "alloc"},  {"calloc",      "alloc"},
+        {"realloc",      "alloc"},  {"kmalloc",     "alloc"},
+        {"kzalloc",      "alloc"},  {"vmalloc",     "alloc"},
+        {"kvmalloc",     "alloc"},  {"krealloc",    "alloc"},
+        {"kmem_cache_alloc", "cache_obj"},
+        {"kbase_mem_alloc",  "region"},
+        {"kbase_alloc_phy_pages_helper_locked", "pages"},
+        {"CreateFileW",  "handle"}, {"CreateFileA", "handle"},
+        {"OpenProcess",  "proc"},   {"VirtualAlloc","alloc"},
+        {"LoadLibraryA", "hmod"},   {"LoadLibraryW","hmod"},
+        {"GetProcAddress","pfn"},   {"HeapAlloc",   "alloc"},
+        {"fopen",        "fp"},     {"fdopen",      "fp"},
+        {"strdup",       "dup"},    {"strndup",     "dup"},
+        {"mmap",         "mapped"}, {"dlopen",      "handle"},
+        {"socket",       "sock"},   {"accept",      "conn"},
+    };
+
+    // Table: call target → param semantic names (positional)
+    static const llvm::StringMap<std::vector<std::string>> kParamNames = {
+        {"mutex_lock",      {"lock"}},
+        {"mutex_unlock",    {"lock"}},
+        {"mutex_trylock",   {"lock"}},
+        {"down_read",       {"sem"}},
+        {"down_write",      {"sem"}},
+        {"up_read",         {"sem"}},
+        {"up_write",        {"sem"}},
+        {"_raw_spin_lock",  {"spinlock"}},
+        {"_raw_spin_unlock",{"spinlock"}},
+        {"spin_lock",       {"spinlock"}},
+        {"spin_unlock",     {"spinlock"}},
+        {"kfree",           {"ptr"}},
+        {"vfree",           {"ptr"}},
+        {"free",            {"ptr"}},
+        {"memcpy",          {"dst", "src", "size"}},
+        {"memset",          {"dst", "val", "size"}},
+        {"memmove",         {"dst", "src", "size"}},
+        {"strcmp",           {"s1", "s2"}},
+        {"strncmp",          {"s1", "s2", "n"}},
+        {"strcpy",           {"dst", "src"}},
+        {"strlen",           {"str"}},
+    };
+
+    // Track which variables have been renamed (first rename wins)
+    // and which target names have been used (for uniqueness).
+    std::unordered_set<std::string> renamed;
+    std::unordered_set<std::string> usedNames;
+
+    // Collect existing names to avoid conflicts.
+    for (auto& d : func.localVars)
+        usedNames.insert(d.varName);
+    for (auto& p : func.params)
+        usedNames.insert(p.name);
+
+    // Helper: make a unique name by appending _N if needed.
+    auto makeUnique = [&](const std::string& base) -> std::string {
+        if (!usedNames.count(base)) {
+            usedNames.insert(base);
+            return base;
+        }
+        for (unsigned i = 2; i < 100; ++i) {
+            auto candidate = base + "_" + std::to_string(i);
+            if (!usedNames.count(candidate)) {
+                usedNames.insert(candidate);
+                return candidate;
+            }
+        }
+        return base; // fallback
+    };
+
+    // ── Item 3: Return value naming ──────────────────────────────────
+    // Scan for: target = callFunc(...)
+    // If target is register-named and callFunc is in kReturnNames, rename.
+    for (auto& sp : func.body) {
+        if (!sp || sp->getKind() != NodeKind::AssignStmt) continue;
+        auto& a = static_cast<CAssignStmt&>(*sp);
+        if (!a.target || !a.value) continue;
+        if (a.target->getKind() != NodeKind::VarRefExpr) continue;
+        if (a.value->getKind() != NodeKind::CallExpr) continue;
+
+        auto& tgt = static_cast<CVarRefExpr&>(*a.target);
+        auto& call = static_cast<CCallExpr&>(*a.value);
+
+        if (!isPlainRegisterName(tgt.varName)) continue;
+        if (renamed.count(tgt.varName)) continue;
+
+        auto it = kReturnNames.find(call.targetName);
+        if (it == kReturnNames.end()) continue;
+
+        std::string oldName = tgt.varName;
+        std::string newName = makeUnique(it->second);
+
+        renamed.insert(oldName);
+        applyRenameInStmts(func.body, oldName, newName);
+
+        // Also rename in variable declarations.
+        for (auto& d : func.localVars) {
+            if (d.varName == oldName) d.varName = newName;
+        }
+    }
+
+    // ── Item 1: Call arg naming ──────────────────────────────────────
+    // Scan for: callFunc(regVar, ...) where regVar is register-named.
+    // If callFunc is in kParamNames, rename regVar to the param name.
+    //
+    // We collect rename candidates first, then apply (to avoid modifying
+    // the AST while scanning).
+    std::vector<std::pair<std::string, std::string>> argRenames;
+
+    auto scanCallArgs = [&](const CCallExpr& call) {
+        auto it = kParamNames.find(call.targetName);
+        if (it == kParamNames.end()) return;
+        const auto& paramNames = it->second;
+
+        for (size_t i = 0; i < call.args.size() && i < paramNames.size(); ++i) {
+            if (!call.args[i]) continue;
+            if (call.args[i]->getKind() != NodeKind::VarRefExpr) continue;
+            auto& arg = static_cast<const CVarRefExpr&>(*call.args[i]);
+            if (!isPlainRegisterName(arg.varName)) continue;
+            if (renamed.count(arg.varName)) continue;
+
+            std::string uniqueName = makeUnique(paramNames[i]);
+            renamed.insert(arg.varName);
+            argRenames.emplace_back(arg.varName, uniqueName);
+        }
+    };
+
+    // Scan all call expressions (in statements and nested expressions).
+    std::function<void(const std::vector<StmtPtr>&)> scanStmts;
+    scanStmts = [&](const std::vector<StmtPtr>& stmts) {
+        for (auto& sp : stmts) {
+            if (!sp) continue;
+            switch (sp->getKind()) {
+            case NodeKind::ExprStmt: {
+                auto& e = static_cast<CExprStmt&>(*sp);
+                if (e.expr && e.expr->getKind() == NodeKind::CallExpr)
+                    scanCallArgs(static_cast<CCallExpr&>(*e.expr));
+                break;
+            }
+            case NodeKind::AssignStmt: {
+                auto& a = static_cast<CAssignStmt&>(*sp);
+                if (a.value && a.value->getKind() == NodeKind::CallExpr)
+                    scanCallArgs(static_cast<CCallExpr&>(*a.value));
+                break;
+            }
+            case NodeKind::IfStmt: {
+                auto& s = static_cast<CIfStmt&>(*sp);
+                scanStmts(s.thenBody);
+                scanStmts(s.elseBody);
+                break;
+            }
+            case NodeKind::WhileStmt:
+                scanStmts(static_cast<CWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::DoWhileStmt:
+                scanStmts(static_cast<CDoWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::ForStmt:
+                scanStmts(static_cast<CForStmt&>(*sp).body);
+                break;
+            default:
+                break;
+            }
+        }
+    };
+    scanStmts(func.body);
+
+    // Apply arg renames.
+    for (auto& [oldName, newName] : argRenames) {
+        applyRenameInStmts(func.body, oldName, newName);
+        for (auto& d : func.localVars) {
+            if (d.varName == oldName) d.varName = newName;
+        }
+    }
+}
+
+void CAstOptimizer::removeDanglingGotos(CFuncDecl& func) {
+    // Only drop gotos whose target label doesn't exist anywhere in the
+    // function body.  Gotos to defined labels are KEPT because kernel
+    // cleanup code legitimately uses goto (the IDA ground truth for
+    // kbase_jit_allocate has 10 gotos and 6 labels — they're idiomatic).
+    std::unordered_set<std::string> definedLabels;
+    collectLabels(func.body, definedLabels);
+    dropDanglingGotosInList(func.body, definedLabels);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: renameRemainingRegisterVars — catch-all for register-named variables
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// After inferSemanticNames has renamed variables with known call context,
+// any remaining register-named variables (r15, rbx_2, rdi_1, xmm4, etc.)
+// and _promoted_N temporaries are renamed to sequential v1, v2, v3...
+//
+// Register names should NEVER appear in decompiled output — they are
+// internal to the CPU and meaningless to a reader.  IDA uses vN, Ghidra
+// uses uVarN.  We follow the IDA convention.
+
+/// Collect all unique variable names referenced in an expression.
+static void collectVarNamesInExpr(const CExpr* expr,
+                                   std::unordered_set<std::string>& names) {
+    if (!expr) return;
+    switch (expr->getKind()) {
+    case NodeKind::VarRefExpr:
+        names.insert(static_cast<const CVarRefExpr&>(*expr).varName);
+        break;
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<const CBinaryExpr&>(*expr);
+        collectVarNamesInExpr(b.lhs.get(), names);
+        collectVarNamesInExpr(b.rhs.get(), names);
+        break;
+    }
+    case NodeKind::UnaryExpr:
+        collectVarNamesInExpr(
+            static_cast<const CUnaryExpr&>(*expr).operand.get(), names);
+        break;
+    case NodeKind::CastExpr:
+        collectVarNamesInExpr(
+            static_cast<const CCastExpr&>(*expr).operand.get(), names);
+        break;
+    case NodeKind::CallExpr:
+        for (auto& a : static_cast<const CCallExpr&>(*expr).args)
+            collectVarNamesInExpr(a.get(), names);
+        break;
+    case NodeKind::FieldAccessExpr:
+        collectVarNamesInExpr(
+            static_cast<const CFieldAccessExpr&>(*expr).base.get(), names);
+        break;
+    case NodeKind::SubscriptExpr: {
+        auto& s = static_cast<const CSubscriptExpr&>(*expr);
+        collectVarNamesInExpr(s.base.get(), names);
+        collectVarNamesInExpr(s.index.get(), names);
+        break;
+    }
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<const CTernaryExpr&>(*expr);
+        collectVarNamesInExpr(t.cond.get(), names);
+        collectVarNamesInExpr(t.trueVal.get(), names);
+        collectVarNamesInExpr(t.falseVal.get(), names);
+        break;
+    }
+    default: break;
+    }
+}
+
+/// Collect all unique variable names referenced in a statement list.
+static void collectVarNamesInStmts(const std::vector<StmtPtr>& stmts,
+                                    std::unordered_set<std::string>& names) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::AssignStmt: {
+            auto& a = static_cast<const CAssignStmt&>(*sp);
+            collectVarNamesInExpr(a.target.get(), names);
+            collectVarNamesInExpr(a.value.get(), names);
+            break;
+        }
+        case NodeKind::ExprStmt:
+            collectVarNamesInExpr(
+                static_cast<const CExprStmt&>(*sp).expr.get(), names);
+            break;
+        case NodeKind::ReturnStmt:
+            collectVarNamesInExpr(
+                static_cast<const CReturnStmt&>(*sp).value.get(), names);
+            break;
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<const CIfStmt&>(*sp);
+            collectVarNamesInExpr(s.condition.get(), names);
+            collectVarNamesInStmts(s.thenBody, names);
+            collectVarNamesInStmts(s.elseBody, names);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            auto& s = static_cast<const CWhileStmt&>(*sp);
+            collectVarNamesInExpr(s.condition.get(), names);
+            collectVarNamesInStmts(s.body, names);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& s = static_cast<const CDoWhileStmt&>(*sp);
+            collectVarNamesInExpr(s.condition.get(), names);
+            collectVarNamesInStmts(s.body, names);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            auto& s = static_cast<const CForStmt&>(*sp);
+            collectVarNamesInExpr(s.condition.get(), names);
+            collectVarNamesInStmts(s.body, names);
+            break;
+        }
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<const CSwitchStmt&>(*sp).cases)
+                collectVarNamesInStmts(c.body, names);
+            break;
+        case NodeKind::BlockStmt:
+            collectVarNamesInStmts(
+                static_cast<const CBlockStmt&>(*sp).stmts, names);
+            break;
+        default: break;
+        }
+    }
+}
+
+void CAstOptimizer::renameRemainingRegisterVars(CFuncDecl& func) {
+    // Collect all existing names to avoid collisions.
+    std::unordered_set<std::string> usedNames;
+    for (auto& d : func.localVars) usedNames.insert(d.varName);
+    for (auto& p : func.params)    usedNames.insert(p.name);
+
+    unsigned nextId = 1;
+    auto makeUnique = [&]() -> std::string {
+        while (true) {
+            auto name = "v" + std::to_string(nextId++);
+            if (!usedNames.count(name)) {
+                usedNames.insert(name);
+                return name;
+            }
+        }
+    };
+
+    // Phase 1: Rename register-named variables in localVars.
+    for (auto& d : func.localVars) {
+        bool needsRename = isPlainRegisterName(d.varName)
+                        || d.varName.starts_with("_promoted_");
+        if (!needsRename) continue;
+
+        std::string oldName = d.varName;
+        std::string newName = makeUnique();
+
+        applyRenameInStmts(func.body, oldName, newName);
+        d.varName = newName;
+    }
+
+    // Phase 2: Scan body for register-named references NOT in localVars.
+    // These come from MLIR block arguments or SSA values that were never
+    // assigned to a local variable declaration.
+    std::unordered_set<std::string> bodyNames;
+    collectVarNamesInStmts(func.body, bodyNames);
+
+    // Rebuild usedNames after Phase 1 renames.
+    usedNames.clear();
+    for (auto& d : func.localVars) usedNames.insert(d.varName);
+    for (auto& p : func.params)    usedNames.insert(p.name);
+
+    for (auto& name : bodyNames) {
+        if (usedNames.count(name)) continue;  // already a known var
+        if (!isPlainRegisterName(name) && !name.starts_with("_promoted_"))
+            continue;
+
+        std::string newName = makeUnique();
+        applyRenameInStmts(func.body, name, newName);
+
+        // Add a declaration for the newly named variable so it appears
+        // in the local variable list (otherwise the output has undeclared
+        // references).  Default to int64_t — type propagation runs earlier.
+        uint32_t varId = 90000 + static_cast<uint32_t>(func.localVars.size());
+        func.localVars.emplace_back(
+            varId, newName, CType::int64());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: decomposeNativeOpcodes — replace raw x86 opcode calls with C semantics
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Remill lifts certain x86 instructions as function calls with their
+// mnemonic as the target name (e.g., BTSmem, XADD, CMPXCHG).  Detect
+// these by NAME SHAPE (uppercase mnemonic, optionally with mem/reg/imm
+// suffix) rather than a hardcoded list, then map to readable C-level
+// equivalents.
+//
+// Known mnemonic → semantic mappings.  Anything that matches the shape
+// but isn't in this map gets a fallback `__native_<mnemonic>` rename so
+// it's still recognizable in the output.
+
+/// Returns true if `name` looks like a Remill native opcode mnemonic.
+///
+/// Real Remill opcode names we want to ACCEPT:
+///   - All-uppercase mnemonic, optionally with digits (e.g. "BSWAP", "RDTSC",
+///     "TZCNT", "MOV64", "CVTSS2SI", "CMPSB")
+///   - All-uppercase + lowercase addressing-mode/register suffix
+///     (e.g. "BTSmem", "BTSreg", "BTSimm", "MOVDQx", "MOVDQa", "STOSb",
+///     "MULrax", "DIVrdxrax", "FMULmem")
+///   - Underscores INSIDE the uppercase portion (e.g. "LOCK_ADD", "MOVSD_MEM",
+///     "CVTSS2SI_32")
+///
+/// Library/syscall identifiers we MUST NOT misclassify:
+///   - "IO_read", "PR_init", "TLS_setup", "GFP_kernel", "NSS_init"
+///     (UPPER_PREFIX_lowercase_word) — caught by Rule A.
+///   - "OSPanic", "IOError", "HTMLParser", "JNIInit" (UPPER + word, no `_`)
+///     — caught by Rule B (explicit prefix deny-list of common namespaces).
+///
+/// The two protection rules:
+///   (A) An underscore must NEVER be immediately followed by a lowercase
+///       letter — that's the library `<PREFIX>_<word>` pattern.
+///   (B) The leading uppercase prefix (before first lowercase) must NOT
+///       match a known library/namespace prefix from a curated deny-list.
+///       This list is short and only contains identifiers that are NEVER
+///       valid x86/ARM instruction mnemonics.
+// Forward declaration so `isNativeOpcodeName` can early-accept names that
+// appear in the semantic map (Remill variants like `FADDmem_ST0_implicit`
+// fail Rules A/B but are unambiguously x87 opcodes we want to decompose).
+static std::string_view kSemanticMapLookup(std::string_view name);
+
+static bool isNativeOpcodeName(std::string_view name) {
+    if (name.size() < 2 || name.size() > 24) return false;
+
+    // Allow-list: any name registered in the decomposition semantic map is
+    // a known Remill opcode intrinsic, regardless of whether it follows the
+    // conservative shape Rules A/B below.  This catches cases like
+    // `FADDmem_ST0_implicit` (x87 memory-form add with implicit ST0) where
+    // the `_implicit` tail matches Rule A's library `<PREFIX>_<word>` shape
+    // but the full name is still an opcode.
+    if (!kSemanticMapLookup(name).empty()) return true;
+
+    // Must start with at least two uppercase letters (excludes camelCase
+    // names like "Add", "Or", "Rdtsc", "ReadFile", "CreateProcess").
+    if (!(name[0] >= 'A' && name[0] <= 'Z')) return false;
+    if (!(name[1] >= 'A' && name[1] <= 'Z')) return false;
+
+    bool sawLower = false;
+    size_t firstLowerIdx = std::string::npos;
+    for (size_t i = 0; i < name.size(); ++i) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') {
+            if (sawLower) return false;  // upper after lower → not a mnemonic
+        } else if (c >= 'a' && c <= 'z') {
+            if (!sawLower) {
+                sawLower = true;
+                firstLowerIdx = i;
+            }
+            // Rule A: an underscore directly before this lowercase letter
+            // means we hit the library `<PREFIX>_<word>` pattern
+            // (e.g. IO_read, PR_init, GFP_kernel).
+            if (i > 0 && name[i - 1] == '_') return false;
+        } else if (c >= '0' && c <= '9') {
+            // Digits only allowed inside the uppercase part (e.g., "MOV64rr").
+            if (sawLower) return false;
+        } else if (c == '_') {
+            // Underscore only inside uppercase part. The next char must NOT
+            // be a lowercase letter (caught by Rule A above).
+            if (sawLower) return false;
+        } else {
+            return false;
+        }
+    }
+
+    // Rule B: prefix deny-list — short uppercase namespace prefixes that
+    // are common in libraries/runtimes but never valid CPU mnemonics.
+    // We compare the leading uppercase prefix (everything before the first
+    // lowercase letter) against this list.  Order matters only for clarity.
+    if (sawLower) {
+        std::string_view prefix = name.substr(0, firstLowerIdx);
+        // Each prefix here is only matched against names with a lowercase
+        // tail; all-uppercase mnemonics (e.g. VMOVDQA, FNCLEX, FSQRT) are
+        // never compared against this list because Rule B is gated on
+        // sawLower==true.
+        static constexpr std::string_view kLibraryPrefixes[] = {
+            // C / POSIX / kernel runtime
+            "IO", "OS", "FS", "VM", "PR", "BR", "FN",
+            // Java / Android
+            "JNI",
+            // Web / scripting / serialization
+            "JS", "WS", "HTML", "XML", "JSON", "URI", "URL", "DOM",
+            // Network / crypto
+            "TLS", "SSL", "NSS", "FTP", "HTTP", "HTTPS", "DNS", "TCP", "UDP",
+            // Graphics
+            "GL", "EGL", "GLX", "WGL", "GLES", "GLSL", "DX", "DXGI", "D3D",
+            "UI", "GUI", "GTK", "QT", "GDK",
+            // Memory / GC / heap
+            "GFP", "GC",
+            // Misc
+            "NS", "BSD", "POSIX", "IPC", "RPC",
+            // Game engines / common app namespaces
+            "AI", "FX", "VFX", "SFX", "GFX",
+        };
+        for (auto& p : kLibraryPrefixes) {
+            if (prefix == p) return false;
+        }
+    }
+
+    return true;
+}
+
+/// Shared static kSemanticMap accessor.  Defined once here so both the
+/// shape-aware decomposer (`mapNativeOpcode`) and the early-accept lookup
+/// used by `isNativeOpcodeName` (`kSemanticMapLookup`) hit the same table.
+static const llvm::StringMap<std::string>& getSemanticMap() {
+    static const llvm::StringMap<std::string> kSemanticMap = {
+        // Atomic / bit operations
+        {"BTS",      "atomic_test_and_set"},
+        {"BTR",      "atomic_test_and_reset"},
+        {"BTC",      "atomic_test_and_complement"},
+        {"BT",       "bit_test"},
+        {"XADD",     "atomic_fetch_add"},
+        {"XCHG",     "atomic_exchange"},
+        {"CMPXCHG",  "atomic_compare_exchange"},
+        {"CMPXCHG8B",  "atomic_compare_exchange_8b"},
+        {"CMPXCHG16B", "atomic_compare_exchange_16b"},
+        // Locked variants
+        {"LOCK_ADD", "atomic_add"},
+        {"LOCK_SUB", "atomic_sub"},
+        {"LOCK_AND", "atomic_and"},
+        {"LOCK_OR",  "atomic_or"},
+        {"LOCK_XOR", "atomic_xor"},
+        {"LOCK_INC", "atomic_inc"},
+        {"LOCK_DEC", "atomic_dec"},
+        {"LOCK_NEG", "atomic_neg"},
+        {"LOCK_NOT", "atomic_not"},
+        // Carry / borrow arithmetic
+        {"ADC",      "add_with_carry"},
+        {"SBB",      "sub_with_borrow"},
+        // Bit count
+        {"TZCNT",    "count_trailing_zeros"},
+        {"BSF",      "count_trailing_zeros"},
+        {"LZCNT",    "count_leading_zeros"},
+        {"BSR",      "count_leading_zeros"},
+        {"POPCNT",   "popcount"},
+        // Byte manipulation
+        {"BSWAP",    "byte_swap"},
+        {"PEXT",     "parallel_bits_extract"},
+        {"PDEP",     "parallel_bits_deposit"},
+        // Time/CPU
+        {"RDTSC",    "read_timestamp_counter"},
+        {"RDTSCP",   "read_timestamp_counter_processor"},
+        {"CPUID",    "cpuid"},
+        {"PAUSE",    "cpu_pause"},
+        {"HLT",      "cpu_halt"},
+        // Memory ordering
+        {"LFENCE",   "memory_barrier_load"},
+        {"SFENCE",   "memory_barrier_store"},
+        {"MFENCE",   "memory_barrier_full"},
+        {"CLFLUSH",  "cache_line_flush"},
+        // MSR
+        {"RDMSR",    "read_msr"},
+        {"WRMSR",    "write_msr"},
+        {"RDPMC",    "read_pmc"},
+        // I/O
+        {"IN",       "io_read"},
+        {"INS",      "io_read_string"},
+        {"OUT",      "io_write"},
+        {"OUTS",     "io_write_string"},
+        // Interrupts / system
+        {"INT",      "software_interrupt"},
+        {"INT3",     "debug_break"},
+        {"IRET",     "interrupt_return"},
+        {"SYSCALL",  "syscall"},
+        {"SYSENTER", "sysenter"},
+        {"SYSEXIT",  "sysexit"},
+        {"SYSRET",   "sysret"},
+        {"UD2",      "undefined_instruction"},
+        // Floating point conversion
+        {"CVTTSS2SI", "float_to_int_truncate"},
+        {"CVTSS2SI",  "float_to_int"},
+        {"CVTSI2SS",  "int_to_float"},
+        {"CVTTSD2SI", "double_to_int_truncate"},
+        {"CVTSD2SI",  "double_to_int"},
+        {"CVTSI2SD",  "int_to_double"},
+        // Stack
+        {"ENTER",    "stack_enter"},
+        {"LEAVE",    "stack_leave"},
+        // Random
+        {"RDRAND",   "hardware_random"},
+        {"RDSEED",   "hardware_random_seed"},
+        // SSE/SIMD scalar moves
+        {"MOVQ",       "simd_move_quad"},
+        {"MOVD",       "simd_move_dword"},
+        {"MOVDQ",      "simd_move_dquad"},
+        {"MOVDQA",     "simd_move_dquad_aligned"},
+        {"MOVDQU",     "simd_move_dquad_unaligned"},
+        {"MOVAPS",     "simd_move_aligned_packed_single"},
+        {"MOVUPS",     "simd_move_unaligned_packed_single"},
+        {"MOVAPD",     "simd_move_aligned_packed_double"},
+        {"MOVUPD",     "simd_move_unaligned_packed_double"},
+        {"MOVSS",      "simd_move_scalar_single"},
+        {"MOVSD",      "simd_move_scalar_double"},
+        {"MOVSS_MEM",  "simd_load_scalar_single"},
+        {"MOVSD_MEM",  "simd_load_scalar_double"},
+        // SSE/SIMD shifts
+        {"PSRLDQ",     "simd_shift_right_dquad"},
+        {"PSLLDQ",     "simd_shift_left_dquad"},
+        {"PSRLQ",      "simd_shift_right_quad"},
+        {"PSLLQ",      "simd_shift_left_quad"},
+        {"PSRLD",      "simd_shift_right_dword"},
+        {"PSLLD",      "simd_shift_left_dword"},
+        {"PSRLW",      "simd_shift_right_word"},
+        {"PSLLW",      "simd_shift_left_word"},
+        // SSE/SIMD packed arithmetic
+        {"PADDB",      "simd_add_byte"},
+        {"PADDW",      "simd_add_word"},
+        {"PADDD",      "simd_add_dword"},
+        {"PADDQ",      "simd_add_quad"},
+        {"PSUBB",      "simd_sub_byte"},
+        {"PSUBW",      "simd_sub_word"},
+        {"PSUBD",      "simd_sub_dword"},
+        {"PSUBQ",      "simd_sub_quad"},
+        // SSE/SIMD compare/permute/shuffle
+        {"PCMPEQB",    "simd_cmp_eq_byte"},
+        {"PCMPEQW",    "simd_cmp_eq_word"},
+        {"PCMPEQD",    "simd_cmp_eq_dword"},
+        {"PSHUFB",     "simd_shuffle_byte"},
+        {"PSHUFD",     "simd_shuffle_dword"},
+        {"PSHUFHW",    "simd_shuffle_high_word"},
+        {"PSHUFLW",    "simd_shuffle_low_word"},
+        // SSE/SIMD logical
+        {"PAND",       "simd_and"},
+        {"POR",        "simd_or"},
+        {"PXOR",       "simd_xor"},
+        {"PANDN",      "simd_andnot"},
+        // SSE/SIMD min/max
+        {"PMINUB",     "simd_min_unsigned_byte"},
+        {"PMAXUB",     "simd_max_unsigned_byte"},
+        {"PMINSW",     "simd_min_signed_word"},
+        {"PMAXSW",     "simd_max_signed_word"},
+        // SSE/SIMD byte mask
+        {"PMOVMSKB",   "simd_move_mask_byte"},
+        {"MOVMSKPS",   "simd_move_mask_packed_single"},
+        {"MOVMSKPD",   "simd_move_mask_packed_double"},
+        // Float→int conversions
+        {"CVTSS2SI",    "float_to_int_truncate"},
+        {"CVTSD2SI",    "double_to_int_truncate"},
+        {"CVTSI2SS",    "int_to_float"},
+        {"CVTSI2SD",    "int_to_double"},
+        {"CVTSS2SI_32", "float_to_int32_truncate"},
+        {"CVTSD2SI_64", "double_to_int64_truncate"},
+        {"CVTSI2SS_32", "int32_to_float"},
+        {"CVTSI2SD_64", "int64_to_double"},
+        {"CVTSS2SD",    "float_to_double"},
+        {"CVTSD2SS",    "double_to_float"},
+        {"CVTDQ2PS",    "int_packed_to_float_packed"},
+        {"CVTPS2DQ",    "float_packed_to_int_packed"},
+        {"CVTPS2PD",    "float_packed_to_double_packed"},
+        {"CVTPD2PS",    "double_packed_to_float_packed"},
+        {"CVTPI2PS",    "int_packed_to_float_packed_mmx"},
+        {"CVTPS2PI",    "float_packed_to_int_packed_mmx"},
+        {"CVTTSS2SI",   "float_to_int_truncate"},
+        {"CVTTSD2SI",   "double_to_int_truncate"},
+        {"CVTTPS2DQ",   "float_packed_to_int_packed_truncate"},
+        {"CVTTPD2DQ",   "double_packed_to_int_packed_truncate"},
+        // VEX-encoded versions (AVX) — same semantics as non-V counterparts
+        {"VMOVQ",      "simd_move_quad"},
+        {"VMOVD",      "simd_move_dword"},
+        {"VMOVDQA",    "simd_move_dquad_aligned"},
+        {"VMOVDQU",    "simd_move_dquad_unaligned"},
+        {"VMOVAPS",    "simd_move_aligned_packed_single"},
+        {"VMOVUPS",    "simd_move_unaligned_packed_single"},
+        {"VMOVAPD",    "simd_move_aligned_packed_double"},
+        {"VMOVUPD",    "simd_move_unaligned_packed_double"},
+        {"VPSRLDQ",    "simd_shift_right_dquad"},
+        {"VPSLLDQ",    "simd_shift_left_dquad"},
+        {"VPXOR",      "simd_xor"},
+        {"VPAND",      "simd_and"},
+        {"VPOR",       "simd_or"},
+        // Integer multiplication / division (with implicit rax/rdx operand
+        // encoding stripped by the suffix walker — DIVrdxrax → DIV).
+        {"MUL",        "umul_full"},
+        {"IMUL",       "imul_full"},
+        {"DIV",        "udiv_full"},
+        {"IDIV",       "idiv_full"},
+        // String operations (REP/REPE/REPNE-prefixed by lifter)
+        {"CMPSB",      "string_compare_byte"},
+        {"CMPSW",      "string_compare_word"},
+        {"CMPSD",      "string_compare_dword"},
+        {"CMPSQ",      "string_compare_qword"},
+        {"MOVSB",      "string_move_byte"},
+        {"MOVSW",      "string_move_word"},
+        {"SCASB",      "string_scan_byte"},
+        {"SCASW",      "string_scan_word"},
+        {"SCASD",      "string_scan_dword"},
+        {"SCASQ",      "string_scan_qword"},
+        {"STOS",       "string_store"},
+        {"LODS",       "string_load"},
+        // x87 floating point (when not converted to LLVM intrinsics)
+        {"FMUL",       "fp_mul"},
+        {"FADD",       "fp_add"},
+        {"FSUB",       "fp_sub"},
+        {"FDIV",       "fp_div"},
+        {"FSQRT",      "fp_sqrt"},
+        {"FABS",       "fp_abs"},
+        {"FCHS",       "fp_negate"},
+        {"FSIN",       "fp_sin"},
+        {"FCOS",       "fp_cos"},
+        {"FPREM",      "fp_partial_remainder"},
+
+        // x87 memory-operand and implicit-ST0 variants (x86 gta-sa corpus
+        // bug A).  Remill names these with explicit `mem`/`ST0_implicit`
+        // suffixes for the variants that read/write to memory or use ST0
+        // as an implicit source/destination.
+        {"FLD",        "fp_load"},
+        {"FLDmem",     "fp_load"},
+        {"FSTP",       "fp_store_pop"},
+        {"FSTPmem",    "fp_store_pop"},
+        {"FST",        "fp_store"},
+        {"FSTmem",     "fp_store"},
+        {"FILD",       "fp_load_int"},
+        {"FILDmem",    "fp_load_int"},
+        {"FIST",       "fp_store_int"},
+        {"FISTP",      "fp_store_int_pop"},
+        {"FCOM",       "fp_compare"},
+        {"FCOMmem",    "fp_compare"},
+        {"FCOMP",      "fp_compare_pop"},
+        {"FCOMPmem",   "fp_compare_pop"},
+        {"FUCOM",      "fp_compare_unordered"},
+        {"FUCOMP",     "fp_compare_unordered_pop"},
+        {"FNSTSW",     "fp_store_status_word"},
+        {"FSTSW",      "fp_store_status_word"},
+        {"FNSTCW",     "fp_store_control_word"},
+        {"FLDCW",      "fp_load_control_word"},
+        {"FADDmem_ST0_implicit",    "fp_add"},
+        {"FSUBmem_ST0_implicit",    "fp_sub"},
+        {"FMULmem_ST0_implicit",    "fp_mul"},
+        {"FDIVmem_ST0_implicit",    "fp_div"},
+        {"FIADDmem_ST0_implicit",   "fp_add_int"},
+        {"FISUBmem_ST0_implicit",   "fp_sub_int"},
+        {"FIMULmem_ST0_implicit",   "fp_mul_int"},
+        {"FIDIVmem_ST0_implicit",   "fp_div_int"},
+
+        // x86 (32-bit) control-flow and stack opcodes that Remill lifts by
+        // name.  Without these, x86 output leaks `__native_LOOPNE`,
+        // `__native_POPAD`, `__native_RET_IMM` et al. (gta-sa bug G).
+        {"LOOPNE",     "loop_while_ne"},
+        {"LOOPE",      "loop_while_eq"},
+        {"LOOP",       "loop_decrement"},
+        {"POPAD",      "pop_all_gprs"},
+        {"PUSHAD",     "push_all_gprs"},
+        {"POPFD",      "pop_flags"},
+        {"PUSHFD",     "push_flags"},
+        {"POPF",       "pop_flags"},
+        {"PUSHF",      "push_flags"},
+        {"LAHF",       "load_flags_into_ah"},
+        {"SAHF",       "store_ah_to_flags"},
+
+        // Add-with-carry / sub-with-borrow variants (bug G).
+        {"ADC",                "add_with_carry"},
+        {"ADCmem",             "add_with_carry"},
+        {"SBB",                "sub_with_borrow"},
+        {"SBBmem",             "sub_with_borrow"},
+        {"add_with_carry",     "add_with_carry"},
+        {"sub_with_borrow",    "sub_with_borrow"},
+
+        // I/O port opcodes (ring-0 code, drivers).
+        {"IN8",        "port_in_byte"},
+        {"IN16",       "port_in_word"},
+        {"IN32",       "port_in_dword"},
+        {"OUT8",       "port_out_byte"},
+        {"OUT16",      "port_out_word"},
+        {"OUT32",      "port_out_dword"},
+
+        // Far jumps / calls (segmented memory — drivers, bootloaders).
+        {"JMP_FAR_MEM",    "far_jump_mem"},
+        {"JMP_FAR",        "far_jump"},
+        {"CALL_FAR_MEM",   "far_call_mem"},
+        {"CALL_FAR",       "far_call"},
+        {"RET_FAR",        "far_return"},
+
+        // Misc x86 opcodes commonly surviving in legacy code.
+        {"CPUID",      "cpuid"},
+        {"RDTSC",      "read_timestamp_counter"},
+        {"XCHG",       "exchange"},
+        {"BSR",        "bit_scan_reverse"},
+        {"BSF",        "bit_scan_forward"},
+        {"BTS",        "bit_test_and_set"},
+        {"BTR",        "bit_test_and_reset"},
+        {"BTC",        "bit_test_and_complement"},
+    };
+    return kSemanticMap;
+}
+
+/// Direct kSemanticMap lookup (no mnemonic stripping).  Used by
+/// `isNativeOpcodeName` as an allow-list so Remill's `FADDmem_ST0_implicit`
+/// style names pass through even though Rule A would reject them.
+static std::string_view kSemanticMapLookup(std::string_view name) {
+    auto& m = getSemanticMap();
+    auto it = m.find(name);
+    if (it == m.end()) return {};
+    return it->second;
+}
+
+/// Map a recognized native opcode mnemonic to a readable semantic name.
+/// Returns empty string if no mapping is known.
+static std::string mapNativeOpcode(const std::string& name) {
+    // Strip lowercase suffix (e.g. MOVDQx → MOVDQ, BTSmem → BTS).
+    // The suffix is everything after the last uppercase letter that's
+    // followed by a lowercase character.
+    //
+    // Example splits:
+    //   MOVDQx     → MOVDQ + x
+    //   BTSmem     → BTS + mem
+    //   CVTSS2SI_32 → CVTSS2SI + _32   (special: _NN is preserved as-is)
+    //   MOVSD_MEM  → no split (all upper)
+
+    // First: direct match against the semantic map (catches full Remill
+    // names like `FADDmem_ST0_implicit` that would survive stripping).
+    auto& m = getSemanticMap();
+    if (auto it = m.find(name); it != m.end())
+        return it->second;
+
+    std::string base = name;
+    size_t firstLower = std::string::npos;
+    for (size_t i = 0; i < base.size(); ++i) {
+        char c = base[i];
+        if (c >= 'a' && c <= 'z') { firstLower = i; break; }
+    }
+    if (firstLower != std::string::npos && firstLower > 0) {
+        // The character before firstLower must be uppercase.
+        char before = base[firstLower - 1];
+        if (before >= 'A' && before <= 'Z') {
+            base = base.substr(0, firstLower);
+        }
+    }
+
+    auto it = m.find(base);
+    if (it != m.end())
+        return it->second;
+    return {};
+}
+
+/// Recognize Remill REP-prefixed string operation wrappers like
+/// "DoREPE_CMPSB", "DoREPNE_SCASB", "DoREP_MOVSB" and rewrite them as
+/// readable single-token names: rep_while_equal_string_compare_byte, etc.
+/// Returns the flattened name if recognized, or empty if not a REP wrapper.
+static std::string tryStripRepPrefix(const std::string& name) {
+    // Match shapes:
+    //   DoREP_<MNEMONIC>     → rep
+    //   DoREPE_<MNEMONIC>    → rep_while_equal
+    //   DoREPNE_<MNEMONIC>   → rep_while_not_equal
+    static constexpr std::pair<std::string_view, std::string_view> kPrefixes[] = {
+        {"DoREPNE_", "rep_while_not_equal"},
+        {"DoREPE_",  "rep_while_equal"},
+        {"DoREP_",   "rep"},
+    };
+    for (auto& [prefix, wrapper] : kPrefixes) {
+        if (name.size() <= prefix.size()) continue;
+        if (name.compare(0, prefix.size(), prefix.data(), prefix.size()) != 0)
+            continue;
+        std::string innerName(name.substr(prefix.size()));
+        if (!isNativeOpcodeName(innerName))
+            return {};
+        auto mapped = mapNativeOpcode(innerName);
+        if (mapped.empty()) mapped = "native_" + innerName;
+        return std::string(wrapper) + "_" + mapped;
+    }
+    return {};
+}
+
+static void decomposeNativeInExpr(CExpr* expr) {
+    if (!expr) return;
+    switch (expr->getKind()) {
+    case NodeKind::CallExpr: {
+        auto& call = static_cast<CCallExpr&>(*expr);
+        // First check for REP-prefixed string ops (DoREPE_CMPSB etc.).
+        auto repWrapper = tryStripRepPrefix(call.targetName);
+        if (!repWrapper.empty()) {
+            call.targetName = std::move(repWrapper);
+        } else if (isNativeOpcodeName(call.targetName)) {
+            auto mapped = mapNativeOpcode(call.targetName);
+            if (!mapped.empty()) {
+                call.targetName = mapped;
+            } else {
+                // Unknown native opcode — prefix with __native_ so it's
+                // visibly distinct from regular function calls.  This
+                // also makes it easy to find unhandled mnemonics in
+                // output for future mapping.
+                call.targetName = "__native_" + call.targetName;
+            }
+        }
+        for (auto& arg : call.args)
+            decomposeNativeInExpr(arg.get());
+        break;
+    }
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<CBinaryExpr&>(*expr);
+        decomposeNativeInExpr(b.lhs.get());
+        decomposeNativeInExpr(b.rhs.get());
+        break;
+    }
+    case NodeKind::UnaryExpr:
+        decomposeNativeInExpr(static_cast<CUnaryExpr&>(*expr).operand.get());
+        break;
+    case NodeKind::CastExpr:
+        decomposeNativeInExpr(static_cast<CCastExpr&>(*expr).operand.get());
+        break;
+    case NodeKind::FieldAccessExpr:
+        decomposeNativeInExpr(static_cast<CFieldAccessExpr&>(*expr).base.get());
+        break;
+    case NodeKind::SubscriptExpr: {
+        auto& s = static_cast<CSubscriptExpr&>(*expr);
+        decomposeNativeInExpr(s.base.get());
+        decomposeNativeInExpr(s.index.get());
+        break;
+    }
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<CTernaryExpr&>(*expr);
+        decomposeNativeInExpr(t.cond.get());
+        decomposeNativeInExpr(t.trueVal.get());
+        decomposeNativeInExpr(t.falseVal.get());
+        break;
+    }
+    default: break;
+    }
+}
+
+static void decomposeNativeInStmts(std::vector<StmtPtr>& stmts) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::AssignStmt: {
+            auto& a = static_cast<CAssignStmt&>(*sp);
+            decomposeNativeInExpr(a.target.get());
+            decomposeNativeInExpr(a.value.get());
+            break;
+        }
+        case NodeKind::ExprStmt:
+            decomposeNativeInExpr(static_cast<CExprStmt&>(*sp).expr.get());
+            break;
+        case NodeKind::ReturnStmt:
+            decomposeNativeInExpr(static_cast<CReturnStmt&>(*sp).value.get());
+            break;
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            decomposeNativeInExpr(s.condition.get());
+            decomposeNativeInStmts(s.thenBody);
+            decomposeNativeInStmts(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            auto& s = static_cast<CWhileStmt&>(*sp);
+            decomposeNativeInExpr(s.condition.get());
+            decomposeNativeInStmts(s.body);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& s = static_cast<CDoWhileStmt&>(*sp);
+            decomposeNativeInExpr(s.condition.get());
+            decomposeNativeInStmts(s.body);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            auto& s = static_cast<CForStmt&>(*sp);
+            decomposeNativeInExpr(s.condition.get());
+            decomposeNativeInStmts(s.body);
+            break;
+        }
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                decomposeNativeInStmts(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            decomposeNativeInStmts(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default: break;
+        }
+    }
+}
+
+void CAstOptimizer::decomposeNativeOpcodes(CFuncDecl& func) {
+    decomposeNativeInStmts(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: recognizeStackCanary — elide stack canary save/check patterns
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Stack canaries (a.k.a. stack cookies, stack protectors) are compiler-
+// inserted security infrastructure that should NOT appear in decompiled
+// output.  Different toolchains use different patterns:
+//
+//   - SysV / Linux:  TLS-based at fs:0x28 or gs:0x28
+//                    Check: if(saved != fs:0x28) __stack_chk_fail();
+//   - Win64 / MSVC:  Global __security_cookie XOR'd with RSP
+//                    Check: __security_check_cookie(local ^ rsp);
+//   - GCC fortify:   __stack_chk_guard global variable
+//                    Check: if(saved != __stack_chk_guard) __stack_chk_fail();
+//
+// Generalized detection strategy: instead of pattern-matching the canary
+// READ (which varies by toolchain), we detect the canary CHECK by looking
+// for calls to known check-failure functions:
+//
+//   __stack_chk_fail, __stack_chk_fail_local, __security_check_cookie,
+//   __chk_fail
+//
+// When such a call is found, we walk backward looking for an enclosing
+// if-statement (or the immediately preceding sibling if-stmt) and elide
+// both the if-statement (keeping its then-body, which is the normal path)
+// and the failure call.
+
+/// Returns true if name is a known stack canary check failure function.
+static bool isCanaryFailFunction(std::string_view name) {
+    return name == "__stack_chk_fail" ||
+           name == "__stack_chk_fail_local" ||
+           name == "__security_check_cookie" ||
+           name == "__chk_fail" ||
+           name == "__report_gsfailure" ||
+           name == "abort";  // some toolchains use abort directly
+}
+
+/// Returns true if the expression matches a known stack canary read pattern.
+/// Currently recognizes:
+///   - SysV/Linux: *(type)(void*)0 + 40  (gs:0x28 or fs:0x28 lifted)
+///   - SysV/Linux: __readgsqword(0x28), __readfsqword(0x28)
+///   - Win64:      __security_cookie  (referenced as global)
+static bool isCanaryRead(const CExpr* expr) {
+    if (!expr) return false;
+
+    // Pattern 1: deref of null + segment offset (typical kernel/SysV).
+    // *(int64_t)(void*)0 + N where N matches a segment-relative TLS offset.
+    if (expr->getKind() == NodeKind::BinaryExpr) {
+        auto& bin = static_cast<const CBinaryExpr&>(*expr);
+        if (bin.op == BinaryOp::Add &&
+            bin.rhs && bin.rhs->getKind() == NodeKind::IntLitExpr) {
+            int64_t offset =
+                static_cast<const CIntLitExpr&>(*bin.rhs).value;
+            // Common segment-relative canary offsets:
+            //   0x28 = 40   (Linux/glibc on x86-64)
+            //   0x14 = 20   (Linux/glibc on x86-32)
+            //   0x10 = 16   (FreeBSD)
+            //   0x08 = 8    (some embedded toolchains)
+            if (offset == 40 || offset == 20 || offset == 16 || offset == 8) {
+                if (bin.lhs && bin.lhs->getKind() == NodeKind::UnaryExpr) {
+                    auto& deref = static_cast<const CUnaryExpr&>(*bin.lhs);
+                    if (deref.op == UnaryOp::Deref)
+                        return true;
+                }
+            }
+        }
+    }
+
+    // Pattern 2: __readgsqword/__readfsqword call with a canary offset.
+    if (expr->getKind() == NodeKind::CallExpr) {
+        auto& call = static_cast<const CCallExpr&>(*expr);
+        if ((call.targetName == "__readgsqword" ||
+             call.targetName == "__readfsqword") &&
+            call.args.size() == 1 &&
+            call.args[0]->getKind() == NodeKind::IntLitExpr) {
+            int64_t offset =
+                static_cast<const CIntLitExpr&>(*call.args[0]).value;
+            if (offset == 40 || offset == 20 || offset == 16 || offset == 8)
+                return true;
+        }
+        // Win64: __security_cookie reference (often appears as a load of
+        // a global named __security_cookie).
+        if (call.targetName == "__security_cookie")
+            return true;
+    }
+
+    // Pattern 3: VarRefExpr to "__security_cookie" or "__stack_chk_guard".
+    if (expr->getKind() == NodeKind::VarRefExpr) {
+        const auto& var = static_cast<const CVarRefExpr&>(*expr);
+        if (var.varName == "__security_cookie" ||
+            var.varName == "__stack_chk_guard")
+            return true;
+    }
+
+    return false;
+}
+
+/// Returns the variable name if this statement is `var = canary_read`.
+static std::string getCanarySaveVar(const CStmt* stmt) {
+    if (!stmt || stmt->getKind() != NodeKind::AssignStmt) return "";
+    auto& assign = static_cast<const CAssignStmt&>(*stmt);
+    if (!assign.target || !assign.value) return "";
+    if (assign.target->getKind() != NodeKind::VarRefExpr) return "";
+    if (!isCanaryRead(assign.value.get())) return "";
+    return static_cast<const CVarRefExpr&>(*assign.target).varName;
+}
+
+/// Returns true if this statement is a stack canary failure call.
+/// Generalized to recognize SysV (__stack_chk_fail) and Win64
+/// (__security_check_cookie) toolchain conventions.
+static bool isStackChkFail(const CStmt* stmt) {
+    if (!stmt) return false;
+    if (stmt->getKind() == NodeKind::ExprStmt) {
+        auto& expr = static_cast<const CExprStmt&>(*stmt);
+        if (expr.expr && expr.expr->getKind() == NodeKind::CallExpr) {
+            auto& call = static_cast<const CCallExpr&>(*expr.expr);
+            return isCanaryFailFunction(call.targetName);
+        }
+    }
+    return false;
+}
+
+/// Returns true if expr references varName.
+static bool exprRefsVar(const CExpr* expr, const std::string& varName) {
+    if (!expr) return false;
+    switch (expr->getKind()) {
+    case NodeKind::VarRefExpr:
+        return static_cast<const CVarRefExpr&>(*expr).varName == varName;
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<const CBinaryExpr&>(*expr);
+        return exprRefsVar(b.lhs.get(), varName) || exprRefsVar(b.rhs.get(), varName);
+    }
+    case NodeKind::UnaryExpr:
+        return exprRefsVar(static_cast<const CUnaryExpr&>(*expr).operand.get(), varName);
+    case NodeKind::CastExpr:
+        return exprRefsVar(static_cast<const CCastExpr&>(*expr).operand.get(), varName);
+    case NodeKind::CallExpr: {
+        auto& c = static_cast<const CCallExpr&>(*expr);
+        for (auto& arg : c.args)
+            if (exprRefsVar(arg.get(), varName)) return true;
+        return false;
+    }
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<const CTernaryExpr&>(*expr);
+        return exprRefsVar(t.cond.get(), varName) ||
+               exprRefsVar(t.trueVal.get(), varName) ||
+               exprRefsVar(t.falseVal.get(), varName);
+    }
+    default: return false;
+    }
+}
+
+/// Returns true if this is a canary check: if(!(var - canary)) or if(var - canary).
+static bool isCanaryCheck(const CStmt* stmt, const std::string& canaryVar) {
+    if (!stmt || stmt->getKind() != NodeKind::IfStmt) return false;
+    auto& ifStmt = static_cast<const CIfStmt&>(*stmt);
+    if (!ifStmt.condition) return false;
+
+    // The condition references the canary var and a canary read
+    const CExpr* cond = ifStmt.condition.get();
+
+    // Unwrap negation: !(expr)
+    if (cond->getKind() == NodeKind::UnaryExpr) {
+        auto& u = static_cast<const CUnaryExpr&>(*cond);
+        if (u.op == UnaryOp::LogNot) cond = u.operand.get();
+    }
+
+    // Check: var - canary_read, or canary_read subtraction
+    return exprRefsVar(cond, canaryVar);
+}
+
+static void removeCanaryInStmts(std::vector<StmtPtr>& stmts,
+                                 const std::string& canaryVar) {
+    for (size_t i = stmts.size(); i-- > 0;) {
+        if (!stmts[i]) continue;
+        auto* s = stmts[i].get();
+
+        // Remove canary save: var = *(type)(void*)0 + 40
+        if (!getCanarySaveVar(s).empty() && getCanarySaveVar(s) == canaryVar) {
+            stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+            continue;
+        }
+
+        // Remove __stack_chk_fail calls
+        if (isStackChkFail(s)) {
+            stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+            continue;
+        }
+
+        // Remove canary check if-statements
+        if (isCanaryCheck(s, canaryVar)) {
+            // Keep the "normal" path (usually the then-body) and drop the check
+            auto& ifStmt = static_cast<CIfStmt&>(*s);
+            // The then-body is typically the normal return path
+            if (!ifStmt.thenBody.empty()) {
+                auto thenBody = std::move(ifStmt.thenBody);
+                stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+                stmts.insert(stmts.begin() + static_cast<ptrdiff_t>(i),
+                             std::make_move_iterator(thenBody.begin()),
+                             std::make_move_iterator(thenBody.end()));
+            } else {
+                stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+            }
+            continue;
+        }
+
+        // Recurse into nested scopes
+        switch (s->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& ifs = static_cast<CIfStmt&>(*s);
+            removeCanaryInStmts(ifs.thenBody, canaryVar);
+            removeCanaryInStmts(ifs.elseBody, canaryVar);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            removeCanaryInStmts(static_cast<CWhileStmt&>(*s).body, canaryVar);
+            break;
+        case NodeKind::DoWhileStmt:
+            removeCanaryInStmts(static_cast<CDoWhileStmt&>(*s).body, canaryVar);
+            break;
+        case NodeKind::ForStmt:
+            removeCanaryInStmts(static_cast<CForStmt&>(*s).body, canaryVar);
+            break;
+        case NodeKind::BlockStmt:
+            removeCanaryInStmts(static_cast<CBlockStmt&>(*s).stmts, canaryVar);
+            break;
+        default: break;
+        }
+    }
+}
+
+/// Returns true if the expression tree contains *(type)(void*)0 + 40 anywhere.
+static bool containsCanaryRead(const CExpr* expr) {
+    if (!expr) return false;
+    if (isCanaryRead(expr)) return true;
+    switch (expr->getKind()) {
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<const CBinaryExpr&>(*expr);
+        return containsCanaryRead(b.lhs.get()) || containsCanaryRead(b.rhs.get());
+    }
+    case NodeKind::UnaryExpr:
+        return containsCanaryRead(static_cast<const CUnaryExpr&>(*expr).operand.get());
+    case NodeKind::CastExpr:
+        return containsCanaryRead(static_cast<const CCastExpr&>(*expr).operand.get());
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<const CTernaryExpr&>(*expr);
+        return containsCanaryRead(t.cond.get()) ||
+               containsCanaryRead(t.trueVal.get()) ||
+               containsCanaryRead(t.falseVal.get());
+    }
+    default: return false;
+    }
+}
+
+void CAstOptimizer::recognizeStackCanary(CFuncDecl& func) {
+    // Strategy 1: Direct canary save — var = *(type)(void*)0 + 40
+    std::string canaryVar;
+    for (size_t i = 0; i < std::min<size_t>(func.body.size(), 10); ++i) {
+        auto v = getCanarySaveVar(func.body[i].get());
+        if (!v.empty()) { canaryVar = v; break; }
+    }
+
+    if (!canaryVar.empty()) {
+        removeCanaryInStmts(func.body, canaryVar);
+        func.localVars.erase(
+            std::remove_if(func.localVars.begin(), func.localVars.end(),
+                [&](const CVarDecl& d) { return d.varName == canaryVar; }),
+            func.localVars.end());
+        return;
+    }
+
+    // Strategy 2: Match the check pattern directly.
+    // Look for: if (!(var - (*(type)(void*)0 + 40))) or similar
+    // Also remove __stack_chk_fail calls.
+    bool foundCanaryCheck = false;
+
+    for (size_t i = func.body.size(); i-- > 0;) {
+        if (!func.body[i]) continue;
+
+        // Remove __stack_chk_fail calls
+        if (isStackChkFail(func.body[i].get())) {
+            func.body.erase(func.body.begin() + static_cast<ptrdiff_t>(i));
+            foundCanaryCheck = true;
+            continue;
+        }
+
+        // Match if-statements whose condition contains *(type)(void*)0 + 40
+        if (func.body[i]->getKind() == NodeKind::IfStmt) {
+            auto& ifStmt = static_cast<CIfStmt&>(*func.body[i]);
+            if (containsCanaryRead(ifStmt.condition.get())) {
+                // The then-body is the normal return path — inline it
+                if (!ifStmt.thenBody.empty()) {
+                    auto thenBody = std::move(ifStmt.thenBody);
+                    func.body.erase(func.body.begin() + static_cast<ptrdiff_t>(i));
+                    func.body.insert(
+                        func.body.begin() + static_cast<ptrdiff_t>(i),
+                        std::make_move_iterator(thenBody.begin()),
+                        std::make_move_iterator(thenBody.end()));
+                } else {
+                    func.body.erase(func.body.begin() + static_cast<ptrdiff_t>(i));
+                }
+                foundCanaryCheck = true;
+                continue;
+            }
+        }
+    }
+
+    // If we found and removed a canary check, also try to remove the
+    // canary save.  The save is typically: var_90 = var_68 at function
+    // start, where var_68 was the original canary read that got
+    // copy-propagated away.  We remove it by looking for the first
+    // assignment in the body that assigns to a stack variable from
+    // another stack variable, where one of them is later unused.
+    // (Dead store elimination will handle this naturally.)
+    (void)foundCanaryCheck; // let DCE clean up remaining dead stores
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: reanalyzeConfidence — post-optimization confidence re-scoring
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Re-computes confidence score from the C AST after all optimization passes
+// have run.  This replaces the MLIR-based analysis from CAstBuilder which
+// runs before optimization and therefore over-reports issues.
+
+void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
+    double deduction = 0.0;
+    func.confidenceIssues.clear();
+
+    // ── Native opcodes (check for unmapped native call targets) ──────
+    // After decomposeNativeOpcodes runs, any remaining native instructions
+    // are renamed with __native_ prefix.  Anything else with the native-
+    // opcode name shape is also a candidate (catches missed cases).
+    unsigned nativeOps = 0;
+    auto isUnmappedNative = [](std::string_view name) -> bool {
+        if (name.starts_with("__native_")) return true;
+        return isNativeOpcodeName(name);
+    };
+    std::function<void(const std::vector<StmtPtr>&)> countNative;
+    countNative = [&](const std::vector<StmtPtr>& stmts) {
+        for (auto& sp : stmts) {
+            if (!sp) continue;
+            switch (sp->getKind()) {
+            case NodeKind::ExprStmt: {
+                auto& e = static_cast<const CExprStmt&>(*sp);
+                if (e.expr && e.expr->getKind() == NodeKind::CallExpr) {
+                    auto& call = static_cast<const CCallExpr&>(*e.expr);
+                    if (isUnmappedNative(call.targetName)) nativeOps++;
+                }
+                break;
+            }
+            case NodeKind::AssignStmt: {
+                auto& a = static_cast<const CAssignStmt&>(*sp);
+                if (a.value && a.value->getKind() == NodeKind::CallExpr) {
+                    auto& call = static_cast<const CCallExpr&>(*a.value);
+                    if (isUnmappedNative(call.targetName)) nativeOps++;
+                }
+                break;
+            }
+            case NodeKind::IfStmt: {
+                auto& s = static_cast<const CIfStmt&>(*sp);
+                countNative(s.thenBody);
+                countNative(s.elseBody);
+                break;
+            }
+            case NodeKind::WhileStmt:
+                countNative(static_cast<const CWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::DoWhileStmt:
+                countNative(static_cast<const CDoWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::ForStmt:
+                countNative(static_cast<const CForStmt&>(*sp).body);
+                break;
+            case NodeKind::SwitchStmt:
+                for (auto& c : static_cast<const CSwitchStmt&>(*sp).cases)
+                    countNative(c.body);
+                break;
+            case NodeKind::BlockStmt:
+                countNative(static_cast<const CBlockStmt&>(*sp).stmts);
+                break;
+            default: break;
+            }
+        }
+    };
+    countNative(func.body);
+    if (nativeOps > 0) {
+        deduction += std::min(30.0, (double)nativeOps * 3.0);
+        func.confidenceIssues.push_back(
+            std::format("{} native opcode(s) not decomposed", nativeOps));
+    }
+
+    // ── Register-named variables ─────────────────────────────────────
+    static const char* kRegs[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    };
+    unsigned regVars = 0;
+    for (auto& d : func.localVars) {
+        for (auto* r : kRegs) {
+            if (d.varName.starts_with(r)) { regVars++; break; }
+        }
+    }
+    if (regVars > 0) {
+        deduction += std::min(20.0, (double)regVars * 2.0);
+        func.confidenceIssues.push_back(
+            std::format("{} register-named variable(s)", regVars));
+    }
+
+    // ── Goto count ───────────────────────────────────────────────────
+    unsigned gotos = 0;
+    std::function<void(const std::vector<StmtPtr>&)> countGotos;
+    countGotos = [&](const std::vector<StmtPtr>& stmts) {
+        for (auto& sp : stmts) {
+            if (!sp) continue;
+            if (sp->getKind() == NodeKind::GotoStmt) { gotos++; continue; }
+            switch (sp->getKind()) {
+            case NodeKind::IfStmt: {
+                auto& s = static_cast<const CIfStmt&>(*sp);
+                countGotos(s.thenBody);
+                countGotos(s.elseBody);
+                break;
+            }
+            case NodeKind::WhileStmt:
+                countGotos(static_cast<const CWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::DoWhileStmt:
+                countGotos(static_cast<const CDoWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::ForStmt:
+                countGotos(static_cast<const CForStmt&>(*sp).body);
+                break;
+            default: break;
+            }
+        }
+    };
+    countGotos(func.body);
+    if (gotos > 0) {
+        deduction += std::min(20.0, (double)gotos * 2.0);
+        func.confidenceIssues.push_back(
+            std::format("{} goto(s)", gotos));
+    }
+
+    // ── Empty if/else blocks ─────────────────────────────────────────
+    unsigned emptyIfs = 0;
+    std::function<void(const std::vector<StmtPtr>&)> countEmpty;
+    countEmpty = [&](const std::vector<StmtPtr>& stmts) {
+        for (auto& sp : stmts) {
+            if (!sp) continue;
+            if (sp->getKind() == NodeKind::IfStmt) {
+                auto& s = static_cast<const CIfStmt&>(*sp);
+                if (s.thenBody.empty() && s.elseBody.empty()) emptyIfs++;
+                countEmpty(s.thenBody);
+                countEmpty(s.elseBody);
+            } else if (sp->getKind() == NodeKind::WhileStmt) {
+                countEmpty(static_cast<const CWhileStmt&>(*sp).body);
+            } else if (sp->getKind() == NodeKind::DoWhileStmt) {
+                countEmpty(static_cast<const CDoWhileStmt&>(*sp).body);
+            } else if (sp->getKind() == NodeKind::ForStmt) {
+                countEmpty(static_cast<const CForStmt&>(*sp).body);
+            }
+        }
+    };
+    countEmpty(func.body);
+    if (emptyIfs > 0) {
+        deduction += std::min(10.0, (double)emptyIfs * 2.0);
+        func.confidenceIssues.push_back(
+            std::format("{} empty if/else block(s)", emptyIfs));
+    }
+
+    // ── Stub / very short function ───────────────────────────────────
+    // Count total statements recursively (not just top-level body).
+    unsigned totalStmts = 0;
+    std::function<void(const std::vector<StmtPtr>&)> countStmts;
+    countStmts = [&](const std::vector<StmtPtr>& stmts) {
+        for (auto& sp : stmts) {
+            if (!sp) continue;
+            totalStmts++;
+            switch (sp->getKind()) {
+            case NodeKind::IfStmt: {
+                auto& s = static_cast<const CIfStmt&>(*sp);
+                countStmts(s.thenBody);
+                countStmts(s.elseBody);
+                break;
+            }
+            case NodeKind::WhileStmt:
+                countStmts(static_cast<const CWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::DoWhileStmt:
+                countStmts(static_cast<const CDoWhileStmt&>(*sp).body);
+                break;
+            case NodeKind::ForStmt:
+                countStmts(static_cast<const CForStmt&>(*sp).body);
+                break;
+            case NodeKind::SwitchStmt:
+                for (auto& c : static_cast<const CSwitchStmt&>(*sp).cases)
+                    countStmts(c.body);
+                break;
+            case NodeKind::BlockStmt:
+                countStmts(static_cast<const CBlockStmt&>(*sp).stmts);
+                break;
+            default: break;
+            }
+        }
+    };
+    countStmts(func.body);
+    if (totalStmts <= 3) {
+        deduction += 15.0;
+        func.confidenceIssues.push_back("stub function");
+    } else if (totalStmts <= 8) {
+        deduction += 5.0;
+        func.confidenceIssues.push_back("very short function");
+    }
+
+    // ── Lifter silent-bailout detection (bug F) ─────────────────────
+    //
+    // When Remill can't handle an opcode mid-function, it sometimes emits
+    // IR with just the prologue + the offending instruction, then stops.
+    // The resulting helix.c is a stub like:
+    //   CPlayerInfo_Process(void) { loop_while_ne(); return; }
+    // — a single opcode-like call followed by return, no real logic.
+    //
+    // Counts both undecomposed opcodes (`nativeOps > 0`) AND decomposed
+    // ones whose semantic-map name begins with a known "this-is-really-an-
+    // instruction-not-a-function" prefix (`fp_`, `loop_`, `port_`, `far_`,
+    // `string_`, `bit_scan_`, `bit_test_`, `pop_all_`, `push_all_`, etc.).
+    // A real tiny wrapper like `SetHealth(x) { field = x; return; }`
+    // doesn't hit this rule because it has an assignment, not an opcode.
+    unsigned opcodeCalls = nativeOps;
+    {
+        auto isOpcodeSemanticName = [](std::string_view name) -> bool {
+            static constexpr std::string_view kOpcodePrefixes[] = {
+                "fp_", "loop_", "port_in_", "port_out_",
+                "far_jump", "far_call", "far_return",
+                "string_compare_", "string_move_", "string_scan_",
+                "string_store", "string_load",
+                "pop_all_gprs", "push_all_gprs",
+                "pop_flags", "push_flags",
+                "load_flags_into_ah", "store_ah_to_flags",
+                "bit_scan_", "bit_test_",
+                "read_timestamp_counter", "cpuid",
+                "hardware_random", "hardware_random_seed",
+                "atomic_test_and_", "atomic_fetch_", "atomic_exchange",
+                "atomic_compare_exchange",
+                "sub_with_borrow", "add_with_carry",
+            };
+            for (auto p : kOpcodePrefixes)
+                if (name.starts_with(p)) return true;
+            return false;
+        };
+
+        std::function<void(const std::vector<StmtPtr>&)> countOpcodes;
+        countOpcodes = [&](const std::vector<StmtPtr>& stmts) {
+            for (auto& sp : stmts) {
+                if (!sp) continue;
+                switch (sp->getKind()) {
+                case NodeKind::ExprStmt: {
+                    auto& e = static_cast<const CExprStmt&>(*sp);
+                    if (e.expr && e.expr->getKind() == NodeKind::CallExpr) {
+                        auto& call = static_cast<const CCallExpr&>(*e.expr);
+                        if (isOpcodeSemanticName(call.targetName))
+                            ++opcodeCalls;
+                    }
+                    break;
+                }
+                case NodeKind::AssignStmt: {
+                    auto& a = static_cast<const CAssignStmt&>(*sp);
+                    if (a.value && a.value->getKind() == NodeKind::CallExpr) {
+                        auto& call = static_cast<const CCallExpr&>(*a.value);
+                        if (isOpcodeSemanticName(call.targetName))
+                            ++opcodeCalls;
+                    }
+                    break;
+                }
+                case NodeKind::IfStmt: {
+                    auto& s = static_cast<const CIfStmt&>(*sp);
+                    countOpcodes(s.thenBody);
+                    countOpcodes(s.elseBody);
+                    break;
+                }
+                case NodeKind::WhileStmt:
+                    countOpcodes(static_cast<const CWhileStmt&>(*sp).body);
+                    break;
+                case NodeKind::DoWhileStmt:
+                    countOpcodes(static_cast<const CDoWhileStmt&>(*sp).body);
+                    break;
+                case NodeKind::ForStmt:
+                    countOpcodes(static_cast<const CForStmt&>(*sp).body);
+                    break;
+                case NodeKind::BlockStmt:
+                    countOpcodes(static_cast<const CBlockStmt&>(*sp).stmts);
+                    break;
+                default: break;
+                }
+            }
+        };
+        countOpcodes(func.body);
+    }
+
+    if (totalStmts <= 3 && opcodeCalls > 0) {
+        deduction += 40.0;
+        func.confidenceIssues.push_back(
+            "possibly truncated by lifter — body is a single undecomposed "
+            "opcode; Remill may have bailed mid-function");
+    }
+
+    // ── Undeclared variable references (bug C) ──────────────────────
+    //
+    // SSA destruction sometimes produces VarRef nodes that reference
+    // names (`v0`, `param_2`, `result`) without a matching decl in
+    // `func.localVars` or `func.params`.  The resulting C is not
+    // compilable.  Count them and heavily penalise confidence.
+    {
+        std::unordered_set<std::string> declaredNames;
+        for (auto& p : func.params)    declaredNames.insert(p.name);
+        for (auto& d : func.localVars) declaredNames.insert(d.varName);
+
+        std::unordered_set<std::string> referenced;
+        collectVarNamesInStmts(func.body, referenced);
+
+        // Same filter as `declareUndeclaredVars` — a name has to be a
+        // valid C identifier AND not one of the stack-bookkeeping
+        // pseudo-names the printer still surfaces on occasion.  Keeps
+        // the two passes in lockstep so the confidence Issue never
+        // fires after the decl-injection pass has run.
+        auto isValidCIdent = [](std::string_view n) -> bool {
+            if (n.empty()) return false;
+            char c0 = n.front();
+            if (!((c0 >= 'A' && c0 <= 'Z') ||
+                  (c0 >= 'a' && c0 <= 'z') ||
+                  c0 == '_'))
+                return false;
+            for (size_t i = 1; i < n.size(); ++i) {
+                char c = n[i];
+                if (!((c >= 'A' && c <= 'Z') ||
+                      (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') ||
+                      c == '_'))
+                    return false;
+            }
+            return true;
+        };
+
+        unsigned undeclared = 0;
+        for (auto& n : referenced) {
+            if (n == "rsp" || n == "rbp" || n == "esp" || n == "ebp")
+                continue;
+            if (!isValidCIdent(n))
+                continue;
+            if (!declaredNames.count(n))
+                ++undeclared;
+        }
+        if (undeclared > 0) {
+            deduction += std::min(40.0, 6.0 + 4.0 * (double)undeclared);
+            func.confidenceIssues.push_back(
+                std::format("{} reference(s) to undeclared variable(s)"
+                            " — output does not compile",
+                            undeclared));
+        }
+    }
+
+    // ── Synthesised-variable smell (FIX-045) ────────────────────────
+    //
+    // `declareUndeclaredVars` (FIX-043) injects placeholder decls for
+    // names the body referenced without a matching declaration.  After
+    // the pass runs the output compiles, but a high count of synthetic
+    // decls is still a strong signal of lift-quality issues — SSA
+    // destruction gaps, or (file 14 of the gta-sa stress set) data
+    // bytes Remill lifted as if they were code.  Penalise proportional
+    // to the count but less harshly than the raw-undeclared case (which
+    // literally breaks compilation).  The Issue wording makes it clear
+    // these were auto-declared so the user knows to cross-reference
+    // against IDA.
+    if (func.synthesizedVarDecls > 0) {
+        unsigned n = func.synthesizedVarDecls;
+        deduction += std::min(25.0, 3.0 + 2.5 * (double)n);
+        func.confidenceIssues.push_back(
+            std::format("{} auto-declared placeholder variable(s)"
+                        " — lift-quality concern; verify against IDA",
+                        n));
+    }
+
+    // ── Typed parameter bonus ────────────────────────────────────────
+    if (!func.params.empty()) {
+        unsigned typedParams = 0;
+        for (auto& p : func.params) {
+            if (p.type) {
+                auto typeName = p.type->format();
+                if (typeName != "int64_t" && typeName != "uint64_t")
+                    typedParams++;
+            }
+        }
+        if (typedParams > 0) {
+            double bonus = std::min(5.0,
+                (double)typedParams / (double)func.params.size() * 5.0);
+            deduction -= bonus;
+        }
+    }
+
+    func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeUnusedDeclarations — drop variable declarations with no references
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// After dead code removal and other optimizations, some variables may no
+// longer be referenced in the function body.  Remove their declarations
+// to reduce clutter in the output.
+
+void CAstOptimizer::removeUnusedDeclarations(CFuncDecl& func) {
+    // Collect all variable names referenced in the body.
+    std::unordered_set<std::string> referencedVars;
+    collectVarNamesInStmts(func.body, referencedVars);
+
+    // Remove declarations for variables not referenced in the body.
+    func.localVars.erase(
+        std::remove_if(func.localVars.begin(), func.localVars.end(),
+            [&](const CVarDecl& d) {
+                return !referencedVars.count(d.varName);
+            }),
+        func.localVars.end());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeDeadStoresBeforeReturn — strip trailing var = const before return
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Pattern: var_X = <constant>; return Y;
+// where var_X is never read elsewhere in the function.  These are dead
+// stores that the generic DSE may miss because of conservative liveness
+// across nested scopes.
+
+static void removeDeadStoresBeforeReturnInList(
+    std::vector<StmtPtr>& stmts,
+    const std::unordered_map<std::string, unsigned>& globalRefCount) {
+    // Recurse into nested scopes first.
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            removeDeadStoresBeforeReturnInList(s.thenBody, globalRefCount);
+            removeDeadStoresBeforeReturnInList(s.elseBody, globalRefCount);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            removeDeadStoresBeforeReturnInList(
+                static_cast<CWhileStmt&>(*sp).body, globalRefCount);
+            break;
+        case NodeKind::DoWhileStmt:
+            removeDeadStoresBeforeReturnInList(
+                static_cast<CDoWhileStmt&>(*sp).body, globalRefCount);
+            break;
+        case NodeKind::ForStmt:
+            removeDeadStoresBeforeReturnInList(
+                static_cast<CForStmt&>(*sp).body, globalRefCount);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                removeDeadStoresBeforeReturnInList(c.body, globalRefCount);
+            break;
+        case NodeKind::BlockStmt:
+            removeDeadStoresBeforeReturnInList(
+                static_cast<CBlockStmt&>(*sp).stmts, globalRefCount);
+            break;
+        default: break;
+        }
+    }
+
+    // Walk the list backward, looking for return statements preceded by
+    // dead stores.
+    for (size_t i = stmts.size(); i-- > 0;) {
+        if (!stmts[i] || stmts[i]->getKind() != NodeKind::ReturnStmt)
+            continue;
+
+        // Walk backward from i-1, removing trivially dead stores.
+        for (size_t j = i; j-- > 0;) {
+            if (!stmts[j]) continue;
+            if (stmts[j]->getKind() != NodeKind::AssignStmt) break;
+
+            auto& a = static_cast<CAssignStmt&>(*stmts[j]);
+            if (!a.target || !a.value) break;
+            if (a.target->getKind() != NodeKind::VarRefExpr) break;
+
+            // Don't touch unsafe targets.
+            if (a.value->getKind() == NodeKind::CallExpr) break;
+
+            const auto& tgt =
+                static_cast<const CVarRefExpr&>(*a.target).varName;
+
+            // Skip if the variable has any read references in the function
+            // (countVarRefs counts only READS, not write targets, so the
+            // map count == 0 means "no reads anywhere" → safe to remove).
+            auto it = globalRefCount.find(tgt);
+            unsigned readCount = (it == globalRefCount.end()) ? 0 : it->second;
+            if (readCount > 0) break;  // has reads → not dead
+
+            // No reads anywhere → safe to remove the trailing store.
+            stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(j));
+            // Update i since j was just erased.
+            i--;
+        }
+    }
+}
+
+void CAstOptimizer::removeDeadStoresBeforeReturn(CFuncDecl& func) {
+    // Build a global reference count map.
+    std::unordered_map<std::string, unsigned> refCount;
+    countVarRefs(func.body, refCount);
+    removeDeadStoresBeforeReturnInList(func.body, refCount);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeAdjacentDuplicateStmts — collapse consecutive identical stmts
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Pattern:
+//   mutex_unlock(var_70);
+//   mutex_unlock(var_70);    ← duplicate, remove
+//
+// Caused by structural duplication during CFG flattening or copy propagation.
+
+static bool exprEqual(const CExpr* a, const CExpr* b);
+
+static bool stmtsEqual(const CStmt* a, const CStmt* b) {
+    if (!a || !b) return false;
+    if (a->getKind() != b->getKind()) return false;
+    switch (a->getKind()) {
+    case NodeKind::ExprStmt: {
+        auto& ea = static_cast<const CExprStmt&>(*a);
+        auto& eb = static_cast<const CExprStmt&>(*b);
+        return exprEqual(ea.expr.get(), eb.expr.get());
+    }
+    case NodeKind::AssignStmt: {
+        auto& aa = static_cast<const CAssignStmt&>(*a);
+        auto& ab = static_cast<const CAssignStmt&>(*b);
+        return exprEqual(aa.target.get(), ab.target.get()) &&
+               exprEqual(aa.value.get(), ab.value.get());
+    }
+    default: return false;
+    }
+}
+
+static bool exprEqual(const CExpr* a, const CExpr* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->getKind() != b->getKind()) return false;
+    switch (a->getKind()) {
+    case NodeKind::IntLitExpr: {
+        auto& la = static_cast<const CIntLitExpr&>(*a);
+        auto& lb = static_cast<const CIntLitExpr&>(*b);
+        return la.value == lb.value;
+    }
+    case NodeKind::VarRefExpr: {
+        auto& va = static_cast<const CVarRefExpr&>(*a);
+        auto& vb = static_cast<const CVarRefExpr&>(*b);
+        return va.varName == vb.varName;
+    }
+    case NodeKind::BinaryExpr: {
+        auto& ba = static_cast<const CBinaryExpr&>(*a);
+        auto& bb = static_cast<const CBinaryExpr&>(*b);
+        return ba.op == bb.op &&
+               exprEqual(ba.lhs.get(), bb.lhs.get()) &&
+               exprEqual(ba.rhs.get(), bb.rhs.get());
+    }
+    case NodeKind::UnaryExpr: {
+        auto& ua = static_cast<const CUnaryExpr&>(*a);
+        auto& ub = static_cast<const CUnaryExpr&>(*b);
+        return ua.op == ub.op &&
+               exprEqual(ua.operand.get(), ub.operand.get());
+    }
+    case NodeKind::CastExpr: {
+        auto& ca = static_cast<const CCastExpr&>(*a);
+        auto& cb = static_cast<const CCastExpr&>(*b);
+        return exprEqual(ca.operand.get(), cb.operand.get());
+    }
+    case NodeKind::CallExpr: {
+        auto& ca = static_cast<const CCallExpr&>(*a);
+        auto& cb = static_cast<const CCallExpr&>(*b);
+        if (ca.targetName != cb.targetName) return false;
+        if (ca.args.size() != cb.args.size()) return false;
+        for (size_t i = 0; i < ca.args.size(); ++i) {
+            if (!exprEqual(ca.args[i].get(), cb.args[i].get())) return false;
+        }
+        return true;
+    }
+    case NodeKind::FieldAccessExpr: {
+        auto& fa = static_cast<const CFieldAccessExpr&>(*a);
+        auto& fb = static_cast<const CFieldAccessExpr&>(*b);
+        return fa.fieldName == fb.fieldName &&
+               exprEqual(fa.base.get(), fb.base.get());
+    }
+    case NodeKind::SubscriptExpr: {
+        auto& sa = static_cast<const CSubscriptExpr&>(*a);
+        auto& sb = static_cast<const CSubscriptExpr&>(*b);
+        return exprEqual(sa.base.get(), sb.base.get()) &&
+               exprEqual(sa.index.get(), sb.index.get());
+    }
+    default: return false;
+    }
+}
+
+static void removeDuplicatesInList(std::vector<StmtPtr>& stmts) {
+    // Recurse first.
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            removeDuplicatesInList(s.thenBody);
+            removeDuplicatesInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            removeDuplicatesInList(static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            removeDuplicatesInList(static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            removeDuplicatesInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                removeDuplicatesInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            removeDuplicatesInList(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default: break;
+        }
+    }
+
+    // Now scan for adjacent duplicate ExprStmts.  Two adjacent identical
+    // call statements can be safely collapsed only if removing one
+    // preserves program semantics in ALL cases.  We use a conservative
+    // rule: collapse only when ALL arguments to the call are LITERAL
+    // CONSTANTS (no variable references, no side-effecting expressions).
+    //
+    // Rationale: a call with all-literal arguments has no dependency on
+    // program state between the two invocations, so a duplicate is
+    // provably equivalent to the single call (e.g., `kfree(0); kfree(0);`).
+    // Calls with variable arguments may have meaning (mutex_unlock
+    // bracketing, lock acquisition patterns, hardware MMIO writes) that
+    // would be broken by removing duplicates.  We leave them alone.
+    auto allArgsLiteral = [](const CCallExpr& call) -> bool {
+        for (const auto& arg : call.args) {
+            if (!arg) continue;
+            auto k = arg->getKind();
+            if (k != NodeKind::IntLitExpr &&
+                k != NodeKind::FloatLitExpr &&
+                k != NodeKind::StringLitExpr &&
+                k != NodeKind::AddrLitExpr) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (size_t i = 0; i + 1 < stmts.size();) {
+        if (!stmts[i] || !stmts[i + 1]) { ++i; continue; }
+        if (stmts[i]->getKind() != NodeKind::ExprStmt ||
+            stmts[i + 1]->getKind() != NodeKind::ExprStmt) {
+            ++i; continue;
+        }
+        auto& a = static_cast<const CExprStmt&>(*stmts[i]);
+        auto& b = static_cast<const CExprStmt&>(*stmts[i + 1]);
+        if (!a.expr || !b.expr) { ++i; continue; }
+        if (a.expr->getKind() != NodeKind::CallExpr) { ++i; continue; }
+        if (!exprEqual(a.expr.get(), b.expr.get())) { ++i; continue; }
+
+        const auto& call = static_cast<const CCallExpr&>(*a.expr);
+        if (!allArgsLiteral(call)) { ++i; continue; }
+
+        // Safe to remove the duplicate.
+        stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i + 1));
+        // Don't increment i — re-check this position in case there's
+        // a triple.
+    }
+
+    // ── FIX-049 (Wave 11, item D — same-origin duplicate call emission) ──
+    //
+    // Scan for the pattern:
+    //     foo(x, y);           // CExprStmt  (line N, addr A)
+    //     v = foo(x, y);       // CAssignStmt(value = CCallExpr, addr A)
+    //
+    // where BOTH statements originate from the SAME MLIR high::CallOp
+    // (i.e., they carry the same `.address` — the lifted binary PC).
+    // This pattern is a well-known side-effect of FIX-031's synthetic-RAX-
+    // RegWrite companion: the CallOp emits as an expression statement for
+    // its side effects AND as the value of an assignment capturing the
+    // return register.  Two textual statements, one MLIR origin.
+    //
+    // Safety conditions (ALL must hold):
+    //   1. Statement i is CExprStmt with a CCallExpr value.
+    //   2. Statement i+1 is CAssignStmt whose .value is CCallExpr.
+    //   3. The two CCallExprs are `exprEqual` (same name + same arg tree).
+    //   4. Both statements have the same non-zero `address`.  Zero-valued
+    //      addresses are rejected because address=0 is Helix's "unknown
+    //      origin" sentinel; two such stmts may well be distinct MLIR ops.
+    //   5. The assignment target is a simple VarRefExpr (not a deref/field)
+    //      so dropping the ExprStmt cannot cancel an lvalue side effect.
+    //
+    // Observed impact (corpus snapshot, pre-FIX-049):
+    //     kbase_jit_allocate : 12 pairs  → -12 lines
+    //     kbase_mem_alloc    :  7 pairs  → -7
+    //     kbase_mem_commit   :  4 pairs  → -4
+    //     kbase_mem_import   :  1 pair
+    //     Recoil-mulss-region:  1 pair
+    //     sub_140013adc      :  2 pairs
+    // All other baseline corpora: 0 pairs (zero regression risk).
+    for (size_t i = 0; i + 1 < stmts.size();) {
+        if (!stmts[i] || !stmts[i + 1]) { ++i; continue; }
+        if (stmts[i]->getKind() != NodeKind::ExprStmt ||
+            stmts[i + 1]->getKind() != NodeKind::AssignStmt) {
+            ++i; continue;
+        }
+        auto& exprStmt = static_cast<const CExprStmt&>(*stmts[i]);
+        auto& assignStmt = static_cast<const CAssignStmt&>(*stmts[i + 1]);
+        if (!exprStmt.expr || !assignStmt.value || !assignStmt.target) {
+            ++i; continue;
+        }
+        if (exprStmt.expr->getKind() != NodeKind::CallExpr ||
+            assignStmt.value->getKind() != NodeKind::CallExpr) {
+            ++i; continue;
+        }
+        if (!exprEqual(exprStmt.expr.get(), assignStmt.value.get())) {
+            ++i; continue;
+        }
+        const auto& callA =
+            static_cast<const CCallExpr&>(*exprStmt.expr);
+        const auto& callB =
+            static_cast<const CCallExpr&>(*assignStmt.value);
+        // If the two CCallExpr nodes carry different non-zero addresses
+        // they're distinct call sites in the binary — preserve both.
+        // When either address is 0 (emitter didn't carry it through) the
+        // fact that they are (a) exprEqual, (b) adjacent statements with
+        // (c) ExprStmt→AssignStmt shape is strong enough evidence of
+        // the FIX-031 double-emit artifact on its own.
+        if (callA.getAddress() != 0 && callB.getAddress() != 0 &&
+            callA.getAddress() != callB.getAddress()) {
+            ++i; continue;
+        }
+        (void)callA; (void)callB; // suppress unused warning
+        // Target must be a plain variable.  Dropping an ExprStmt whose
+        // twin assigns into a deref or field is risky if the address
+        // expression has side effects; easier to just skip.
+        if (assignStmt.target->getKind() != NodeKind::VarRefExpr) {
+            ++i; continue;
+        }
+        // Safe: drop the orphan ExprStmt.  The assignment will stand as
+        // the single emission for this CallOp.
+        stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+        // Don't increment i — the newly-shifted stmt[i] may itself be
+        // the prelude of another duplicate pair (unlikely but cheap).
+    }
+}
+
+void CAstOptimizer::removeAdjacentDuplicateStmts(CFuncDecl& func) {
+    removeDuplicatesInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: cleanupParameterSSASuffixes — rename param_X_N to vN
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When a parameter is reassigned, the SSA splitting pass creates suffixed
+// versions like param_1_7, param_3_1.  These should be renamed to clean
+// vN names since they represent local variables that just happen to be
+// derived from a parameter.
+
+void CAstOptimizer::cleanupParameterSSASuffixes(CFuncDecl& func) {
+    // Build a set of parameter names to recognize their suffixed versions.
+    std::unordered_set<std::string> paramNames;
+    for (const auto& p : func.params)
+        paramNames.insert(p.name);
+
+    // Collect existing names.
+    std::unordered_set<std::string> usedNames;
+    for (auto& d : func.localVars) usedNames.insert(d.varName);
+    for (auto& p : func.params)    usedNames.insert(p.name);
+
+    unsigned nextId = 1;
+    auto makeUnique = [&]() -> std::string {
+        while (true) {
+            auto name = "v" + std::to_string(nextId++);
+            if (!usedNames.count(name)) {
+                usedNames.insert(name);
+                return name;
+            }
+        }
+    };
+
+    // Helper: check if a name is "param_<digits>_<digits>" (SSA suffix).
+    auto isSuffixedParam = [&paramNames](const std::string& name) -> bool {
+        if (!name.starts_with("param_")) return false;
+        // Find first underscore after "param_"
+        size_t lastUnderscore = name.rfind('_');
+        if (lastUnderscore <= 5) return false;  // "param_" already has _
+        // Verify the suffix is digits.
+        for (size_t i = lastUnderscore + 1; i < name.size(); ++i) {
+            if (!isdigit(static_cast<unsigned char>(name[i]))) return false;
+        }
+        // Verify the part before the last underscore is "param_<digits>"
+        // (a real parameter name).
+        std::string base = name.substr(0, lastUnderscore);
+        return paramNames.count(base) > 0;
+    };
+
+    // Phase 1: collect varNames in body that look like SSA-suffixed params.
+    std::unordered_set<std::string> bodyNames;
+    collectVarNamesInStmts(func.body, bodyNames);
+
+    // Phase 2: rename declared SSA-suffixed params.
+    for (auto& d : func.localVars) {
+        if (!isSuffixedParam(d.varName)) continue;
+        std::string oldName = d.varName;
+        std::string newName = makeUnique();
+        applyRenameInStmts(func.body, oldName, newName);
+        d.varName = newName;
+    }
+
+    // Phase 3: rename body-only SSA-suffixed params (no local declaration).
+    for (auto& name : bodyNames) {
+        if (usedNames.count(name)) continue;
+        if (!isSuffixedParam(name)) continue;
+        std::string newName = makeUnique();
+        applyRenameInStmts(func.body, name, newName);
+
+        uint32_t varId = 90000 + static_cast<uint32_t>(func.localVars.size());
+        func.localVars.emplace_back(varId, newName, CType::int64());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: narrowVariableTypes — narrow declarations based on actual use
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// If an int64_t variable is ALWAYS read with a narrowing cast (e.g., always
+// `(int16_t)var` or `(int8_t)var`), narrow the declaration accordingly.
+// This makes the output more accurate.
+
+void CAstOptimizer::narrowVariableTypes(CFuncDecl& func) {
+    // Skip — this is a non-trivial analysis that requires us to track ALL
+    // reads of each variable and see if they're always wrapped in casts.
+    // For now, this is a placeholder.  The narrowing analysis is left for
+    // future work because it requires careful handling of pointer-typed
+    // variables (where casts indicate type confusion, not narrowing) and
+    // assignment targets (which determine the storage type).
+    (void)func;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: resolveFramePointerLeaks — convert `var ± const` to `&var_X`
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When the lifter doesn't fully resolve frame pointer references, expressions
+// like `v12 - 64` (where v12 is rbp and 64 matches a known stack variable
+// offset) leak into the C output as raw arithmetic.  These should be
+// `&var_40` (the address of the stack variable at offset -0x40).
+//
+// Detection heuristic:
+//   1. The variable being subtracted is a body-only register-derived var
+//      (created by renameRemainingRegisterVars Phase 2 — vN with no semantic
+//      origin, declared as int64_t).
+//   2. The constant matches a known stack variable offset.
+//
+// Replacement: replace the arithmetic expression with `&<var_name>`.
+
+static ExprPtr tryResolveFrameRefExpr(
+    ExprPtr expr,
+    const std::map<int64_t, std::string>& offsetToVarName,
+    const std::unordered_set<std::string>& candidateFrameVars);
+
+/// Recursively walk an expression tree, but ONLY transform `var ± const`
+/// to `&var_X` when the expression appears as a function CALL ARGUMENT.
+/// In arithmetic contexts (operands of +, -, *, etc.), the substitution
+/// would change semantics: `x -= rbp - 128` is computing `x - (size)128`,
+/// not `x - &var_80`.  Only call argument positions are unambiguously
+/// "address-of stack var" contexts.
+static void resolveFrameRefsInExpr(
+    ExprPtr& slot,
+    const std::map<int64_t, std::string>& offsetToVarName,
+    const std::unordered_set<std::string>& candidateFrameVars,
+    bool inArgPosition);
+
+static void resolveFrameRefsInChildren(
+    CExpr* expr,
+    const std::map<int64_t, std::string>& offsetToVarName,
+    const std::unordered_set<std::string>& candidateFrameVars) {
+    if (!expr) return;
+    switch (expr->getKind()) {
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<CBinaryExpr&>(*expr);
+        // Operands of arithmetic ops are NOT in argument position.
+        resolveFrameRefsInExpr(b.lhs, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        resolveFrameRefsInExpr(b.rhs, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        break;
+    }
+    case NodeKind::UnaryExpr: {
+        auto& u = static_cast<CUnaryExpr&>(*expr);
+        resolveFrameRefsInExpr(u.operand, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        break;
+    }
+    case NodeKind::CastExpr: {
+        auto& c = static_cast<CCastExpr&>(*expr);
+        resolveFrameRefsInExpr(c.operand, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        break;
+    }
+    case NodeKind::CallExpr: {
+        auto& c = static_cast<CCallExpr&>(*expr);
+        // Function call args ARE in argument position — eligible for
+        // frame pointer leak resolution.
+        for (auto& arg : c.args)
+            resolveFrameRefsInExpr(arg, offsetToVarName, candidateFrameVars,
+                                    /*inArgPosition=*/true);
+        break;
+    }
+    case NodeKind::FieldAccessExpr: {
+        auto& f = static_cast<CFieldAccessExpr&>(*expr);
+        // Base of field access is dereferenced — pointer context.
+        resolveFrameRefsInExpr(f.base, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        break;
+    }
+    case NodeKind::SubscriptExpr: {
+        auto& s = static_cast<CSubscriptExpr&>(*expr);
+        resolveFrameRefsInExpr(s.base, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        resolveFrameRefsInExpr(s.index, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        break;
+    }
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<CTernaryExpr&>(*expr);
+        resolveFrameRefsInExpr(t.cond, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        resolveFrameRefsInExpr(t.trueVal, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        resolveFrameRefsInExpr(t.falseVal, offsetToVarName, candidateFrameVars,
+                                /*inArgPosition=*/false);
+        break;
+    }
+    default: break;
+    }
+}
+
+static void resolveFrameRefsInExpr(
+    ExprPtr& slot,
+    const std::map<int64_t, std::string>& offsetToVarName,
+    const std::unordered_set<std::string>& candidateFrameVars,
+    bool inArgPosition) {
+    if (!slot) return;
+
+    // First recurse into children.
+    resolveFrameRefsInChildren(slot.get(), offsetToVarName, candidateFrameVars);
+
+    // Only attempt the conversion if we're in argument position.
+    // Otherwise, the `var ± const` expression is meaningful arithmetic
+    // (size/offset computation) and should be left alone.
+    if (!inArgPosition) return;
+
+    auto resolved = tryResolveFrameRefExpr(
+        std::move(slot), offsetToVarName, candidateFrameVars);
+    slot = std::move(resolved);
+}
+
+static ExprPtr tryResolveFrameRefExpr(
+    ExprPtr expr,
+    const std::map<int64_t, std::string>& offsetToVarName,
+    const std::unordered_set<std::string>& candidateFrameVars) {
+    if (!expr || expr->getKind() != NodeKind::BinaryExpr)
+        return expr;
+
+    auto& bin = static_cast<CBinaryExpr&>(*expr);
+    if (bin.op != BinaryOp::Add && bin.op != BinaryOp::Sub)
+        return expr;
+
+    // The LHS must be a candidate frame pointer variable.
+    if (!bin.lhs || bin.lhs->getKind() != NodeKind::VarRefExpr)
+        return expr;
+    const auto& var = static_cast<const CVarRefExpr&>(*bin.lhs);
+    if (!candidateFrameVars.count(var.varName))
+        return expr;
+
+    // The RHS must be a constant integer.
+    if (!bin.rhs || bin.rhs->getKind() != NodeKind::IntLitExpr)
+        return expr;
+    int64_t constant = static_cast<const CIntLitExpr&>(*bin.rhs).value;
+
+    // Compute the effective stack offset.
+    int64_t effectiveOffset = (bin.op == BinaryOp::Sub)
+        ? -constant
+        : constant;
+
+    // Look up the offset in the known stack variables.
+    auto it = offsetToVarName.find(effectiveOffset);
+    if (it == offsetToVarName.end())
+        return expr;
+
+    // Build &var_X using AddressOf wrapping a VarRefExpr.
+    auto varRef = std::make_unique<CVarRefExpr>(
+        /*varId=*/0,
+        it->second,
+        CType::voidPtr(),
+        expr->getAddress());
+    return std::make_unique<CUnaryExpr>(
+        UnaryOp::AddressOf,
+        std::move(varRef),
+        CType::voidPtr(),
+        expr->getAddress());
+}
+
+static void resolveFrameRefsInStmts(
+    std::vector<StmtPtr>& stmts,
+    const std::map<int64_t, std::string>& offsetToVarName,
+    const std::unordered_set<std::string>& candidateFrameVars) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::AssignStmt: {
+            auto& a = static_cast<CAssignStmt&>(*sp);
+            // Top-level assignment RHS is NOT in arg position; the recursive
+            // walker will descend into any nested CallExpr::args and set
+            // inArgPosition=true there.
+            resolveFrameRefsInExpr(a.value, offsetToVarName, candidateFrameVars,
+                                    /*inArgPosition=*/false);
+            break;
+        }
+        case NodeKind::ExprStmt:
+            resolveFrameRefsInExpr(
+                static_cast<CExprStmt&>(*sp).expr,
+                offsetToVarName, candidateFrameVars,
+                /*inArgPosition=*/false);
+            break;
+        case NodeKind::ReturnStmt:
+            resolveFrameRefsInExpr(
+                static_cast<CReturnStmt&>(*sp).value,
+                offsetToVarName, candidateFrameVars,
+                /*inArgPosition=*/false);
+            break;
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            resolveFrameRefsInExpr(s.condition, offsetToVarName, candidateFrameVars,
+                                    /*inArgPosition=*/false);
+            resolveFrameRefsInStmts(s.thenBody, offsetToVarName, candidateFrameVars);
+            resolveFrameRefsInStmts(s.elseBody, offsetToVarName, candidateFrameVars);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            auto& s = static_cast<CWhileStmt&>(*sp);
+            resolveFrameRefsInExpr(s.condition, offsetToVarName, candidateFrameVars,
+                                    /*inArgPosition=*/false);
+            resolveFrameRefsInStmts(s.body, offsetToVarName, candidateFrameVars);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& s = static_cast<CDoWhileStmt&>(*sp);
+            resolveFrameRefsInExpr(s.condition, offsetToVarName, candidateFrameVars,
+                                    /*inArgPosition=*/false);
+            resolveFrameRefsInStmts(s.body, offsetToVarName, candidateFrameVars);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            auto& s = static_cast<CForStmt&>(*sp);
+            resolveFrameRefsInExpr(s.condition, offsetToVarName, candidateFrameVars,
+                                    /*inArgPosition=*/false);
+            resolveFrameRefsInStmts(s.body, offsetToVarName, candidateFrameVars);
+            break;
+        }
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                resolveFrameRefsInStmts(c.body, offsetToVarName, candidateFrameVars);
+            break;
+        case NodeKind::BlockStmt:
+            resolveFrameRefsInStmts(
+                static_cast<CBlockStmt&>(*sp).stmts,
+                offsetToVarName, candidateFrameVars);
+            break;
+        default: break;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: splitVariablesByType — TIE-style type-aware variable splitting
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When a single variable is assigned from sources with conflicting semantic
+// types over its lifetime (e.g., a field access producing a pointer, then an
+// arithmetic result producing an integer), split it into multiple variables.
+// Each "lifetime" gets its own variable with the appropriate type semantics.
+//
+// Reference: TIE (Lee/Avgerinos/Brumley 2011), §5.1 — SSA reconstruction with
+// type-aware lifetime splitting.
+//
+// Algorithm:
+//   1. Walk function body in order, tracking each variable's "current type"
+//      based on the most recent assignment's RHS.
+//   2. When an assignment's RHS type differs from the variable's current
+//      type AND the previous type was non-trivial (pointer or value), the
+//      assignment starts a new "lifetime".
+//   3. Rename the new lifetime to a fresh variable name.
+//   4. Forward-rename all subsequent uses until the next assignment that
+//      restores or changes the type again.
+
+namespace {
+
+enum class ValueTypeKind : uint8_t {
+    Unknown,
+    Pointer,   // result of field access, deref, &var, address-like
+    Integer,   // result of arithmetic, comparison, integer literal
+};
+
+/// Infer the semantic type of an expression's value.
+ValueTypeKind inferValueType(const CExpr* expr) {
+    if (!expr) return ValueTypeKind::Unknown;
+    switch (expr->getKind()) {
+    case NodeKind::IntLitExpr:
+        // Treat large literals (likely addresses) as pointers, small as int.
+        // For safety, treat all integer literals as Unknown — they could be
+        // either pointer or value depending on context.
+        return ValueTypeKind::Unknown;
+
+    case NodeKind::AddrLitExpr:
+        return ValueTypeKind::Pointer;
+
+    case NodeKind::FieldAccessExpr:
+        // Field access RESULT is pointer-like only if the field's type is
+        // a pointer.  Without type info, conservatively treat as Unknown
+        // (the result could be any field type — int, char, pointer, etc.)
+        return ValueTypeKind::Unknown;
+
+    case NodeKind::UnaryExpr: {
+        const auto& u = static_cast<const CUnaryExpr&>(*expr);
+        if (u.op == UnaryOp::AddressOf) return ValueTypeKind::Pointer;
+        if (u.op == UnaryOp::Deref)     return ValueTypeKind::Unknown;
+        // Negation, bitwise not, logical not → integer
+        if (u.op == UnaryOp::Neg || u.op == UnaryOp::BitNot ||
+            u.op == UnaryOp::LogNot)
+            return ValueTypeKind::Integer;
+        return ValueTypeKind::Unknown;
+    }
+
+    case NodeKind::BinaryExpr: {
+        const auto& b = static_cast<const CBinaryExpr&>(*expr);
+        // Comparisons → integer (boolean)
+        if (b.op == BinaryOp::Eq || b.op == BinaryOp::Ne ||
+            b.op == BinaryOp::Lt || b.op == BinaryOp::Le ||
+            b.op == BinaryOp::Gt || b.op == BinaryOp::Ge ||
+            b.op == BinaryOp::LogAnd || b.op == BinaryOp::LogOr)
+            return ValueTypeKind::Integer;
+        // Pure bitwise ops → integer
+        if (b.op == BinaryOp::BitAnd || b.op == BinaryOp::BitOr ||
+            b.op == BinaryOp::BitXor || b.op == BinaryOp::Shl ||
+            b.op == BinaryOp::Shr || b.op == BinaryOp::Sar ||
+            b.op == BinaryOp::Mul || b.op == BinaryOp::Div ||
+            b.op == BinaryOp::Mod)
+            return ValueTypeKind::Integer;
+        // Add/Sub: pointer arithmetic preserves pointer type, but plain
+        // int arithmetic produces int.  Without precise type info, return
+        // Unknown.
+        return ValueTypeKind::Unknown;
+    }
+
+    case NodeKind::CastExpr:
+        // The result type is whatever we cast to — recurse on the operand.
+        return inferValueType(static_cast<const CCastExpr&>(*expr).operand.get());
+
+    case NodeKind::CallExpr:
+        // Call results are typed by their return type — without that info,
+        // we treat as Unknown.  Could be pointer or value.
+        return ValueTypeKind::Unknown;
+
+    case NodeKind::VarRefExpr:
+        // Plain variable reference — type is determined by the variable.
+        return ValueTypeKind::Unknown;
+
+    default:
+        return ValueTypeKind::Unknown;
+    }
+}
+
+/// Determine how a variable is being USED at a specific reference site.
+/// Returns Pointer if the use is dereferencing, field access base, etc.
+/// Returns Integer if the use is in arithmetic/comparison.
+/// Returns Unknown otherwise.
+ValueTypeKind classifyVarUse(const CExpr* parent, const CExpr* varRef) {
+    if (!parent) return ValueTypeKind::Unknown;
+    switch (parent->getKind()) {
+    case NodeKind::UnaryExpr: {
+        const auto& u = static_cast<const CUnaryExpr&>(*parent);
+        if (u.operand.get() == varRef && u.op == UnaryOp::Deref)
+            return ValueTypeKind::Pointer;
+        return ValueTypeKind::Unknown;
+    }
+    case NodeKind::FieldAccessExpr: {
+        const auto& f = static_cast<const CFieldAccessExpr&>(*parent);
+        if (f.base.get() == varRef)
+            return ValueTypeKind::Pointer;
+        return ValueTypeKind::Unknown;
+    }
+    case NodeKind::SubscriptExpr: {
+        const auto& s = static_cast<const CSubscriptExpr&>(*parent);
+        if (s.base.get() == varRef)
+            return ValueTypeKind::Pointer;
+        return ValueTypeKind::Unknown;
+    }
+    case NodeKind::BinaryExpr: {
+        const auto& b = static_cast<const CBinaryExpr&>(*parent);
+        // Arithmetic / comparison / bitwise → integer use
+        if (b.op == BinaryOp::Add || b.op == BinaryOp::Sub ||
+            b.op == BinaryOp::Mul || b.op == BinaryOp::Div ||
+            b.op == BinaryOp::Mod || b.op == BinaryOp::Shl ||
+            b.op == BinaryOp::Shr || b.op == BinaryOp::Sar ||
+            b.op == BinaryOp::BitAnd || b.op == BinaryOp::BitOr ||
+            b.op == BinaryOp::BitXor || b.op == BinaryOp::Eq ||
+            b.op == BinaryOp::Ne || b.op == BinaryOp::Lt ||
+            b.op == BinaryOp::Le || b.op == BinaryOp::Gt ||
+            b.op == BinaryOp::Ge)
+            return ValueTypeKind::Integer;
+        return ValueTypeKind::Unknown;
+    }
+    default:
+        return ValueTypeKind::Unknown;
+    }
+}
+
+} // anonymous namespace
+
+void CAstOptimizer::splitVariablesByType(CFuncDecl& func) {
+    // For now, this is a placeholder.  A robust implementation requires
+    // building use-def chains and live range analysis at the C AST level,
+    // which is a substantial undertaking.  The current Phase 3.5 / Phase 4
+    // semantic compatibility check in RecoverVariables.cpp catches the
+    // common case of pointer-vs-value coalescing at the SSA level — the
+    // remaining cases (where the variable was never split into SSA
+    // versions in the first place) would benefit from this analysis but
+    // require more infrastructure.
+    //
+    // The helper functions above (inferValueType, classifyVarUse) are
+    // available for future use.
+    (void)func;
+    (void)inferValueType;
+    (void)classifyVarUse;
+}
+
+// Forward declaration — implementation appears later in the file.
+static void collapseAssignBeforeReturnInList(std::vector<StmtPtr>& stmts);
+
+void CAstOptimizer::collapseAssignBeforeReturn(CFuncDecl& func) {
+    collapseAssignBeforeReturnInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: collapseAssignBeforeReturn — `var = X; return var;` → `return X;`
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When the LAST statement before a return is an assignment to the same
+// variable that's being returned, AND the variable is not used after the
+// assignment (which it can't be since we're returning), collapse the
+// assignment into the return:
+//
+//   lock_2 = v2;
+//   return lock_2;     →    return v2;
+//
+// This is a more focused version of copy propagation that handles the
+// specific "scratch register holding return value" pattern.
+
+static void collapseAssignBeforeReturnInList(std::vector<StmtPtr>& stmts) {
+    // Recurse first.
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            collapseAssignBeforeReturnInList(s.thenBody);
+            collapseAssignBeforeReturnInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            collapseAssignBeforeReturnInList(
+                static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            collapseAssignBeforeReturnInList(
+                static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            collapseAssignBeforeReturnInList(
+                static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                collapseAssignBeforeReturnInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            collapseAssignBeforeReturnInList(
+                static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default: break;
+        }
+    }
+
+    // Walk for the return-after-assign pattern.
+    for (size_t i = 0; i + 1 < stmts.size();) {
+        if (!stmts[i] || !stmts[i + 1]) { ++i; continue; }
+        if (stmts[i]->getKind() != NodeKind::AssignStmt ||
+            stmts[i + 1]->getKind() != NodeKind::ReturnStmt) {
+            ++i; continue;
+        }
+        auto& assign = static_cast<CAssignStmt&>(*stmts[i]);
+        auto& ret = static_cast<CReturnStmt&>(*stmts[i + 1]);
+
+        // Both target and return value must be VarRefExpr to the same name.
+        if (!assign.target || !assign.value || !ret.value) { ++i; continue; }
+        if (assign.target->getKind() != NodeKind::VarRefExpr) { ++i; continue; }
+        if (ret.value->getKind() != NodeKind::VarRefExpr) { ++i; continue; }
+
+        const auto& tgt = static_cast<const CVarRefExpr&>(*assign.target);
+        const auto& retVar = static_cast<const CVarRefExpr&>(*ret.value);
+        if (tgt.varName != retVar.varName) { ++i; continue; }
+
+        // CallExpr values are SAFE to move into the return position:
+        // the call still executes at exactly the same point in the
+        // statement sequence (the assign and the return are adjacent),
+        // and side effects are unaffected.  This handles the common
+        // pattern `tmp = foo(); return tmp;` → `return foo();`.
+
+        // Skip compound assignments (x += y; return x;).
+        if (!assign.compoundOp.empty()) { ++i; continue; }
+
+        // Replace return value with the assigned expression.
+        ret.value = std::move(assign.value);
+
+        // Remove the assignment.
+        stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+        // Don't increment — re-check this position.
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: initializeReadBeforeWriteVars
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// SSA destruction in RecoverVariables can produce variables that are read on
+// some path before any defining assignment.  Example from kbase_jit_allocate:
+//
+//   int64_t lock_2;
+//   if (param_4 < param_5) {
+//       return lock_2;        // ❌ read uninitialized
+//   }
+//   ...
+//   lock_2 = something;       // first definition is here, but the path above
+//                             // already returned the uninitialized value
+//
+// This makes the output look fundamentally broken to a human reader, even
+// though it accurately reflects what the lifter produced.  The fix at this
+// stage is conservative: walk the body in pre-order, and for each local
+// variable whose FIRST occurrence is on the right-hand side (a read) rather
+// than the left-hand side of an assignment, attach a default initializer to
+// its declaration.  This makes the output legal C and gives readers a hint
+// that the variable's true value is determined elsewhere.
+//
+// We never lose information — if the variable is later definitively assigned,
+// the printed `int64_t lock = 0;` is identical to leaving it uninitialized
+// from the program's perspective (any sane downstream analysis will dataflow
+// the real assignment forward).
+//
+// Parameters and variables that already have an initExpr are skipped.
+//
+// KNOWN LIMITATION (under-detection, not over-detection):
+//
+// The pre-order scan marks a variable as "seen" the moment ANY path writes
+// to it.  If the THEN branch of an if-statement writes a variable and the
+// ELSE branch reads it without a prior write, the read in the ELSE branch
+// is NOT flagged because the variable is already in `info.seen`:
+//
+//   if (cond) {
+//       x = 5;        // x enters info.seen here
+//   } else {
+//       return x;     // not flagged — but actually read-before-write
+//   }
+//
+// This pass is therefore CONSERVATIVE in the safe direction: it never adds
+// a wrong initializer (no over-detection), but it may miss some variables
+// that should have one (under-detection).  Fixing this properly requires
+// definitely-assigned analysis with per-branch tracking — out of scope
+// here.  When future tests surface a variable that "should have gotten
+// `= 0` but didn't", that's the cause.
+
+namespace {
+
+/// Default-initializer expression for the given C type.  Returns nullptr if
+/// no sensible default exists (e.g. for void or function-pointer types where
+/// `0` would be misleading).
+static ExprPtr makeDefaultInitFor(const CType& type) {
+    switch (type.kind) {
+    case TypeKind::Bool:
+    case TypeKind::Int:
+        return std::make_unique<CIntLitExpr>(
+            /*value=*/0,
+            std::make_shared<CType>(type),
+            /*address=*/0);
+    case TypeKind::Pointer:
+    case TypeKind::FuncPtr:
+        // Cast 0 to the pointer type so the printer emits something legal.
+        return std::make_unique<CCastExpr>(
+            std::make_shared<CType>(type),
+            std::make_unique<CIntLitExpr>(
+                /*value=*/0,
+                CType::int64(),
+                /*address=*/0),
+            /*address=*/0);
+    case TypeKind::Float:
+        // Direct float literal so the printer emits "0.0f" / "0.0".
+        return std::make_unique<CFloatLitExpr>(
+            /*value=*/0.0,
+            std::make_shared<CType>(type),
+            /*address=*/0);
+    default:
+        return nullptr;
+    }
+}
+
+/// Result of scanning the function body for variable use ordering.
+struct VarFirstUseInfo {
+    /// Variables whose first occurrence in pre-order traversal is a READ
+    /// (RHS of an assignment, function arg, condition, return value, etc.).
+    /// These need an initializer added to their declaration.
+    std::unordered_set<std::string> readBeforeWrite;
+    /// Variables that have been observed at all (used to skip never-touched
+    /// declarations — those should be removed by removeUnusedDeclarations).
+    std::unordered_set<std::string> seen;
+};
+
+/// Walk every CVarRefExpr inside an expression and add the names to `out`.
+static void gatherVarRefNames(const CExpr* expr,
+                              std::unordered_set<std::string>& out) {
+    if (!expr) return;
+    switch (expr->getKind()) {
+    case NodeKind::VarRefExpr:
+        out.insert(static_cast<const CVarRefExpr*>(expr)->varName);
+        return;
+    case NodeKind::BinaryExpr: {
+        const auto& b = static_cast<const CBinaryExpr&>(*expr);
+        gatherVarRefNames(b.lhs.get(), out);
+        gatherVarRefNames(b.rhs.get(), out);
+        return;
+    }
+    case NodeKind::UnaryExpr:
+        gatherVarRefNames(
+            static_cast<const CUnaryExpr*>(expr)->operand.get(), out);
+        return;
+    case NodeKind::CastExpr:
+        gatherVarRefNames(
+            static_cast<const CCastExpr*>(expr)->operand.get(), out);
+        return;
+    case NodeKind::CallExpr: {
+        const auto& c = static_cast<const CCallExpr&>(*expr);
+        for (const auto& arg : c.args)
+            gatherVarRefNames(arg.get(), out);
+        return;
+    }
+    case NodeKind::TernaryExpr: {
+        const auto& t = static_cast<const CTernaryExpr&>(*expr);
+        gatherVarRefNames(t.cond.get(), out);
+        gatherVarRefNames(t.trueVal.get(), out);
+        gatherVarRefNames(t.falseVal.get(), out);
+        return;
+    }
+    case NodeKind::SubscriptExpr: {
+        const auto& s = static_cast<const CSubscriptExpr&>(*expr);
+        gatherVarRefNames(s.base.get(), out);
+        gatherVarRefNames(s.index.get(), out);
+        return;
+    }
+    case NodeKind::FieldAccessExpr:
+        gatherVarRefNames(
+            static_cast<const CFieldAccessExpr*>(expr)->base.get(), out);
+        return;
+    default:
+        return;
+    }
+}
+
+/// Pre-order walk over a statement list.  For each statement we record:
+///   - which variable is DEFINED (LHS of a plain assign), if any
+///   - which variables are READ (everything else inside the statement)
+///
+/// First-write-or-read is then folded into VarFirstUseInfo via the rule:
+///   "if a variable is READ before it is DEFINED, add it to readBeforeWrite".
+static void scanStmtListForFirstUse(const std::vector<StmtPtr>& stmts,
+                                    VarFirstUseInfo& info);
+
+static void scanStmtForFirstUse(const CStmt* stmt, VarFirstUseInfo& info) {
+    if (!stmt) return;
+    switch (stmt->getKind()) {
+    case NodeKind::AssignStmt: {
+        const auto& a = static_cast<const CAssignStmt&>(*stmt);
+        // The RHS is read regardless.
+        std::unordered_set<std::string> rhsReads;
+        gatherVarRefNames(a.value.get(), rhsReads);
+        // For the LHS, if it's a plain var ref, treat it as a definition;
+        // otherwise (deref, field, subscript) it's actually a read of the
+        // base for indexing purposes.
+        std::unordered_set<std::string> lhsDefs;
+        std::unordered_set<std::string> lhsReads;
+        if (a.target && a.target->getKind() == NodeKind::VarRefExpr) {
+            lhsDefs.insert(
+                static_cast<const CVarRefExpr&>(*a.target).varName);
+            // Compound assignments (`x += y`) read x as well.
+            if (!a.compoundOp.empty())
+                lhsReads.insert(
+                    static_cast<const CVarRefExpr&>(*a.target).varName);
+        } else {
+            gatherVarRefNames(a.target.get(), lhsReads);
+        }
+        // Reads happen first (semantically RHS is evaluated before LHS
+        // store). Then defs.
+        for (const auto& n : rhsReads) {
+            if (!info.seen.count(n)) {
+                info.readBeforeWrite.insert(n);
+            }
+            info.seen.insert(n);
+        }
+        for (const auto& n : lhsReads) {
+            if (!info.seen.count(n)) {
+                info.readBeforeWrite.insert(n);
+            }
+            info.seen.insert(n);
+        }
+        for (const auto& n : lhsDefs) {
+            info.seen.insert(n);
+        }
+        return;
+    }
+    case NodeKind::ExprStmt: {
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(
+            static_cast<const CExprStmt&>(*stmt).expr.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        return;
+    }
+    case NodeKind::ReturnStmt: {
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(
+            static_cast<const CReturnStmt&>(*stmt).value.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        return;
+    }
+    case NodeKind::IfStmt: {
+        const auto& s = static_cast<const CIfStmt&>(*stmt);
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(s.condition.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        // Recurse into both arms.  We do NOT track per-arm definitions —
+        // if a variable is defined in only one arm and read after the if,
+        // we still consider it potentially undefined.  But the heuristic
+        // is "first SEEN" so if it was already seen before the if (e.g.
+        // assigned in a prior statement), the arm is irrelevant.
+        scanStmtListForFirstUse(s.thenBody, info);
+        scanStmtListForFirstUse(s.elseBody, info);
+        return;
+    }
+    case NodeKind::WhileStmt: {
+        const auto& s = static_cast<const CWhileStmt&>(*stmt);
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(s.condition.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        scanStmtListForFirstUse(s.body, info);
+        return;
+    }
+    case NodeKind::DoWhileStmt: {
+        const auto& s = static_cast<const CDoWhileStmt&>(*stmt);
+        scanStmtListForFirstUse(s.body, info);
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(s.condition.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        return;
+    }
+    case NodeKind::ForStmt: {
+        const auto& s = static_cast<const CForStmt&>(*stmt);
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(s.condition.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        scanStmtListForFirstUse(s.body, info);
+        return;
+    }
+    case NodeKind::SwitchStmt: {
+        const auto& s = static_cast<const CSwitchStmt&>(*stmt);
+        std::unordered_set<std::string> reads;
+        gatherVarRefNames(s.selector.get(), reads);
+        for (const auto& n : reads) {
+            if (!info.seen.count(n))
+                info.readBeforeWrite.insert(n);
+            info.seen.insert(n);
+        }
+        for (const auto& c : s.cases)
+            scanStmtListForFirstUse(c.body, info);
+        return;
+    }
+    case NodeKind::BlockStmt:
+        scanStmtListForFirstUse(
+            static_cast<const CBlockStmt&>(*stmt).stmts, info);
+        return;
+    default:
+        return;
+    }
+}
+
+static void scanStmtListForFirstUse(const std::vector<StmtPtr>& stmts,
+                                    VarFirstUseInfo& info) {
+    for (const auto& sp : stmts)
+        scanStmtForFirstUse(sp.get(), info);
+}
+
+} // namespace
+
+void CAstOptimizer::initializeReadBeforeWriteVars(CFuncDecl& func) {
+    // Names of parameters — these are always defined at function entry,
+    // so we never want to add an initializer for them, and they should be
+    // pre-seeded as "seen" so any inner assignment to a parameter doesn't
+    // count as a definition.
+    std::unordered_set<std::string> paramNames;
+    for (const auto& p : func.params)
+        paramNames.insert(p.name);
+
+    VarFirstUseInfo info;
+    info.seen = paramNames;  // params are defined at entry
+
+    scanStmtListForFirstUse(func.body, info);
+
+    // For each local var that's in readBeforeWrite and currently has no
+    // initExpr, attach a default-initializer expression matching its type.
+    for (auto& d : func.localVars) {
+        if (d.initExpr) continue;                           // already initialized
+        if (!info.readBeforeWrite.count(d.varName)) continue; // never read first
+        if (!d.type) continue;                              // missing type info
+
+        auto initExpr = makeDefaultInitFor(*d.type);
+        if (initExpr) {
+            d.initExpr = std::move(initExpr);
+        }
+    }
+}
+
+void CAstOptimizer::resolveFramePointerLeaks(CFuncDecl& func) {
+    // Build a map of stack variable offsets.
+    std::map<int64_t, std::string> offsetToVarName;
+    for (const auto& d : func.localVars) {
+        if (d.stackOffset.has_value()) {
+            offsetToVarName[*d.stackOffset] = d.varName;
+        }
+    }
+    if (offsetToVarName.empty()) return;
+
+    // Identify candidate frame pointer variables: body-only synthetic
+    // names (vN, where N is a number) declared as int64_t with no stack
+    // offset.  These are the variables that came from register references
+    // (rbp, rsp, etc.) which weren't resolved by RecoverStackLayout.
+    std::unordered_set<std::string> candidateFrameVars;
+    for (const auto& d : func.localVars) {
+        if (d.stackOffset.has_value()) continue;  // already a stack var
+        // Pattern: "v<digits>"
+        if (d.varName.size() < 2 || d.varName[0] != 'v') continue;
+        bool allDigits = true;
+        for (size_t i = 1; i < d.varName.size(); ++i) {
+            if (!isdigit(static_cast<unsigned char>(d.varName[i]))) {
+                allDigits = false;
+                break;
+            }
+        }
+        if (!allDigits) continue;
+        candidateFrameVars.insert(d.varName);
+    }
+    if (candidateFrameVars.empty()) return;
+
+    resolveFrameRefsInStmts(func.body, offsetToVarName, candidateFrameVars);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: unwrapTrivialDoWhile — collapse do-while loops that always break
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// After StructureControlFlow's break synthesis, some loops are detected
+// that aren't really loops in the original program — they're just
+// straight-line code that StructureControlFlow incorrectly classified
+// as a back-edge.  These appear as:
+//
+//   do {
+//     ...code...
+//     break;        // unconditional break at the end
+//   } while (true);
+//
+// The unconditional break makes the loop execute exactly once, so it's
+// equivalent to just executing the body statements directly.
+
+/// Returns true if the statement list (recursively) contains any BreakStmt
+/// or ContinueStmt that would be left orphaned if the enclosing loop was
+/// removed.  Nested loops/switches don't count — their breaks belong to them.
+static bool containsLoopBreakOrContinue(const std::vector<StmtPtr>& stmts) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        auto k = sp->getKind();
+        if (k == NodeKind::BreakStmt || k == NodeKind::ContinueStmt)
+            return true;
+        if (k == NodeKind::IfStmt) {
+            auto& s = static_cast<const CIfStmt&>(*sp);
+            if (containsLoopBreakOrContinue(s.thenBody)) return true;
+            if (containsLoopBreakOrContinue(s.elseBody)) return true;
+        } else if (k == NodeKind::BlockStmt) {
+            if (containsLoopBreakOrContinue(
+                    static_cast<const CBlockStmt&>(*sp).stmts))
+                return true;
+        }
+        // Don't recurse into nested loops or switch — their break/continue
+        // belongs to those constructs, not the enclosing loop.
+    }
+    return false;
+}
+
+static void unwrapTrivialDoWhileInList(std::vector<StmtPtr>& stmts) {
+    // First, recurse into nested scopes.
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            unwrapTrivialDoWhileInList(s.thenBody);
+            unwrapTrivialDoWhileInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            unwrapTrivialDoWhileInList(static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            unwrapTrivialDoWhileInList(static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            unwrapTrivialDoWhileInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                unwrapTrivialDoWhileInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            unwrapTrivialDoWhileInList(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Now scan for do-while loops that end with an unconditional break
+    // AND have no other break/continue statements (which would be left
+    // orphaned if we unwrapped the loop).
+    for (size_t i = 0; i < stmts.size(); ++i) {
+        if (!stmts[i] || stmts[i]->getKind() != NodeKind::DoWhileStmt)
+            continue;
+
+        auto& dw = static_cast<CDoWhileStmt&>(*stmts[i]);
+
+        // Check that the body's last statement is an unconditional break.
+        if (dw.body.empty()) continue;
+        auto& last = dw.body.back();
+        if (!last || last->getKind() != NodeKind::BreakStmt) continue;
+
+        // Pop the trailing break temporarily to check the rest.
+        auto trailingBreak = std::move(dw.body.back());
+        dw.body.pop_back();
+
+        // If the remaining body has any break/continue, we can't unwrap
+        // (they would become orphaned).  Restore the break and skip.
+        if (containsLoopBreakOrContinue(dw.body)) {
+            dw.body.push_back(std::move(trailingBreak));
+            continue;
+        }
+
+        // Safe to unwrap.  Replace the do-while with its body statements.
+        auto body = std::move(dw.body);
+        stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+        stmts.insert(stmts.begin() + static_cast<ptrdiff_t>(i),
+                     std::make_move_iterator(body.begin()),
+                     std::make_move_iterator(body.end()));
+        // Re-check from this position in case the unwrap created new
+        // statements that themselves should be unwrapped.
+        --i;
+    }
+}
+
+void CAstOptimizer::unwrapTrivialDoWhile(CFuncDecl& func) {
+    unwrapTrivialDoWhileInList(func.body);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1167,49 +4654,63 @@ void CAstOptimizer::propagateCopies(CFuncDecl& func) {
 // Pass 5: simplifyExpressions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr) {
+ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr, bool isLValue) {
     if (!expr) return nullptr;
 
     // Bottom-up: simplify children first.
+    //
+    // FIX-047): carry `isLValue` only through rewrites that
+    // PRESERVE the lvalue nature of the parent.  A unary `*` deref is
+    // itself an lvalue (`*p = x` is legal), and its operand is an
+    // rvalue — so a deref inside an lvalue context makes its operand
+    // rvalue-safe.  Subscripts and field accesses similarly have lvalue
+    // identity but rvalue operands (base / index).  Everything else is
+    // unconditionally rvalue — reaching e.g. a binary `+` or a cast on
+    // an assignment LHS would be malformed C to begin with.
     switch (expr->getKind()) {
     case NodeKind::BinaryExpr: {
         auto& b = static_cast<CBinaryExpr&>(*expr);
-        b.lhs = simplifyExpr(std::move(b.lhs));
-        b.rhs = simplifyExpr(std::move(b.rhs));
+        b.lhs = simplifyExpr(std::move(b.lhs), /*isLValue=*/false);
+        b.rhs = simplifyExpr(std::move(b.rhs), /*isLValue=*/false);
         break;
     }
     case NodeKind::UnaryExpr: {
         auto& u = static_cast<CUnaryExpr&>(*expr);
-        u.operand = simplifyExpr(std::move(u.operand));
+        // *x is itself an lvalue when x is a pointer expression, but the
+        // operand x is an rvalue regardless of the parent context.
+        u.operand = simplifyExpr(std::move(u.operand), /*isLValue=*/false);
         break;
     }
     case NodeKind::CastExpr: {
         auto& c = static_cast<CCastExpr&>(*expr);
-        c.operand = simplifyExpr(std::move(c.operand));
+        // A cast expression is never an lvalue in C (`(T)x = y` is illegal).
+        c.operand = simplifyExpr(std::move(c.operand), /*isLValue=*/false);
         break;
     }
     case NodeKind::CallExpr: {
         auto& c = static_cast<CCallExpr&>(*expr);
         for (auto& a : c.args)
-            a = simplifyExpr(std::move(a));
+            a = simplifyExpr(std::move(a), /*isLValue=*/false);
         break;
     }
     case NodeKind::TernaryExpr: {
         auto& t = static_cast<CTernaryExpr&>(*expr);
-        t.cond     = simplifyExpr(std::move(t.cond));
-        t.trueVal  = simplifyExpr(std::move(t.trueVal));
-        t.falseVal = simplifyExpr(std::move(t.falseVal));
+        t.cond     = simplifyExpr(std::move(t.cond), /*isLValue=*/false);
+        t.trueVal  = simplifyExpr(std::move(t.trueVal), /*isLValue=*/false);
+        t.falseVal = simplifyExpr(std::move(t.falseVal), /*isLValue=*/false);
         break;
     }
     case NodeKind::SubscriptExpr: {
         auto& s = static_cast<CSubscriptExpr&>(*expr);
-        s.base  = simplifyExpr(std::move(s.base));
-        s.index = simplifyExpr(std::move(s.index));
+        // a[i] is lvalue; base and index themselves are rvalues.
+        s.base  = simplifyExpr(std::move(s.base), /*isLValue=*/false);
+        s.index = simplifyExpr(std::move(s.index), /*isLValue=*/false);
         break;
     }
     case NodeKind::FieldAccessExpr: {
         auto& f = static_cast<CFieldAccessExpr&>(*expr);
-        f.base = simplifyExpr(std::move(f.base));
+        // a.field / a->field is lvalue; the base is an rvalue.
+        f.base = simplifyExpr(std::move(f.base), /*isLValue=*/false);
         break;
     }
     default:
@@ -1233,6 +4734,46 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr) {
             }
         }
 
+        // *((T)NULL) → 0   (FIX-042 bug B: unresolved-global sentinel)
+        //
+        // When Helix can't resolve an absolute address into a named global,
+        // the emitter surfaces the load as `*(int64_t)(void*)0` / `*(void*)0`.
+        // Leaving this in the output is user-hostile (it looks like a real
+        // NULL deref, and — worse — propagates through `+` arithmetic into
+        // shapes like `*(v2 + 8 + *(int64_t)(void*)0)`).  Treating the deref
+        // as 0 makes the containing expression compilable (the `+ 0` then
+        // folds via the existing `x + 0 → x` rule) and matches the
+        // observable semantics: on Windows i386 the `NULL` page is not
+        // mapped, so any real execution of this load would trap; emitting
+        // 0 is the best static approximation we have without the original
+        // global's address.
+        //
+        // FIX-047): but only when this expression is used as an
+        // rvalue.  Collapsing `*(T)(void*)0 = rhs` to `0 = rhs` produces
+        // malformed C (assignment to an integer literal) which was shipping
+        // in SOTR's `HealthData-read.c` line 41.  When the caller signalled
+        // lvalue context (e.g. CAssignStmt::target), leave the deref alone
+        // so the statement either survives to eliminateNullPtrStores (which
+        // deletes it) or downstream RemillState→register recovery (which
+        // replaces it with a RegWriteOp-style name).
+        if (!isLValue && u.op == UnaryOp::Deref && u.operand) {
+            // Walk through at most 3 levels of casts to find a literal 0.
+            const CExpr* cur = u.operand.get();
+            for (int depth = 0; depth < 3 && cur; ++depth) {
+                if (cur->getKind() == NodeKind::IntLitExpr &&
+                    static_cast<const CIntLitExpr&>(*cur).value == 0) {
+                    return std::make_unique<CIntLitExpr>(
+                        0, u.type ? u.type : CType::int64(),
+                        expr->getAddress());
+                }
+                if (cur->getKind() == NodeKind::CastExpr) {
+                    cur = static_cast<const CCastExpr&>(*cur).operand.get();
+                    continue;
+                }
+                break;
+            }
+        }
+
         // &(*x) → x  (address-of deref)
         if (u.op == UnaryOp::AddressOf &&
             u.operand->getKind() == NodeKind::UnaryExpr) {
@@ -1250,6 +4791,34 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr) {
                 static_cast<const CUnaryExpr&>(*u.operand);
             if (inner.op == UnaryOp::LogNot && inner.operand)
                 return cloneExpr(inner.operand.get());
+        }
+
+        // !constant → constant fold
+        // !0 → 1, !N → 0 for any non-zero N
+        if (u.op == UnaryOp::LogNot &&
+            u.operand->getKind() == NodeKind::IntLitExpr) {
+            const auto& lit = static_cast<const CIntLitExpr&>(*u.operand);
+            int64_t result = (lit.value == 0) ? 1 : 0;
+            return std::make_unique<CIntLitExpr>(
+                result, CType::int32(), expr->getAddress());
+        }
+
+        // ~constant → constant fold (bitwise not)
+        if (u.op == UnaryOp::BitNot &&
+            u.operand->getKind() == NodeKind::IntLitExpr) {
+            const auto& lit = static_cast<const CIntLitExpr&>(*u.operand);
+            return std::make_unique<CIntLitExpr>(
+                ~lit.value, lit.type ? lit.type : CType::int64(),
+                expr->getAddress());
+        }
+
+        // -constant → constant fold (negation)
+        if (u.op == UnaryOp::Neg &&
+            u.operand->getKind() == NodeKind::IntLitExpr) {
+            const auto& lit = static_cast<const CIntLitExpr&>(*u.operand);
+            return std::make_unique<CIntLitExpr>(
+                -lit.value, lit.type ? lit.type : CType::int64(),
+                expr->getAddress());
         }
 
         // -(-x) → x  (double negation)
@@ -1276,6 +4845,28 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr) {
         }
     }
 
+    // ── Comparison combinator simplification ──────────────────────────────
+    // (cmp1) & (cmp2) → (cmp1) && (cmp2)
+    // (cmp1) | (cmp2) → (cmp1) || (cmp2)
+    // These are equivalent for boolean operands but more idiomatic in C.
+    if (expr->getKind() == NodeKind::BinaryExpr) {
+        auto& b = static_cast<CBinaryExpr&>(*expr);
+        if ((b.op == BinaryOp::BitAnd || b.op == BinaryOp::BitOr) &&
+            b.lhs && b.rhs &&
+            b.lhs->getKind() == NodeKind::BinaryExpr &&
+            b.rhs->getKind() == NodeKind::BinaryExpr) {
+            const auto& lb = static_cast<const CBinaryExpr&>(*b.lhs);
+            const auto& rb = static_cast<const CBinaryExpr&>(*b.rhs);
+            if (isCmpOp(lb.op) && isCmpOp(rb.op)) {
+                b.op = (b.op == BinaryOp::BitAnd)
+                    ? BinaryOp::LogAnd
+                    : BinaryOp::LogOr;
+                if (b.type == nullptr || b.type->kind == TypeKind::Unknown)
+                    b.type = CType::boolTy();
+            }
+        }
+    }
+
     // ── Binary patterns ───────────────────────────────────────────────────────
     if (expr->getKind() == NodeKind::BinaryExpr) {
         auto& b = static_cast<CBinaryExpr&>(*expr);
@@ -1287,9 +4878,48 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr) {
         if (b.op == BinaryOp::Add && isIntLit(b.rhs.get(), 0))
             return std::move(b.lhs);
 
+        // x + (-N) → x - N  (negative constant addition → subtraction)
+        if (b.op == BinaryOp::Add &&
+            b.rhs->getKind() == NodeKind::IntLitExpr) {
+            auto& lit = static_cast<CIntLitExpr&>(*b.rhs);
+            if (lit.value < 0) {
+                lit.value = -lit.value;
+                b.op = BinaryOp::Sub;
+                return std::move(expr);
+            }
+        }
+
         // x - 0 → x
         if (b.op == BinaryOp::Sub && isIntLit(b.rhs.get(), 0))
             return std::move(b.lhs);
+
+        // x - (x - y) → y   (FIX-041 bug I: SBB+SUB compiler idiom)
+        //
+        // Observed on gta-sa.exe `sub_4095a0` as `v1 -= v1 - v3;`, which is
+        // the compound form of `v1 = v1 - (v1 - v3)` — a lowering artifact
+        // from x86 `sbb eax, eax` followed by `sub eax, ebx`.  Algebraically
+        // `x - (x - y) = y`, so we rewrite the outer BinaryExpr to just `y`.
+        // Runs BEFORE `synthesizeCompoundAssign` in optimize(), so the
+        // compound `-=` never forms.
+        if (b.op == BinaryOp::Sub && b.rhs->getKind() == NodeKind::BinaryExpr) {
+            const auto& inner = static_cast<const CBinaryExpr&>(*b.rhs);
+            if (inner.op == BinaryOp::Sub && inner.lhs &&
+                isSameExpr(b.lhs.get(), inner.lhs.get()) && inner.rhs) {
+                return cloneExpr(inner.rhs.get());
+            }
+        }
+
+        // (x - y) - x → -y   (same idiom, swapped operand order)
+        if (b.op == BinaryOp::Sub && b.lhs->getKind() == NodeKind::BinaryExpr) {
+            const auto& inner = static_cast<const CBinaryExpr&>(*b.lhs);
+            if (inner.op == BinaryOp::Sub && inner.lhs && inner.rhs &&
+                isSameExpr(inner.lhs.get(), b.rhs.get())) {
+                return std::make_unique<CUnaryExpr>(
+                    UnaryOp::Neg, cloneExpr(inner.rhs.get()),
+                    inner.rhs->type ? inner.rhs->type : CType::int64(),
+                    expr->getAddress());
+            }
+        }
 
         // x * 1 → x
         if (b.op == BinaryOp::Mul && isIntLit(b.rhs.get(), 1))
@@ -1372,9 +5002,9 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr) {
     return expr;
 }
 
-void CAstOptimizer::simplifyExprInStmt(ExprPtr& slot) {
+void CAstOptimizer::simplifyExprInStmt(ExprPtr& slot, bool isLValue) {
     if (slot)
-        slot = simplifyExpr(std::move(slot));
+        slot = simplifyExpr(std::move(slot), isLValue);
 }
 
 void CAstOptimizer::simplifyStmtList(std::vector<StmtPtr>& stmts) {
@@ -1383,8 +5013,10 @@ void CAstOptimizer::simplifyStmtList(std::vector<StmtPtr>& stmts) {
         switch (sp->getKind()) {
         case NodeKind::AssignStmt: {
             auto& a = static_cast<CAssignStmt&>(*sp);
-            simplifyExprInStmt(a.target);
-            simplifyExprInStmt(a.value);
+            // FIX-047): target is an lvalue — suppress rewrites
+            // that would turn designators into non-lvalues (`*(T)NULL → 0`).
+            simplifyExprInStmt(a.target, /*isLValue=*/true);
+            simplifyExprInStmt(a.value, /*isLValue=*/false);
             break;
         }
         case NodeKind::ExprStmt: {
@@ -1605,6 +5237,162 @@ void CAstOptimizer::removeDeadAfterReturnInList(std::vector<StmtPtr>& stmts) {
         }
     }
 
+    // Check if a loop body has any exit path (break, return, goto).
+    std::function<bool(const std::vector<StmtPtr>&)> hasExitPath;
+    hasExitPath = [&](const std::vector<StmtPtr>& body) -> bool {
+        for (auto& sp : body) {
+            if (!sp) continue;
+            auto k = sp->getKind();
+            if (k == NodeKind::ReturnStmt || k == NodeKind::BreakStmt ||
+                k == NodeKind::GotoStmt)
+                return true;
+            if (k == NodeKind::IfStmt) {
+                auto& s = static_cast<const CIfStmt&>(*sp);
+                if (hasExitPath(s.thenBody) || hasExitPath(s.elseBody))
+                    return true;
+            }
+        }
+        return false;
+    };
+
+    // Check if a statement is an unconditional infinite loop (no exit path).
+    auto isInfiniteLoop = [&](const CStmt* s) -> bool {
+        if (!s) return false;
+        if (s->getKind() == NodeKind::DoWhileStmt) {
+            auto& dw = static_cast<const CDoWhileStmt&>(*s);
+            // while(true) condition — check for literal true/1
+            if (dw.condition) {
+                if (dw.condition->getKind() == NodeKind::IntLitExpr) {
+                    auto& lit = static_cast<const CIntLitExpr&>(*dw.condition);
+                    if (lit.value != 0 && !hasExitPath(dw.body))
+                        return true;
+                }
+            }
+        } else if (s->getKind() == NodeKind::WhileStmt) {
+            auto& w = static_cast<const CWhileStmt&>(*s);
+            if (w.condition) {
+                if (w.condition->getKind() == NodeKind::IntLitExpr) {
+                    auto& lit = static_cast<const CIntLitExpr&>(*w.condition);
+                    if (lit.value != 0 && !hasExitPath(w.body))
+                        return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // FIX-050 (Wave 12, Frente A — content recovery): helper that decides
+    // whether a statement tail "after a terminator" is safe to erase.
+    //
+    // Background: `helix_low.jmp` and `helix_low.jcc` never emit
+    // CAstStmts (see CAstBuilder::buildStatement for helix_low::JmpOp
+    // / JccOp — both return nullptr).  StructureControlFlow handled the
+    // flows it could schema-match, but **error-recovery blocks that are
+    // reachable only through low-level jumps** reach CAstBuilder without
+    // any surrounding CLabelStmt or CGotoStmt to tell the optimizer they
+    // are alive.  Those blocks appear as plain statement sequences at
+    // the same scope level, positioned AFTER a ReturnStmt that exited an
+    // earlier if-branch.
+    //
+    // Without this guard, `removeDeadAfterReturnInList` erased **every**
+    // such block on `kbase_jit_allocate.ll`, dropping 6 call-of-interest
+    // targets (`_dev_info`, `_dev_err`, `__kbase_tlstream_jit_alloc`,
+    // `kbase_set_phy_alloc_page_status`,
+    // `kbase_free_phy_pages_helper_locked`, `__stack_chk_fail`) and
+    // shrinking output from the lifted 176 L down to 145 L (31-line loss).
+    //
+    // Conservative fix: if the tail we're about to erase contains ANY
+    // side-effecting content (a CallExpr anywhere, or any of the
+    // containing-block statement kinds the other passes depend on seeing),
+    // assume it's reachable through an un-modelled CFG edge and preserve
+    // it.  This can leave some genuinely-dead code in the output when the
+    // function has real unreachable tail code — but that's a strictly
+    // safer failure mode than dropping reachable calls.  Real-dead tails
+    // are usually either pure assignments or empty, which still get
+    // pruned.
+    auto containsCallExpr = [](const CExpr* expr) -> bool {
+        // Walk expression tree looking for any CCallExpr node.
+        std::function<bool(const CExpr*)> rec = [&](const CExpr* e) -> bool {
+            if (!e) return false;
+            if (e->getKind() == NodeKind::CallExpr) return true;
+            switch (e->getKind()) {
+            case NodeKind::BinaryExpr: {
+                const auto& b = static_cast<const CBinaryExpr&>(*e);
+                return rec(b.lhs.get()) || rec(b.rhs.get());
+            }
+            case NodeKind::UnaryExpr:
+                return rec(static_cast<const CUnaryExpr&>(*e).operand.get());
+            case NodeKind::CastExpr:
+                return rec(static_cast<const CCastExpr&>(*e).operand.get());
+            case NodeKind::TernaryExpr: {
+                const auto& t = static_cast<const CTernaryExpr&>(*e);
+                return rec(t.cond.get()) || rec(t.trueVal.get()) || rec(t.falseVal.get());
+            }
+            case NodeKind::SubscriptExpr: {
+                const auto& s = static_cast<const CSubscriptExpr&>(*e);
+                return rec(s.base.get()) || rec(s.index.get());
+            }
+            case NodeKind::FieldAccessExpr:
+                return rec(static_cast<const CFieldAccessExpr&>(*e).base.get());
+            default: return false;
+            }
+        };
+        return rec(expr);
+    };
+
+    std::function<bool(const std::vector<StmtPtr>&)> tailHasSideEffect;
+    tailHasSideEffect = [&](const std::vector<StmtPtr>& body) -> bool {
+        for (const auto& sp : body) {
+            if (!sp) continue;
+            switch (sp->getKind()) {
+            case NodeKind::AssignStmt: {
+                const auto& a = static_cast<const CAssignStmt&>(*sp);
+                if (containsCallExpr(a.value.get()) ||
+                    containsCallExpr(a.target.get())) return true;
+                break;
+            }
+            case NodeKind::ExprStmt:
+                if (containsCallExpr(static_cast<const CExprStmt&>(*sp).expr.get()))
+                    return true;
+                break;
+            case NodeKind::ReturnStmt:
+                if (containsCallExpr(static_cast<const CReturnStmt&>(*sp).value.get()))
+                    return true;
+                break;
+            case NodeKind::IfStmt: {
+                const auto& s = static_cast<const CIfStmt&>(*sp);
+                if (containsCallExpr(s.condition.get()) ||
+                    tailHasSideEffect(s.thenBody) ||
+                    tailHasSideEffect(s.elseBody)) return true;
+                break;
+            }
+            case NodeKind::WhileStmt: {
+                const auto& s = static_cast<const CWhileStmt&>(*sp);
+                if (containsCallExpr(s.condition.get()) ||
+                    tailHasSideEffect(s.body)) return true;
+                break;
+            }
+            case NodeKind::DoWhileStmt: {
+                const auto& s = static_cast<const CDoWhileStmt&>(*sp);
+                if (containsCallExpr(s.condition.get()) ||
+                    tailHasSideEffect(s.body)) return true;
+                break;
+            }
+            case NodeKind::ForStmt: {
+                const auto& s = static_cast<const CForStmt&>(*sp);
+                if (tailHasSideEffect(s.body)) return true;
+                break;
+            }
+            case NodeKind::BlockStmt:
+                if (tailHasSideEffect(static_cast<const CBlockStmt&>(*sp).stmts))
+                    return true;
+                break;
+            default: break;
+            }
+        }
+        return false;
+    };
+
     // Now truncate after first unconditional terminator at this scope level.
     for (size_t i = 0; i < stmts.size(); ++i) {
         if (!stmts[i]) continue;
@@ -1612,11 +5400,27 @@ void CAstOptimizer::removeDeadAfterReturnInList(std::vector<StmtPtr>& stmts) {
         if (kind == NodeKind::ReturnStmt ||
             kind == NodeKind::BreakStmt ||
             kind == NodeKind::ContinueStmt ||
-            kind == NodeKind::GotoStmt) {
-            // Everything after this is unreachable — erase.
+            kind == NodeKind::GotoStmt ||
+            isInfiniteLoop(stmts[i].get())) {
+            // Everything after this is nominally unreachable.  But in
+            // the presence of un-modelled CFG edges (helix_low.jmp with
+            // no corresponding goto emission), the "dead" tail can carry
+            // real calls.  Guard with the side-effect check above.
             if (i + 1 < stmts.size()) {
+                std::vector<StmtPtr> tail(
+                    std::make_move_iterator(stmts.begin() +
+                                            static_cast<ptrdiff_t>(i + 1)),
+                    std::make_move_iterator(stmts.end()));
                 stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i + 1),
                             stmts.end());
+                if (tailHasSideEffect(tail)) {
+                    // Preserve: move the tail back in place.  The calls
+                    // are almost certainly reachable via an un-modelled
+                    // jump; leaving them in place makes the decompiled
+                    // output MATCH the binary's reachable set.
+                    for (auto& sp : tail)
+                        stmts.push_back(std::move(sp));
+                }
             }
             break;
         }
@@ -2028,15 +5832,44 @@ void CAstOptimizer::eliminateConstBranchesInList(std::vector<StmtPtr>& stmts) {
             eliminateConstBranchesInList(s.elseBody);
             break;
         }
-        case NodeKind::WhileStmt:
-            eliminateConstBranchesInList(static_cast<CWhileStmt&>(*sp).body);
+        case NodeKind::WhileStmt: {
+            auto& s = static_cast<CWhileStmt&>(*sp);
+            eliminateConstBranchesInList(s.body);
+            // Normalize non-zero constant condition to literal 1 (→ "true")
+            // to avoid "while (-1)" artifacts from lifted jmp loops.
+            if (s.condition) {
+                auto cv = getIntLit(s.condition.get());
+                if (cv && *cv != 0 && *cv != 1) {
+                    s.condition = std::make_unique<CIntLitExpr>(
+                        1, CType::boolTy(), s.condition->getAddress());
+                }
+            }
             break;
-        case NodeKind::DoWhileStmt:
-            eliminateConstBranchesInList(static_cast<CDoWhileStmt&>(*sp).body);
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& s = static_cast<CDoWhileStmt&>(*sp);
+            eliminateConstBranchesInList(s.body);
+            if (s.condition) {
+                auto cv = getIntLit(s.condition.get());
+                if (cv && *cv != 0 && *cv != 1) {
+                    s.condition = std::make_unique<CIntLitExpr>(
+                        1, CType::boolTy(), s.condition->getAddress());
+                }
+            }
             break;
-        case NodeKind::ForStmt:
-            eliminateConstBranchesInList(static_cast<CForStmt&>(*sp).body);
+        }
+        case NodeKind::ForStmt: {
+            auto& s = static_cast<CForStmt&>(*sp);
+            eliminateConstBranchesInList(s.body);
+            if (s.condition) {
+                auto cv = getIntLit(s.condition.get());
+                if (cv && *cv != 0 && *cv != 1) {
+                    s.condition = std::make_unique<CIntLitExpr>(
+                        1, CType::boolTy(), s.condition->getAddress());
+                }
+            }
             break;
+        }
         case NodeKind::SwitchStmt:
             for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
                 eliminateConstBranchesInList(c.body);
@@ -2875,6 +6708,480 @@ void CAstOptimizer::invertEmptyIfInList(std::vector<StmtPtr>& stmts) {
 
 void CAstOptimizer::invertEmptyIfThen(CFuncDecl& func) {
     invertEmptyIfInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass 17: simplifyConditionPolarity
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Collapse redundant zero comparisons inside control-flow conditions so
+// the output matches the idiomatic C that IDA / Ghidra emit:
+//
+//   if (v != 0)     →  if (v)
+//   if (v == 0)     →  if (!v)
+//   while (v != 0)  →  while (v)
+//   do { ... } while (v == 0)  →  do { ... } while (!v)
+//
+// Only applies to the top-level operator of the condition expression —
+// nested comparisons (`a && b != 0`) are left untouched because stripping
+// the `!= 0` there would lose the boolean coercion around a wider-int
+// operand.  The transform moves operand ownership rather than cloning to
+// keep this pass allocation-free on large functions (Hogwarts Legacy
+// godmode has ~90 conditions).
+
+ExprPtr CAstOptimizer::flattenZeroComparison(ExprPtr condition) {
+    if (!condition || condition->getKind() != NodeKind::BinaryExpr)
+        return condition;
+
+    auto& bin = static_cast<CBinaryExpr&>(*condition);
+    if (bin.op != BinaryOp::Eq && bin.op != BinaryOp::Ne)
+        return condition;
+
+    auto isZeroLit = [](const CExpr* e) {
+        if (!e || e->getKind() != NodeKind::IntLitExpr) return false;
+        return static_cast<const CIntLitExpr&>(*e).value == 0;
+    };
+
+    ExprPtr nonZero;
+    if (isZeroLit(bin.rhs.get()))
+        nonZero = std::move(bin.lhs);
+    else if (isZeroLit(bin.lhs.get()))
+        nonZero = std::move(bin.rhs);
+    else
+        return condition;
+
+    if (!nonZero)
+        return condition;
+
+    // Guard against degenerate shapes where the nonZero operand is itself
+    // a zero literal (0 == 0, 0 != 0) — leave to constant folding.
+    if (nonZero->getKind() == NodeKind::IntLitExpr)
+        return condition;
+
+    uint64_t addr = condition->getAddress();
+
+    if (bin.op == BinaryOp::Ne) {
+        // X != 0  →  X   (C coerces non-zero integer to true automatically)
+        return nonZero;
+    }
+
+    // X == 0  →  !X
+    return std::make_unique<CUnaryExpr>(
+        UnaryOp::LogNot, std::move(nonZero), CType::boolTy(), addr);
+}
+
+void CAstOptimizer::simplifyConditionPolarityInList(
+    std::vector<StmtPtr>& stmts) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            s.condition = flattenZeroComparison(std::move(s.condition));
+            simplifyConditionPolarityInList(s.thenBody);
+            simplifyConditionPolarityInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            auto& s = static_cast<CWhileStmt&>(*sp);
+            s.condition = flattenZeroComparison(std::move(s.condition));
+            simplifyConditionPolarityInList(s.body);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& s = static_cast<CDoWhileStmt&>(*sp);
+            s.condition = flattenZeroComparison(std::move(s.condition));
+            simplifyConditionPolarityInList(s.body);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            auto& s = static_cast<CForStmt&>(*sp);
+            if (s.condition)
+                s.condition = flattenZeroComparison(std::move(s.condition));
+            simplifyConditionPolarityInList(s.body);
+            break;
+        }
+        case NodeKind::SwitchStmt: {
+            auto& s = static_cast<CSwitchStmt&>(*sp);
+            for (auto& c : s.cases)
+                simplifyConditionPolarityInList(c.body);
+            break;
+        }
+        case NodeKind::BlockStmt:
+            simplifyConditionPolarityInList(
+                static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void CAstOptimizer::simplifyConditionPolarity(CFuncDecl& func) {
+    simplifyConditionPolarityInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass 18: foldDegenerateCompounds
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// `CAstBuilder::detectCompoundOp` collapses `target = target OP rhs` into the
+// compound form `target OP= rhs` very early, before `simplifyExpressions`
+// sees the full expression tree.  For the x86 `sbb eax, eax` + `sub eax, ebx`
+// pair Remill lifts as `v1 = v1 - (v1 - v3)`, the compound step stores only
+// `v1 - v3` as the assignment value (with `compoundOp = "-="`), and the
+// algebraic fold `x - (x - y) → y` in `simplifyExpr` never gets a chance
+// to run against the outer `-`.  The printed output is the mathematically
+// degenerate `v1 -= v1 - v3;`.
+//
+// This pass runs AFTER `synthesizeCompoundAssign` and specifically inspects
+// compound assigns whose RHS already mentions the target:
+//
+//   target -= target - Y      →   target = Y
+//   target += target + Y      →   target = target + target + Y  (kept)
+//                                 — not degenerate; leave it.
+//
+// Only `-=` is folded because the SBB+SUB idiom is the one that produces a
+// fold (subtraction is non-commutative and the self-reference cancels).
+// `+=` / `*=` / etc. with self-references aren't the same algebraic cancel.
+
+void CAstOptimizer::foldDegenerateCompoundsInList(
+    std::vector<StmtPtr>& stmts) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::AssignStmt: {
+            auto& a = static_cast<CAssignStmt&>(*sp);
+            if (a.compoundOp != "-=" || !a.target || !a.value)
+                break;
+            if (a.value->getKind() != NodeKind::BinaryExpr)
+                break;
+            auto& rhs = static_cast<CBinaryExpr&>(*a.value);
+            // Degenerate: `target -= target - Y` → `target = Y`.
+            if (rhs.op == BinaryOp::Sub && rhs.lhs && rhs.rhs &&
+                isSameExpr(a.target.get(), rhs.lhs.get())) {
+                a.value = std::move(rhs.rhs);
+                a.compoundOp.clear();
+            }
+            break;
+        }
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            foldDegenerateCompoundsInList(s.thenBody);
+            foldDegenerateCompoundsInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            foldDegenerateCompoundsInList(
+                static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            foldDegenerateCompoundsInList(
+                static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            foldDegenerateCompoundsInList(
+                static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                foldDegenerateCompoundsInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            foldDegenerateCompoundsInList(
+                static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void CAstOptimizer::foldDegenerateCompounds(CFuncDecl& func) {
+    foldDegenerateCompoundsInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass 19: downgradeDeadAssignedCalls (gta-sa bug E)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Walks each statement list (per-scope) and downgrades
+//
+//   v = fN(args);
+//   ...
+//   v = fM(args);      // overwrites without reading v in between
+//
+// into
+//
+//   fN(args);          // expression-statement; side effect preserved
+//   ...
+//   v = fM(args);
+//
+// Triggered by the gta-sa `sub_53b51f` (camera cmd) vtable-chain pattern,
+// where 90+ consecutive assignments to `v2` each hold the result of a
+// different vfunc call — but `v2` is never read until the function
+// returns via a fresh call, so every intermediate assignment was a dead
+// store on the LHS while carrying a live side-effecting CallExpr on the
+// RHS.  The existing `eliminateDeadStores` pass conservatively keeps the
+// full `v = call()` when RHS has side effects; this pass goes further
+// and strips the target when safe.
+//
+// Safety rules (intentionally conservative):
+//   - Only touches simple VarRefExpr targets (no field access, no deref,
+//     no compound-assign modifiers — those have observable state changes
+//     beyond the value assignment).
+//   - Only scans FORWARD within the same scope (not across if/while
+//     boundaries).  A read behind a branch keeps the assign.
+//   - Stops at any CallExpr whose args reference the target (the callee
+//     may read the target via an alias).
+//   - Stops at any form of MemWrite / AddressOf(target) / pointer access
+//     (target could alias).  For safety we only look at direct VarRefExpr
+//     reads of `target.varName`.
+
+namespace {
+/// Returns true if any CVarRefExpr anywhere in `e` has the given name.
+static bool exprReadsVarName(const CExpr* e, std::string_view name) {
+    if (!e) return false;
+    switch (e->getKind()) {
+    case NodeKind::VarRefExpr:
+        return static_cast<const CVarRefExpr*>(e)->varName == name;
+    case NodeKind::UnaryExpr:
+        return exprReadsVarName(
+            static_cast<const CUnaryExpr*>(e)->operand.get(), name);
+    case NodeKind::BinaryExpr: {
+        auto& b = *static_cast<const CBinaryExpr*>(e);
+        return exprReadsVarName(b.lhs.get(), name) ||
+               exprReadsVarName(b.rhs.get(), name);
+    }
+    case NodeKind::CastExpr:
+        return exprReadsVarName(
+            static_cast<const CCastExpr*>(e)->operand.get(), name);
+    case NodeKind::CallExpr: {
+        auto& c = *static_cast<const CCallExpr*>(e);
+        for (auto& a : c.args)
+            if (exprReadsVarName(a.get(), name)) return true;
+        return false;
+    }
+    case NodeKind::SubscriptExpr: {
+        auto& s = *static_cast<const CSubscriptExpr*>(e);
+        return exprReadsVarName(s.base.get(), name) ||
+               exprReadsVarName(s.index.get(), name);
+    }
+    case NodeKind::FieldAccessExpr:
+        return exprReadsVarName(
+            static_cast<const CFieldAccessExpr*>(e)->base.get(), name);
+    case NodeKind::TernaryExpr: {
+        auto& t = *static_cast<const CTernaryExpr*>(e);
+        return exprReadsVarName(t.cond.get(), name) ||
+               exprReadsVarName(t.trueVal.get(), name) ||
+               exprReadsVarName(t.falseVal.get(), name);
+    }
+    default:
+        return false;
+    }
+}
+} // anonymous namespace
+
+void CAstOptimizer::downgradeDeadAssignedCallsInList(
+    std::vector<StmtPtr>& stmts) {
+    // Recurse into nested scopes first.
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            downgradeDeadAssignedCallsInList(s.thenBody);
+            downgradeDeadAssignedCallsInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            downgradeDeadAssignedCallsInList(
+                static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            downgradeDeadAssignedCallsInList(
+                static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            downgradeDeadAssignedCallsInList(
+                static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                downgradeDeadAssignedCallsInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            downgradeDeadAssignedCallsInList(
+                static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Now scan the current list for downgrade opportunities.
+    for (size_t i = 0; i < stmts.size(); ++i) {
+        auto& sp = stmts[i];
+        if (!sp || sp->getKind() != NodeKind::AssignStmt) continue;
+        auto& a = static_cast<CAssignStmt&>(*sp);
+        if (!a.compoundOp.empty()) continue;      // compound — semantic is "x OP= y", target is read
+        if (!a.target || !a.value) continue;
+        if (a.target->getKind() != NodeKind::VarRefExpr) continue;
+        if (a.value->getKind() != NodeKind::CallExpr) continue;
+
+        const auto& tgtRef = *static_cast<const CVarRefExpr*>(a.target.get());
+        std::string_view tgtName = tgtRef.varName;
+        if (tgtName.empty()) continue;
+
+        // Scan forward in this scope for a read of tgtName or an overwrite.
+        // If we hit an overwrite without a read → downgrade this assign.
+        bool foundReadBefore = false;
+        bool foundOverwrite  = false;
+        for (size_t j = i + 1; j < stmts.size(); ++j) {
+            auto& next = stmts[j];
+            if (!next) continue;
+
+            switch (next->getKind()) {
+            case NodeKind::AssignStmt: {
+                auto& na = static_cast<CAssignStmt&>(*next);
+                // Look at both sides: RHS read, LHS overwrite.
+                if (exprReadsVarName(na.value.get(), tgtName))
+                    foundReadBefore = true;
+                if (na.target && na.target->getKind() == NodeKind::VarRefExpr &&
+                    static_cast<const CVarRefExpr*>(na.target.get())->varName == tgtName &&
+                    na.compoundOp.empty()) {
+                    foundOverwrite = true;
+                }
+                break;
+            }
+            case NodeKind::ExprStmt: {
+                auto& e = static_cast<CExprStmt&>(*next);
+                if (exprReadsVarName(e.expr.get(), tgtName))
+                    foundReadBefore = true;
+                break;
+            }
+            case NodeKind::ReturnStmt: {
+                auto& r = static_cast<CReturnStmt&>(*next);
+                if (exprReadsVarName(r.value.get(), tgtName))
+                    foundReadBefore = true;
+                // Return ends the function — effectively overwrites (tgt can't
+                // be observed past the return).
+                foundOverwrite = true;
+                break;
+            }
+            // Any control-flow construct in between means we can't be sure
+            // the target isn't read on some path.  Bail conservatively.
+            case NodeKind::IfStmt:
+            case NodeKind::WhileStmt:
+            case NodeKind::DoWhileStmt:
+            case NodeKind::ForStmt:
+            case NodeKind::SwitchStmt:
+            case NodeKind::BlockStmt:
+            case NodeKind::GotoStmt:
+            case NodeKind::LabelStmt:
+            case NodeKind::BreakStmt:
+            case NodeKind::ContinueStmt:
+                foundReadBefore = true; // treat as potential read
+                break;
+            default:
+                break;
+            }
+            if (foundReadBefore || foundOverwrite) break;
+        }
+
+        // Downgrade only when we proved no read before overwrite/return.
+        if (foundOverwrite && !foundReadBefore) {
+            auto callValue = std::move(a.value);
+            sp = std::make_unique<CExprStmt>(std::move(callValue),
+                                             a.getAddress());
+        }
+    }
+}
+
+void CAstOptimizer::downgradeDeadAssignedCalls(CFuncDecl& func) {
+    downgradeDeadAssignedCallsInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass 20: declareUndeclaredVars (gta-sa bug C)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// FIX-040 reports undeclared variable references as a confidence penalty
+// but doesn't actually inject the missing `int64_t v0;` declaration.  This
+// pass does — conservatively, with `int64_t` as the default type for any
+// orphan name.  Runs BEFORE `removeUnusedDeclarations` so the injected
+// decls stick around if they're genuinely referenced, and before
+// `reanalyzeConfidence` so the confidence reflects the final state.
+
+void CAstOptimizer::declareUndeclaredVars(CFuncDecl& func) {
+    // Build the set of already-declared names (params + locals).
+    std::unordered_set<std::string> declared;
+    for (auto& p : func.params)    declared.insert(p.name);
+    for (auto& d : func.localVars) declared.insert(d.varName);
+
+    // Collect all VarRef names in the body.
+    std::unordered_set<std::string> referenced;
+    collectVarNamesInStmts(func.body, referenced);
+
+    // Identify orphans.  Skip stack bookkeeping names the printer handles
+    // specially, skip empty-string references (malformed nodes), and
+    // validate the name is a legal C identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+    // Integer literals sometimes leak into `collectVarNamesInStmts` as
+    // stringified values like "0" or "4" — we must not emit `int64_t 0;`
+    // as a declaration.  The caller (`reanalyzeConfidence`) already
+    // penalises genuine undeclared refs separately, so a false negative
+    // here is strictly less harmful than a false positive.
+    auto isValidCIdent = [](std::string_view n) -> bool {
+        if (n.empty()) return false;
+        char c0 = n.front();
+        if (!((c0 >= 'A' && c0 <= 'Z') ||
+              (c0 >= 'a' && c0 <= 'z') ||
+              c0 == '_'))
+            return false;
+        for (size_t i = 1; i < n.size(); ++i) {
+            char c = n[i];
+            if (!((c >= 'A' && c <= 'Z') ||
+                  (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '_'))
+                return false;
+        }
+        return true;
+    };
+
+    std::vector<std::string> orphans;
+    for (auto& n : referenced) {
+        if (n == "rsp" || n == "rbp" || n == "esp" || n == "ebp")
+            continue;
+        if (!isValidCIdent(n))
+            continue;
+        if (!declared.count(n))
+            orphans.push_back(n);
+    }
+    if (orphans.empty()) return;
+
+    // Pick a varId range above any existing one.  `CParamDecl` doesn't
+    // carry an SSA varId (it has `index` instead), so we only seed from
+    // `localVars`.
+    uint32_t nextId = 1;
+    for (auto& d : func.localVars)
+        nextId = std::max(nextId, d.varId + 1u);
+
+    // Sort for deterministic output (stable across runs).
+    std::sort(orphans.begin(), orphans.end());
+
+    for (auto& name : orphans) {
+        // Use int64_t as the safe default.  Downstream type propagation
+        // may refine later passes, but the decl being PRESENT is what
+        // makes the output compile — that's the whole point of this pass.
+        CVarDecl decl(nextId++, name, CType::int64());
+        func.localVars.push_back(std::move(decl));
+    }
+
+    // Record how many synthetic decls we added so the confidence analyser
+    // can still surface this as a smell even though the output now
+    // technically compiles.  See FIX-045.
+    func.synthesizedVarDecls += static_cast<unsigned>(orphans.size());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

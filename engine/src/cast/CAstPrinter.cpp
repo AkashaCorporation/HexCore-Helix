@@ -111,10 +111,25 @@ void CAstPrinter::printExpr(const CExpr& expr, int parentPrec) {
     }
     case NodeKind::FloatLitExpr: {
         const auto& e = static_cast<const CFloatLitExpr&>(expr);
-        // Use snprintf for consistent formatting
+        // Use snprintf with %g for compactness, but ensure the result
+        // contains a decimal point or exponent marker so the literal is
+        // unambiguously a floating-point token (not an int).  Append a
+        // single-precision suffix when the type is `float`.
         char buf[64];
         std::snprintf(buf, sizeof(buf), "%g", e.value);
-        os << buf;
+        std::string lit(buf);
+        if (lit.find('.') == std::string::npos &&
+            lit.find('e') == std::string::npos &&
+            lit.find('E') == std::string::npos &&
+            lit.find('n') == std::string::npos /* nan */ &&
+            lit.find('i') == std::string::npos /* inf */) {
+            lit += ".0";
+        }
+        os << lit;
+        if (e.type && e.type->kind == TypeKind::Float &&
+            e.type->bitWidth == 32) {
+            os << "f";
+        }
         break;
     }
     case NodeKind::StringLitExpr: {
@@ -282,7 +297,16 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
         const auto& s = static_cast<const CWhileStmt&>(stmt);
         indent(depth);
         os << "while (";
-        printExpr(*s.condition, 0);
+        // Normalize constant non-zero loop condition to "true" for
+        // readability: the lift produces "while (-1)" for infinite loops
+        // (unconditional jmp), which is legal C but ugly.
+        if (s.condition &&
+            s.condition->getKind() == NodeKind::IntLitExpr &&
+            static_cast<const CIntLitExpr&>(*s.condition).value != 0) {
+            os << "true";
+        } else {
+            printExpr(*s.condition, 0);
+        }
         os << ") {\n";
         for (const auto& st : s.body)
             printStmt(*st, depth + 1);
@@ -298,7 +322,13 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
             printStmt(*st, depth + 1);
         indent(depth);
         os << "} while (";
-        printExpr(*s.condition, 0);
+        if (s.condition &&
+            s.condition->getKind() == NodeKind::IntLitExpr &&
+            static_cast<const CIntLitExpr&>(*s.condition).value != 0) {
+            os << "true";
+        } else {
+            printExpr(*s.condition, 0);
+        }
         os << ");\n";
         break;
     }
@@ -312,8 +342,14 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
             printExpr(*static_cast<const CExprStmt&>(*s.init).expr, 0);
         }
         os << "; ";
-        if (s.condition)
-            printExpr(*s.condition, 0);
+        if (s.condition) {
+            if (s.condition->getKind() == NodeKind::IntLitExpr &&
+                static_cast<const CIntLitExpr&>(*s.condition).value != 0) {
+                os << "true";
+            } else {
+                printExpr(*s.condition, 0);
+            }
+        }
         os << "; ";
         if (s.step) {
             printExpr(*static_cast<const CExprStmt&>(*s.step).expr, 0);

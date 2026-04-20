@@ -36,6 +36,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <cstdint>
+#include <unordered_map>
 
 #define DEBUG_TYPE "escape-analysis"
 
@@ -47,6 +48,7 @@ STATISTIC(NumVarsEscaping,    "Number of variables that escape");
 STATISTIC(NumVarsNonEscaping, "Number of variables that do not escape");
 STATISTIC(NumPtrArithEscapes, "Number of variables escaping via pointer arithmetic");
 STATISTIC(NumIndirectCallEscapes, "Number of variables escaping due to indirect calls");
+STATISTIC(NumAliasClasses,   "Number of must-alias equivalence classes found");
 
 namespace {
 
@@ -202,6 +204,132 @@ private:
                 }
             }
         });
+
+        // ── Phase 3.5: Must-alias class detection ─────────────────────────
+        //
+        // Compute must-alias equivalence classes for stack pointers.
+        // Two variables must-alias if they are both derived from the same
+        // base slot via identical pointer arithmetic chains.
+        //
+        // Key: (baseSlot, offset) — all variables with the same key are in
+        // the same must-alias class.  This enables the DCE to determine
+        // that a store via `param_1 + 0x40` is NOT observable if nothing
+        // reads from alias class (param_1, 0x40).
+        //
+        // The alias class ID is annotated on each var.decl as
+        // "helix.alias_class" (IntegerAttr).  Same ID = same class.
+        {
+            struct AliasKey {
+                uint32_t baseSlot;
+                int64_t offset;
+                bool operator==(const AliasKey& o) const {
+                    return baseSlot == o.baseSlot && offset == o.offset;
+                }
+            };
+
+            // Helper hash for AliasKey.
+            struct AliasKeyHash {
+                size_t operator()(const AliasKey& k) const {
+                    return llvm::hash_combine(k.baseSlot, k.offset);
+                }
+            };
+
+            // Map: variable slot → (baseSlot, offset) derived from.
+            llvm::DenseMap<uint32_t, AliasKey> slotAliasKeys;
+
+            // Collect all store ops that assign an AddrOf(var.ref) + offset
+            // to another variable.  This traces the address derivation.
+            body.walk([&](mid::VarDeclOp declOp) {
+                uint32_t slot = declOp.getSlotId();
+                // The simplest must-alias: each variable aliases itself.
+                slotAliasKeys[slot] = AliasKey{slot, 0};
+            });
+
+            // Trace assignments where a variable is set to
+            // AddrOf(other_var) + constant_offset.
+            // mid::AssignOp uses (slot_id, value) — no VarRefOp target.
+            body.walk([&](mid::AssignOp assignOp) {
+                uint32_t targetSlot = assignOp.getSlotId();
+                Value rhs = assignOp.getValue();
+
+                // Case 1: rhs = AddrOf(var.ref other) — direct alias.
+                if (auto addrSlot = traceAddrOfToVarSlot(rhs)) {
+                    slotAliasKeys[targetSlot] =
+                        AliasKey{*addrSlot, 0};
+                    return;
+                }
+
+                // Case 2: rhs = binexpr Add(AddrOf(other), constant) —
+                // alias at offset.
+                if (auto binExpr = rhs.getDefiningOp<mid::BinExprOp>()) {
+                    if (binExpr.getKind() != mid::BinExprKind::Add)
+                        return;
+
+                    // Try: Add(AddrOf(other), constant)
+                    for (int side = 0; side < 2; ++side) {
+                        Value addrSide = (side == 0)
+                            ? binExpr.getLhs() : binExpr.getRhs();
+                        Value constSide = (side == 0)
+                            ? binExpr.getRhs() : binExpr.getLhs();
+
+                        auto baseSlot = traceAddrOfToVarSlot(addrSide);
+                        if (!baseSlot)
+                            continue;
+
+                        int64_t offset = 0;
+                        if (auto constOp =
+                                constSide.getDefiningOp<mid::ConstantOp>())
+                            offset = constOp.getValue();
+
+                        slotAliasKeys[targetSlot] =
+                            AliasKey{*baseSlot, offset};
+                        return;
+                    }
+                }
+
+                // Case 3: rhs = var.ref other — copy alias.
+                if (auto rhsRef = rhs.getDefiningOp<mid::VarRefOp>()) {
+                    uint32_t rhsSlot = rhsRef.getSlotId();
+                    auto it = slotAliasKeys.find(rhsSlot);
+                    if (it != slotAliasKeys.end())
+                        slotAliasKeys[targetSlot] = it->second;
+                }
+            });
+
+            // Group slots by AliasKey → assign class IDs.
+            std::unordered_map<AliasKey, uint32_t, AliasKeyHash> keyToClass;
+            uint32_t nextClass = 0;
+
+            for (auto& [slot, key] : slotAliasKeys) {
+                auto [it, inserted] = keyToClass.try_emplace(key, nextClass);
+                if (inserted)
+                    ++nextClass;
+            }
+
+            NumAliasClasses += nextClass;
+
+            // Annotate var.decl ops with alias class.
+            body.walk([&](mid::VarDeclOp declOp) {
+                uint32_t slot = declOp.getSlotId();
+                auto it = slotAliasKeys.find(slot);
+                if (it == slotAliasKeys.end())
+                    return;
+
+                auto classIt = keyToClass.find(it->second);
+                if (classIt == keyToClass.end())
+                    return;
+
+                declOp->setAttr("helix.alias_class",
+                    IntegerAttr::get(
+                        IntegerType::get(declOp.getContext(), 32),
+                        classIt->second));
+            });
+
+            LLVM_DEBUG(llvm::dbgs()
+                << "  Phase 3.5: " << nextClass
+                << " must-alias classes from "
+                << slotAliasKeys.size() << " slots\n");
+        }
 
         // ── Phase 4: Pointer arithmetic escape (Osprey heuristic) ───────
         //

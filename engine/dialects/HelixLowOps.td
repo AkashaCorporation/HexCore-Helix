@@ -254,6 +254,13 @@ def HelixLow_CallOp : HelixLow_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
     the function name is known (from signature database or symbol table).
     At this level, arguments are implicit (in registers per calling convention).
     The calling convention pass in HelixHigh will fold explicit arguments.
+
+    Produces an optional integer result representing the callee's return
+    value (RAX on x86-64 / x0 on ARM).  When present, a subsequent
+    `reg.write RAX, %result` carries the return value into the register
+    SSA graph so callers can consume it as a distinct variable
+    (`v1 = sub_xxx(); if (v1 != 0) { ... }`).  The result is optional so
+    void callers remain representable without forcing a dead RAX def.
   }];
 
   let arguments = (ins
@@ -262,9 +269,11 @@ def HelixLow_CallOp : HelixLow_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
     OptionalAttr<StrAttr>:$target_name,
     OptionalAttr<UI64Attr>:$address
   );
+  let results = (outs Optional<AnyInteger>:$result);
 
   let assemblyFormat = [{
-    $target_addr (`name` $target_name^)? `(` $args `)` (`at` $address^)? attr-dict `:` type($target_addr) (`,` type($args)^)?
+    $target_addr (`name` $target_name^)? `(` $args `)` (`at` $address^)? attr-dict
+    `:` type($target_addr) (`,` type($args)^)? (`->` type($result)^)?
   }];
 }
 

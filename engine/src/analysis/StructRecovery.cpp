@@ -83,8 +83,18 @@ RecoveredStruct StructRecoveryAnalyzer::buildStruct(
 
         RecoveredField field;
         field.offset = static_cast<unsigned>(offset);
-        field.name = std::format("field_{:x}", field.offset);
         field.access_count = static_cast<unsigned>(accesses.size());
+
+        // Check if any access at this offset is a dynamic array pattern.
+        bool hasDynamicArray = false;
+        int64_t arrayStride = 0;
+        for (const auto* a : accesses) {
+            if (a->is_dynamic_array && a->stride > 0) {
+                hasDynamicArray = true;
+                arrayStride = a->stride;
+                break;
+            }
+        }
 
         // Determine field size: use the maximum access width seen at this offset.
         unsigned maxWidth = 0;
@@ -92,7 +102,6 @@ RecoveredStruct StructRecoveryAnalyzer::buildStruct(
             if (a->access_width > maxWidth)
                 maxWidth = a->access_width;
         }
-        field.size = maxWidth;
 
         // Determine field type: prefer the most specific type hint.
         // If multiple accesses have type hints, use meet() to combine them.
@@ -109,17 +118,52 @@ RecoveredStruct StructRecoveryAnalyzer::buildStruct(
             }
         }
 
-        if (!hasTypeHint) {
-            // Infer type from access width.
-            switch (maxWidth) {
-            case 1: fieldType = HelixTypeInfo::makeInt(8, false); break;
-            case 2: fieldType = HelixTypeInfo::makeInt(16, true); break;
-            case 4: fieldType = HelixTypeInfo::makeInt(32, true); break;
-            case 8: fieldType = HelixTypeInfo::makeInt(64, true); break;
-            default: fieldType = HelixTypeInfo::makeUnknown(); break;
+        if (hasDynamicArray) {
+            // Dynamic array: *(base + index * stride) at this offset.
+            unsigned elemSize = (arrayStride > 0)
+                ? static_cast<unsigned>(arrayStride) : maxWidth;
+
+            // Element type from stride width.
+            HelixTypeInfo elemType;
+            if (hasTypeHint) {
+                elemType = fieldType;
+            } else if (elemSize == 1) {
+                // stride=1 byte access → likely char/string
+                elemType = HelixTypeInfo::makeInt(8, false);
+            } else {
+                switch (elemSize) {
+                case 2: elemType = HelixTypeInfo::makeInt(16, true); break;
+                case 4: elemType = HelixTypeInfo::makeInt(32, true); break;
+                case 8: elemType = HelixTypeInfo::makeInt(64, true); break;
+                default: elemType = HelixTypeInfo::makeInt(elemSize * 8, true); break;
+                }
             }
+
+            // Unknown length (dynamic) → 0.
+            field.type = HelixTypeInfo::makeArray(elemType, /*length=*/0);
+            field.size = elemSize;  // Minimum known element size.
+
+            // Name: "array_<offset>" or "str_<offset>" for byte-stride.
+            if (elemSize == 1)
+                field.name = std::format("str_{:x}", field.offset);
+            else
+                field.name = std::format("array_{:x}", field.offset);
+        } else {
+            // Regular constant-offset field.
+            field.size = maxWidth;
+
+            if (!hasTypeHint) {
+                switch (maxWidth) {
+                case 1: fieldType = HelixTypeInfo::makeInt(8, false); break;
+                case 2: fieldType = HelixTypeInfo::makeInt(16, true); break;
+                case 4: fieldType = HelixTypeInfo::makeInt(32, true); break;
+                case 8: fieldType = HelixTypeInfo::makeInt(64, true); break;
+                default: fieldType = HelixTypeInfo::makeUnknown(); break;
+                }
+            }
+            field.type = fieldType;
+            field.name = std::format("field_{:x}", field.offset);
         }
-        field.type = fieldType;
 
         result.fields.push_back(std::move(field));
     }

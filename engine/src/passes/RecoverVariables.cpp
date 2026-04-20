@@ -100,6 +100,7 @@ STATISTIC(NumSSAVersions,      "Number of SSA variable versions created");
 STATISTIC(NumDeadFlagWrites,   "Number of dead flag/RIP RegWrites eliminated");
 STATISTIC(NumUndefReplaced,    "Number of __undef references replaced with defaults");
 STATISTIC(NumVarsMerged,       "Number of variables eliminated by cover-based merging");
+STATISTIC(NumVersionsCoalesced,"Number of SSA versions coalesced into base register var");
 STATISTIC(NumTempsInlined,     "Number of single-use temporaries inlined");
 
 namespace {
@@ -388,6 +389,11 @@ struct SSAVersionTracker {
     /// Current (most recent) version for each canonical register.
     llvm::StringMap<Version> current;
 
+    /// All versions ever created, grouped by canonical register.
+    /// Used by Phase 3.5 (same-register coalescing) to identify
+    /// versions of the same logical variable.
+    llvm::StringMap<llvm::SmallVector<Version, 4>> allVersions;
+
     /// Counter for creating unique names per register (rax→0, rax→1, ...).
     llvm::StringMap<unsigned> versionCounters;
 
@@ -433,6 +439,7 @@ struct SSAVersionTracker {
 
         uint32_t newId = declOp.getVarId();
         current[canonReg] = {declOp, newId, varName};
+        allVersions[canonReg].push_back({declOp, newId, varName});
 
         ++NumRegVarsCreated;
         ++NumSSAVersions;
@@ -653,12 +660,23 @@ private:
 
         // ── Initialize calling convention info ───────────────────────────
         // The RecoverCallingConventionPass sets "calling_convention" and
-        // "has_return_value" attributes on the function.
+        // "has_return_value" attributes on the function.  Three values are
+        // possible today: "win64", "sysv", "cdecl" (32-bit x86 — all args on
+        // the stack).  For cdecl we leave argRegPositions empty so the
+        // parameter-register detection path finds nothing; stack-frame args
+        // are recovered by RecoverStackLayout instead.
         bool isWin64 = true;
+        bool isCdecl32 = false;
         if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention")) {
-            isWin64 = (ccAttr.getValue() == "win64");
+            auto ccVal = ccAttr.getValue();
+            isWin64   = (ccVal == "win64");
+            isCdecl32 = (ccVal == "cdecl");
         }
-        tracker.initArgRegPositions(isWin64);
+        if (isCdecl32) {
+            tracker.argRegPositions.clear();
+        } else {
+            tracker.initArgRegPositions(isWin64);
+        }
         tracker.hasReturnValue =
             func->hasAttr("has_return_value");
 
@@ -671,11 +689,13 @@ private:
 
         auto funcLoc = func.getLoc();
 
-        LLVM_DEBUG(llvm::dbgs() << "RecoverVariables: processing '"
-                                << func.getSymName() << "' (cc="
-                                << (isWin64 ? "win64" : "sysv")
-                                << ", hasReturn="
-                                << tracker.hasReturnValue << ")\n");
+        LLVM_DEBUG({
+            const char* ccDbg = isCdecl32 ? "cdecl"
+                              : (isWin64  ? "win64" : "sysv");
+            llvm::dbgs() << "RecoverVariables: processing '"
+                         << func.getSymName() << "' (cc=" << ccDbg
+                         << ", hasReturn=" << tracker.hasReturnValue << ")\n";
+        });
 
         // ── Phase 0: Eliminate dead flag/RIP RegWrites ──────────────────
         //
@@ -1389,6 +1409,267 @@ private:
                          << tracker.tempCounter << " temps\n";
         });
 
+        // ── Phase 3.5: Same-register SSA version coalescing ──────────────
+        //
+        // For each canonical register (RAX, RBX, etc.), check if multiple
+        // SSA versions can be collapsed into a single variable.  This
+        // converts  "rax, rax_1, rax_2"  →  "rax"  with reassignments.
+        //
+        // Algorithm:
+        //   1. Group VarDeclOps by source register (from allVersions)
+        //   2. For each version V_i (i>0) of register R:
+        //      a. Collect blocks where V_0 and V_i are referenced
+        //      b. If no block contains uses of BOTH after V_i's def → coalesce
+        //      c. For same-block versions: use program-order position check
+        //   3. Rewrite V_i's VarRefOps → V_0, erase V_i's VarDeclOp
+        //
+        // This runs BEFORE Phase 4 (generic cover-based merge) because it
+        // has register-awareness: it knows rax_0 and rax_1 are the same
+        // logical variable and can safely be merged even when Phase 4's
+        // block-level overlap check would reject them.
+
+        LLVM_DEBUG(llvm::dbgs()
+            << "  Phase 3.5: same-register SSA version coalescing\n");
+
+        // Pre-compute usage classification for every variable referenced in
+        // the function.  Each variable is classified as:
+        //   - Address: used as a pointer (mem.read addr, field access base)
+        //   - Value:   used in arithmetic, comparison, etc.
+        //   - Mixed:   both address and value uses
+        //   - None:    no classifying uses
+        //
+        // Used for semantic compatibility in coalescing — we refuse to merge
+        // an Address-only variable with a Value-only variable, even if the
+        // explicit type attributes don't conflict.
+        enum class UsageKind : uint8_t { None, Address, Value, Mixed };
+        llvm::DenseMap<unsigned, uint8_t> usageMap;
+        funcBody.walk([&](helix::high::VarRefOp ref) {
+            unsigned varId = ref.getVarId();
+            uint8_t flags = usageMap.lookup(varId);
+            // bit 0 = addr use, bit 1 = value use
+            for (auto& use : ref.getResult().getUses()) {
+                Operation* user = use.getOwner();
+                unsigned idx = use.getOperandNumber();
+
+                if (isa<helix::low::MemReadOp>(user)) {
+                    if (idx == 0) flags |= 0x1;  // addr operand
+                } else if (isa<helix::low::MemWriteOp>(user)) {
+                    if (idx == 0) flags |= 0x1;  // addr operand
+                    else flags |= 0x2;            // value operand
+                } else if (isa<helix::high::FieldAccessOp>(user)) {
+                    if (idx == 0) flags |= 0x1;  // base operand
+                } else if (isa<arith::AddIOp>(user) ||
+                           isa<arith::SubIOp>(user) ||
+                           isa<arith::MulIOp>(user) ||
+                           isa<arith::DivSIOp>(user) ||
+                           isa<arith::DivUIOp>(user) ||
+                           isa<arith::CmpIOp>(user) ||
+                           isa<arith::ShLIOp>(user) ||
+                           isa<arith::ShRSIOp>(user) ||
+                           isa<arith::ShRUIOp>(user) ||
+                           isa<arith::AndIOp>(user) ||
+                           isa<arith::OrIOp>(user) ||
+                           isa<arith::XOrIOp>(user)) {
+                    flags |= 0x2;
+                } else if (isa<helix::low::BinOp>(user)) {
+                    flags |= 0x2;
+                }
+            }
+            usageMap[varId] = flags;
+        });
+
+        auto getUsageKind = [&](unsigned varId) -> UsageKind {
+            uint8_t flags = usageMap.lookup(varId);
+            bool addr = (flags & 0x1) != 0;
+            bool val  = (flags & 0x2) != 0;
+            if (addr && val) return UsageKind::Mixed;
+            if (addr) return UsageKind::Address;
+            if (val) return UsageKind::Value;
+            return UsageKind::None;
+        };
+
+        // Helper: returns true if a type string represents a pointer.
+        auto isPtrTypeStr = [](StringRef s) {
+            return !s.empty() && s.ends_with("*");
+        };
+
+        {
+            unsigned coalesced = 0;
+
+            for (auto& entry : ssaTracker.allVersions) {
+                auto& versions = entry.getValue();
+                if (versions.size() <= 1)
+                    continue;
+
+                // Base version (version 0) — the one we keep.
+                auto& base = versions[0];
+                if (!base.decl)
+                    continue;
+
+                // Type of the base version (for compatibility check).
+                auto baseTypeAttr =
+                    base.decl->getAttrOfType<StringAttr>("inferred_type");
+                bool basePtr = static_cast<bool>(baseTypeAttr) &&
+                               isPtrTypeStr(baseTypeAttr.getValue());
+                auto baseKind = getUsageKind(base.varId);
+
+                for (size_t vi = 1; vi < versions.size(); ++vi) {
+                    auto& ver = versions[vi];
+                    if (!ver.decl)
+                        continue;
+
+                    // ── Type compatibility check ──────────────────────────
+                    auto verTypeAttr =
+                        ver.decl->getAttrOfType<StringAttr>("inferred_type");
+                    if (baseTypeAttr && verTypeAttr &&
+                        baseTypeAttr.getValue() != verTypeAttr.getValue())
+                        continue;
+
+                    // ── Pointer/non-pointer type mismatch ─────────────────
+                    // Refuse coalescing if exactly one version is explicitly
+                    // typed as a pointer.  This catches the case where one
+                    // version had its pointer type inferred but the other
+                    // version was untyped (or typed as integer).
+                    bool verPtr = static_cast<bool>(verTypeAttr) &&
+                                  isPtrTypeStr(verTypeAttr.getValue());
+                    if (basePtr != verPtr) {
+                        if (baseTypeAttr || verTypeAttr) continue;
+                    }
+
+                    // ── Semantic usage compatibility ──────────────────────
+                    // Refuse coalescing if one version is used exclusively
+                    // as an address (pointer) and the other exclusively as
+                    // a value (arithmetic operand).  This catches the case
+                    // where the Remill lift assigned the same register to
+                    // semantically distinct values that share no type info.
+                    auto verKind = getUsageKind(ver.varId);
+                    if ((baseKind == UsageKind::Address &&
+                         verKind == UsageKind::Value) ||
+                        (baseKind == UsageKind::Value &&
+                         verKind == UsageKind::Address))
+                        continue;
+
+                    // ── Liveness interference check ───────────────────────
+                    //
+                    // Collect blocks where base and ver are referenced.
+                    // If they share no block → safe (same as Phase 4 check).
+                    // If they share a block → fine-grained position check.
+
+                    llvm::SmallPtrSet<Block*, 4> baseBlocks;
+                    llvm::SmallPtrSet<Block*, 4> verBlocks;
+
+                    funcBody.walk([&](helix::high::VarRefOp ref) {
+                        if (ref.getVarId() == base.varId)
+                            baseBlocks.insert(ref->getBlock());
+                        else if (ref.getVarId() == ver.varId)
+                            verBlocks.insert(ref->getBlock());
+                    });
+
+                    // Check for shared blocks.
+                    bool interferes = false;
+                    for (auto* blk : baseBlocks) {
+                        if (!verBlocks.contains(blk))
+                            continue;
+
+                        // Both present in this block.  Fine-grained check:
+                        // scan ops in program order.  Find the FIRST def of
+                        // ver (its AssignOp target).  If base has any use
+                        // AFTER that def → interference.
+                        Operation* verDefPoint = nullptr;
+                        for (auto& op : *blk) {
+                            if (auto assign =
+                                    dyn_cast<helix::high::AssignOp>(&op)) {
+                                auto target =
+                                    assign.getTarget()
+                                        .getDefiningOp<helix::high::VarRefOp>();
+                                if (target &&
+                                    target.getVarId() == ver.varId) {
+                                    verDefPoint = &op;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!verDefPoint) {
+                            // ver is read but never defined in this block —
+                            // it was defined in a dominator.  If base is also
+                            // used here, they interfere (both "live-in").
+                            interferes = true;
+                            break;
+                        }
+
+                        // Scan from verDefPoint to end of block: any use of
+                        // base after this point means interference.
+                        bool pastDef = false;
+                        for (auto& op : *blk) {
+                            if (&op == verDefPoint) {
+                                pastDef = true;
+                                continue;
+                            }
+                            if (!pastDef)
+                                continue;
+                            if (auto ref =
+                                    dyn_cast<helix::high::VarRefOp>(&op)) {
+                                if (ref.getVarId() == base.varId) {
+                                    // Check if this is a VALUE read (not an
+                                    // assign target).
+                                    bool isTarget = false;
+                                    for (auto& use :
+                                         ref.getResult().getUses()) {
+                                        if (auto a =
+                                                dyn_cast<helix::high::AssignOp>(
+                                                    use.getOwner())) {
+                                            if (use.getOperandNumber() == 0)
+                                                isTarget = true;
+                                        }
+                                    }
+                                    if (!isTarget) {
+                                        interferes = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (interferes)
+                            break;
+                    }
+
+                    if (interferes)
+                        continue;
+
+                    // ── Coalesce: rewrite all VarRefOps of ver → base ─────
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "    Coalescing '" << ver.varName
+                        << "' (id=" << ver.varId
+                        << ") into '" << base.varName
+                        << "' (id=" << base.varId << ")\n");
+
+                    funcBody.walk([&](helix::high::VarRefOp ref) {
+                        if (ref.getVarId() == ver.varId) {
+                            ref.setVarId(base.varId);
+                            ref.setVarName(base.varName);
+                        }
+                    });
+
+                    // Propagate type from ver → base if base lacks one.
+                    if (!baseTypeAttr && verTypeAttr)
+                        base.decl->setAttr("inferred_type", verTypeAttr);
+
+                    // Erase ver's VarDeclOp.
+                    ver.decl->erase();
+                    ver.decl = nullptr;
+
+                    ++coalesced;
+                    ++NumVersionsCoalesced;
+                }
+            }
+
+            LLVM_DEBUG(llvm::dbgs()
+                << "    Coalesced " << coalesced
+                << " SSA versions\n");
+        }
+
         // ── Phase 4: Cover-based variable merging ─────────────────────────
         //
         // Reduce variable count by merging variables whose live ranges do
@@ -1479,6 +1760,58 @@ private:
             return true;
         };
 
+        // Rebuild the usage map for Phase 4 — Phase 3.5 may have changed
+        // varIds via coalescing rewrites.
+        usageMap.clear();
+        funcBody.walk([&](helix::high::VarRefOp ref) {
+            unsigned varId = ref.getVarId();
+            uint8_t flags = usageMap.lookup(varId);
+            for (auto& use : ref.getResult().getUses()) {
+                Operation* user = use.getOwner();
+                unsigned idx = use.getOperandNumber();
+
+                if (isa<helix::low::MemReadOp>(user)) {
+                    if (idx == 0) flags |= 0x1;
+                } else if (isa<helix::low::MemWriteOp>(user)) {
+                    if (idx == 0) flags |= 0x1;
+                    else flags |= 0x2;
+                } else if (isa<helix::high::FieldAccessOp>(user)) {
+                    if (idx == 0) flags |= 0x1;
+                } else if (isa<arith::AddIOp>(user) ||
+                           isa<arith::SubIOp>(user) ||
+                           isa<arith::MulIOp>(user) ||
+                           isa<arith::DivSIOp>(user) ||
+                           isa<arith::DivUIOp>(user) ||
+                           isa<arith::CmpIOp>(user) ||
+                           isa<arith::ShLIOp>(user) ||
+                           isa<arith::ShRSIOp>(user) ||
+                           isa<arith::ShRUIOp>(user) ||
+                           isa<arith::AndIOp>(user) ||
+                           isa<arith::OrIOp>(user) ||
+                           isa<arith::XOrIOp>(user)) {
+                    flags |= 0x2;
+                } else if (isa<helix::low::BinOp>(user)) {
+                    flags |= 0x2;
+                }
+            }
+            usageMap[varId] = flags;
+        });
+
+        // Phase 4 semantic compatibility: refuse merging an Address-only
+        // variable with a Value-only variable.
+        auto areSemanticsCompatible = [&](uint32_t idA, uint32_t idB) -> bool {
+            uint8_t a = usageMap.lookup(idA);
+            uint8_t b = usageMap.lookup(idB);
+            bool aAddr = (a & 0x1) != 0;
+            bool aVal  = (a & 0x2) != 0;
+            bool bAddr = (b & 0x1) != 0;
+            bool bVal  = (b & 0x2) != 0;
+            // Address-only and Value-only conflict
+            if (aAddr && !aVal && bVal && !bAddr) return false;
+            if (bAddr && !bVal && aVal && !aAddr) return false;
+            return true;
+        };
+
         // ---------- Helper: check if live ranges overlap ----------
 
         auto rangesOverlap = [](const VarInfo& a,
@@ -1562,6 +1895,11 @@ private:
 
                     // Types must be compatible.
                     if (!areTypesCompatible(infoA.decl, infoB.decl))
+                        continue;
+
+                    // Semantic usage must be compatible (refuse merging
+                    // address-only with value-only).
+                    if (!areSemanticsCompatible(idA, idB))
                         continue;
 
                     // Live ranges must not overlap.
@@ -1775,7 +2113,8 @@ private:
         }
 
         LLVM_DEBUG(llvm::dbgs()
-            << "  Phase 4+5 summary: merged " << totalMerged
+            << "  Phase 3.5-5 summary: coalesced " << NumVersionsCoalesced
+            << " SSA versions, merged " << totalMerged
             << " variables, inlined " << NumTempsInlined
             << " temporaries\n");
 

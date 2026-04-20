@@ -399,12 +399,44 @@ static std::optional<int64_t> tryExtractConstantInt(Value v) {
 /// Check if a register name is an infrastructure/bookkeeping register.
 /// These are Remill architectural state values that should not appear in
 /// decompiled output: program counter tracking, branch targets, return
-/// addresses.  Stores to PC/NEXT_PC are already skipped by RemillToHelixLow,
-/// but *reads* survive and propagate through the pipeline as noise.
+/// addresses, and the x86/x87/AMD64 EFLAGS bits.  Stores to PC/NEXT_PC
+/// are already skipped by RemillToHelixLow, but *reads* survive and
+/// propagate through the pipeline as noise.
+///
+/// FIX-047, part 1): x86 EFLAGS bits added so that infrastructure
+/// attribute propagation (Pass 1/2/3 in the `runOnOperation` pre-scan)
+/// seeds flag reads uniformly.  Previously, flag RegReadOps were typed
+/// as regular i1 values and only got filtered post-hoc in 4 downstream
+/// passes (RecoverVariables, CAstBuilder, EliminateDeadCode,
+/// PseudoCEmitter), each with its own partial flag list.  Seeding here
+/// lets Pass 2's transitive closure also mark `BinOp(RegRead("CF"), ...)`
+/// style computations as infrastructure, giving EliminateDeadCode a
+/// uniform handle to remove them bottom-up.  Observable output on the
+/// malwarebytes/SOTR/gta-sa corpora is unchanged (downstream filters
+/// were already catching the tail cases); the win is architectural
+/// consistency — one list instead of four overlapping lists, and fewer
+/// opportunities for a future corpus to smuggle a flag leak past the
+/// last filter.
 static bool isInfrastructureRegister(llvm::StringRef name) {
-    return name == "PC" || name == "NEXT_PC" || name == "RETURN_PC" ||
-           name == "BRANCH_TAKEN" || name == "BRANCH_NOT_TAKEN" ||
-           name == "RIP" || name == "rip";
+    // Program counter / control-flow bookkeeping.
+    if (name == "PC" || name == "NEXT_PC" || name == "RETURN_PC" ||
+        name == "BRANCH_TAKEN" || name == "BRANCH_NOT_TAKEN" ||
+        name == "RIP" || name == "rip" ||
+        name == "EIP" || name == "eip")
+        return true;
+
+    // x86 EFLAGS bits.  Remill models these as individual single-bit
+    // registers (see RemillToHelixLow.cpp:85-86, 504-505, 2256-2258).
+    // They exist in IR only for arithmetic-flag bookkeeping; the real
+    // control flow comes from JccOp/CMovOp, and the flag VALUE as an
+    // SSA variable is infrastructure.
+    if (name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
+        name == "SF" || name == "DF" || name == "OF" || name == "TF" ||
+        name == "IF" || name == "NT" || name == "RF" || name == "VM" ||
+        name == "AC" || name == "VIF" || name == "VIP" || name == "ID")
+        return true;
+
+    return false;
 }
 
 /// Check if a Value is a RegReadOp of a frame pointer register (RBP or RSP).

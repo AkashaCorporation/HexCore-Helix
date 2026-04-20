@@ -549,6 +549,25 @@ static bool isLiveConsumer(Operation* op) {
            isa<helix::low::MemWriteOp>(op);
 }
 
+/// Check whether an op, if found on the RHS of a now-dead assignment,
+/// must still be kept because it has observable side effects (calls,
+/// memory writes, returns).  Used by orphan-cleanup paths in Phase 7
+/// so that `rax = sub_foo(); return;` — where the `rax` assignment is
+/// dead but the call is not — doesn't accidentally erase the call.
+static bool isSideEffectingRhs(Operation* op) {
+    if (!op) return false;
+    return isa<helix::low::CallOp>(op) ||
+           isa<helix::high::CallOp>(op) ||
+           isa<helix::mid::CallOp>(op) ||
+           isa<helix::low::MemWriteOp>(op) ||
+           isa<helix::low::RetOp>(op) ||
+           isa<helix::high::ReturnOp>(op) ||
+           isa<helix::low::PushOp>(op) ||
+           isa<helix::low::PopOp>(op) ||
+           isa<helix::low::RepMovsOp>(op) ||
+           isa<helix::low::RepStosOp>(op);
+}
+
 /// Map from var_id to all VarRefOps that reference it.
 /// Pre-built once per function to avoid repeated walks during liveness analysis.
 using VarRefMap = llvm::DenseMap<uint32_t,
@@ -571,7 +590,15 @@ using VarRefMap = llvm::DenseMap<uint32_t,
 /// @return          True if the value reaches a live consumer.
 static bool isValueLive(Value value,
                         llvm::SmallPtrSetImpl<Operation*>& visited,
-                        const VarRefMap* refMap = nullptr) {
+                        const VarRefMap* refMap = nullptr,
+                        unsigned depth = 0) {
+    // Depth limit: for very large functions (anti-cheat, VMs),
+    // recursive liveness tracing can be O(n^2).  If we exceed
+    // the budget, conservatively assume live (safe — keeps the
+    // assignment rather than risk deleting live code).
+    if (depth > 64)
+        return true;
+
     for (auto* user : value.getUsers()) {
         if (!visited.insert(user).second)
             continue;  // already visited — avoid infinite loops
@@ -598,14 +625,15 @@ static bool isValueLive(Value value,
                                 targetRef.getOperation())
                                 continue;
                             if (isValueLive(refOp.getResult(), visited,
-                                            refMap))
+                                            refMap, depth + 1))
                                 return true;
                         }
                     }
                 }
             } else {
                 // Legacy path: trace the target's SSA value.
-                if (isValueLive(assignOp.getTarget(), visited))
+                if (isValueLive(assignOp.getTarget(), visited,
+                                nullptr, depth + 1))
                     return true;
             }
             continue;
@@ -614,7 +642,7 @@ static bool isValueLive(Value value,
         // For any other operation that produces results, check if those
         // results are live.
         for (auto result : user->getResults()) {
-            if (isValueLive(result, visited, refMap))
+            if (isValueLive(result, visited, refMap, depth + 1))
                 return true;
         }
     }
@@ -1707,8 +1735,16 @@ private:
         unsigned totalUndef   = 0;
 
         bool changed = true;
-        while (changed) {
+        unsigned iteration = 0;
+        // Budget: large functions (anti-cheat VMs, >5000 ops) get
+        // limited iterations to avoid O(n^2 × k) runaway.
+        unsigned totalOps = 0;
+        funcBody.walk([&](Operation*) { totalOps++; });
+        unsigned maxIterations = (totalOps > 5000) ? 3 : 16;
+
+        while (changed && iteration < maxIterations) {
             changed = false;
+            ++iteration;
 
             // Build the VarRefMap once per iteration for SSA-aware
             // liveness analysis.  This is rebuilt after each iteration
@@ -1735,7 +1771,8 @@ private:
                     ++totalAssigns;
                     changed = true;
 
-                    if (rhsDef && rhsDef->use_empty())
+                    if (rhsDef && rhsDef->use_empty() &&
+                        !isSideEffectingRhs(rhsDef))
                         rhsDef->erase();
                     if (lhsDef && lhsDef->use_empty())
                         lhsDef->erase();
@@ -1761,7 +1798,8 @@ private:
                     ++totalUndef;
                     changed = true;
 
-                    if (rhsDef && rhsDef->use_empty())
+                    if (rhsDef && rhsDef->use_empty() &&
+                        !isSideEffectingRhs(rhsDef))
                         rhsDef->erase();
                     if (lhsDef && lhsDef->use_empty())
                         lhsDef->erase();
@@ -1817,9 +1855,9 @@ private:
                                     targetRef.getOperation())
                                     continue;
 
-                                llvm::SmallPtrSet<Operation*, 16> visited;
+                                llvm::SmallPtrSet<Operation*, 32> visited;
                                 if (isValueLive(refOp.getResult(), visited,
-                                                &refMap))
+                                                &refMap, 0))
                                     anyLive = true;
                             }
                         }
@@ -1833,8 +1871,13 @@ private:
                         ++totalAssigns;
                         changed = true;
 
-                        // Clean up orphaned operand definitions.
-                        if (rhsDef && rhsDef->use_empty())
+                        // Clean up orphaned operand definitions — but never
+                        // erase side-effecting ops (calls, memory writes)
+                        // just because their result became unused.  A call
+                        // like `sub_foo()` whose return value is ignored
+                        // still needs to emit for its side effects.
+                        if (rhsDef && rhsDef->use_empty() &&
+                            !isSideEffectingRhs(rhsDef))
                             rhsDef->erase();
                         if (lhsOp && lhsOp->use_empty())
                             lhsOp->erase();
@@ -1860,7 +1903,8 @@ private:
                         ++totalVars;
                         changed = true;
 
-                        if (initDef && initDef->use_empty())
+                        if (initDef && initDef->use_empty() &&
+                            !isSideEffectingRhs(initDef))
                             initDef->erase();
                     } else {
                         declOp.erase();

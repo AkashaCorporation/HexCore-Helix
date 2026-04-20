@@ -55,6 +55,7 @@ using namespace helix;
 STATISTIC(NumVtableStoresFound,  "Number of vtable pointer stores identified");
 STATISTIC(NumCallsDevirtualized, "Number of indirect calls devirtualized");
 STATISTIC(NumCallsAnnotated,     "Number of indirect calls annotated with vtable info");
+STATISTIC(NumClassesInferred,    "Number of class names inferred from vtable grouping");
 
 namespace {
 
@@ -315,6 +316,117 @@ private:
 
             ++NumCallsDevirtualized;
         });
+
+        // ── Phase 4: Vtable-based class naming (Tier 1 RTTI) ──────────────
+        //
+        // Group resolved vtable calls by vtable_addr → each group shares a
+        // class.  Infer the class name from the common prefix of resolved
+        // function names, or assign a synthetic "Class_0xADDR" name.
+        //
+        // For each call: emit "ClassName::methodName" as the resolved name.
+        //
+        // This is Tier 1 — no binary .rodata access needed.  Tier 2
+        // (RTTI typeinfo parsing) requires HexCore binary data integration.
+        {
+            // Group calls by vtable address.
+            llvm::DenseMap<uint64_t,
+                           llvm::SmallVector<mid::CallOp, 4>> callsByVtable;
+
+            func->walk([&](mid::CallOp call) {
+                auto vtAddr = call->getAttrOfType<IntegerAttr>(
+                    "helix.vtable_addr");
+                if (!vtAddr)
+                    return;
+                callsByVtable[vtAddr.getInt()].push_back(call);
+            });
+
+            if (callsByVtable.empty())
+                return;
+
+            // For each vtable group, infer a class name.
+            for (auto& [vtAddr, calls] : callsByVtable) {
+                // Collect resolved function names for this vtable.
+                llvm::SmallVector<StringRef, 4> resolvedNames;
+                for (auto call : calls) {
+                    if (auto name = call->getAttrOfType<StringAttr>(
+                            "helix.resolved_name"))
+                        resolvedNames.push_back(name.getValue());
+                }
+
+                // Infer class name from common prefix of function names.
+                // E.g., "Player_TakeDamage", "Player_GetHealth" → "Player"
+                std::string className;
+
+                if (!resolvedNames.empty()) {
+                    // Find longest common prefix ending with '_'.
+                    StringRef first = resolvedNames[0];
+                    size_t prefixLen = first.size();
+
+                    for (size_t i = 1; i < resolvedNames.size(); ++i) {
+                        StringRef other = resolvedNames[i];
+                        size_t maxLen = std::min(prefixLen, other.size());
+                        size_t match = 0;
+                        while (match < maxLen &&
+                               first[match] == other[match])
+                            ++match;
+                        prefixLen = match;
+                    }
+
+                    // Trim to last '_' boundary for clean class name.
+                    StringRef prefix = first.substr(0, prefixLen);
+                    size_t lastUnderscore = prefix.rfind('_');
+                    if (lastUnderscore != StringRef::npos &&
+                        lastUnderscore >= 3) {
+                        className = prefix.substr(0, lastUnderscore).str();
+                    }
+                }
+
+                // Fallback: synthetic class name from vtable address.
+                if (className.empty() || className.size() < 3)
+                    className = std::format("Class_0x{:X}", vtAddr);
+
+                // Strip "sub_" prefix from class names (common artifact).
+                if (className.starts_with("sub_"))
+                    className = std::format("Class_0x{:X}", vtAddr);
+
+                ++NumClassesInferred;
+
+                LLVM_DEBUG(llvm::dbgs()
+                    << "  Vtable 0x"
+                    << llvm::Twine::utohexstr(vtAddr)
+                    << " → class '" << className << "' ("
+                    << calls.size() << " calls)\n");
+
+                // Annotate each call with class::method naming.
+                MLIRContext* ctx = func->getContext();
+                for (auto call : calls) {
+                    auto offsetAttr = call->getAttrOfType<IntegerAttr>(
+                        "helix.vtable_offset");
+                    uint64_t offset = offsetAttr
+                        ? static_cast<uint64_t>(offsetAttr.getInt()) : 0;
+
+                    std::string methodName;
+                    if (auto existing = call->getAttrOfType<StringAttr>(
+                            "helix.resolved_name")) {
+                        methodName = existing.getValue().str();
+                        // Strip class prefix if it matches.
+                        if (methodName.starts_with(className + "_"))
+                            methodName = methodName.substr(
+                                className.size() + 1);
+                    } else {
+                        methodName = std::format("vfunc_{}", offset);
+                    }
+
+                    call->setAttr("helix.resolved_name",
+                        StringAttr::get(ctx, llvm::StringRef(
+                            className + "::" + methodName)));
+
+                    // Also store the class name separately for downstream.
+                    call->setAttr("helix.class_name",
+                        StringAttr::get(ctx, llvm::StringRef(className)));
+                }
+            }
+        }
     }
 };
 
