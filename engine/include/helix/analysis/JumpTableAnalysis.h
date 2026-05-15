@@ -112,8 +112,24 @@ struct JumpTableInfo {
     /// For Two-level tables: address of the secondary (byte) index table.
     uint64_t level2_table_addr = 0;
 
-    /// Resolved target addresses, one per case index (0..entry_count-1).
+    /// Resolved target addresses, one per entry in the cascade.
+    /// For Direct/PICRelative: targets[i] is the target for case value `i`.
+    /// For TwoLevel: targets[i] is the target reached by secondary index `i`,
+    /// and `case_values[i]` is the *set* of selector values that map to it
+    /// (encoded as one entry per selector — see comment on `case_values`).
     std::vector<uint64_t> targets;
+
+    /// Selector value for each entry in `targets`, parallel array.
+    /// - Direct/PICRelative: `case_values[i] == i` (linear).
+    /// - TwoLevel: one entry per *selector value* that maps to a target.  When
+    ///   multiple selector values share a handler (the whole point of the
+    ///   two-level table), `targets` is duplicated so the cascade can still
+    ///   emit one jcc per case value.  `case_values.size() == targets.size()`.
+    ///
+    /// Without this, RecoverSwitchTables would emit `cmp selector, i` for the
+    /// raw index `i`, which is wrong for sparse switches (e.g. case 16, 81,
+    /// 110, ... in MSVC-compiled state machines).
+    std::vector<int64_t> case_values;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -4,6 +4,7 @@
 #include "helix/Engine.h"
 #include "helix/Pipeline.h"
 #include "helix/passes/Passes.h"
+#include "helix/analysis/DataSectionProvider.h"
 #include "helix/dialects/HelixLowDialect.h"
 #include "helix/dialects/HelixMidDialect.h"     // v1.0
 #include "helix/dialects/HelixHighDialect.h"
@@ -23,6 +24,50 @@
 #include <format>
 
 namespace helix {
+
+namespace {
+/// RAII installer for the thread-local DataSectionProvider used by the MLIR
+/// pass pipeline.  Wraps the engine's accumulated data sections in a reader
+/// closure, makes it active for the current thread, and clears it on
+/// destruction so a follow-up decompile on the same thread never sees stale
+/// bytes from a prior run.
+class ScopedDataSectionProvider {
+public:
+    explicit ScopedDataSectionProvider(
+        const std::vector<Engine::DataSection>* sections) {
+        if (!sections || sections->empty())
+            return;
+        // The Engine instance outlives this scope, so capturing the pointer
+        // is safe — section bytes are stable for the duration of the run.
+        const auto* secs = sections;
+        provider_ = std::make_unique<DataSectionProvider>(
+            [secs](uint64_t addr, uint8_t* buf, size_t len) -> size_t {
+                for (const auto& s : *secs) {
+                    if (addr < s.va_start) continue;
+                    uint64_t off = addr - s.va_start;
+                    if (off >= s.bytes.size()) continue;
+                    size_t avail = s.bytes.size() - static_cast<size_t>(off);
+                    size_t copy  = (len < avail) ? len : avail;
+                    std::memcpy(buf, s.bytes.data() + off, copy);
+                    return copy;
+                }
+                return 0;
+            });
+        setActiveDataSectionProvider(provider_.get());
+    }
+
+    ~ScopedDataSectionProvider() {
+        if (provider_)
+            setActiveDataSectionProvider(nullptr);
+    }
+
+    ScopedDataSectionProvider(const ScopedDataSectionProvider&) = delete;
+    ScopedDataSectionProvider& operator=(const ScopedDataSectionProvider&) = delete;
+
+private:
+    std::unique_ptr<DataSectionProvider> provider_;
+};
+} // namespace
 
 // ─── Construction ──────────────────────────────────────────────────────────────
 
@@ -158,6 +203,7 @@ HelixStatus Engine::decompileIR(
     //   - helix_tool.exe: /STACK:16777216 set in CMakeLists.txt
     //   - Rust FFI: caller spawns a thread with 16 MB stack via
     //     std::thread::Builder::stack_size()
+    ScopedDataSectionProvider scopedProvider(&data_sections_);
     llvm::StringRef irStr(ir_text, ir_len);
     auto result = pipeline_->decompile(irStr);
 
@@ -204,6 +250,7 @@ HelixStatus Engine::decompileIRText(
 
     // Run the full MLIR decompilation pipeline.
     // Stack requirements documented in decompileIR().
+    ScopedDataSectionProvider scopedProvider(&data_sections_);
     llvm::StringRef irStr(ir_text, ir_len);
     auto result = pipeline_->decompile(irStr);
 
@@ -231,6 +278,19 @@ HelixStatus Engine::decompileIRText(
     last_error_.clear();
 
     return HELIX_OK;
+}
+
+void Engine::addDataSection(uint64_t va_start, const uint8_t* bytes, size_t len) {
+    if (!bytes || len == 0)
+        return;
+    data_sections_.push_back(DataSection{
+        va_start,
+        std::vector<uint8_t>(bytes, bytes + len)
+    });
+}
+
+void Engine::clearDataSections() {
+    data_sections_.clear();
 }
 
 const char* Engine::lastError() const noexcept {

@@ -515,6 +515,20 @@ bool JumpTableAnalyzer::enumerateTargets(JumpTableInfo& info) {
 
     info.targets.clear();
     info.targets.reserve(info.entry_count);
+    info.case_values.clear();
+    info.case_values.reserve(info.entry_count);
+
+    // The selector value for entry `i` is `i` for every supported pattern:
+    //   - Direct/PICRelative use the selector directly to index `targets[]`.
+    //   - TwoLevel uses the selector to index the *level2* byte table; the
+    //     guard's range check is `0 <= selector < entry_count`, so entries
+    //     0..entry_count-1 still correspond to selector values 0..entry_count-1.
+    //
+    // Deduplication of selector values that map to the same target (typical
+    // in TwoLevel for the implicit default handler) is the *consumer's* job
+    // — see RecoverSwitchTables which skips entries equal to default_target.
+    for (unsigned i = 0; i < info.entry_count; ++i)
+        info.case_values.push_back(static_cast<int64_t>(i));
 
     switch (info.pattern) {
     case JumpTablePattern::Direct: {

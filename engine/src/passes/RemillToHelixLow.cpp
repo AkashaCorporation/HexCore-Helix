@@ -184,6 +184,32 @@ struct RegisterTracker {
                                 }
                             }
                         }
+
+                        // AddressSpace: gep %state, 0, 0, 5, <seg_idx>, ...
+                        // Remill X86 AddressSpace layout (in order):
+                        //   [0] SS_BASE  [1] ES_BASE  [2] CS_BASE
+                        //   [3] DS_BASE  [4] FS_BASE  [5] GS_BASE
+                        // MLIR's LLVM importer drops the !remill_register
+                        // metadata, so we have to identify these GEPs
+                        // structurally.  Without this, GS:[0x60]/FS:[0x30]
+                        // accesses collapse to `0->field_0xN` in the C output.
+                        if (structField == 5) {
+                            const char* segName = nullptr;
+                            switch (subIdx) {
+                                case 0: segName = "SSBASE"; break;
+                                case 1: segName = "ESBASE"; break;
+                                case 2: segName = "CSBASE"; break;
+                                case 3: segName = "DSBASE"; break;
+                                case 4: segName = "FSBASE"; break;
+                                case 5: segName = "GSBASE"; break;
+                                default: break;
+                            }
+                            if (segName) {
+                                gep_to_reg[gep.getResult()] = segName;
+                                reg_widths[segName] = 64;
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -2114,6 +2140,76 @@ private:
         return nullptr;
     }
 
+    /// Detect a segment-register-relative memory address.
+    ///
+    /// Recognises Remill's lowering of `gs:[N]` / `fs:[N]` in two forms:
+    ///   (a) Pre-conversion (LLVM IR straight from Remill):
+    ///         %seg_base = load i64, ptr %{GS,FS}BASE_gep
+    ///         %addr     = add i64 %seg_base, N
+    ///   (b) Post-conversion (after the LoadOp handler in this same pass has
+    ///       already replaced the load with a RegReadOp):
+    ///         %seg_base = helix_low.reg.read "GSBASE"|"FSBASE"
+    ///         %addr     = add i64 %seg_base, N
+    ///
+    /// Returns the segment name ("gs" / "fs") and the constant offset N if
+    /// `addr` matches; otherwise std::nullopt.  Used so MOV reg, gs:[0x60]
+    /// emits a `__readgsqword(0x60)` intrinsic call rather than a raw
+    /// `MemRead(0 + 0x60)` once GSBASE itself is DCE'd to zero.
+    static std::optional<std::pair<std::string, int64_t>>
+    matchSegmentRelativeAddr(Value addr) {
+        auto add = addr.getDefiningOp<LLVM::AddOp>();
+        if (!add) return std::nullopt;
+
+        auto extractSegName =
+            [](Value baseVal) -> std::optional<std::string> {
+            // Form (a): direct load of the GSBASE/FSBASE GEP slot.
+            if (auto load = baseVal.getDefiningOp<LLVM::LoadOp>()) {
+                if (auto rn = RegisterTracker::extractRegisterNameFromValue(
+                        load.getAddr())) {
+                    if (*rn == "GSBASE") return std::string("gs");
+                    if (*rn == "FSBASE") return std::string("fs");
+                }
+            }
+            // Form (b): the load was already lowered to a RegReadOp.
+            if (auto rr = baseVal.getDefiningOp<helix::low::RegReadOp>()) {
+                auto rn = rr.getRegName();
+                if (rn == "GSBASE") return std::string("gs");
+                if (rn == "FSBASE") return std::string("fs");
+            }
+            return std::nullopt;
+        };
+
+        auto tryMatch =
+            [&](Value baseVal, Value constVal)
+            -> std::optional<std::pair<std::string, int64_t>> {
+            auto seg = extractSegName(baseVal);
+            if (!seg) return std::nullopt;
+            auto cst = constVal.getDefiningOp<LLVM::ConstantOp>();
+            if (!cst) return std::nullopt;
+            auto intAttr = dyn_cast<IntegerAttr>(cst.getValue());
+            if (!intAttr) return std::nullopt;
+            return std::make_pair(*seg, intAttr.getValue().getSExtValue());
+        };
+
+        if (auto m = tryMatch(add.getLhs(), add.getRhs())) return m;
+        if (auto m = tryMatch(add.getRhs(), add.getLhs())) return m;
+        return std::nullopt;
+    }
+
+    /// Build the MSVC-style segment intrinsic name for a given segment, width,
+    /// and direction: __read{gs,fs}{byte,word,dword,qword} (read=true) or the
+    /// "__write…" counterparts.
+    static std::string segmentIntrinsicName(
+        llvm::StringRef seg, unsigned widthBits, bool isRead) {
+        const char* suffix =
+            (widthBits == 8)  ? "byte"  :
+            (widthBits == 16) ? "word"  :
+            (widthBits == 32) ? "dword" :
+                                "qword";
+        const char* verb = isRead ? "__read" : "__write";
+        return (llvm::Twine(verb) + seg + suffix).str();
+    }
+
     /// Convert a recognized Remill semantic function call to HelixLow ops.
     void convertSemantic(LLVM::CallOp call, OpBuilder& builder,
                          const RegisterTracker& regs,
@@ -2397,13 +2493,38 @@ private:
                     if (semInfo.has_memory_src) {
                         unsigned readWidth = semInfo.src_width;
                         auto readTy = builder.getIntegerType(readWidth);
-                        auto memRead = builder.create<helix::low::MemReadOp>(
-                            loc,
-                            readTy,
-                            ensureInt64(srcValue, builder, loc, &regs, &pcTracker),
-                            builder.getUI32IntegerAttr(readWidth),
-                            addrAttr);
-                        finalVal = memRead.getResult();
+
+                        // ─── Segment-relative: MOV reg, gs:[N] / fs:[N] ─
+                        // Emit `__readgsqword(N)` etc. instead of a raw
+                        // MemRead — otherwise GSBASE gets DCE'd to 0 and the
+                        // C output reads `*(0 + N)`, losing the segment.
+                        if (auto seg = matchSegmentRelativeAddr(srcValue)) {
+                            auto offsetCst = builder.create<LLVM::ConstantOp>(
+                                loc, i64Ty,
+                                builder.getI64IntegerAttr(seg->second));
+                            auto machineTy = machineIntTy(builder);
+                            auto zeroTarget = builder.create<LLVM::ConstantOp>(
+                                loc, machineTy,
+                                builder.getI64IntegerAttr(0));
+                            auto intrinsic = segmentIntrinsicName(
+                                seg->first, readWidth, /*isRead=*/true);
+                            auto segCall = builder.create<helix::low::CallOp>(
+                                loc,
+                                /*resultTypes=*/TypeRange{readTy},
+                                zeroTarget.getResult(),
+                                ValueRange{offsetCst.getResult()},
+                                builder.getStringAttr(intrinsic),
+                                addrAttr);
+                            finalVal = segCall.getResult();
+                        } else {
+                            auto memRead = builder.create<helix::low::MemReadOp>(
+                                loc,
+                                readTy,
+                                ensureInt64(srcValue, builder, loc, &regs, &pcTracker),
+                                builder.getUI32IntegerAttr(readWidth),
+                                addrAttr);
+                            finalVal = memRead.getResult();
+                        }
                         // Extend to register width if needed (e.g., 32→64 for MOV EAX, [mem]).
                         if (readWidth < width) {
                             finalVal = builder.create<LLVM::ZExtOp>(loc, intTy, finalVal);
@@ -2443,12 +2564,34 @@ private:
                         }
                     }
 
-                    builder.create<helix::low::MemWriteOp>(
-                        loc,
-                        ensureInt64(destRegPtr, builder, loc, &regs, &pcTracker),
-                        finalVal,
-                        builder.getUI32IntegerAttr(writeWidth),
-                        addrAttr);
+                    // ─── Segment-relative: MOV gs:[N], reg / fs:[N], reg ─
+                    // Symmetric with the load path above — emit
+                    // `__writegsqword(N, value)` instead of MemWrite(0+N).
+                    if (auto seg = matchSegmentRelativeAddr(destRegPtr)) {
+                        auto offsetCst = builder.create<LLVM::ConstantOp>(
+                            loc, i64Ty,
+                            builder.getI64IntegerAttr(seg->second));
+                        auto machineTy = machineIntTy(builder);
+                        auto zeroTarget = builder.create<LLVM::ConstantOp>(
+                            loc, machineTy,
+                            builder.getI64IntegerAttr(0));
+                        auto intrinsic = segmentIntrinsicName(
+                            seg->first, writeWidth, /*isRead=*/false);
+                        builder.create<helix::low::CallOp>(
+                            loc,
+                            /*resultTypes=*/TypeRange{},
+                            zeroTarget.getResult(),
+                            ValueRange{offsetCst.getResult(), finalVal},
+                            builder.getStringAttr(intrinsic),
+                            addrAttr);
+                    } else {
+                        builder.create<helix::low::MemWriteOp>(
+                            loc,
+                            ensureInt64(destRegPtr, builder, loc, &regs, &pcTracker),
+                            finalVal,
+                            builder.getUI32IntegerAttr(writeWidth),
+                            addrAttr);
+                    }
                 }
             }
             break;
@@ -3354,14 +3497,12 @@ private:
                     if (canonical.empty())
                         canonical = *destRegName;
 
-                    if (canonical == "RCX") {
-                        builder.create<helix::low::RegWriteOp>(
-                            loc,
-                            effectiveAddr,
-                            builder.getStringAttr(canonical),
-                            builder.getUI32IntegerAttr(64),
-                            addrAttr);
-                    }
+                    builder.create<helix::low::RegWriteOp>(
+                        loc,
+                        effectiveAddr,
+                        builder.getStringAttr(canonical),
+                        builder.getUI32IntegerAttr(64),
+                        addrAttr);
                 }
             }
             break;
@@ -3379,59 +3520,50 @@ private:
         }
 
         // ─── Bit Test ────────────────────────────────────────────────────
+        // BT/BTS/BTR/BTC: CF = (base >> (offset & 63)) & 1
+        // BTS: result = base |  (1 << (offset & 63))
+        // BTR: result = base & ~(1 << (offset & 63))
+        // BTC: result = base ^  (1 << (offset & 63))
         case RemillSemantic::BT: {
-            // BT base, offset — test bit at position `offset` in `base`.
-            // Sets CF = bit value. No modification to the base.
-            // Remill layout: call @BT(mem, state, base_reg_ptr, base_val, bit_offset)
             if (call.getNumOperands() >= 5) {
-                auto baseVal = call.getOperand(3);
-                auto bitOffset = call.getOperand(4);
-                // Emit as CMP-like: the downstream passes treat CF as the
-                // result of the bit test. We use a CMP of the extracted bit
-                // against zero to set flags appropriately.
-                auto cmpOp = builder.create<helix::low::CmpOp>(
-                    loc,
-                    /*carry_flag=*/i1Ty,
-                    /*zero_flag=*/i1Ty,
-                    /*sign_flag=*/i1Ty,
-                    /*overflow_flag=*/i1Ty,
-                    ensureInt64(baseVal, builder, loc, &regs, &pcTracker),
-                    ensureInt64(bitOffset, builder, loc, &regs, &pcTracker),
-                    addrAttr);
-                // BT only sets CF; write all flags for consistency.
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getZeroFlag(), builder.getStringAttr("ZF"), builder.getUI32IntegerAttr(1), addrAttr);
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getSignFlag(), builder.getStringAttr("SF"), builder.getUI32IntegerAttr(1), addrAttr);
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getOverflowFlag(), builder.getStringAttr("OF"), builder.getUI32IntegerAttr(1), addrAttr);
+                auto base   = ensureInt64(call.getOperand(3), builder, loc, &regs, &pcTracker);
+                auto offset = ensureInt64(call.getOperand(4), builder, loc, &regs, &pcTracker);
+                // mask = 1 << (offset & 63)
+                auto c63  = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(63));
+                auto c1   = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(1));
+                auto maskedOff = builder.create<arith::AndIOp>(loc, offset, c63).getResult();
+                auto mask = builder.create<arith::ShLIOp>(loc, c1, maskedOff).getResult();
+                // CF = (base & mask) != 0
+                auto andVal = builder.create<arith::AndIOp>(loc, base, mask).getResult();
+                auto zero64 = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(0));
+                auto cf = builder.create<arith::CmpIOp>(
+                    loc, arith::CmpIPredicate::ne, andVal, zero64).getResult();
+                builder.create<helix::low::RegWriteOp>(loc, cf, builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
             }
             break;
         }
 
         case RemillSemantic::BTS: {
-            // BTS base, offset — test bit and SET it.
-            // Remill layout: call @BTS(mem, state, dest_reg_ptr, base_val, bit_offset)
             if (call.getNumOperands() >= 5) {
                 auto destRegPtr = call.getOperand(2);
-                auto baseVal = call.getOperand(3);
-                auto bitOffset = call.getOperand(4);
-                // Emit bit test (CF) via CMP
-                auto cmpOp = builder.create<helix::low::CmpOp>(
-                    loc, i1Ty, i1Ty, i1Ty, i1Ty,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
-                    addrAttr);
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
-                // Emit OR to set the bit: result = base | (1 << offset)
-                auto binOp = builder.create<helix::low::BinOp>(
-                    loc, i64Ty, i1Ty, i1Ty, i1Ty, i1Ty,
-                    helix::low::BinOpKind::Or,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
-                    addrAttr, UnitAttr{});
+                auto base   = ensureInt64(call.getOperand(3), builder, loc, &regs, &pcTracker);
+                auto offset = ensureInt64(call.getOperand(4), builder, loc, &regs, &pcTracker);
+                auto c63  = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(63));
+                auto c1   = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(1));
+                auto maskedOff = builder.create<arith::AndIOp>(loc, offset, c63).getResult();
+                auto mask = builder.create<arith::ShLIOp>(loc, c1, maskedOff).getResult();
+                // CF = (base & mask) != 0
+                auto andVal = builder.create<arith::AndIOp>(loc, base, mask).getResult();
+                auto zero64 = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(0));
+                auto cf = builder.create<arith::CmpIOp>(
+                    loc, arith::CmpIPredicate::ne, andVal, zero64).getResult();
+                builder.create<helix::low::RegWriteOp>(loc, cf, builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
+                // result = base | mask
+                auto result = builder.create<arith::OrIOp>(loc, base, mask).getResult();
                 auto regName = regs.getRegName(destRegPtr);
                 unsigned width = regName ? RegisterTracker::inferRegWidth(*regName) : 64;
                 builder.create<helix::low::RegWriteOp>(
-                    loc, binOp.getResult(),
+                    loc, result,
                     builder.getStringAttr(regName ? *regName : "unknown"),
                     builder.getUI32IntegerAttr(width), addrAttr);
             }
@@ -3439,29 +3571,30 @@ private:
         }
 
         case RemillSemantic::BTR: {
-            // BTR base, offset — test bit and RESET (clear) it.
-            // Remill layout: call @BTR(mem, state, dest_reg_ptr, base_val, bit_offset)
             if (call.getNumOperands() >= 5) {
                 auto destRegPtr = call.getOperand(2);
-                auto baseVal = call.getOperand(3);
-                auto bitOffset = call.getOperand(4);
-                auto cmpOp = builder.create<helix::low::CmpOp>(
-                    loc, i1Ty, i1Ty, i1Ty, i1Ty,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
-                    addrAttr);
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
-                // Emit AND to clear the bit: result = base & ~(1 << offset)
-                auto binOp = builder.create<helix::low::BinOp>(
-                    loc, i64Ty, i1Ty, i1Ty, i1Ty, i1Ty,
-                    helix::low::BinOpKind::And,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
-                    addrAttr, UnitAttr{});
+                auto base   = ensureInt64(call.getOperand(3), builder, loc, &regs, &pcTracker);
+                auto offset = ensureInt64(call.getOperand(4), builder, loc, &regs, &pcTracker);
+                auto c63  = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(63));
+                auto c1   = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(1));
+                auto maskedOff = builder.create<arith::AndIOp>(loc, offset, c63).getResult();
+                auto mask = builder.create<arith::ShLIOp>(loc, c1, maskedOff).getResult();
+                // CF = (base & mask) != 0
+                auto andVal = builder.create<arith::AndIOp>(loc, base, mask).getResult();
+                auto zero64 = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(0));
+                auto cf = builder.create<arith::CmpIOp>(
+                    loc, arith::CmpIPredicate::ne, andVal, zero64).getResult();
+                builder.create<helix::low::RegWriteOp>(loc, cf, builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
+                // result = base & ~mask
+                auto notMask = builder.create<arith::XOrIOp>(
+                    loc, mask,
+                    builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(-1)).getResult()
+                ).getResult();
+                auto result = builder.create<arith::AndIOp>(loc, base, notMask).getResult();
                 auto regName = regs.getRegName(destRegPtr);
                 unsigned width = regName ? RegisterTracker::inferRegWidth(*regName) : 64;
                 builder.create<helix::low::RegWriteOp>(
-                    loc, binOp.getResult(),
+                    loc, result,
                     builder.getStringAttr(regName ? *regName : "unknown"),
                     builder.getUI32IntegerAttr(width), addrAttr);
             }
@@ -3469,29 +3602,26 @@ private:
         }
 
         case RemillSemantic::BTC: {
-            // BTC base, offset — test bit and COMPLEMENT (toggle) it.
-            // Remill layout: call @BTC(mem, state, dest_reg_ptr, base_val, bit_offset)
             if (call.getNumOperands() >= 5) {
                 auto destRegPtr = call.getOperand(2);
-                auto baseVal = call.getOperand(3);
-                auto bitOffset = call.getOperand(4);
-                auto cmpOp = builder.create<helix::low::CmpOp>(
-                    loc, i1Ty, i1Ty, i1Ty, i1Ty,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
-                    addrAttr);
-                builder.create<helix::low::RegWriteOp>(loc, cmpOp.getCarryFlag(), builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
-                // Emit XOR to toggle the bit: result = base ^ (1 << offset)
-                auto binOp = builder.create<helix::low::BinOp>(
-                    loc, i64Ty, i1Ty, i1Ty, i1Ty, i1Ty,
-                    helix::low::BinOpKind::Xor,
-                    ensureInt64(baseVal, builder, loc),
-                    ensureInt64(bitOffset, builder, loc),
-                    addrAttr, UnitAttr{});
+                auto base   = ensureInt64(call.getOperand(3), builder, loc, &regs, &pcTracker);
+                auto offset = ensureInt64(call.getOperand(4), builder, loc, &regs, &pcTracker);
+                auto c63  = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(63));
+                auto c1   = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(1));
+                auto maskedOff = builder.create<arith::AndIOp>(loc, offset, c63).getResult();
+                auto mask = builder.create<arith::ShLIOp>(loc, c1, maskedOff).getResult();
+                // CF = (base & mask) != 0
+                auto andVal = builder.create<arith::AndIOp>(loc, base, mask).getResult();
+                auto zero64 = builder.create<LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(0));
+                auto cf = builder.create<arith::CmpIOp>(
+                    loc, arith::CmpIPredicate::ne, andVal, zero64).getResult();
+                builder.create<helix::low::RegWriteOp>(loc, cf, builder.getStringAttr("CF"), builder.getUI32IntegerAttr(1), addrAttr);
+                // result = base ^ mask
+                auto result = builder.create<arith::XOrIOp>(loc, base, mask).getResult();
                 auto regName = regs.getRegName(destRegPtr);
                 unsigned width = regName ? RegisterTracker::inferRegWidth(*regName) : 64;
                 builder.create<helix::low::RegWriteOp>(
-                    loc, binOp.getResult(),
+                    loc, result,
                     builder.getStringAttr(regName ? *regName : "unknown"),
                     builder.getUI32IntegerAttr(width), addrAttr);
             }
@@ -3584,16 +3714,118 @@ private:
 
         // ─── SETcc ────────────────────────────────────────────────────────
         case RemillSemantic::SETcc: {
-            // SETcc sets a byte register based on flags.
-            // Emit as a generic call with the conditional name.
+            // SETcc writes 1 or 0 to a byte register based on flags.
+            // Reuse the same findFlagValue lambda built for Jcc above — it
+            // searches backwards for the most recent RegWriteOp to the named
+            // flag register (ZF, CF, SF, OF) emitted by a preceding CMP/TEST.
             if (call.getNumOperands() >= 3) {
                 auto destRegPtr = call.getOperand(2);
                 auto regName = regs.getRegName(destRegPtr);
                 unsigned width = regName ? RegisterTracker::inferRegWidth(*regName) : 8;
-                auto zero = builder.create<LLVM::ConstantOp>(
-                    loc, i64Ty, builder.getI64IntegerAttr(0));
+
+                auto findFlagValueSET = [&](llvm::StringRef flagName) -> Value {
+                    Block* block = builder.getInsertionBlock();
+                    if (!block) return nullptr;
+                    Value result = findFlagValueInBlock(
+                        block, builder.getInsertionPoint(), flagName);
+                    if (result) return result;
+                    llvm::DenseSet<Block*> visiting;
+                    return findFlagValueInPredecessors(
+                        block, flagName, /*depth=*/3, visiting);
+                };
+
+                // Derive condition from raw_name (e.g. "SETE", "SETNE", "SETL").
+                llvm::StringRef rn = semInfo.raw_name;
+                // Strip leading "SET" prefix.
+                llvm::StringRef cond = rn.starts_with("SET") ? rn.drop_front(3) : rn;
+
+                Value condVal = nullptr;
+                auto one = builder.create<arith::ConstantOp>(
+                    loc, i1Ty, builder.getBoolAttr(true));
+
+                if (cond == "E" || cond == "Z") {
+                    condVal = findFlagValueSET("ZF");
+                } else if (cond == "NE" || cond == "NZ") {
+                    if (auto zf = findFlagValueSET("ZF"))
+                        condVal = builder.create<arith::XOrIOp>(loc, zf, one).getResult();
+                } else if (cond == "B" || cond == "C" || cond == "NAE") {
+                    condVal = findFlagValueSET("CF");
+                } else if (cond == "NB" || cond == "NC" || cond == "AE") {
+                    if (auto cf = findFlagValueSET("CF"))
+                        condVal = builder.create<arith::XOrIOp>(loc, cf, one).getResult();
+                } else if (cond == "S") {
+                    condVal = findFlagValueSET("SF");
+                } else if (cond == "NS") {
+                    if (auto sf = findFlagValueSET("SF"))
+                        condVal = builder.create<arith::XOrIOp>(loc, sf, one).getResult();
+                } else if (cond == "O") {
+                    condVal = findFlagValueSET("OF");
+                } else if (cond == "NO") {
+                    if (auto of = findFlagValueSET("OF"))
+                        condVal = builder.create<arith::XOrIOp>(loc, of, one).getResult();
+                } else if (cond == "L" || cond == "NGE") {
+                    // SF != OF
+                    Value sf = findFlagValueSET("SF");
+                    Value of = findFlagValueSET("OF");
+                    if (sf && of)
+                        condVal = builder.create<arith::XOrIOp>(loc, sf, of).getResult();
+                } else if (cond == "NL" || cond == "GE") {
+                    // !(SF != OF)
+                    Value sf = findFlagValueSET("SF");
+                    Value of = findFlagValueSET("OF");
+                    if (sf && of) {
+                        auto xorVal = builder.create<arith::XOrIOp>(loc, sf, of);
+                        condVal = builder.create<arith::XOrIOp>(loc, xorVal, one).getResult();
+                    }
+                } else if (cond == "LE" || cond == "NG") {
+                    // ZF || (SF != OF)
+                    Value zf = findFlagValueSET("ZF");
+                    Value sf = findFlagValueSET("SF");
+                    Value of = findFlagValueSET("OF");
+                    if (zf && sf && of) {
+                        auto sfNeOf = builder.create<arith::XOrIOp>(loc, sf, of);
+                        condVal = builder.create<arith::OrIOp>(loc, zf, sfNeOf).getResult();
+                    }
+                } else if (cond == "NLE" || cond == "G") {
+                    // !ZF && (SF == OF)
+                    Value zf = findFlagValueSET("ZF");
+                    Value sf = findFlagValueSET("SF");
+                    Value of = findFlagValueSET("OF");
+                    if (zf && sf && of) {
+                        auto notZf = builder.create<arith::XOrIOp>(loc, zf, one);
+                        auto sfEqOf = builder.create<arith::XOrIOp>(loc, sf, of);
+                        auto notSfNeOf = builder.create<arith::XOrIOp>(loc, sfEqOf, one);
+                        condVal = builder.create<arith::AndIOp>(loc, notZf, notSfNeOf).getResult();
+                    }
+                } else if (cond == "BE" || cond == "NA") {
+                    // CF || ZF
+                    Value cf = findFlagValueSET("CF");
+                    Value zf = findFlagValueSET("ZF");
+                    if (cf && zf)
+                        condVal = builder.create<arith::OrIOp>(loc, cf, zf).getResult();
+                } else if (cond == "NBE" || cond == "A") {
+                    // !CF && !ZF
+                    Value cf = findFlagValueSET("CF");
+                    Value zf = findFlagValueSET("ZF");
+                    if (cf && zf) {
+                        auto notCf = builder.create<arith::XOrIOp>(loc, cf, one);
+                        auto notZf = builder.create<arith::XOrIOp>(loc, zf, one);
+                        condVal = builder.create<arith::AndIOp>(loc, notCf, notZf).getResult();
+                    }
+                }
+
+                // Extend i1 → target width; fall back to zero if flags unavailable.
+                Value result;
+                if (condVal) {
+                    auto destTy = builder.getIntegerType(width);
+                    result = builder.create<arith::ExtUIOp>(loc, destTy, condVal).getResult();
+                } else {
+                    result = builder.create<LLVM::ConstantOp>(
+                        loc, builder.getIntegerType(width),
+                        builder.getIntegerAttr(builder.getIntegerType(width), 0));
+                }
                 builder.create<helix::low::RegWriteOp>(
-                    loc, zero,
+                    loc, result,
                     builder.getStringAttr(regName ? *regName : "unknown"),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);

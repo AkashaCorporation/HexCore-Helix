@@ -170,39 +170,58 @@ static bool emitSwitchCascade(
 
     Location loc = jmpOp.getLoc();
 
-    // Resolve target addresses to blocks.
+    // We require the analyzer to have given us a usable default target.
+    // Without one we used to fabricate a `RetOp` block — which silently
+    // claimed "this function ends here on the default branch" and made
+    // downstream structuring lose every case body.  Refuse instead, leaving
+    // the original indirect jmp untouched so a later pass / human can see
+    // that switch recovery didn't complete.
+    Block* defaultBlock = info.default_target;
+    if (!defaultBlock) {
+        LLVM_DEBUG(llvm::dbgs()
+            << "RST: refusing to lower switch without a known default target\n");
+        return false;
+    }
+
+    // Find the address of the default target so we can dedupe cases that
+    // map to it (typical in TwoLevel: every selector outside the active set
+    // is encoded as pointing to the default handler).
+    std::optional<uint64_t> defaultAddr;
+    for (auto& [addr, blk] : addrMap) {
+        if (blk == defaultBlock) { defaultAddr = addr; break; }
+    }
+
+    // Sanity-check that the analyzer gave us parallel targets[] / case_values[].
+    if (info.case_values.size() != info.targets.size()) {
+        LLVM_DEBUG(llvm::dbgs()
+            << "RST: case_values/targets size mismatch ("
+            << info.case_values.size() << " vs "
+            << info.targets.size() << "), refusing to lower\n");
+        return false;
+    }
+
+    // Resolve target addresses to blocks, skipping entries that fall through
+    // to the default (no-op cases) and unresolved addresses.
     llvm::SmallVector<Block*, 64> caseBlocks;
     llvm::SmallVector<int64_t, 64> caseValues;
-    llvm::DenseSet<uint64_t> seenAddrs;
-
-    for (unsigned i = 0; i < info.entry_count; ++i) {
+    for (size_t i = 0; i < info.targets.size(); ++i) {
         uint64_t targetAddr = info.targets[i];
+        if (defaultAddr && targetAddr == *defaultAddr)
+            continue;  // default-bound entry — would be a redundant cmp
         auto it = addrMap.find(targetAddr);
         if (it == addrMap.end()) {
             LLVM_DEBUG(llvm::dbgs()
                 << "RST: cannot resolve target address 0x"
                 << llvm::Twine::utohexstr(targetAddr)
-                << " for case " << i << "\n");
+                << " for case value " << info.case_values[i] << "\n");
             continue;
         }
-
         caseBlocks.push_back(it->second);
-        caseValues.push_back(static_cast<int64_t>(i));
+        caseValues.push_back(info.case_values[i]);
     }
 
     if (caseBlocks.empty())
         return false;
-
-    // Find or create a default block.
-    Block* defaultBlock = info.default_target;
-    if (!defaultBlock) {
-        // If we couldn't identify a default target, create a new block
-        // with a ret (unreachable default).
-        defaultBlock = new Block();
-        parentRegion->push_back(defaultBlock);
-        OpBuilder defaultBuilder(defaultBlock, defaultBlock->end());
-        defaultBuilder.create<low::RetOp>(loc, /*address=*/IntegerAttr{});
-    }
 
     // ── Build the comparison cascade ─────────────────────────────────────
     //

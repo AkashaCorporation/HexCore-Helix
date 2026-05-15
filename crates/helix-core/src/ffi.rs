@@ -96,6 +96,21 @@ extern "C" {
 
     /// Clear all variable renames.
     pub fn helix_engine_clear_variable_renames(engine: *mut HelixEngineHandle);
+
+    /// Register raw bytes for a virtual-address range so passes can read
+    /// from the original binary (jump tables, vtables, string literals).
+    /// Bytes are copied into the engine; the caller may free immediately.
+    /// Without at least one section, RecoverSwitchTables skips itself and
+    /// switch statements collapse to `goto default` in the C output.
+    pub fn helix_engine_add_data_section(
+        engine: *mut HelixEngineHandle,
+        va_start: u64,
+        bytes: *const u8,
+        len: usize,
+    );
+
+    /// Drop every registered data section.
+    pub fn helix_engine_clear_data_sections(engine: *mut HelixEngineHandle);
 }
 
 // ─── Safe Rust Wrapper ─────────────────────────────────────────────────────────
@@ -168,6 +183,27 @@ impl EngineHandle {
     pub fn clear_variable_renames(&mut self) {
         unsafe {
             helix_engine_clear_variable_renames(self.handle);
+        }
+    }
+
+    /// Register a virtual-address range with the engine's data-section store.
+    /// Required for switch table recovery — without it,
+    /// `RecoverSwitchTables` skips itself and switch statements lose every
+    /// case body in the C output.  Bytes are copied; caller can free
+    /// immediately.  Multiple calls accumulate.
+    pub fn add_data_section(&mut self, va_start: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        unsafe {
+            helix_engine_add_data_section(self.handle, va_start, bytes.as_ptr(), bytes.len());
+        }
+    }
+
+    /// Drop every registered data section.
+    pub fn clear_data_sections(&mut self) {
+        unsafe {
+            helix_engine_clear_data_sections(self.handle);
         }
     }
 

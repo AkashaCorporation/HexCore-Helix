@@ -677,6 +677,12 @@ private:
         } else {
             tracker.initArgRegPositions(isWin64);
         }
+        // Win64 entry points: incoming RCX/RDX/R8/R9 are OS-set values, not
+        // named parameters.  RecoverCallingConvention sets "no_reg_params" to
+        // suppress param_N naming for these functions.
+        if (func->hasAttr("no_reg_params")) {
+            tracker.argRegPositions.clear();
+        }
         tracker.hasReturnValue =
             func->hasAttr("has_return_value");
 

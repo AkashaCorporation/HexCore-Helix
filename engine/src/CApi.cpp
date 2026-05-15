@@ -143,4 +143,19 @@ void helix_engine_clear_variable_renames(HelixEngineHandle* handle) {
     }
 }
 
+void helix_engine_add_data_section(HelixEngineHandle* handle,
+                                    uint64_t va_start,
+                                    const uint8_t* bytes,
+                                    size_t len) {
+    if (handle && bytes && len > 0) {
+        to_engine(handle)->addDataSection(va_start, bytes, len);
+    }
+}
+
+void helix_engine_clear_data_sections(HelixEngineHandle* handle) {
+    if (handle) {
+        to_engine(handle)->clearDataSections();
+    }
+}
+
 } // extern "C"

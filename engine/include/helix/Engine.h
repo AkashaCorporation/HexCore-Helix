@@ -113,8 +113,33 @@ public:
     /// Clear all variable renames.
     void clearVariableRenames();
 
+    /// Register raw bytes for a virtual-address range so passes can read from
+    /// the original binary (jump tables, vtables, string literals, etc.).
+    ///
+    /// Call before decompile.  Multiple calls accumulate.  Without at least
+    /// one section registered, `RecoverSwitchTables` skips itself and switch
+    /// statements collapse to `goto default` in the C output — losing every
+    /// case body.  The TypeScript / Rust callers are expected to read the
+    /// PE/ELF binary's data sections (e.g. `.rdata` for MSVC) and feed the
+    /// VA + bytes here.
+    ///
+    /// `bytes` is copied into the engine; the caller may free its buffer
+    /// after the call returns.
+    void addDataSection(uint64_t va_start, const uint8_t* bytes, size_t len);
+
+    /// Drop every registered data section.
+    void clearDataSections();
+
     /// Get the last error message. Returns nullptr if no error.
     [[nodiscard]] const char* lastError() const noexcept;
+
+    // Storage for `addDataSection` — public so the in-Engine.cpp scoped
+    // installer (anon namespace) can access it without a friend declaration.
+    struct DataSection { uint64_t va_start; std::vector<uint8_t> bytes; };
+
+    [[nodiscard]] const std::vector<DataSection>& dataSections() const noexcept {
+        return data_sections_;
+    }
 
 private:
     HelixArch arch_;
@@ -123,6 +148,10 @@ private:
     // Phase 2: MLIR context and pipeline
     std::unique_ptr<mlir::MLIRContext> mlir_context_;
     std::unique_ptr<Pipeline> pipeline_;
+
+    // Data sections owned by this engine instance.  Lazily wrapped into a
+    // DataSectionProvider for the active thread before each pipeline run.
+    std::vector<DataSection> data_sections_;
 };
 
 } // namespace helix
@@ -233,6 +262,21 @@ void helix_engine_set_data_reader(
     helix_data_reader_fn reader,
     void* user_data
 );
+
+/// Register raw bytes for a virtual-address range so passes can read from
+/// the original binary (jump tables, vtables, string literals, etc.).  Bytes
+/// are copied into the engine; the caller may free its buffer immediately.
+/// Multiple calls accumulate.  Without at least one section,
+/// `RecoverSwitchTables` skips itself and switch statements collapse.
+void helix_engine_add_data_section(
+    HelixEngineHandle* engine,
+    uint64_t va_start,
+    const uint8_t* bytes,
+    size_t len
+);
+
+/// Drop every registered data section.
+void helix_engine_clear_data_sections(HelixEngineHandle* engine);
 
 #ifdef __cplusplus
 }

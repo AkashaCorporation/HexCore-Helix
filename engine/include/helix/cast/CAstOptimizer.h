@@ -47,6 +47,22 @@ public:
     void declareUndeclaredVars(CFuncDecl& func);
     void downgradeDeadAssignedCalls(CFuncDecl& func);
     void removeSelfAssignments(CFuncDecl& func);
+    /// v0.9.1 (G-002): when the first executable statement of the function
+    /// is a `return`, drop everything after it. The existing
+    /// `removeDeadCodeAfterReturn` is intentionally conservative (FIX-050
+    /// preserves tails with side effects); this pass handles the strict
+    /// subset where there is *no* live prefix at all, so the entire tail
+    /// must be the lift's downstream garbage from G-003 unapplied
+    /// relocations.
+    void removeUnreachableAfterFirstReturn(CFuncDecl& func);
+    /// v0.9.1 (G-002): drop `*<v> = …` statements where `<v>` is a local
+    /// declared `= 0` / `(void*)0` / `NULL` and never reassigned before
+    /// this store. Such a store is UB on the original semantics — it
+    /// cannot have come from real machine code, only from a lift artefact
+    /// (typically the zero-address placeholder path in
+    /// RemillToHelixLow.cpp). Removing it makes the output compile and
+    /// matches what every other decompiler would emit.
+    void removeNullDerefPlaceholderStores(CFuncDecl& func);
     void removeDanglingGotos(CFuncDecl& func);
     void inferSemanticNames(CFuncDecl& func);
     void renameRemainingRegisterVars(CFuncDecl& func);

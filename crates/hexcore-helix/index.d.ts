@@ -41,6 +41,21 @@ export declare class HelixEngine {
    * if the rename set changes.
    */
   clearVariableRenames(): void
+  /**
+   * Register a virtual-address range with the engine's data-section
+   * store.  REQUIRED for switch-table recovery — without at least one
+   * section, `RecoverSwitchTables` skips itself and every `switch (...)`
+   * in the source binary collapses to `goto default` in the decompiled
+   * output.  Call before decompileIr().  Multiple calls accumulate; each
+   * call copies the buffer (caller can free immediately).
+   *
+   * Typical usage from the extension: read the PE/ELF binary's data
+   * sections (`.rdata` for MSVC PE, `.rodata` for ELF) and pass the
+   * section's virtual address + bytes here once per file.
+   */
+  addDataSection(vaStart: bigint, bytes: Buffer): void
+  /** Drop every registered data section.  Call between binaries. */
+  clearDataSections(): void
   /** Get the engine version string. */
   version(): string
   /** Get the target architecture name. */

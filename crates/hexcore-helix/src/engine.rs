@@ -181,6 +181,36 @@ impl HelixEngine {
         Ok(())
     }
 
+    /// Register a virtual-address range with the engine's data-section
+    /// store.  REQUIRED for switch-table recovery — without at least one
+    /// section, `RecoverSwitchTables` skips itself and every `switch (...)`
+    /// in the source binary collapses to `goto default` in the decompiled
+    /// output.  Call before decompileIr().  Multiple calls accumulate; each
+    /// call copies the buffer (caller can free immediately).
+    ///
+    /// Typical usage from the extension: read the PE/ELF binary's data
+    /// sections (`.rdata` for MSVC PE, `.rodata` for ELF) and pass the
+    /// section's virtual address + bytes here once per file.
+    #[napi]
+    pub fn add_data_section(&mut self, va_start: BigInt, bytes: Buffer) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        let (_signed, va, _lossless) = va_start.get_u64();
+        handle.add_data_section(va, &bytes);
+        Ok(())
+    }
+
+    /// Drop every registered data section.  Call between binaries.
+    #[napi]
+    pub fn clear_data_sections(&mut self) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        handle.clear_data_sections();
+        Ok(())
+    }
+
     /// Get the engine version string.
     #[napi]
     pub fn version(&self) -> String {

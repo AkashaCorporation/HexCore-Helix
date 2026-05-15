@@ -299,10 +299,58 @@ private:
         case CallingConv::Cdecl32: argRegs = kCdecl32IntArgs; break;
         }
 
+        // --- Win64 entry-point detection ---
+        // PE entry-point functions (start, hc_entry, Remill's generic
+        // "entry_point", etc.) receive their argument registers from the OS
+        // loader, not from calls within the binary.  The early reads of
+        // RCX/RDX/R8/R9 in their bodies are obfuscation / OS-set values, NOT
+        // meaningful named parameters.  Skip Phase 1+2 for these functions to
+        // prevent phantom param declarations.
+        bool skipParamInference = false;
+        if (cc == CallingConv::Win64 && module) {
+            const llvm::StringRef funcName = func.getName();
+
+            // 1. Name-based: known zero-arg PE entry-point symbols.
+            static constexpr std::array<std::string_view, 8> kNoArgEntryNames = {
+                "entry_point", "hc_entry", "start", "_start",
+                "mainCRTStartup", "wmainCRTStartup",
+                "_mainCRTStartup", "_wmainCRTStartup",
+            };
+            for (auto name : kNoArgEntryNames) {
+                if (funcName == llvm::StringRef(name.data(), name.size())) {
+                    skipParamInference = true; break;
+                }
+            }
+
+            // 2. Caller-count heuristic: in a multi-function module, a Win64
+            //    function that is never the target of any internal CallOp is
+            //    the root entry / exported symbol — treat as zero-param.
+            if (!skipParamInference) {
+                unsigned moduleFuncCount = 0;
+                module.walk([&](helix::low::FuncOp) { ++moduleFuncCount; });
+                if (moduleFuncCount > 1) {
+                    bool calledInternally = false;
+                    module.walk([&](helix::low::CallOp call) {
+                        if (call->getParentOfType<helix::low::FuncOp>() == func)
+                            return; // skip self-recursive calls
+                        if (auto t = call.getTargetName(); t && *t == funcName)
+                            calledInternally = true;
+                    });
+                    skipParamInference = !calledInternally;
+                }
+            }
+
+            if (skipParamInference)
+                llvm::errs() << "[P0-DEBUG] RecoverCC: '" << funcName
+                             << "' is a Win64 entry point — skipping param inference\n";
+        }
+
         // Phase 1: Identify function parameters.
         // Scan from the top for reg.read operations that read argument registers
         // before any write to those registers — these are function parameters.
         llvm::SmallVector<unsigned> paramIndices;
+
+        if (!skipParamInference) {
         llvm::DenseSet<llvm::StringRef> writtenRegs;
         llvm::DenseSet<unsigned> seenParamIndices;
 
@@ -328,9 +376,10 @@ private:
             }
         });
         llvm::sort(paramIndices);
+        } // end !skipParamInference (Phase 1)
 
         // Phase 2: Emit parameter declarations at function entry.
-        if (!paramIndices.empty()) {
+        if (!skipParamInference && !paramIndices.empty()) {
             OpBuilder builder(func->getContext());
             auto& entryBlock = func.getBody().front();
             builder.setInsertionPointToStart(&entryBlock);
@@ -543,6 +592,12 @@ private:
             StringAttr::get(func->getContext(), ccStr));
         if (hasReturnValue) {
             func->setAttr("has_return_value",
+                UnitAttr::get(func->getContext()));
+        }
+        // Tell RecoverVariables not to create param_N vars for arg registers
+        // on Win64 entry-point functions (OS-set register values, not real params).
+        if (skipParamInference) {
+            func->setAttr("no_reg_params",
                 UnitAttr::get(func->getContext()));
         }
     }

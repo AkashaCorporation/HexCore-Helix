@@ -6,11 +6,16 @@
 /// nodes instead of emitting text.
 
 #include "helix/cast/CAstBuilder.h"
+#include "helix/cast/CDecl.h"
+#include "helix/cast/CStmt.h"
+#include "helix/cast/CExpr.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/dialects/HelixHighTypes.h"
 #include "helix/dialects/HelixHighDialect.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
+
+#include <unordered_set>
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -3520,6 +3525,231 @@ void CAstBuilder::prescanStructFieldNames(Operation* funcOp) {
 // Confidence Analysis
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ─── Garbage-pattern detection for the confidence score ──────────────────────
+//
+// The historical confidence calculator misses entire classes of output that
+// `helix-validate` (`tools/helix-validate/`) detects via dataflow theorems:
+// outputs where the first executable statement is a `return` shadowing live
+// code, derefs of placeholder vars whose only definition is `0`, identity
+// no-ops, and self-referencing assignments of the form `x op= ... x ...`.
+//
+// These patterns are not stylistic preferences — each one is a *theorem*
+// that the emitted output is degenerate (see paper-supplement-v091.md §2.1
+// for the formal statements). When the existing scorer reports 91% on a
+// function whose first statement is `return sub_c();` followed by 30 lines
+// of unreachable tail (the `init_module → hook_syslog` case observed on
+// the `rev_kernel_monarch` rootkit corpus), the scorer is the problem,
+// not the output.
+//
+// The detectors below walk the CAst AFTER it is fully built, count the
+// occurrences of each pattern, and contribute deductions to the same
+// `deduction` running total the original analyzer uses. They never
+// suppress an issue — only add to it.
+
+namespace {
+
+/// True iff `e` is the literal `0`, `(void*)0`, `NULL`, or a cast of any.
+bool isZeroLiteralExpr(const CExpr* e) {
+    if (!e) return false;
+    if (auto* lit = llvm::dyn_cast<CIntLitExpr>(e)) {
+        return lit->value == 0;
+    }
+    if (auto* lit = llvm::dyn_cast<CAddrLitExpr>(e)) {
+        return lit->addrValue == 0;
+    }
+    if (auto* castE = llvm::dyn_cast<CCastExpr>(e)) {
+        return isZeroLiteralExpr(castE->operand.get());
+    }
+    return false;
+}
+
+/// Return the var-name iff `e` is a plain `CVarRefExpr`. Stripped of casts.
+std::string varNameOf(const CExpr* e) {
+    if (!e) return {};
+    if (auto* castE = llvm::dyn_cast<CCastExpr>(e)) {
+        return varNameOf(castE->operand.get());
+    }
+    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e)) {
+        return v->varName;
+    }
+    return {};
+}
+
+/// True iff `e` contains a `CVarRefExpr` referencing `name` anywhere in its
+/// expression tree (so we can detect `x = x + 1`, `x += y * x`, etc.).
+bool exprReferencesVar(const CExpr* e, llvm::StringRef name) {
+    if (!e || name.empty()) return false;
+    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e)) {
+        return v->varName == name;
+    }
+    if (auto* b = llvm::dyn_cast<CBinaryExpr>(e)) {
+        return exprReferencesVar(b->lhs.get(), name) ||
+               exprReferencesVar(b->rhs.get(), name);
+    }
+    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e)) {
+        return exprReferencesVar(u->operand.get(), name);
+    }
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e)) {
+        return exprReferencesVar(c->operand.get(), name);
+    }
+    if (auto* t = llvm::dyn_cast<CTernaryExpr>(e)) {
+        return exprReferencesVar(t->cond.get(), name) ||
+               exprReferencesVar(t->trueVal.get(), name) ||
+               exprReferencesVar(t->falseVal.get(), name);
+    }
+    if (auto* s = llvm::dyn_cast<CSubscriptExpr>(e)) {
+        return exprReferencesVar(s->base.get(), name) ||
+               exprReferencesVar(s->index.get(), name);
+    }
+    if (auto* fa = llvm::dyn_cast<CFieldAccessExpr>(e)) {
+        return exprReferencesVar(fa->base.get(), name);
+    }
+    if (auto* call = llvm::dyn_cast<CCallExpr>(e)) {
+        // CCallExpr holds the target as a string/address, not as an expr.
+        for (auto& a : call->args) {
+            if (exprReferencesVar(a.get(), name)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+struct GarbageCounts {
+    int unreachableAfterReturn = 0;  // theorem T5
+    int nullDerefPlaceholder   = 0;  // theorem T1
+    int suspiciousSelfRef      = 0;  // theorem T3
+    int identityNoOp           = 0;  // theorem T2
+};
+
+void analyzeStmtList(const std::vector<StmtPtr>& body,
+                     const std::unordered_set<std::string>& zeroInitVars,
+                     std::unordered_set<std::string>& reassigned,
+                     GarbageCounts& g);
+
+void analyzeStmt(const CStmt* s,
+                 const std::unordered_set<std::string>& zeroInitVars,
+                 std::unordered_set<std::string>& reassigned,
+                 GarbageCounts& g) {
+    if (!s) return;
+
+    // (T1) Null deref of placeholder: `*<zero_var> = …`.
+    if (auto* assign = llvm::dyn_cast<CAssignStmt>(s)) {
+        if (auto* u = llvm::dyn_cast<CUnaryExpr>(assign->target.get())) {
+            if (u->op == UnaryOp::Deref) {
+                auto vn = varNameOf(u->operand.get());
+                if (!vn.empty() && zeroInitVars.count(vn) &&
+                    !reassigned.count(vn)) {
+                    g.nullDerefPlaceholder++;
+                }
+            }
+        }
+        // Record reassignment to `target` (whole-var only — `*p =` does NOT
+        // reassign `p`, it writes through it; we already detected that case
+        // above before processing).
+        if (auto vn = varNameOf(assign->target.get()); !vn.empty()) {
+            reassigned.insert(vn);
+        }
+
+        // (T2 / T3) Self-referencing or identity assignment.
+        if (auto targetName = varNameOf(assign->target.get());
+            !targetName.empty()) {
+            bool rhsRefs = exprReferencesVar(
+                assign->value.get(), targetName);
+            // x = x  (plain) or  x op= x  is identity for op in {|, &}.
+            bool plainSelfAssign =
+                assign->compoundOp.empty() &&
+                varNameOf(assign->value.get()) == targetName;
+            bool selfOrAnd =
+                (assign->compoundOp == "|=" || assign->compoundOp == "&=") &&
+                varNameOf(assign->value.get()) == targetName;
+            // x op= 0  is identity for op in {+, -, |, ^}.
+            bool opZero =
+                (assign->compoundOp == "+=" || assign->compoundOp == "-=" ||
+                 assign->compoundOp == "|=" || assign->compoundOp == "^=") &&
+                isZeroLiteralExpr(assign->value.get());
+
+            if (plainSelfAssign || selfOrAnd || opZero) {
+                g.identityNoOp++;
+            } else if (rhsRefs) {
+                // Not exact identity, but the RHS still references the same
+                // variable we're writing to — non-canonical self-reference
+                // (e.g. `x += x - 16` = `2x - 16`, the AmmoUsage case).
+                g.suspiciousSelfRef++;
+            }
+        }
+        return;
+    }
+
+    if (auto* ifS = llvm::dyn_cast<CIfStmt>(s)) {
+        analyzeStmtList(ifS->thenBody, zeroInitVars, reassigned, g);
+        analyzeStmtList(ifS->elseBody, zeroInitVars, reassigned, g);
+        return;
+    }
+    if (auto* wh = llvm::dyn_cast<CWhileStmt>(s)) {
+        analyzeStmtList(wh->body, zeroInitVars, reassigned, g);
+        return;
+    }
+    if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(s)) {
+        analyzeStmtList(dw->body, zeroInitVars, reassigned, g);
+        return;
+    }
+    if (auto* fr = llvm::dyn_cast<CForStmt>(s)) {
+        analyzeStmtList(fr->body, zeroInitVars, reassigned, g);
+        return;
+    }
+    if (auto* sw = llvm::dyn_cast<CSwitchStmt>(s)) {
+        for (auto& c : sw->cases) {
+            analyzeStmtList(c.body, zeroInitVars, reassigned, g);
+        }
+        return;
+    }
+    if (auto* blk = llvm::dyn_cast<CBlockStmt>(s)) {
+        analyzeStmtList(blk->stmts, zeroInitVars, reassigned, g);
+        return;
+    }
+}
+
+void analyzeStmtList(const std::vector<StmtPtr>& body,
+                     const std::unordered_set<std::string>& zeroInitVars,
+                     std::unordered_set<std::string>& reassigned,
+                     GarbageCounts& g) {
+    // (T5) Unreachable-after-return: anything following the first top-level
+    // `return` in this list is dead. We count *statements*, not lines, so a
+    // 30-line tail of one CAssignStmt + one CExprStmt + … counts as N.
+    bool sawReturn = false;
+    for (auto& sp : body) {
+        if (sawReturn) {
+            g.unreachableAfterReturn++;
+            // Don't analyse the unreachable subtree further — its findings
+            // are already shadowed by the dead-code finding.
+            continue;
+        }
+        analyzeStmt(sp.get(), zeroInitVars, reassigned, g);
+        if (llvm::isa<CReturnStmt>(sp.get())) {
+            sawReturn = true;
+        }
+    }
+}
+
+GarbageCounts collectGarbagePatterns(const CFuncDecl& func) {
+    // Build the zero-init placeholder set from the function's local decls.
+    // A var counts as a placeholder iff its declared initializer is
+    // syntactically zero (literal 0, (void*)0, NULL via address literal,
+    // or a cast of any of those).
+    std::unordered_set<std::string> zeroInit;
+    for (const auto& lv : func.localVars) {
+        if (lv.initExpr && isZeroLiteralExpr(lv.initExpr.get())) {
+            zeroInit.insert(lv.varName);
+        }
+    }
+    std::unordered_set<std::string> reassigned;
+    GarbageCounts g;
+    analyzeStmtList(func.body, zeroInit, reassigned, g);
+    return g;
+}
+
+} // namespace
+
 void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
     double deduction = 0.0;
     auto& issues = func.confidenceIssues;
@@ -3611,6 +3841,52 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
         double bonus = std::min(5.0,
             (double)typedParams / (double)func.params.size() * 5.0);
         deduction -= bonus;
+    }
+
+    // ── v0.9.1: garbage-pattern penalties (closes G-015) ────────────────
+    // Walk the CAst and count theorem-grounded defects. These are the same
+    // patterns helix-validate detects; landing them in the engine's own
+    // scorer means the self-reported confidence stops disagreeing with the
+    // external validator. See comment block on `collectGarbagePatterns`.
+    auto g = collectGarbagePatterns(func);
+    if (g.unreachableAfterReturn > 0) {
+        // The single most damning pattern — `return X; <more code>` at the
+        // top level means the function body that should have run is gone.
+        // 5 points per unreachable stmt, capped at 40 so a small tail
+        // doesn't dominate the score by itself.
+        deduction += std::min(40.0,
+            (double)g.unreachableAfterReturn * 5.0);
+        issues.push_back(std::format(
+            "{} unreachable statement(s) after `return` (lift-quality concern)",
+            g.unreachableAfterReturn));
+    }
+    if (g.nullDerefPlaceholder > 0) {
+        // `*v = …` where v was declared = 0 and never reassigned — UB on
+        // the original semantics. 10 points each, capped at 30.
+        deduction += std::min(30.0,
+            (double)g.nullDerefPlaceholder * 10.0);
+        issues.push_back(std::format(
+            "{} null-deref of zero-initialised placeholder",
+            g.nullDerefPlaceholder));
+    }
+    if (g.suspiciousSelfRef > 0) {
+        // `x op= … x …` — non-canonical self-reference (the
+        // `param_2 += param_2 - 16` AmmoUsage case). 5 points each,
+        // capped at 20 — milder than null-deref because it can occasionally
+        // be legitimate (e.g. `x = x + 1` in a real algorithm).
+        deduction += std::min(20.0,
+            (double)g.suspiciousSelfRef * 5.0);
+        issues.push_back(std::format(
+            "{} suspicious self-referencing assignment(s)",
+            g.suspiciousSelfRef));
+    }
+    if (g.identityNoOp > 0) {
+        // `x = x`, `x ^= 0`, `x |= x`, etc. — pure identities the lifter
+        // shouldn't have emitted. Mild penalty.
+        deduction += std::min(10.0,
+            (double)g.identityNoOp * 3.0);
+        issues.push_back(std::format(
+            "{} identity / no-op assignment(s)", g.identityNoOp));
     }
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));

@@ -18,6 +18,7 @@
 #include "helix/cast/CType.h"
 
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Casting.h"
 
 #include <algorithm>
 #include <array>
@@ -234,6 +235,14 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     removeDeadStoresBeforeReturn(func);
     collapseAssignBeforeReturn(func);
     initializeReadBeforeWriteVars(func);
+    // v0.9.1 (G-002): drop the lift's downstream garbage — null-deref
+    // stores on placeholder vars and unreachable tails after a leading
+    // return. These passes run last in the optimisation order so they
+    // see the AST after every other simplification has had a chance to
+    // legitimise the patterns (e.g. propagateCopies may rewrite `*v` to
+    // a real lvalue if `v` was a simple alias of a real pointer).
+    removeNullDerefPlaceholderStores(func);
+    removeUnreachableAfterFirstReturn(func);
     removeUnusedDeclarations(func);
     reanalyzeConfidence(func);
 }
@@ -314,6 +323,183 @@ static void removeSelfAssignsInList(std::vector<StmtPtr>& stmts) {
 
 void CAstOptimizer::removeSelfAssignments(CFuncDecl& func) {
     removeSelfAssignsInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeUnreachableAfterFirstReturn (G-002, v0.9.1)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When the *very first executable statement* of the function body is a
+// `return`, every statement after it is unreachable by construction —
+// there is no live prefix from which any branch could re-enter the
+// trailing region. This pass drops that trailing region.
+//
+// The motivation is the malware.ko `init_module → hook_syslog` output:
+//
+//   int64_t hook_syslog(...) {
+//       int64_t v1 = 0;          ← decls (allowed before the return)
+//       ...
+//       return sub_c();          ← first executable statement
+//       param_1_1 = ...;         ← dead
+//       v3 = ...;                ← dead
+//       ... 16 more lines ...    ← all dead
+//   }
+//
+// The existing `removeDeadCodeAfterReturn` preserves tails when any
+// statement after the return has side effects (FIX-050, Wave 12). That
+// preservation is correct for the *general* case (error-path tails are
+// legitimate); it is wrong here because the function body never reaches
+// the tail at all. The stricter condition this pass uses — "the FIRST
+// executable statement was a return" — guarantees the tail is from a
+// lift defect (the G-003 unapplied-relocation cascade) and is safe to
+// elide. We do *not* extend `removeDeadCodeAfterReturn` itself, to
+// preserve its FIX-050 behaviour on functions that have legitimate
+// executable code before their early return.
+
+void CAstOptimizer::removeUnreachableAfterFirstReturn(CFuncDecl& func) {
+    // Find the index of the first non-comment, non-label executable
+    // statement. We tolerate leading CCommentStmt and CLabelStmt because
+    // those are bookkeeping, not "the function actually did something."
+    size_t firstExec = func.body.size();
+    for (size_t i = 0; i < func.body.size(); ++i) {
+        const CStmt* s = func.body[i].get();
+        if (!s) continue;
+        auto k = s->getKind();
+        if (k == NodeKind::CommentStmt || k == NodeKind::LabelStmt) continue;
+        firstExec = i;
+        break;
+    }
+    if (firstExec >= func.body.size()) return;
+    if (func.body[firstExec]->getKind() != NodeKind::ReturnStmt) return;
+
+    // The function returns on the first executable statement. Everything
+    // after that index is unreachable. Truncate.
+    if (firstExec + 1 < func.body.size()) {
+        func.body.erase(func.body.begin() + (firstExec + 1), func.body.end());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeNullDerefPlaceholderStores (G-002, v0.9.1)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Drop statements of the form
+//
+//     *<v> = <anything>;
+//
+// where `<v>` is a local declared with an initialiser that is
+// syntactically zero (`0`, `(void*)0`, `NULL`, or a cast of either) AND
+// has not been reassigned anywhere in the function body before this
+// statement. The store dereferences a value provably 0 at this program
+// point — it is undefined behaviour on the original program semantics
+// and cannot have come from real machine code. It is exclusively a lift
+// artefact (the zero-address placeholder path in RemillToHelixLow.cpp,
+// downstream of G-003's unapplied relocations).
+//
+// We walk the body in program order, tracking which placeholder vars
+// have already been reassigned (so a `*v = …` *after* a `v = real_value;`
+// is preserved — it is a real store through a now-valid pointer).
+// This pass does NOT touch `*v = …` where `v` is a parameter or any
+// non-zero-init local: those are real writes through a possibly-valid
+// pointer and removing them would lose program semantics.
+
+namespace {
+
+bool isZeroLitForPlaceholderDetect(const CExpr* e) {
+    if (!e) return false;
+    if (auto* lit = llvm::dyn_cast<CIntLitExpr>(e)) return lit->value == 0;
+    if (auto* lit = llvm::dyn_cast<CAddrLitExpr>(e)) return lit->addrValue == 0;
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return isZeroLitForPlaceholderDetect(c->operand.get());
+    return false;
+}
+
+std::string varNameOfStripped(const CExpr* e) {
+    if (!e) return {};
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return varNameOfStripped(c->operand.get());
+    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e)) return v->varName;
+    return {};
+}
+
+void dropNullDerefStoresInList(
+    std::vector<StmtPtr>& body,
+    const std::unordered_set<std::string>& zeroInit,
+    std::unordered_set<std::string>& reassigned)
+{
+    std::vector<StmtPtr> kept;
+    kept.reserve(body.size());
+    for (auto& sp : body) {
+        if (!sp) { kept.push_back(std::move(sp)); continue; }
+        // Recurse into compound statements (the program-order traversal
+        // matters because `reassigned` is updated as we go).
+        if (auto* i = llvm::dyn_cast<CIfStmt>(sp.get())) {
+            dropNullDerefStoresInList(i->thenBody, zeroInit, reassigned);
+            dropNullDerefStoresInList(i->elseBody, zeroInit, reassigned);
+            kept.push_back(std::move(sp));
+            continue;
+        }
+        if (auto* w = llvm::dyn_cast<CWhileStmt>(sp.get())) {
+            dropNullDerefStoresInList(w->body, zeroInit, reassigned);
+            kept.push_back(std::move(sp));
+            continue;
+        }
+        if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(sp.get())) {
+            dropNullDerefStoresInList(dw->body, zeroInit, reassigned);
+            kept.push_back(std::move(sp));
+            continue;
+        }
+        if (auto* fr = llvm::dyn_cast<CForStmt>(sp.get())) {
+            dropNullDerefStoresInList(fr->body, zeroInit, reassigned);
+            kept.push_back(std::move(sp));
+            continue;
+        }
+        if (auto* sw = llvm::dyn_cast<CSwitchStmt>(sp.get())) {
+            for (auto& c : sw->cases)
+                dropNullDerefStoresInList(c.body, zeroInit, reassigned);
+            kept.push_back(std::move(sp));
+            continue;
+        }
+        if (auto* blk = llvm::dyn_cast<CBlockStmt>(sp.get())) {
+            dropNullDerefStoresInList(blk->stmts, zeroInit, reassigned);
+            kept.push_back(std::move(sp));
+            continue;
+        }
+        if (auto* a = llvm::dyn_cast<CAssignStmt>(sp.get())) {
+            // Detect `*<placeholder> = …`.
+            if (auto* u = llvm::dyn_cast<CUnaryExpr>(a->target.get());
+                u && u->op == UnaryOp::Deref) {
+                auto vn = varNameOfStripped(u->operand.get());
+                if (!vn.empty() && zeroInit.count(vn) &&
+                    !reassigned.count(vn)) {
+                    // Drop this statement — UB on a provably-null pointer
+                    // is dead code from the original program's POV.
+                    continue;
+                }
+            }
+            // Track plain-var reassignments. `*p = …` does NOT reassign
+            // `p`; only `p = …` does. The Deref case above already
+            // handled `*p = …` before this check.
+            if (auto vn = varNameOfStripped(a->target.get()); !vn.empty()) {
+                reassigned.insert(vn);
+            }
+        }
+        kept.push_back(std::move(sp));
+    }
+    body = std::move(kept);
+}
+
+} // namespace
+
+void CAstOptimizer::removeNullDerefPlaceholderStores(CFuncDecl& func) {
+    std::unordered_set<std::string> zeroInit;
+    for (const auto& lv : func.localVars) {
+        if (lv.initExpr && isZeroLitForPlaceholderDetect(lv.initExpr.get()))
+            zeroInit.insert(lv.varName);
+    }
+    if (zeroInit.empty()) return;
+    std::unordered_set<std::string> reassigned;
+    dropNullDerefStoresInList(func.body, zeroInit, reassigned);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2229,6 +2415,180 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
                 (double)typedParams / (double)func.params.size() * 5.0);
             deduction -= bonus;
         }
+    }
+
+    // ── v0.9.1 (G-015): theorem-grounded garbage-pattern penalties ───
+    //
+    // Counts the same defect classes helix-validate (tools/helix-validate)
+    // detects via dataflow theorems. Until landed, the scorer reports 91%
+    // on a function whose first statement is `return sub_c();` followed
+    // by 30 lines of unreachable tail (init_module→hook_syslog on the
+    // rev_kernel_monarch rootkit corpus). Penalties here close that gap.
+    //
+    // Each detector implements a theorem stated in
+    // tools/helix-validate/paper-supplement-v091.md §2.1.
+
+    auto isZeroLit = [](const CExpr* e) -> bool {
+        std::function<bool(const CExpr*)> rec = [&](const CExpr* x) -> bool {
+            if (!x) return false;
+            if (auto* lit = llvm::dyn_cast<CIntLitExpr>(x))
+                return lit->value == 0;
+            if (auto* lit = llvm::dyn_cast<CAddrLitExpr>(x))
+                return lit->addrValue == 0;
+            if (auto* c = llvm::dyn_cast<CCastExpr>(x))
+                return rec(c->operand.get());
+            return false;
+        };
+        return rec(e);
+    };
+    auto varNameOf = [](const CExpr* e) -> std::string {
+        std::function<std::string(const CExpr*)> rec = [&](const CExpr* x) -> std::string {
+            if (!x) return {};
+            if (auto* c = llvm::dyn_cast<CCastExpr>(x))
+                return rec(c->operand.get());
+            if (auto* v = llvm::dyn_cast<CVarRefExpr>(x))
+                return v->varName;
+            return {};
+        };
+        return rec(e);
+    };
+    std::function<bool(const CExpr*, llvm::StringRef)> referencesVar =
+        [&](const CExpr* e, llvm::StringRef name) -> bool {
+        if (!e || name.empty()) return false;
+        if (auto* v = llvm::dyn_cast<CVarRefExpr>(e))
+            return v->varName == name;
+        if (auto* b = llvm::dyn_cast<CBinaryExpr>(e))
+            return referencesVar(b->lhs.get(), name) ||
+                   referencesVar(b->rhs.get(), name);
+        if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
+            return referencesVar(u->operand.get(), name);
+        if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+            return referencesVar(c->operand.get(), name);
+        if (auto* t = llvm::dyn_cast<CTernaryExpr>(e))
+            return referencesVar(t->cond.get(), name) ||
+                   referencesVar(t->trueVal.get(), name) ||
+                   referencesVar(t->falseVal.get(), name);
+        if (auto* s = llvm::dyn_cast<CSubscriptExpr>(e))
+            return referencesVar(s->base.get(), name) ||
+                   referencesVar(s->index.get(), name);
+        if (auto* fa = llvm::dyn_cast<CFieldAccessExpr>(e))
+            return referencesVar(fa->base.get(), name);
+        if (auto* call = llvm::dyn_cast<CCallExpr>(e)) {
+            for (auto& a : call->args)
+                if (referencesVar(a.get(), name)) return true;
+        }
+        return false;
+    };
+
+    // Pre-compute zero-init placeholders from this function's declarations.
+    std::unordered_set<std::string> zeroInit;
+    for (const auto& lv : func.localVars) {
+        if (lv.initExpr && isZeroLit(lv.initExpr.get()))
+            zeroInit.insert(lv.varName);
+    }
+    std::unordered_set<std::string> reassigned;
+
+    struct Counts {
+        int unreachableAfterReturn = 0;
+        int nullDerefPlaceholder   = 0;
+        int suspiciousSelfRef      = 0;
+        int identityNoOp           = 0;
+    } cnt;
+
+    std::function<void(const CStmt*)> walkStmt;
+    std::function<void(const std::vector<StmtPtr>&)> walkList =
+        [&](const std::vector<StmtPtr>& body) {
+        bool sawReturn = false;
+        for (auto& sp : body) {
+            if (sawReturn) { cnt.unreachableAfterReturn++; continue; }
+            walkStmt(sp.get());
+            if (llvm::isa_and_nonnull<CReturnStmt>(sp.get())) sawReturn = true;
+        }
+    };
+    walkStmt = [&](const CStmt* s) {
+        if (!s) return;
+        if (auto* a = llvm::dyn_cast<CAssignStmt>(s)) {
+            // T1 — `*<zero_var> = …` and `<zero_var>` not yet reassigned.
+            if (auto* u = llvm::dyn_cast<CUnaryExpr>(a->target.get())) {
+                if (u->op == UnaryOp::Deref) {
+                    auto vn = varNameOf(u->operand.get());
+                    if (!vn.empty() && zeroInit.count(vn) &&
+                        !reassigned.count(vn)) {
+                        cnt.nullDerefPlaceholder++;
+                    }
+                }
+            }
+            // Then record the assignment as a reassignment of `target` (if
+            // target is a plain var ref — `*p = …` writes through `p`,
+            // does NOT reassign `p` itself, which the check above
+            // already handled).
+            if (auto vn = varNameOf(a->target.get()); !vn.empty()) {
+                reassigned.insert(vn);
+            }
+            // T2 / T3 — identity / suspicious-self-ref.
+            if (auto tn = varNameOf(a->target.get()); !tn.empty()) {
+                bool rhsRefs = referencesVar(a->value.get(), tn);
+                bool plainSelf = a->compoundOp.empty() &&
+                                 varNameOf(a->value.get()) == tn;
+                bool selfOrAnd =
+                    (a->compoundOp == "|=" || a->compoundOp == "&=") &&
+                    varNameOf(a->value.get()) == tn;
+                bool opZero =
+                    (a->compoundOp == "+=" || a->compoundOp == "-=" ||
+                     a->compoundOp == "|=" || a->compoundOp == "^=") &&
+                    isZeroLit(a->value.get());
+                if (plainSelf || selfOrAnd || opZero) {
+                    cnt.identityNoOp++;
+                } else if (rhsRefs) {
+                    cnt.suspiciousSelfRef++;
+                }
+            }
+            return;
+        }
+        if (auto* i = llvm::dyn_cast<CIfStmt>(s)) {
+            walkList(i->thenBody); walkList(i->elseBody); return;
+        }
+        if (auto* w = llvm::dyn_cast<CWhileStmt>(s)) {
+            walkList(w->body); return;
+        }
+        if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(s)) {
+            walkList(dw->body); return;
+        }
+        if (auto* fr = llvm::dyn_cast<CForStmt>(s)) {
+            walkList(fr->body); return;
+        }
+        if (auto* sw = llvm::dyn_cast<CSwitchStmt>(s)) {
+            for (auto& c : sw->cases) walkList(c.body);
+            return;
+        }
+        if (auto* blk = llvm::dyn_cast<CBlockStmt>(s)) {
+            walkList(blk->stmts); return;
+        }
+    };
+    walkList(func.body);
+
+    if (cnt.unreachableAfterReturn > 0) {
+        deduction += std::min(40.0, (double)cnt.unreachableAfterReturn * 5.0);
+        func.confidenceIssues.push_back(std::format(
+            "{} unreachable statement(s) after `return` (lift-quality concern)",
+            cnt.unreachableAfterReturn));
+    }
+    if (cnt.nullDerefPlaceholder > 0) {
+        deduction += std::min(30.0, (double)cnt.nullDerefPlaceholder * 10.0);
+        func.confidenceIssues.push_back(std::format(
+            "{} null-deref of zero-initialised placeholder",
+            cnt.nullDerefPlaceholder));
+    }
+    if (cnt.suspiciousSelfRef > 0) {
+        deduction += std::min(20.0, (double)cnt.suspiciousSelfRef * 5.0);
+        func.confidenceIssues.push_back(std::format(
+            "{} suspicious self-referencing assignment(s)",
+            cnt.suspiciousSelfRef));
+    }
+    if (cnt.identityNoOp > 0) {
+        deduction += std::min(10.0, (double)cnt.identityNoOp * 3.0);
+        func.confidenceIssues.push_back(std::format(
+            "{} identity / no-op assignment(s)", cnt.identityNoOp));
     }
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
