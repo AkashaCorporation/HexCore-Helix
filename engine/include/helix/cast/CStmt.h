@@ -26,12 +26,12 @@ public:
 
 // ── Concrete statement nodes ────────────────────────────────────────────────
 
-/// Assignment: target = value  or  target += value
+/// Assignment: target = value, target += value, or target++/target--
 class CAssignStmt : public CStmt {
 public:
     ExprPtr target;
     ExprPtr value;
-    std::string compoundOp; // empty for plain "=", "+=" etc for compound
+    std::string compoundOp; // empty for plain "=", "+=", "++", "--", etc.
 
     CAssignStmt(ExprPtr target, ExprPtr value, std::string compoundOp = "",
                 uint64_t address = 0)

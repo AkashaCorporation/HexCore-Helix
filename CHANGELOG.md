@@ -2,6 +2,98 @@
 
 All notable changes to HexCore Helix are documented here.
 
+
+## [v0.9.2-nightly] — 2026-05-18
+
+> **Nightly build** — Operand-binding fidelity push on the `rev_kernel_monarch` Linux ftrace-rootkit corpus (7 functions). Three coordinated fixes (FIX-078, FIX-079, FIX-080) plus one documented REVERT (FIX-081). Total: **-6 `suspicious_self_reference` findings** on the lift-only corpus, **zero regression** on any function previously above 25%.
+
+### Wave 19 — Operand binding + spurious-self-reference cleanup (2026-05-17 / 2026-05-18)
+
+#### FIX-078 — Trailing literal-store DSE in nested scopes (`cast/CAstOptimizer.cpp`)
+
+- **Problem**: `removeDeadStoresBeforeReturnInList` (line ~2628) only scanned direct preceding statements of a `ReturnStmt`.  Inside the kernel-rootkit corpus, lifted `mov dword ptr [rbp-8], 0x5ED` artefacts (PC-bookkeeping leaks Remill emits in the prologue/epilogue region) survived as `var_0 = 0x5ED;` immediately before `return v4;` at nested-scope return sites — `eliminateDeadStores` was too conservative across scope boundaries to catch them.
+- **Fix**: Extended the backward scan to walk through nested `IfStmt`/`WhileStmt`/`DoWhileStmt`/`ForStmt`/`SwitchStmt`/`BlockStmt` children before the per-list scan, and gated removal on a global-ref-count check (`globalRefCount[varName] == 0`) so we never drop a store whose target is read elsewhere in the function.
+- **Result**: `var_0 = 0x5ED;` and similar `*_promoted_N = <const>;` artefacts gone from the corpus.  Side-effecting RHS (`CallExpr`) is still explicitly preserved (line ~2681 break clause).
+
+#### FIX-079 — Operand binding: spurious self-reference in commutative compound assignments (`cast/CAstOptimizer.cpp`)
+
+- **Problem**: After upstream register coalescing, the optimizer emitted statements of the shape `v5 += v5 + 208;` and `v3 += v3 + 34;` in `fh_install_hook` and `fh_install_hooks`.  These read mathematically as `2v + C` while the disassembled binary at the same address is a plain `add reg, C` — the inner `v` is a lift-side artefact, not real source.  The existing `foldDegenerateCompounds` only handled the `-=` case (FIX-041's SBB idiom).
+- **Fix**: `foldDegenerateCompoundsInList` (lines ~7240-7320) extended with a commutative-operator branch.  For `x OP= (x OP_compat C)` where `OP` ∈ `{+= *= &= |= ^=}` and `OP_compat` is the matching `BinaryOp` and the *other* operand is a literal (`IntLitExpr` / `AddrLitExpr`), drop the inner `x` reference.  The literal-only gate is load-bearing — never collapse `x += (x + y)` for a value-bearing `y`, that would be unsound.  Symmetric handling for `(C + x)` via `isCommutativeBinop` canonicalisation.
+- **Result on lift-only corpus**: `v5 += v5 + 208` → `v5 += 208`; `v3 += v3 + 34` → `v3 += 34`.  -4 `suspicious_self_reference` findings (fh_install_hook 9 → 7; fh_install_hooks 7 → 5).  Pre-existing DWARF-enriched corpus mean held at 41.1% (no regression).
+- **Justification per HELIX_PHILOSOPHY (fidelity > polish)**: pre-fix output was already infidel to the binary's `add reg, C`; the rewrite restores fidelity.  No statement is removed, only an artefactual operand.
+
+#### FIX-080 — SSA versioning: dependency-aware Phase 3.5 coalescing (`passes/RecoverVariables.cpp:1574-1620`)
+
+- **Problem**: `RecoverVariables` Phase 3.5 (same-register SSA version coalescing) used a baseline interference check that only scanned for `base` uses AFTER `ver`'s assign in program order.  This missed the operand-binding case where `ver` is assigned the result of a `helix_low.call` whose argument list transitively reads `base` — the call observes the OLD register version while writing a NEW one, and coalescing them produces `v4 = ftrace_set_filter_ip(v2, v4, 0, 0);` and similar self-referential statements.
+- **Fix**: Added the lambda `valueDependsOnBase(Value start, unsigned targetVarId)` — a recursive walker over `defOp->getOperands()` that returns true if any `helix::high::VarRefOp` in the SSA def chain of `start` has `getVarId() == targetVarId`.  Phase 3.5's per-shared-block scan now additionally calls `valueDependsOnBase(verDefAssign.getValue(), base.varId)`; positive result sets `interferes = true` and aborts coalescing for that version pair.  The original post-def liveness scan is retained unchanged.
+- **Result on lift-only corpus**:
+  - `v4 = ftrace_set_filter_ip(v2, v4, 0, 0);` → `v5 = ftrace_set_filter_ip(v2, v4, 0, 0);` (distinct SSA versions preserved).
+  - `v4 = register_ftrace_function(v2, v4, 0, 0);` → `v6 = register_ftrace_function(v2, v4, 0, 0);`.
+  - -2 additional `suspicious_self_reference` findings (corpus total 23 → 21).
+  - Zero regression on hook_read / hook_write / hook_ia32_write / fh_ftrace_thunk / hook_syslog (within ±0.0pp).
+- **Earlier-attempted stricter variant rejected**: refusing coalescing on ANY same-block value read of `base` cost 1.1-1.6pp on hook_read/hook_write/hook_ia32_write via increased `vN` placeholder count; reverted to the dependency-aware variant per the "prefer partial fix that does not regress" rule.
+
+#### FIX-081 — Attempt: narrow 1-level alias chase in Phase 3.5 walker — REVERTED (`passes/RecoverVariables.cpp`, 2026-05-18)
+
+- **Problem**: After FIX-080, the `v3 = printk(0, v3)` × 4 pattern in `fh_install_hook` persisted because Phase 3.5's `valueDependsOnBase` walker only follows the SSA def chain of value-producing ops.  The printk chain reads RAX indirectly through an `RSI` register-alias assignment (`mov rsi, rax; call printk`), so the call's args at Phase 3.5 time reference an intermediate `VarRef(rsi)` whose varId does not match `base.varId`.
+- **Attempted fix**: extended the walker to chase ONE level of intra-block `AssignOp` indirection — when seeing a `VarRefOp(X)` that doesn't match base, look up the most recent `AssignOp` targeting X in the same block and recurse into its RHS.  Strict gating: only active when `verDefAssign.getValue()` is a `low::CallOp` / `high::CallOp`; refuse to cross `MemReadOp` / `MemWriteOp` (struct field access patterns that previously regressed hook_read/hook_write); also added a `siblingVarIds` set so reads of any other already-created SSA version of the same register count as interference.  Patch was 173 lines, all in `RecoverVariables.cpp` Phase 3.5.
+- **Result on lift-only corpus**: zero change to scores or output.  Per-pair trace (via temporary `[FIX-081-DBG]` stderr prints) confirmed the walker correctly refused 3 of 5 `(rax, rax_K)` coalesces in Phase 3.5 of `fh_install_hook`.  But the printk-chain C output remained `v3 = printk(0, v3)` × 4.
+- **Root cause discovered post-trace**: the surviving distinct RAX SSA versions (preserved by Phase 3.5's refusal) get merged with UNRELATED registers (RBX, RDX, etc.) by Phase 4's cover-based merge, because their live ranges in the per-block sense are disjoint from those other registers.  After Phase 4 merges them, `CAstOptimizer::renameRemainingRegisterVars` (`isPlainRegisterName` matches via `starts_with("rax")` / `starts_with("rbx")` / etc., line 624) sees a single canonical name and assigns one `vN`.  The defect's true root is Phase 4 cross-register coalescing, not Phase 3.5 — strengthening Phase 3.5 cannot fix it without also touching Phase 4, which carries high regression risk on the broader corpus.
+- **Tripwire check**: `hook_read` 30.0% → 30.0% (Δ 0.0pp), `hook_write` 27.9% → 27.9% (Δ 0.0pp).  The narrow gating (CallOp-only + Mem refusal) successfully prevented the previously-observed name_quality regression — but also prevented the intended win.
+- **Decision**: REVERTED.  Walker restored to FIX-080-only form (no `chaseAliases` parameter, no `siblingVarIds` set, no recent-AssignOp lookup).  Wave 19 ships FIX-078 + FIX-079 + FIX-080 only.
+- **Two follow-up options, both deferred** (each carries high regression risk on the broader 70-file corpus that already scores well on the existing Phase 4 / cross-register heuristics):
+  1. Extend Phase 4 to refuse cross-register merges when the merged-out variable's history includes a `CallOp` as its source — preserves call-result identity through later renaming.  Risk: Phase 4 is load-bearing across many corpora; this could surface many `vN` placeholders for legitimate disjoint-liveness merges.
+  2. Reorder passes so that `inferSemanticNames` runs BEFORE Phase 4, giving distinct call-result variables distinct semantic names (`result_0`, `result_1`, …) that don't match Phase 4's synthetic-name overlap-merge heuristic.  Risk: changes a pass order that has been stable since v0.9.0 Wave 1.
+
+#### FIX-081 (prior round, kept for history) — Investigation: post-call RAX RegWrite synth audit (`passes/RemillToHelixLow.cpp`, 2026-05-18)
+
+- **Hypothesis (carried over from Wave 19 known-gaps)**: `RemillToHelixLow` was suspected of not synthesising `low::RegWriteOp(RAX, callOp.getResult())` after `low::CallOp`s whose callee is an externally-declared symbol (`declare ptr @printk(...)`).  Without that writeback, Phase 1 of `RecoverVariables` would keep all post-call RAX reads on the pre-call SSA version → `v3 = printk(0, v3)` × 4.
+- **Audit result**: hypothesis **falsified**.  All 7 `helix::low::CallOp` creation sites in `RemillToHelixLow.cpp` already emit the synth RegWrite when the result type is non-void:
+  - Line 1438 (indirect-call path) — synth at 1449-1454.
+  - Line 1537 (unrecognised-mangled / external-decl path — the one the hypothesis targeted) — synth at 1547-1552.
+  - Line 2511 (segment-relative `__readgsqword(...)` intrinsic load) — produces value via `finalVal = segCall.getResult()` directly into a downstream `RegWriteOp(*destRegName)` at 2538, which is the same semantic.
+  - Line 2580 (segment-relative store) — void result, no synth needed.
+  - Line 2826 (CALL semantic — the path the printk calls take) — synth at 2840-2845.
+  - Line 2919 (JMP→tail-call) — synth at 2930-2935.
+  - Line 3704 (CMPXCHG) — void result, no synth needed.
+  - Line 3863 (unhandled-semantic fallback) — synth at 3870-3875.
+  Each printk call in `fh_install_hook.ll` confirmed (via `[P0-DEBUG] CALL semantic: created CallOp target=printk`) to take the path at 2826 and receive a synth RegWrite.
+- **Real root cause of `v3 = printk(0, v3)` × 4**: the synth is in place and `RecoverVariables` Phase 1 IS creating distinct SSA versions for each post-call RAX (`rax`, `rax_1`, `rax_2`, …).  The defect originates downstream in Phase 3.5's coalescing: the call's args at Phase 3.5 time reference an intermediate register variable (`RSI` carries the prior RAX value via `mov rsi, rax`), so FIX-080's `valueDependsOnBase` walker — which only follows the SSA def chain of value-producing ops — does not detect the transitive dependency through the AssignOp that defined RSI.  Adjacent SSA-version pairs `(rax_N, rax_{N+1})` get coalesced because the immediate call-arg VarRefOp targets RSI's varId, not RAX's.
+- **No engine code changed**.  The user-directed fix (extending the synth) would be redundant and would duplicate writes.  The proper fix lives in `RecoverVariables.cpp` Phase 3.5 (extend FIX-080's walker to chase one level of intra-block AssignOp → value indirection) — but the previously-tested aggressive variant of this strengthening regressed `hook_read`/`hook_write`/`hook_ia32_write` by 1.1-1.6 pp on `name_quality` (more `vN` placeholders surfaced from refusing legitimate coalescing).  Per the "prefer partial fix that does not regress" rule, this stays deferred until a more targeted condition is identified (probable shape: "ver's def is a CallOp whose args include a VarRef whose immediate prior AssignOp has a value that transitively reads base").
+
+#### Known gaps still open after Wave 19 (deferred)
+
+- **Pattern: `*v3 = v3 + v3` × 8 in `fh_install_hook` tail** — upstream disassembler issue.  Root cause: 8 consecutive Remill `ADDI3MnW...` helpers (`add byte ptr [rax], al`) emitted by the lifter past the function's real RET (likely junk-code lifted from `.text` padding).  All 8 reads of RAX share one SSA version because no `RegWrite(RAX)` separates them; the output is binary-faithful — the binary really does this.  Not a Helix defect.  No band-aid cosmetic in Helix (HELIX_PHILOSOPHY fidelity > polish).  Fix path: stop lifting past the function's last reachable terminator in the disassembler.
+- **Pattern: `v3 = printk(0, v3)` × 4 in `fh_install_hook`** — see FIX-081 investigation above.  Real root cause is Phase 4 cross-register coalescing then `renameRemainingRegisterVars` collapsing the distinct SSA versions Phase 3.5 preserved.  Deferred pending a Phase-4-aware fix or pass-order shuffle.
+
+---
+
+## [v0.9.1] — PE lift-path + ELF placeholder cleanup + confidence honesty
+
+### Engine
+
+- **RemillToHelixLow** — LEA write-back for any destination register; SETcc lowers flags to real booleans; BT/BTS/BTR/BTC use the `1 << (off & 63)` mask; AddressSpace GEPs identified structurally so GS/FS segment access no longer collapses to address 0; segment reads/writes emit `__readgsqword` / `__readfsqword` / `__writegs*` intrinsics.
+- **RecoverCallingConvention** — detect Win64 entry-point functions and suppress phantom RCX/RDX/R8/R9 parameters.
+- **RecoverSwitchTables** — real case values from the analyser; refuse to fabricate a `RetOp` default block on unknown defaults.
+- **Engine** — data-section API (`addDataSection` / `clearDataSections`) wired through C, Rust FFI and NAPI so `RecoverSwitchTables` can read jump tables from the host binary.
+
+### C AST
+
+- New passes `removeNullDerefPlaceholderStores` and `removeUnreachableAfterFirstReturn` close G-002 (lift placeholder cascades).
+- `analyzeConfidence` / `reanalyzeConfidence` gain penalty terms for unreachable-after-return, null-deref placeholder, suspicious self-reference and identity ops (closes G-015 — confidence on the `malware.ko` `init_module` case falls from 91% to ~50–82%).
+
+### Tools
+
+- `tools/helix-validate` — standalone Python instrument for dataflow-theorem-based output validation, bounded scoring, and cross-version delta.  Stdlib only.
+
+### Release artifact
+
+- `helix-llvm-mlir-deps-win32-x64.zip` rebuilt with the v0.9.1 `helix_engine.lib` (85.47 MB) containing the new symbols.
+
+---
+
+## [v0.9.0-] — Release in 3.8.0 Verify the changelog of HexCoreIDE to more informations.
+
 ---
 
 ## [v0.9.0-nightly] — 2026-04-17 (UNRELEASED)

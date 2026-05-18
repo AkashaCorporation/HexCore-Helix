@@ -260,11 +260,18 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
         const auto& s = static_cast<const CAssignStmt&>(stmt);
         indent(depth);
         printExpr(*s.target, 0);
+        if (s.compoundOp == "++" || s.compoundOp == "--") {
+            os << s.compoundOp << ";\n";
+            break;
+        }
         if (s.compoundOp.empty())
             os << " = ";
         else
             os << " " << s.compoundOp << " ";
-        printExpr(*s.value, 0);
+        if (s.value)
+            printExpr(*s.value, 0);
+        else
+            os << "/* missing rhs */";
         os << ";\n";
         break;
     }

@@ -3861,6 +3861,14 @@ void CAstOptimizer::initializeReadBeforeWriteVars(CFuncDecl& func) {
         if (!info.readBeforeWrite.count(d.varName)) continue; // never read first
         if (!d.type) continue;                              // missing type info
 
+        // `result` is also used as the symbolic return register when Helix
+        // cannot prove a concrete RAX value.  Initializing it to zero would
+        // turn "unknown return value" into a false mathematical fact.
+        if (d.varName == "result" && func.returnType &&
+            func.returnType->kind != TypeKind::Void) {
+            continue;
+        }
+
         auto initExpr = makeDefaultInitFor(*d.type);
         if (initExpr) {
             d.initExpr = std::move(initExpr);
@@ -4449,7 +4457,18 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts) {
                         const auto& na =
                             static_cast<const CAssignStmt&>(*sp);
                         collectVarRefs(na.value.get(), nested);
-                        collectVarRefs(na.target.get(), nested);
+                        // Target is a definition, not a use — only collect
+                        // it when compound (target is also read).
+                        if (!na.compoundOp.empty())
+                            collectVarRefs(na.target.get(), nested);
+                    } else if (sp->getKind() == NodeKind::ReturnStmt) {
+                        collectVarRefs(
+                            static_cast<const CReturnStmt&>(*sp).value.get(),
+                            nested);
+                    } else if (sp->getKind() == NodeKind::ExprStmt) {
+                        collectVarRefs(
+                            static_cast<const CExprStmt&>(*sp).expr.get(),
+                            nested);
                     }
                 }
             };
@@ -4467,6 +4486,16 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts) {
                 if (sp->getKind() == NodeKind::AssignStmt) {
                     const auto& na = static_cast<const CAssignStmt&>(*sp);
                     collectVarRefs(na.value.get(), live);
+                    if (!na.compoundOp.empty())
+                        collectVarRefs(na.target.get(), live);
+                } else if (sp->getKind() == NodeKind::ReturnStmt) {
+                    collectVarRefs(
+                        static_cast<const CReturnStmt&>(*sp).value.get(),
+                        live);
+                } else if (sp->getKind() == NodeKind::ExprStmt) {
+                    collectVarRefs(
+                        static_cast<const CExprStmt&>(*sp).expr.get(),
+                        live);
                 }
             }
             break;
@@ -7207,21 +7236,95 @@ void CAstOptimizer::simplifyConditionPolarity(CFuncDecl& func) {
 
 void CAstOptimizer::foldDegenerateCompoundsInList(
     std::vector<StmtPtr>& stmts) {
+    // Helper: determines whether a compound op's RHS-binary uses the SAME
+    // op (so the spurious self-reference would change the arithmetic result
+    // by exactly one factor of the target).  We only collapse when the
+    // "other" operand is a literal constant — otherwise the rewrite would
+    // discard a real value-bearing subexpression.
+    auto compoundOpMatchesBinary = [](const std::string& compound,
+                                      BinaryOp binop) -> bool {
+        switch (binop) {
+        case BinaryOp::Add:    return compound == "+=";
+        case BinaryOp::Sub:    return compound == "-=";
+        case BinaryOp::Mul:    return compound == "*=";
+        case BinaryOp::BitAnd: return compound == "&=";
+        case BinaryOp::BitOr:  return compound == "|=";
+        case BinaryOp::BitXor: return compound == "^=";
+        default:               return false;
+        }
+    };
+    auto isCommutativeBinop = [](BinaryOp op) -> bool {
+        return op == BinaryOp::Add || op == BinaryOp::Mul ||
+               op == BinaryOp::BitAnd || op == BinaryOp::BitOr ||
+               op == BinaryOp::BitXor;
+    };
+
     for (auto& sp : stmts) {
         if (!sp) continue;
         switch (sp->getKind()) {
         case NodeKind::AssignStmt: {
             auto& a = static_cast<CAssignStmt&>(*sp);
-            if (a.compoundOp != "-=" || !a.target || !a.value)
+            if (a.compoundOp.empty() || !a.target || !a.value)
                 break;
             if (a.value->getKind() != NodeKind::BinaryExpr)
                 break;
             auto& rhs = static_cast<CBinaryExpr&>(*a.value);
-            // Degenerate: `target -= target - Y` → `target = Y`.
-            if (rhs.op == BinaryOp::Sub && rhs.lhs && rhs.rhs &&
+            if (!rhs.lhs || !rhs.rhs) break;
+
+            // (1) Algebraic cancel: `target -= target - Y` → `target = Y`.
+            if (a.compoundOp == "-=" &&
+                rhs.op == BinaryOp::Sub &&
                 isSameExpr(a.target.get(), rhs.lhs.get())) {
                 a.value = std::move(rhs.rhs);
                 a.compoundOp.clear();
+                break;
+            }
+
+            // (2) FIX-079 (Wave 19): spurious self-reference in commutative
+            // compound assignments.  The lifter occasionally synthesises
+            // `x = x + (x + C)` because two reads of the same physical
+            // register (e.g. EBP at two different program points) get
+            // coalesced onto a single SSA-promoted local in
+            // HelixLowToMid::RegReadToVarRef.  The compound-assignment
+            // synthesiser then re-folds this into `x += x + C`, which the
+            // validator (and any human reader) reads as a self-doubling
+            // artefact.
+            //
+            // The disassembled binary at the same address invariably shows
+            // a simple `add reg, C` — i.e. the INNER `x` is the artefact.
+            // We can drop it safely when:
+            //   - the compound op matches the inner binop (e.g. `+=` ↔ `+`),
+            //   - the binop is commutative (so `x op (x op C)` is the same
+            //     as `x op (C op x)` and we can canonicalise),
+            //   - the "other" operand of the inner binop is a literal
+            //     constant (IntLitExpr / AddrLitExpr).  We refuse to drop
+            //     a value-bearing variable — that would be unsound.
+            //
+            // Justification per HELIX_PHILOSOPHY (fidelity > polish): the
+            // pre-fix output `x += x + C` does NOT match the binary semantics
+            // (it computes `2x + C`), so the existing emission is already
+            // infidel.  Rewriting to `x += C` restores fidelity to the
+            // binary's actual `add reg, C` instruction.  No statement is
+            // removed; only an artefactual operand is dropped.
+            if (compoundOpMatchesBinary(a.compoundOp, rhs.op) &&
+                isCommutativeBinop(rhs.op)) {
+                auto isLiteral = [](const CExpr* e) -> bool {
+                    if (!e) return false;
+                    return e->getKind() == NodeKind::IntLitExpr ||
+                           e->getKind() == NodeKind::AddrLitExpr;
+                };
+                bool lhsIsTgt = isSameExpr(a.target.get(), rhs.lhs.get());
+                bool rhsIsTgt = isSameExpr(a.target.get(), rhs.rhs.get());
+                if (lhsIsTgt && isLiteral(rhs.rhs.get())) {
+                    // `target += (target + C)` → `target += C`.
+                    a.value = std::move(rhs.rhs);
+                    break;
+                }
+                if (rhsIsTgt && isLiteral(rhs.lhs.get())) {
+                    // `target += (C + target)` → `target += C`.
+                    a.value = std::move(rhs.lhs);
+                    break;
+                }
             }
             break;
         }

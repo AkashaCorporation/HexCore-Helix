@@ -3,11 +3,31 @@
 
 #include "helix/emit/PseudoCEmitter.h"
 #include "helix/emit/FlatBufSerializer.h"
+#include "helix/cast/CAstOptimizer.h"
+#include "helix/cast/CAstPrinter.h"
+#include "helix/cast/CDecl.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <cstdint>
+#include <memory>
+#include <string>
 
 using namespace helix;
+
+namespace {
+
+using namespace helix::cast;
+
+ExprPtr makeVar(std::string name) {
+    return std::make_unique<CVarRefExpr>(
+        0, std::move(name), CType::int64());
+}
+
+ExprPtr makeInt(int64_t value) {
+    return std::make_unique<CIntLitExpr>(value, CType::int64());
+}
+
+} // namespace
 
 TEST(FlatBufSerializerTest, VerifyEmpty) {
     EXPECT_FALSE(FlatBufSerializer::verify(nullptr, 0));
@@ -87,4 +107,40 @@ TEST(PseudoCEmitterHeuristicsTest, DetectsCalleeSavedRegisters) {
     EXPECT_TRUE(PseudoCEmitter::isCalleeSavedRegisterName("rbx"));
     EXPECT_FALSE(PseudoCEmitter::isCalleeSavedRegisterName("rax"));
     EXPECT_FALSE(PseudoCEmitter::isCalleeSavedRegisterName("r10"));
+}
+
+TEST(CAstPrinterTest, PrintsIncrementCompoundWithoutRhs) {
+    using namespace helix::cast;
+
+    CFuncDecl func("inc_test", 0, CType::voidTy());
+    auto value = std::make_unique<CBinaryExpr>(
+        BinaryOp::Add, makeVar("v1"), makeInt(1), CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v1"), std::move(value), "++"));
+
+    CAstPrinter printer;
+    std::string code = printer.print(func);
+
+    EXPECT_NE(code.find("v1++;"), std::string::npos);
+    EXPECT_EQ(code.find("v1 ++"), std::string::npos);
+    EXPECT_EQ(code.find("v1 + 1"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, SynthesizesCompoundAssignWithReducedRhs) {
+    using namespace helix::cast;
+
+    CFuncDecl func("compound_test", 0, CType::voidTy());
+    auto value = std::make_unique<CBinaryExpr>(
+        BinaryOp::Add, makeVar("v5"), makeInt(208), CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v5"), std::move(value)));
+
+    CAstOptimizer optimizer;
+    optimizer.synthesizeCompoundAssign(func);
+
+    CAstPrinter printer;
+    std::string code = printer.print(func);
+
+    EXPECT_NE(code.find("v5 += 208;"), std::string::npos);
+    EXPECT_EQ(code.find("v5 += v5 + 208"), std::string::npos);
 }

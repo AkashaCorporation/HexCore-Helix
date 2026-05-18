@@ -1571,6 +1571,49 @@ private:
                             verBlocks.insert(ref->getBlock());
                     });
 
+                    // ── FIX-080 (Wave 19): dependency-aware interference ───
+                    //
+                    // The Phase 3.5 baseline check only looks for uses of
+                    // `base` AFTER `ver`'s assign in program order.  That
+                    // misses one common operand-binding defect: when
+                    // `ver`'s assigned VALUE itself transitively reads
+                    // `base` through the SSA def chain.  Example:
+                    //
+                    //   v5 = ftrace_set_filter_ip(v2, v4, ...)
+                    //                                ^ ver = call result
+                    //                                       (RAX_new)
+                    //                                v4 = base = pre-call RAX
+                    //
+                    // Without this check, the post-def scan finds no use
+                    // of base after the assign and coalesces them → both
+                    // names become `v4`, producing `v4 = ftrace_set_filter_ip(v2, v4, ...)`
+                    // — the suspicious self-reference the validator flags.
+                    //
+                    // Helper: walks the SSA def chain of `start` looking
+                    // for any VarRefOp whose varId matches `targetVarId`.
+                    // Only traces through value-producing ops (operands of
+                    // the call result chain).  This catches direct
+                    // self-references in the assign's RHS expression tree.
+                    auto valueDependsOnBase = [&](Value start,
+                                                  unsigned targetVarId) {
+                        llvm::SmallPtrSet<Operation*, 32> visited;
+                        std::function<bool(Value)> rec = [&](Value v) -> bool {
+                            if (!v) return false;
+                            auto* defOp = v.getDefiningOp();
+                            if (!defOp) return false;
+                            if (!visited.insert(defOp).second) return false;
+                            if (auto ref =
+                                    dyn_cast<helix::high::VarRefOp>(defOp)) {
+                                return ref.getVarId() == targetVarId;
+                            }
+                            for (Value operand : defOp->getOperands()) {
+                                if (rec(operand)) return true;
+                            }
+                            return false;
+                        };
+                        return rec(start);
+                    };
+
                     // Check for shared blocks.
                     bool interferes = false;
                     for (auto* blk : baseBlocks) {
@@ -1582,6 +1625,7 @@ private:
                         // ver (its AssignOp target).  If base has any use
                         // AFTER that def → interference.
                         Operation* verDefPoint = nullptr;
+                        helix::high::AssignOp verDefAssign;
                         for (auto& op : *blk) {
                             if (auto assign =
                                     dyn_cast<helix::high::AssignOp>(&op)) {
@@ -1591,6 +1635,7 @@ private:
                                 if (target &&
                                     target.getVarId() == ver.varId) {
                                     verDefPoint = &op;
+                                    verDefAssign = assign;
                                     break;
                                 }
                             }
@@ -1600,6 +1645,17 @@ private:
                             // ver is read but never defined in this block —
                             // it was defined in a dominator.  If base is also
                             // used here, they interfere (both "live-in").
+                            interferes = true;
+                            break;
+                        }
+
+                        // FIX-080: the assign VALUE may transitively read
+                        // `base`.  If so, coalescing would collapse two
+                        // semantically distinct register versions onto one
+                        // name and produce a self-referential statement.
+                        if (verDefAssign && verDefAssign.getValue() &&
+                            valueDependsOnBase(verDefAssign.getValue(),
+                                               base.varId)) {
                             interferes = true;
                             break;
                         }

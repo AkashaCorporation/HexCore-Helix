@@ -1140,6 +1140,9 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
                    !currentReturnValueName_.empty()) {
             value = std::make_unique<CVarRefExpr>(
                 0, applyNameAliases(currentReturnValueName_), CType::int64());
+        } else if (currentFunctionHasReturnValue_) {
+            value = std::make_unique<CVarRefExpr>(
+                0, "result", CType::int64(), addr);
         }
         return std::make_unique<CReturnStmt>(std::move(value), addr);
     }
@@ -1166,7 +1169,7 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
                     CType::int64());
             } else if (currentFunctionHasReturnValue_) {
                 value = std::make_unique<CVarRefExpr>(
-                    0, "result", CType::int64());
+                    0, "result", CType::int64(), addr);
             }
             return std::make_unique<CReturnStmt>(std::move(value), addr);
         }
@@ -1256,6 +1259,9 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             !currentReturnValueName_.empty()) {
             value = std::make_unique<CVarRefExpr>(
                 0, applyNameAliases(currentReturnValueName_), CType::int64());
+        } else if (currentFunctionHasReturnValue_) {
+            value = std::make_unique<CVarRefExpr>(
+                0, "result", CType::int64(), addr);
         }
         return std::make_unique<CReturnStmt>(std::move(value), addr);
     }
