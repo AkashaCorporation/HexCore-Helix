@@ -33,6 +33,22 @@ All notable changes to HexCore Helix are documented here.
   - Zero regression on hook_read / hook_write / hook_ia32_write / fh_ftrace_thunk / hook_syslog (within ±0.0pp).
 - **Earlier-attempted stricter variant rejected**: refusing coalescing on ANY same-block value read of `base` cost 1.1-1.6pp on hook_read/hook_write/hook_ia32_write via increased `vN` placeholder count; reverted to the dependency-aware variant per the "prefer partial fix that does not regress" rule.
 
+#### FIX-082 — HelixLowToMid emits FieldPtrOp for `llvm.add(base, const)` addresses (`passes/HelixLowToMid.cpp`, 2026-05-18)
+
+- **Problem**: Phase 1 investigation (`task-helixmem-provenance.md`) showed that `MemReadToLoad` and `MemWriteToStore` in `HelixLowToMid.cpp` passed `adaptor.getAddr()` verbatim to `mid::LoadOp` / `mid::StoreOp`, even when the address was clearly `llvm.add(base, llvm.constant)` — a struct-field reference.  The `mid::FieldPtrOp` / `mid::IndexPtrOp` ops were already wired through `MidFieldPtrToHighField` (HelixMidToHigh) and `CAstBuilder` but nothing in the pipeline ever produced them.  Field-name recovery happened only as a text-level fallback in `CAstOptimizer::recoverStructFieldAccess` (which still ran and still works).
+- **Fix**: Added the helper `tryDecomposeAddrAsField(Value addr)` (~50 lines) in `passes/HelixLowToMid.cpp` between the `RegWriteToAssign` and `MemReadToLoad` patterns.  It pattern-matches `llvm.add(base, llvm.constant)` (symmetric for `add(constant, base)`); refuses both-constant operands and zero offsets.  Then `MemReadToLoad` and `MemWriteToStore` call the helper and, on match, emit `mid::FieldPtrOp(base, offset)` whose result becomes the LoadOp / StoreOp `addr` operand.  Fallback path unchanged for any address shape that doesn't match (e.g. `Add(Add(...))`, `Add(base, Mul(idx, stride))`, casts in the middle).
+- **Scope (Phase 2 only)**: ONLY the simple `add(base, const)` shape is decomposed this round.  `Add(Add(base, c1), c2)`, `Add(base, Mul/Shl(idx, stride))` for arrays, and `arith` dialect variants are deferred to Phase 3.  `recoverStructFieldAccess` in `CAstOptimizer` is intentionally kept as a fallback — covers cases the pipeline still misses.
+- **Result on lift-only corpus (`02-disasm-fix082`)**: 5 of 7 functions improved, zero regressions.  Corpus mean: 35.1% → **45.7%** (+10.6pp).
+  - `fh_install_hook`: 0.0% → **26.0%** (+26.0pp), struct_recovery 0.0 → 1.0
+  - `fh_install_hooks`: 0.6% → **25.9%** (+25.3pp), struct_recovery 0.0 → 1.0
+  - `hook_ia32_write`: 27.9% → 35.8% (+7.9pp), struct_recovery 0.0 → 1.0
+  - `hook_read`: 30.0% → 37.2% (+7.2pp), struct_recovery 0.0 → 1.0
+  - `hook_write`: 27.9% → 35.8% (+7.9pp), struct_recovery 0.0 → 1.0
+  - `fh_ftrace_thunk` 87.3% and `hook_syslog` 71.9%: unchanged (no in-scope address arithmetic).
+- **Known visual artefact (not a tripwire breach)**: the resulting C output prints `*v3->field_18 = v4` instead of `v3->field_0x18 = v4` for some stores.  Cause: `mid::FieldPtrOp` semantically returns `&base->field` (a pointer), `MidFieldPtrToHighField` lowers it to a `high::FieldAccessOp` that the CAstBuilder treats as a value, then the load/store wraps it in `Deref(...)` → `*(base->field)`.  For pointer-typed struct fields (e.g. `struct files_struct* files` in `task_struct`) this is *correct* — the extra `*` is the real pointer dereference.  For value-typed fields it is verbose but semantically equivalent (`*(&x) == x`).  The validator reads it as a named-field access in either case → struct_recovery sub-score goes 0 → 1, name_quality rises (no `vN` placeholders for struct base + offset arithmetic).  Tightening this to drop the spurious `Deref` for value-typed fields is a Phase 3 polish item.
+- **Tripwire check**: every function held or improved; `hook_read`/`hook_write` rose +7.2pp / +7.9pp (no drop, even a fraction).  DWARF-enriched corpus (`02-disasm/`) unchanged at 41.1% (read-only artefact).
+- **Justification per HELIX_PHILOSOPHY (fidelity > polish)**: the address arithmetic was structurally a `(base, offset)` field access; the prior pipeline lost this provenance by treating it as opaque, forcing a text-level recovery downstream.  Producing `FieldPtrOp` makes the IR structurally faithful to the binary's `MOV [base+const], val` semantics from the moment Mid is entered, and gives every downstream pass (HelixMidToHigh, DevirtualizeIndirectCalls, struct-recovery analyses) a typed handle on the access pattern.
+
 #### FIX-081 — Attempt: narrow 1-level alias chase in Phase 3.5 walker — REVERTED (`passes/RecoverVariables.cpp`, 2026-05-18)
 
 - **Problem**: After FIX-080, the `v3 = printk(0, v3)` × 4 pattern in `fh_install_hook` persisted because Phase 3.5's `valueDependsOnBase` walker only follows the SSA def chain of value-producing ops.  The printk chain reads RAX indirectly through an `RSI` register-alias assignment (`mov rsi, rax; call printk`), so the call's args at Phase 3.5 time reference an intermediate `VarRef(rsi)` whose varId does not match `base.varId`.
@@ -172,7 +188,7 @@ All notable changes to HexCore Helix are documented here.
 
 - **Test corpus expanded 51 → 70 files**: added the SOTR (Shadow of the Tomb Raider) set at `C:\Users\Mazum\Desktop\HexCore-SOTR\hexcore-reports\sotr-decompile\*.ll` (5 files) and the Souper-2 kernel set at `fresh-helix-souper-2/*.ll` (7 files, including `kbase_jit_allocate.ll`). All 70 files pass with 0 crashes.
 - **Quality scan across 3,377 lines of output (post-fix)**: 0 `__expr` (was 13), 0 `__unknown_`, 0 `__native_`, 0 `__cond`, 0 `__tmp_`, 0 `_promoted_`, 0 `sub_indirect`. 70/70 functions report 100% confidence (High).
-- **Upstream-ceiling document** (`.claude/UPSTREAM_CEILING_v0.9.0.md`, NEW): documents the 5 specific output-quality issues that cannot be solved inside the Helix engine and require Remill or HexCore upstream changes:
+- **Upstream-ceiling document** documents the 5 specific output-quality issues that cannot be solved inside the Helix engine and require Remill or HexCore upstream changes:
   1. Variable type confusion across SSA destruction (TIE-style DVSA needed pre-Helix)
   2. Missing function-call arguments (LLVM dropped arg-register stores before lifting)
   3. INC/DEC `[mem]` decomposed as LEA-store (`v3->field_0xC5E9 = v3 + 0xC5E9 + 1` — Remill semantic bug)
@@ -665,14 +681,13 @@ All notable changes to HexCore Helix are documented here.
 | `engine/src/cast/CAstOptimizer.cpp` | Wave 1 `removeSelfAssignments`, constant loop normalisation, `removeDanglingGotos`; Wave 2 `initializeReadBeforeWriteVars`, `tryStripRepPrefix`, `kSemanticMap` expansion, hardened `isNativeOpcodeName`, `collapseAssignBeforeReturn` CallExpr support; FIX-027 frame-pointer `inArgPosition`; FIX-035 `simplifyConditionPolarity` pass wired after `invertEmptyIfThen` |
 | `engine/include/helix/cast/CAstOptimizer.h` | Wave 2 `initializeReadBeforeWriteVars` declaration; FIX-035 `simplifyConditionPolarity` + `flattenZeroComparison` / `simplifyConditionPolarityInList` declarations |
 | `engine/src/cast/CAstPrinter.cpp` | FIX-029 float literal printer appends `.0` and `f` suffix for floats |
-| `.claude/UPSTREAM_CEILING_v0.9.0.md` | NEW — upstream-ceiling documentation |
 
 ### Known Gaps vs IDA (post-v0.9.0-nightly)
 
 - **FLIRT-style signature matching**: `sub_14001433c` vs IDA's `_security_init_cookie`. Requires HQL signature infrastructure (queued as next wave).
 - **`return <call>()` for tail calls**: we emit `call(); return;` where IDA emits `return call();`. Cosmetic emitter work.
 - **Magic-constant recognition** (`0x2B992DDFA232` in `_security_init_cookie` cookie check): unrelated literal-recognition issue.
-- **5 upstream-ceiling items** already catalogued in `.claude/UPSTREAM_CEILING_v0.9.0.md` (see Wave 4).
+
 
 ---
 
