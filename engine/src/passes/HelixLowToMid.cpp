@@ -152,6 +152,65 @@ struct RegWriteToAssign : public OpConversionPattern<low::RegWriteOp> {
     }
 };
 
+// ─── FIX-082 (Wave 19): pointer-provenance decomposition helper ──────────────
+//
+// When a memory-access address is shaped `llvm.add(base, llvm.constant)` (or
+// symmetric `add(constant, base)`), the access is a struct-field reference.
+// We recover the (base, offset) pair so MemReadToLoad / MemWriteToStore can
+// emit `mid::FieldPtrOp(base, offset)` instead of leaving the raw arithmetic
+// in place.  This activates the FieldPtrOp/IndexPtrOp pipeline that was
+// already wired through `HelixMidToHigh::MidFieldPtrToHighField` and
+// `CAstBuilder::midFieldPtr` but never fed by an emitter.
+//
+// Phase 2 scope (this commit): ONLY the simple `add(base, const)` shape.
+// `Add(Add(base, c1), c2)`, `Add(base, Mul/Shl(idx, stride))`, and arith
+// dialect variants are deferred to Phase 3.  Anything that doesn't match
+// the narrow shape falls through to the original opaque-address conversion
+// (no behavioural change for those addresses).
+//
+// Reference for the symmetry handling: `RecoverStructTypes::decomposeAddress`
+// (lines 72-92), adapted here for LLVM dialect operands since the address
+// chain is still in LLVM dialect form at HelixLowToMid time (the address
+// arithmetic was emitted directly by `RemillToHelixLow` and never lifted
+// to `mid.bin.expr`).
+struct AddrFieldDecomposition {
+    Value base;
+    uint64_t offset;
+};
+
+static std::optional<AddrFieldDecomposition>
+tryDecomposeAddrAsField(Value addr) {
+    if (!addr) return std::nullopt;
+    auto addOp = addr.getDefiningOp<LLVM::AddOp>();
+    if (!addOp) return std::nullopt;
+    auto lhs = addOp.getLhs();
+    auto rhs = addOp.getRhs();
+    if (!lhs || !rhs) return std::nullopt;
+
+    auto extractConst = [](Value v) -> std::optional<uint64_t> {
+        auto cst = v.getDefiningOp<LLVM::ConstantOp>();
+        if (!cst) return std::nullopt;
+        auto intAttr = dyn_cast<IntegerAttr>(cst.getValue());
+        if (!intAttr) return std::nullopt;
+        return intAttr.getValue().getZExtValue();
+    };
+
+    auto lhsConst = extractConst(lhs);
+    auto rhsConst = extractConst(rhs);
+
+    // Refuse if both operands are constants (fully-foldable; no provenance).
+    if (lhsConst && rhsConst) return std::nullopt;
+    // Refuse zero-offset — not a real field, just a pointer alias.
+    if (rhsConst && *rhsConst == 0) return std::nullopt;
+    if (lhsConst && *lhsConst == 0) return std::nullopt;
+
+    if (rhsConst)
+        return AddrFieldDecomposition{lhs, *rhsConst};
+    if (lhsConst)
+        return AddrFieldDecomposition{rhs, *lhsConst};
+    return std::nullopt;
+}
+
 /// Convert helix_low.mem.read → helix_mid.load
 struct MemReadToLoad : public OpConversionPattern<low::MemReadOp> {
     using OpConversionPattern::OpConversionPattern;
@@ -160,10 +219,29 @@ struct MemReadToLoad : public OpConversionPattern<low::MemReadOp> {
         low::MemReadOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
+        // FIX-082: if the address is `llvm.add(base, const)`, lift it to
+        // `mid::FieldPtrOp(base, offset)` before constructing the LoadOp.
+        // The FieldPtrOp result becomes the LoadOp's addr operand and is
+        // later converted by `MidFieldPtrToHighField` (already wired) into
+        // a `high::FieldAccessOp`, which `CAstBuilder` renders as
+        // `base->field_0xN`.  Fallback: leave the address opaque.
+        Value loadAddr = adaptor.getAddr();
+        if (auto decomp = tryDecomposeAddrAsField(loadAddr)) {
+            auto fieldPtr = rewriter.create<mid::FieldPtrOp>(
+                op.getLoc(),
+                loadAddr.getType(),
+                decomp->base,
+                /*field_offset=*/decomp->offset,
+                /*field_name=*/StringAttr{},
+                /*address=*/IntegerAttr{}
+            );
+            loadAddr = fieldPtr.getResult();
+        }
+
         auto new_op = rewriter.create<mid::LoadOp>(
             op.getLoc(),
             op.getResult().getType(),
-            adaptor.getAddr(),
+            loadAddr,
             op.getAddressAttr()
         );
 
@@ -180,9 +258,24 @@ struct MemWriteToStore : public OpConversionPattern<low::MemWriteOp> {
         low::MemWriteOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
+        // FIX-082: same provenance lift as MemReadToLoad — emit FieldPtrOp
+        // when the address is `llvm.add(base, const)`.
+        Value storeAddr = adaptor.getAddr();
+        if (auto decomp = tryDecomposeAddrAsField(storeAddr)) {
+            auto fieldPtr = rewriter.create<mid::FieldPtrOp>(
+                op.getLoc(),
+                storeAddr.getType(),
+                decomp->base,
+                /*field_offset=*/decomp->offset,
+                /*field_name=*/StringAttr{},
+                /*address=*/IntegerAttr{}
+            );
+            storeAddr = fieldPtr.getResult();
+        }
+
         rewriter.create<mid::StoreOp>(
             op.getLoc(),
-            adaptor.getAddr(),
+            storeAddr,
             adaptor.getValue(),
             op.getAddressAttr()
         );
