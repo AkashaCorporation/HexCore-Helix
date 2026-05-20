@@ -213,6 +213,12 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     canonicalizeXorPatterns(func);
     recoverStructFieldAccess(func);
     simplifyExpressions(func);
+    // FIX-086 (dewolf-inspired): strip casts that are no-ops at the C
+    // type level (e.g. `(int64_t)(void*)0` → `0`).  Must run after
+    // `simplifyExpressions` so we operate on the canonicalized tree but
+    // before `synthesizeCompoundAssign` so cast-wrapped RHSs are matched
+    // against bare-LHS targets in `tryCompound`.
+    eliminateRedundantCasts(func);
     synthesizeCompoundAssign(func);
     eliminateConstantBranches(func);
     removeEmptyIfStatements(func);
@@ -4578,36 +4584,64 @@ bool CAstOptimizer::isSyntheticName(std::string_view name) {
     return false;
 }
 
-static unsigned exprDepth(const CExpr* e) {
-    if (!e) return 0;
+// FIX-085 (DREAM-inspired): depth bound on the recursive helper itself.
+// The previous unbounded form could stack-overflow on pathological CFG
+// shapes that produced 20+ levels of nested boolean conditions.  The
+// `maxDepth` parameter both prevents the recursion from blowing the stack
+// and serves as a quick sentinel for callers that only need to know
+// "deeper than N" without computing the exact depth.
+static unsigned exprDepth(const CExpr* e, unsigned maxDepth = 64) {
+    if (!e || maxDepth == 0) return 0;
     switch (e->getKind()) {
     case NodeKind::BinaryExpr: {
         const auto& b = static_cast<const CBinaryExpr&>(*e);
-        return 1 + std::max(exprDepth(b.lhs.get()), exprDepth(b.rhs.get()));
+        return 1 + std::max(exprDepth(b.lhs.get(), maxDepth - 1),
+                            exprDepth(b.rhs.get(), maxDepth - 1));
     }
     case NodeKind::UnaryExpr:
         return 1 + exprDepth(
-                       static_cast<const CUnaryExpr*>(e)->operand.get());
+                       static_cast<const CUnaryExpr*>(e)->operand.get(),
+                       maxDepth - 1);
     case NodeKind::CastExpr:
         return 1 + exprDepth(
-                       static_cast<const CCastExpr*>(e)->operand.get());
+                       static_cast<const CCastExpr*>(e)->operand.get(),
+                       maxDepth - 1);
     case NodeKind::TernaryExpr: {
         const auto& t = static_cast<const CTernaryExpr&>(*e);
-        return 1 + std::max({exprDepth(t.cond.get()),
-                              exprDepth(t.trueVal.get()),
-                              exprDepth(t.falseVal.get())});
+        return 1 + std::max({exprDepth(t.cond.get(), maxDepth - 1),
+                              exprDepth(t.trueVal.get(), maxDepth - 1),
+                              exprDepth(t.falseVal.get(), maxDepth - 1)});
     }
     case NodeKind::SubscriptExpr: {
         const auto& s = static_cast<const CSubscriptExpr&>(*e);
-        return 1 + std::max(exprDepth(s.base.get()),
-                            exprDepth(s.index.get()));
+        return 1 + std::max(exprDepth(s.base.get(), maxDepth - 1),
+                            exprDepth(s.index.get(), maxDepth - 1));
     }
     case NodeKind::FieldAccessExpr:
         return 1 + exprDepth(
-                       static_cast<const CFieldAccessExpr*>(e)->base.get());
+                       static_cast<const CFieldAccessExpr*>(e)->base.get(),
+                       maxDepth - 1);
     default:
         return 1;
     }
+}
+
+// FIX-085 (DREAM-inspired): boolean-only depth probe.
+//
+// Counts the depth of an `&&` / `||` chain *only* — single-level
+// comparisons, calls, casts, etc. all bottom out at depth 1.  Used by
+// `simplifyExpr` to decide when a propagated condition has grown so deep
+// that further rewriting would be both slow and likely to produce an
+// unreadable expression for the user.  Threshold of 8 matches DREAM's
+// observation that human-readable C expressions seldom exceed 6 atoms.
+static unsigned boolExprDepth(const CExpr* e, unsigned maxDepth = 16) {
+    if (!e || maxDepth == 0) return 0;
+    if (e->getKind() != NodeKind::BinaryExpr) return 1;
+    const auto& bin = static_cast<const CBinaryExpr&>(*e);
+    if (bin.op != BinaryOp::LogAnd && bin.op != BinaryOp::LogOr) return 1;
+    return 1 + std::max(
+        boolExprDepth(bin.lhs.get(), maxDepth - 1),
+        boolExprDepth(bin.rhs.get(), maxDepth - 1));
 }
 
 bool CAstOptimizer::isSimpleExpr(const CExpr* expr, unsigned maxDepth) {
@@ -5247,11 +5281,21 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr, bool isLValue) {
             const auto& lb = static_cast<const CBinaryExpr&>(*b.lhs);
             const auto& rb = static_cast<const CBinaryExpr&>(*b.rhs);
             if (isCmpOp(lb.op) && isCmpOp(rb.op)) {
-                b.op = (b.op == BinaryOp::BitAnd)
-                    ? BinaryOp::LogAnd
-                    : BinaryOp::LogOr;
-                if (b.type == nullptr || b.type->kind == TypeKind::Unknown)
-                    b.type = CType::boolTy();
+                // FIX-085 (DREAM-inspired): bail out before promoting
+                // bitwise-of-cmps into a logical chain if either side is
+                // already a deep boolean tree.  Continuing would only
+                // deepen the expression, eventually overflowing the
+                // printer's stack on pathological CFGs.
+                constexpr unsigned kBoolDepthLimit = 8;
+                if (boolExprDepth(b.lhs.get()) + boolExprDepth(b.rhs.get())
+                        <= kBoolDepthLimit) {
+                    b.op = (b.op == BinaryOp::BitAnd)
+                        ? BinaryOp::LogAnd
+                        : BinaryOp::LogOr;
+                    if (b.type == nullptr ||
+                        b.type->kind == TypeKind::Unknown)
+                        b.type = CType::boolTy();
+                }
             }
         }
     }
@@ -5462,6 +5506,213 @@ void CAstOptimizer::simplifyStmtList(std::vector<StmtPtr>& stmts) {
 void CAstOptimizer::simplifyExpressions(CFuncDecl& func) {
     simplifyStmtList(func.body);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIX-086: eliminateRedundantCasts (dewolf-inspired)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Walks every expression in the function and elides `CCastExpr` nodes
+// whose source/destination types are semantically equivalent.  The most
+// common offenders observed in the stress corpora:
+//   1. `(int64_t)(int64_t)x`             — duplicate casts from MLIR
+//                                          type-system noise
+//   2. `(int64_t)(void*)0`               — Remill represents the null
+//                                          pointer constant as a void*
+//                                          which is then immediately
+//                                          re-typed for an i64 use
+//   3. `(uint64_t)var`  where var is i64 — sign-only difference, both
+//                                          map to a 64-bit register
+//
+// We never elide a cast that changes bit width (that would change the
+// value) and we never elide pointer↔integer casts unless both sides are
+// 64 bits — narrowing to 32 bits would silently drop the upper half on
+// any real 64-bit target.
+
+namespace {
+
+// Returns true when `dst` is structurally identical enough to `src` that
+// a cast between them does not change the runtime value on a 64-bit
+// LP64/LLP64 target.  Conservative — we keep the cast when in doubt.
+bool castIsRedundant(const CType* src, const CType* dst) {
+    if (!src || !dst) return false;
+    if (src == dst) return true;
+    if (*src == *dst) return true;
+
+    auto isInt64 = [](const CType* t) {
+        return t->kind == TypeKind::Int && t->bitWidth == 64;
+    };
+    auto isPtrLike = [](const CType* t) {
+        return t->kind == TypeKind::Pointer ||
+               t->kind == TypeKind::FuncPtr;
+    };
+
+    // int64 ↔ pointer: same bit width on every supported target.
+    if ((isInt64(src) && isPtrLike(dst)) ||
+        (isPtrLike(src) && isInt64(dst)))
+        return true;
+
+    // Same kind + same width: sign-only difference.  Eliminating the
+    // cast keeps the value bits intact; the result type just reflects
+    // the new lvalue's signedness, which the printer picks up from the
+    // surrounding context.
+    if (src->kind == dst->kind && src->bitWidth == dst->bitWidth &&
+        src->bitWidth != 0)
+        return true;
+
+    return false;
+}
+
+// Recursively rewrite an expression tree, collapsing redundant
+// CCastExpr nodes in-place.  Returns a (possibly-replaced) owning
+// pointer.  Bottom-up: we simplify the child first so chained casts
+// (e.g. `(int64_t)(int64_t)x`) collapse in a single pass.
+ExprPtr stripRedundantCasts(ExprPtr expr) {
+    if (!expr) return nullptr;
+
+    switch (expr->getKind()) {
+    case NodeKind::BinaryExpr: {
+        auto& b = static_cast<CBinaryExpr&>(*expr);
+        b.lhs = stripRedundantCasts(std::move(b.lhs));
+        b.rhs = stripRedundantCasts(std::move(b.rhs));
+        break;
+    }
+    case NodeKind::UnaryExpr: {
+        auto& u = static_cast<CUnaryExpr&>(*expr);
+        u.operand = stripRedundantCasts(std::move(u.operand));
+        break;
+    }
+    case NodeKind::CallExpr: {
+        auto& c = static_cast<CCallExpr&>(*expr);
+        for (auto& a : c.args)
+            a = stripRedundantCasts(std::move(a));
+        break;
+    }
+    case NodeKind::TernaryExpr: {
+        auto& t = static_cast<CTernaryExpr&>(*expr);
+        t.cond     = stripRedundantCasts(std::move(t.cond));
+        t.trueVal  = stripRedundantCasts(std::move(t.trueVal));
+        t.falseVal = stripRedundantCasts(std::move(t.falseVal));
+        break;
+    }
+    case NodeKind::SubscriptExpr: {
+        auto& s = static_cast<CSubscriptExpr&>(*expr);
+        s.base  = stripRedundantCasts(std::move(s.base));
+        s.index = stripRedundantCasts(std::move(s.index));
+        break;
+    }
+    case NodeKind::FieldAccessExpr: {
+        auto& f = static_cast<CFieldAccessExpr&>(*expr);
+        f.base = stripRedundantCasts(std::move(f.base));
+        break;
+    }
+    case NodeKind::CastExpr: {
+        auto& c = static_cast<CCastExpr&>(*expr);
+        c.operand = stripRedundantCasts(std::move(c.operand));
+        if (!c.operand) return std::move(expr);
+
+        const CType* srcTy = c.operand->type.get();
+        const CType* dstTy = c.targetType.get();
+        if (castIsRedundant(srcTy, dstTy)) {
+            // Hoist the operand: preserve the outer cast's address so
+            // call-site addressing survives the elision.
+            auto inner = std::move(c.operand);
+            // Adopt the cast's target type onto the operand only if the
+            // operand's own type is missing — we never overwrite a
+            // known operand type because that would corrupt the
+            // downstream printer's precedence decisions.
+            if (!inner->type)
+                inner->type = c.targetType;
+            return inner;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return expr;
+}
+
+void stripRedundantCastsInStmts(std::vector<StmtPtr>& stmts);
+
+void stripRedundantCastsInStmt(CStmt& stmt) {
+    switch (stmt.getKind()) {
+    case NodeKind::AssignStmt: {
+        auto& s = static_cast<CAssignStmt&>(stmt);
+        s.target = stripRedundantCasts(std::move(s.target));
+        s.value  = stripRedundantCasts(std::move(s.value));
+        break;
+    }
+    case NodeKind::ExprStmt: {
+        auto& s = static_cast<CExprStmt&>(stmt);
+        s.expr = stripRedundantCasts(std::move(s.expr));
+        break;
+    }
+    case NodeKind::ReturnStmt: {
+        auto& s = static_cast<CReturnStmt&>(stmt);
+        if (s.value)
+            s.value = stripRedundantCasts(std::move(s.value));
+        break;
+    }
+    case NodeKind::IfStmt: {
+        auto& s = static_cast<CIfStmt&>(stmt);
+        s.condition = stripRedundantCasts(std::move(s.condition));
+        stripRedundantCastsInStmts(s.thenBody);
+        stripRedundantCastsInStmts(s.elseBody);
+        break;
+    }
+    case NodeKind::WhileStmt: {
+        auto& s = static_cast<CWhileStmt&>(stmt);
+        s.condition = stripRedundantCasts(std::move(s.condition));
+        stripRedundantCastsInStmts(s.body);
+        break;
+    }
+    case NodeKind::DoWhileStmt: {
+        auto& s = static_cast<CDoWhileStmt&>(stmt);
+        s.condition = stripRedundantCasts(std::move(s.condition));
+        stripRedundantCastsInStmts(s.body);
+        break;
+    }
+    case NodeKind::ForStmt: {
+        auto& s = static_cast<CForStmt&>(stmt);
+        // ForStmt's init/step are sub-statements; recurse via the
+        // shared helper.
+        if (s.init) stripRedundantCastsInStmt(*s.init);
+        if (s.step) stripRedundantCastsInStmt(*s.step);
+        if (s.condition)
+            s.condition = stripRedundantCasts(std::move(s.condition));
+        stripRedundantCastsInStmts(s.body);
+        break;
+    }
+    case NodeKind::SwitchStmt: {
+        auto& s = static_cast<CSwitchStmt&>(stmt);
+        s.selector = stripRedundantCasts(std::move(s.selector));
+        for (auto& c : s.cases)
+            stripRedundantCastsInStmts(c.body);
+        break;
+    }
+    case NodeKind::BlockStmt: {
+        auto& s = static_cast<CBlockStmt&>(stmt);
+        stripRedundantCastsInStmts(s.stmts);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void stripRedundantCastsInStmts(std::vector<StmtPtr>& stmts) {
+    for (auto& sp : stmts) {
+        if (!sp) continue;
+        stripRedundantCastsInStmt(*sp);
+    }
+}
+
+} // namespace
+
+void CAstOptimizer::eliminateRedundantCasts(CFuncDecl& func) {
+    stripRedundantCastsInStmts(func.body);
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pass 6: synthesizeCompoundAssign

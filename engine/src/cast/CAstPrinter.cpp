@@ -99,9 +99,33 @@ void CAstPrinter::print(const CFuncDecl& func, llvm::raw_ostream& os) {
 
 // ── Expression printing ─────────────────────────────────────────────────────
 
+// FIX-085 (DREAM-inspired): hard depth guard on the recursive expression
+// printer.  Even if the optimizer has been told to refuse propagating
+// deeply nested boolean trees (see CAstOptimizer.cpp), a stray malformed
+// node from an experimental dialect lowering or a corrupted AST could
+// still push the printer's recursion past the OS stack limit and crash
+// the entire decompile run.  A counter-bound here means the worst case is
+// truncated output, not a process abort.  Threshold of 128 is well above
+// any depth that has occurred organically on the stress corpora while
+// still being orders of magnitude below the default 1 MiB Windows stack.
+namespace {
+constexpr unsigned kMaxPrintExprDepth = 128;
+thread_local unsigned tlsPrintExprDepth = 0;
+struct PrintExprDepthGuard {
+    PrintExprDepthGuard() { ++tlsPrintExprDepth; }
+    ~PrintExprDepthGuard() { --tlsPrintExprDepth; }
+};
+} // namespace
+
 void CAstPrinter::printExpr(const CExpr& expr, int parentPrec) {
     assert(os_ && "printExpr called without active ostream");
     auto& os = *os_;
+
+    PrintExprDepthGuard depthGuard;
+    if (tlsPrintExprDepth > kMaxPrintExprDepth) {
+        os << "/* expr too deep */";
+        return;
+    }
 
     switch (expr.getKind()) {
     case NodeKind::IntLitExpr: {

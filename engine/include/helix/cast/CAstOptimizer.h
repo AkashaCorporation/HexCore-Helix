@@ -31,6 +31,12 @@ public:
     void eliminateDeadStores(CFuncDecl& func);
     void propagateCopies(CFuncDecl& func);
     void simplifyExpressions(CFuncDecl& func);
+    /// FIX-086 (dewolf-inspired): elide redundant CCastExpr nodes whose
+    /// source and target types are semantically equivalent (same bit
+    /// width, or pointer/int64 in a 64-bit context).  Reduces visual
+    /// noise like `(int64_t)(void*)0` to `0`.  Runs after
+    /// `simplifyExpressions`.
+    void eliminateRedundantCasts(CFuncDecl& func);
     void synthesizeCompoundAssign(CFuncDecl& func);
     void removeDeadCodeAfterReturn(CFuncDecl& func);
     void recoverStructFieldAccess(CFuncDecl& func);

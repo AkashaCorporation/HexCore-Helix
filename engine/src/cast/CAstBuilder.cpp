@@ -1529,9 +1529,34 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     if (op->getDialect() && op->getDialect()->getNamespace() == "helix_mid")
         return nullptr;
 
-    // ─── Fallback: unhandled op → comment ───────────────────────────────
-    return std::make_unique<CCommentStmt>(
-        std::format("/* unhandled: {} */", op->getName().getStringRef().str()));
+    // ─── Fallback: unhandled op → __helix_unhandled_<opname>(args) ──────
+    //
+    // FIX-084 (RetDec-inspired): emit an opaque pseudo-call instead of a
+    // bare comment so operand liveness is preserved and downstream passes
+    // see a valid statement node.  This prevents the previously-undefined
+    // behaviour where an unrecognized op silently produced output the AST
+    // walker could not classify.  Argument expressions that fail to build
+    // are skipped (rather than poisoning the call) so a single missing
+    // operand does not lose the rest of the call.
+    {
+        auto callName =
+            "__helix_unhandled_" + op->getName().getStringRef().str();
+        // Normalize dots in dialect-qualified op names (e.g.
+        // "helix_high.foo" → "helix_high_foo") so the result is a valid
+        // C identifier.
+        for (auto& c : callName)
+            if (c == '.') c = '_';
+
+        std::vector<ExprPtr> args;
+        for (Value operand : op->getOperands()) {
+            if (auto expr = buildExpression(operand))
+                args.push_back(std::move(expr));
+        }
+        auto callExpr = std::make_unique<CCallExpr>(
+            std::move(callName), /*targetAddr=*/0, std::move(args),
+            CType::int64(), addr);
+        return std::make_unique<CExprStmt>(std::move(callExpr), addr);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2817,10 +2842,29 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         }
     }
 
-    // ─── Unknown → fallback ─────────────────────────────────────────────
-    return std::make_unique<CVarRefExpr>(
-        0, std::format("__unknown_{}", defOp->getName().getStringRef().str()),
-        convertType(val.getType()), addr);
+    // ─── Unknown → __helix_unhandled_<opname>(operands...) ──────────────
+    //
+    // FIX-084 (RetDec-inspired, expression-side):  Previously emitted a
+    // bare CVarRefExpr like `__unknown_helix_high_foo` which silently
+    // dropped every operand and made it impossible to tell which values
+    // were consumed by the unknown op.  Emitting a CCallExpr preserves
+    // operand liveness so subsequent DSE / copy-prop passes correctly
+    // keep their defining stores live.
+    {
+        auto callName =
+            "__helix_unhandled_" + defOp->getName().getStringRef().str();
+        for (auto& c : callName)
+            if (c == '.') c = '_';
+
+        std::vector<ExprPtr> args;
+        for (Value operand : defOp->getOperands()) {
+            if (auto expr = buildExpression(operand))
+                args.push_back(std::move(expr));
+        }
+        return std::make_unique<CCallExpr>(
+            std::move(callName), /*targetAddr=*/0, std::move(args),
+            convertType(val.getType()), addr);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
