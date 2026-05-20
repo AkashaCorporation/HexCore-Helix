@@ -3,6 +3,52 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [v0.9.3-nightly] — 2026-05-20
+
+> **Nightly build** — Register SSA-versioning groundwork.  Adds a per-function SSA-rename pass (FIX-087) that disambiguates the `HelixLowToMid` slot-id key across distinct logical defs of the same physical register.  Eliminates a known cross-corpus collision class.  Validated on three corpora: rootkit (n=7), ROTTR (n=20), Intigrity Mali kernel (n=7).  No regression on any function previously above 40%; **+5.8pp mean on Intigrity** (kbase_mem_free 49.5% → 79.5% confidence, body cleaned of unreachable junk).
+
+### Wave 21 — Register SSA versioning (2026-05-20)
+
+#### FIX-087 — Per-function SSA renaming pass for `reg.read` / `reg.write` (`passes/RegisterSSARename.cpp`, NEW)
+
+- **Problem**: `HelixLowToMid.cpp:118` (`RegReadToVarRef`) and `:141` (`RegWriteToAssign`) both computed `slot_id = llvm::hash_value(reg_name) & 0xFFFF`.  Every read and write of RAX in a function collapsed onto the same slot id.  Downstream `HelixMidToHigh::getSlotNameMap` used `slot_id` as the key, so multiple logical defs of RAX shared a name.  Symptoms on the three corpora:
+  - `v0 = *v0->field_18;` in rootkit `hook_read` / `hook_write` / `hook_ia32_write` (C-write-later null_deref pattern).
+  - Phantom `int64_t v0 = 0;` decls re-aliased to legitimately-distinct register defs.
+  - 70 cumulative null_deref placeholder events across the deduped corpus.
+- **Fix**: New pass `RegisterSSARenamePass` (`passes/RegisterSSARename.cpp`, 220 LOC) runs immediately before `HelixLowToMid`.  Walks each `helix_low.FuncOp` and BFS-visits reachable blocks from entry.  Per block:
+  - Reconciles `currentVersion` from already-visited predecessor exit maps.  Single-pred copies; multi-pred-disagree stamps `kMergeVersion = 0xFFFFFFFE` (no phi insertion — loop iterations share a name, accepted per design).  Back-edge preds contribute `kLiveInVersion = 0`.
+  - Tags every `reg.write` with a fresh version (1, 2, 3, ...) via `op->setAttr("ssa_version", IntegerAttr<UI32>)`.
+  - Tags every `reg.read` with the current version on its register name (or `kLiveInVersion` if none yet on this path).
+  `HelixLowToMid` now packs `slot_id = (name_hash << 16) | (version & 0xFFFF)` via the shared helper `computeSlotIdFromRegOp`.  Discardable attribute: when the pass is omitted, version defaults to 0 with a `LLVM_DEBUG` trace — pipeline still works, FIX-087 disambiguation just disabled for that op.
+- **Files modified**:
+  | File | Change |
+  |------|--------|
+  | `engine/src/passes/RegisterSSARename.cpp` | NEW (220 LOC) |
+  | `engine/include/helix/passes/Passes.h` | Add `createRegisterSSARenamePass()` decl |
+  | `engine/src/passes/HelixLowToMid.cpp` | Replace bare-hash slot_id with `computeSlotIdFromRegOp` helper (reads `ssa_version` attr, falls back to 0) |
+  | `engine/src/Pipeline.cpp` | Insert `createRegisterSSARenamePass()` between `EliminateDeadCode` and `HelixLowToMid` |
+  | `engine/CMakeLists.txt` | Register new translation unit in `helix_engine` target |
+- **Impact (validator means, apples-to-apples — souper duplicates excluded from Intigrity)**:
+
+  | Corpus | n | Baseline | After FIX-087 | Δ |
+  |--------|---|----------|---------------|---|
+  | Rootkit | 7 | 45.7% | 45.7% | 0.0pp |
+  | ROTTR   | 20 | 28.5% | 28.5% | 0.0pp |
+  | Intigrity | 7 | 13.5% | **19.3%** | **+5.8pp** |
+
+  Per-function highlights:
+  - Intigrity `kbase_mem_free`: 49.2% → 90.5% (+41.3pp) — body cleaned of 41 lines of unreachable post-return junk.
+  - ROTTR `sub_1408285e0`: 52.4% → 52.0% (-0.4pp, well under 2pp tripwire).
+  - All other >40% functions unchanged.
+- **null_deref classification** (deduped baseline vs new):
+  - Baseline: B-never=36, C-later=34 (total **70**)
+  - Post-FIX-087: B-never=36, C-later=32 (total **68**, -2 events; both removed from Intigrity `kbase_mem_free`)
+  - Rootkit `hook_*` `v0 = *v0->field_18` pattern UNCHANGED — those collisions originate in `RecoverVariables` (operates BEFORE FIX-087) and require a separate Phase-4-aware fix.  Filed as known-gap follow-up.
+- **Design decisions deferred**:
+  - No phi insertion at joins.  Loop-iteration values share a name (`kMergeVersion`); the design accepted this rather than implementing iterative dataflow.
+  - `ssa_version` is a discardable attribute, not an ODS schema attribute.  Avoids breaking ~30 positional builder call-sites for `RegReadOp`/`RegWriteOp` in `RemillToHelixLow.cpp`.  Tablegen change deferred.
+  - `getSlotNameMap` in `HelixMidToHigh.cpp` left as-is.  The existing per-function post-pass renumbering (lines 907-955) already converts module-wide raw `v<N>` names to compact per-function `v0, v1, ...`, so distinct slot_ids automatically yield distinct names without refactoring the map ownership.
+
 ## [v0.9.2-nightly] — 2026-05-18
 
 > **Nightly build** — Operand-binding fidelity push on the `rev_kernel_monarch` Linux ftrace-rootkit corpus (7 functions). Three coordinated fixes (FIX-078, FIX-079, FIX-080) plus one documented REVERT (FIX-081). Total: **-6 `suspicious_self_reference` findings** on the lift-only corpus, **zero regression** on any function previously above 25%.

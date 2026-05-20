@@ -66,6 +66,18 @@ std::unique_ptr<mlir::Pass> createRecoverVariablesPass();
 /// register writes, stack pointer bookkeeping (rsp = rsp ± N).
 std::unique_ptr<mlir::Pass> createEliminateDeadCodePass();
 
+/// Create the per-function SSA renaming pass for register reads/writes.
+///
+/// Stamps a `ssa_version` discardable attribute on every
+/// `helix_low.reg.read` / `helix_low.reg.write` so that distinct logical
+/// defs of the same physical register end up with distinct slot ids in
+/// `HelixLowToMid`'s `(name_hash << 16) | version` packing.  Eliminates
+/// the cross-block collision that produced `v0 = *v0->field_18;`.
+///
+/// Designed to be optional: pipelines that omit this pass still work —
+/// `HelixLowToMid` defaults the missing version to 0.
+std::unique_ptr<mlir::Pass> createRegisterSSARenamePass();
+
 // ─── Optimization Passes (v3.8.0) ────────────────────────────────────────────
 
 /// Create the magic number division recovery pass.

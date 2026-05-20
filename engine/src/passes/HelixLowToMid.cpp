@@ -101,6 +101,26 @@ static mid::BinExprKind mapBinOpKind(low::BinOpKind kind) {
 // Conversion Patterns
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// FIX-087 (2026-05-20): slot_id packing = (name_hash << 16) | version
+//
+// `ssa_version` is stamped on every reg.read / reg.write by
+// `RegisterSSARenamePass`, which runs immediately before this pass.  When
+// it's absent (e.g. a custom pipeline that skips the pass), default to
+// version 0 and emit a debug trace — output is still produced, but the
+// FIX-087 cross-version disambiguation is disabled for that op.
+static uint32_t computeSlotIdFromRegOp(Operation* op, llvm::StringRef reg_name) {
+    uint32_t name_hash = static_cast<uint32_t>(llvm::hash_value(reg_name)) & 0xFFFFu;
+    uint32_t version = 0;
+    if (auto vAttr = op->getAttrOfType<IntegerAttr>("ssa_version")) {
+        version = static_cast<uint32_t>(vAttr.getValue().getZExtValue());
+    } else {
+        LLVM_DEBUG(llvm::dbgs() << "[register-ssa] no version on "
+                                << op->getName().getStringRef() << " "
+                                << reg_name << "; defaulting to 0\n");
+    }
+    return (name_hash << 16) | (version & 0xFFFFu);
+}
+
 /// Convert helix_low.reg.read → helix_mid.var.ref
 struct RegReadToVarRef : public OpConversionPattern<low::RegReadOp> {
     using OpConversionPattern::OpConversionPattern;
@@ -111,11 +131,10 @@ struct RegReadToVarRef : public OpConversionPattern<low::RegReadOp> {
     {
         auto result_type = op.getResult().getType();
 
-        // Build a slot_id attribute from the register name.
-        // The actual slot allocation is done per-function in the pass driver.
-        // Here we use a hash-based approach for simplicity.
+        // FIX-087: slot_id now encodes (name_hash << 16) | ssa_version,
+        // disambiguating distinct logical defs of the same physical register.
         auto reg_name = op.getRegName();
-        uint32_t slot_id = llvm::hash_value(reg_name) & 0xFFFF;
+        uint32_t slot_id = computeSlotIdFromRegOp(op.getOperation(), reg_name);
 
         auto new_op = rewriter.create<mid::VarRefOp>(
             op.getLoc(),
@@ -137,8 +156,9 @@ struct RegWriteToAssign : public OpConversionPattern<low::RegWriteOp> {
         low::RegWriteOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
+        // FIX-087: same versioned slot_id as RegReadToVarRef.
         auto reg_name = op.getRegName();
-        uint32_t slot_id = llvm::hash_value(reg_name) & 0xFFFF;
+        uint32_t slot_id = computeSlotIdFromRegOp(op.getOperation(), reg_name);
 
         rewriter.create<mid::AssignOp>(
             op.getLoc(),

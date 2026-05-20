@@ -241,6 +241,7 @@ set(HELIX_SOURCES
     src/passes/RecoverVariables.cpp
     src/passes/RecoverVariablesFactory.cpp
     src/passes/EliminateDeadCode.cpp
+    src/passes/RegisterSSARename.cpp          # FIX-087: per-fn SSA versioning
 
     # Passes — v3.8.0 optimization passes
     src/passes/RecoverMagicDivision.cpp        # NEW v3.8.0

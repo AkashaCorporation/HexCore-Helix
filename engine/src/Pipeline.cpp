@@ -455,6 +455,12 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     pm.addPass(createRecoverVariablesPass());
     pm.addPass(createEliminateDeadCodePass());          // [Nightly: +liveness-driven DCE]
 
+    // ── FIX-087 (2026-05-20): per-function SSA renaming of register reads/
+    //    writes.  Stamps `ssa_version` discardable attrs that the next pass
+    //    (HelixLowToMid) packs into the slot_id key, so distinct logical
+    //    defs of the same register no longer collide on the same `v0`.
+    pm.addPass(createRegisterSSARenamePass());
+
     // ── Tier 2: HelixLow → HelixMid (v1.0) ──────────────────────────────
     //    Converts remaining machine-level ops to ISA-agnostic typed SSA:
     //    registers → abstract variables, flags → comparisons,
