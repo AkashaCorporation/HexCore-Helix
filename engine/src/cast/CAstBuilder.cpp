@@ -3759,7 +3759,15 @@ GarbageCounts collectGarbagePatterns(const CFuncDecl& func) {
 void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
     double deduction = 0.0;
     auto& issues = func.confidenceIssues;
-    auto highFunc = mlir::cast<helix::high::FuncOp>(op);
+
+    // FIX-083: op may be low::FuncOp when the pipeline retains functions
+    // in the low dialect. mlir::cast would abort; use dyn_cast + fallback.
+    auto highFunc = mlir::dyn_cast<helix::high::FuncOp>(op);
+    if (!highFunc) {
+        func.confidenceScore = 50.0;
+        issues.push_back("non-high function — confidence approximate");
+        return;
+    }
 
     // Count total ops for stub detection
     unsigned opCount = 0;

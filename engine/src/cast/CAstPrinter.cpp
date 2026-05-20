@@ -343,10 +343,27 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
         const auto& s = static_cast<const CForStmt&>(stmt);
         indent(depth);
         os << "for (";
-        // Init — printed without indent/newline
+
+        // FIX-083b: s.init and s.step may be CAssignStmt, not CExprStmt.
+        // The prior static_cast<CExprStmt&> was UB when the node was an
+        // assignment (sibling subclass). Print inline based on actual kind.
+        auto printLoopPart = [&](const CStmt& part) {
+            if (part.getKind() == NodeKind::AssignStmt) {
+                const auto& a = static_cast<const CAssignStmt&>(part);
+                if (a.target) printExpr(*a.target, 0);
+                if (a.compoundOp == "++" || a.compoundOp == "--") {
+                    os << a.compoundOp;
+                } else {
+                    os << (a.compoundOp.empty() ? " = " : " " + a.compoundOp + " ");
+                    if (a.value) printExpr(*a.value, 0);
+                }
+            } else if (part.getKind() == NodeKind::ExprStmt) {
+                printExpr(*static_cast<const CExprStmt&>(part).expr, 0);
+            }
+        };
+
         if (s.init) {
-            // Temporarily print inline (strip trailing newline behavior)
-            printExpr(*static_cast<const CExprStmt&>(*s.init).expr, 0);
+            printLoopPart(*s.init);
         }
         os << "; ";
         if (s.condition) {
@@ -359,7 +376,7 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
         }
         os << "; ";
         if (s.step) {
-            printExpr(*static_cast<const CExprStmt&>(*s.step).expr, 0);
+            printLoopPart(*s.step);
         }
         os << ") {\n";
         for (const auto& st : s.body)
