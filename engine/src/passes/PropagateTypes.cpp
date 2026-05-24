@@ -51,6 +51,7 @@
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/SignatureDb.h"
+#include "helix/utils/CallOpHelpers.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -554,8 +555,8 @@ static CTypeInfo inferSlotType(
         if (!acc.isStore)
             continue;
         if (auto* defOp = acc.accessedValue.getDefiningOp()) {
-            if (auto call = dyn_cast<helix::low::CallOp>(defOp)) {
-                if (auto targetName = call.getTargetName()) {
+            if (helix::isAnyCallOp(defOp)) {
+                if (auto targetName = helix::getCallTargetName(defOp)) {
                     auto sig = helix::lookupSignature(*targetName);
                     if (sig && !sig->return_type.empty()) {
                         // We can't call typeFromSignatureStr here (it's a
@@ -1182,8 +1183,8 @@ private:
                 // propagate the return type from SignatureDb to the call
                 // result SSA values (supplements the existing Rule 11 which
                 // only set an attribute, not the typeEnv).
-                if (auto call = dyn_cast<helix::low::CallOp>(op)) {
-                    if (auto targetName = call.getTargetName()) {
+                if (helix::isAnyCallOp(op)) {
+                    if (auto targetName = helix::getCallTargetName(op)) {
                         auto sig = helix::lookupSignature(*targetName);
                         if (sig) {
                             CTypeInfo retType =
@@ -1191,13 +1192,13 @@ private:
                             if (retType.isResolved()) {
                                 // CallOp at HelixLow level has no SSA result,
                                 // but set inferred_return_type for later phases.
-                                call->setAttr("inferred_return_type",
-                                    StringAttr::get(call->getContext(),
+                                op->setAttr("inferred_return_type",
+                                    StringAttr::get(op->getContext(),
                                         sig->return_type));
                             }
                             // Propagate parameter types forward to argument
                             // SSA values (if the call carries explicit args).
-                            auto args = call.getArgs();
+                            auto args = helix::getCallArgs(op);
                             for (unsigned i = 0;
                                  i < args.size() &&
                                  i < sig->param_types.size();
@@ -1436,11 +1437,11 @@ private:
                 // Backward Rule B6: Call argument — if a value is passed as an
                 // argument to a known function, its type should match the
                 // parameter type from SignatureDb.
-                if (auto call = dyn_cast<helix::low::CallOp>(op)) {
-                    if (auto targetName = call.getTargetName()) {
+                if (helix::isAnyCallOp(op)) {
+                    if (auto targetName = helix::getCallTargetName(op)) {
                         auto sig = helix::lookupSignature(*targetName);
                         if (sig) {
-                            auto args = call.getArgs();
+                            auto args = helix::getCallArgs(op);
                             for (unsigned i = 0;
                                  i < args.size() &&
                                  i < sig->param_types.size();
