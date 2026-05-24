@@ -89,7 +89,11 @@ DECL_RE = re.compile(
     r"(?P<var>[A-Za-z_]\w*)\s*"
     r"(?:=\s*(?P<init>[^;]+?))?\s*;"
 )
-DEREF_FIELD_RE = re.compile(r"\b[\w_]+->(?P<field>field_0x[\dA-Fa-f]+|[A-Za-z_]\w*)")
+DEREF_FIELD_RE = re.compile(r"\b[\w_]+->(?P<field>field_(?:0x)?[\dA-Fa-f]+|[A-Za-z_]\w*)")
+# An offset-based field name (raw byte offset, no recovered name) in either
+# hex spelling: `field_0x18` or `field_18`. Used by struct_recovery so both
+# spellings count as unrecovered — see PLACEHOLDER_ID_RE for the rationale.
+RAW_FIELD_RE = re.compile(r"field_(?:0x)?[\dA-Fa-f]+\Z")
 CALL_RE = re.compile(r"\b(?P<callee>[A-Za-z_][\w.]*)\s*\(")
 RETURN_RE = re.compile(r"^\s*return\b")
 BRACE_OPEN_RE = re.compile(r"\{\s*$")
@@ -358,17 +362,26 @@ def _bounded(numer: int, denom: int) -> float:
 
 
 # Identifier-quality theorem: every identifier emitted by Helix that matches
-# `v\d+`, `param_\d+`, or `field_0xN` is a placeholder name carrying no
-# semantic information. Their fraction is a lower bound on the placeholder
-# rate. name_quality = 1 − placeholder_rate ∈ [0, 1].
+# `v\d+`, `param_\d+`, or a bare offset-based field name is a placeholder
+# carrying no semantic information. Their fraction is a lower bound on the
+# placeholder rate. name_quality = 1 − placeholder_rate ∈ [0, 1].
+#
+# Field offsets count as placeholders in BOTH hex spellings — `field_0x18`
+# AND `field_18` (no 0x prefix). A raw byte offset without a recovered field
+# name is incomplete recovery regardless of how the hex is printed; matching
+# only the 0x form let `field_18` masquerade as a real identifier and inflate
+# the score (and made the score sensitive to which lowering path named the
+# field — see the engine-side unification commit). `field_next` / `field_data`
+# etc. do NOT match (fullmatch requires the suffix to be pure hex), so genuine
+# recovered field names are unaffected.
 #
 # Opacity markers (`__helix_opaque_va`, `__helix_zerod_va`, `__helix_arg`)
 # are intentional admissions of uncertainty, NOT recovered identifiers.
-# Without listing them here, the variadic-call mini-ISA would silently
-# inflate name_quality because the regex would treat each marker as a
-# real identifier (see feedback_validator_paralelo_a_isa.md, Wave 22).
+#
+# RULE (see feedback_validator_paralelo_a_isa.md): any new placeholder/marker
+# format Helix emits must be added here, or name_quality inflates silently.
 PLACEHOLDER_ID_RE = re.compile(
-    r"\b(?:v\d+|var_\w+|param_\d+|field_0x[\dA-Fa-f]+"
+    r"\b(?:v\d+|var_\w+|param_\d+|field_(?:0x)?[\dA-Fa-f]+"
     r"|__helix_opaque_va|__helix_zerod_va|__helix_arg)\b"
 )
 ALL_ID_RE = re.compile(r"\b[A-Za-z_][\w]*\b")
@@ -389,13 +402,15 @@ def score_name_quality(body: str) -> float:
     return 1.0 - bad / len(ids)
 
 
-# Struct-field recovery: a deref `x->field_0xN` is an unnamed field; a deref
-# `x->name` (anything else) is a named one. struct_recovery = named / total.
+# Struct-field recovery: a deref `x->field_0xN` / `x->field_N` is an unnamed
+# (raw offset) field; a deref `x->name` (anything else) is a named one.
+# struct_recovery = named / total. Both hex spellings of an offset count as
+# unnamed (see RAW_FIELD_RE).
 def score_struct_recovery(body: str) -> float:
     fields = DEREF_FIELD_RE.findall(body)
     if not fields:
         return 1.0
-    named = sum(1 for f in fields if not f.startswith("field_0x"))
+    named = sum(1 for f in fields if not RAW_FIELD_RE.match(f))
     return _bounded(named, len(fields))
 
 
