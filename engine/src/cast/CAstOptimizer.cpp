@@ -6141,10 +6141,11 @@ ExprPtr CAstOptimizer::recoverFieldAccess(ExprPtr expr) {
             if (bin.op == BinaryOp::Add && bin.lhs && bin.rhs) {
                 auto offsetVal = getIntLit(bin.rhs.get());
                 if (offsetVal && *offsetVal > 0) {
-                    // Build field name: field_0xN
+                    // Build field name: field_0x<lowercase-hex> (canonical,
+                    // shared with HelixMidToHigh + CAstBuilder).
                     char fieldName[32];
                     std::snprintf(fieldName, sizeof(fieldName),
-                                  "field_0x%X",
+                                  "field_0x%x",
                                   static_cast<unsigned>(*offsetVal));
                     return std::make_unique<CFieldAccessExpr>(
                         std::move(bin.lhs), fieldName,
@@ -6157,7 +6158,7 @@ ExprPtr CAstOptimizer::recoverFieldAccess(ExprPtr expr) {
                 if (offsetValL && *offsetValL > 0) {
                     char fieldName[32];
                     std::snprintf(fieldName, sizeof(fieldName),
-                                  "field_0x%X",
+                                  "field_0x%x",
                                   static_cast<unsigned>(*offsetValL));
                     return std::make_unique<CFieldAccessExpr>(
                         std::move(bin.rhs), fieldName,

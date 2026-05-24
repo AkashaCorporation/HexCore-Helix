@@ -669,7 +669,13 @@ struct MidFieldPtrToHighField : public OpConversionPattern<mid::FieldPtrOp> {
         if (auto name_attr = op.getFieldNameAttr())
             field_name = name_attr.getValue().str();
         else
-            field_name = std::format("field_{:X}", op.getFieldOffset());
+            // Canonical unrecovered-field format, shared with CAstBuilder and
+            // CAstOptimizer: `field_0x<lowercase-hex>`. Keeping all three name
+            // producers byte-identical means a field's printed name no longer
+            // depends on which lowering path happens to handle it (which the
+            // dialect-conversion reachability — and thus upstream op shape —
+            // can otherwise flip).
+            field_name = std::format("field_0x{:x}", op.getFieldOffset());
 
         auto new_op = rewriter.create<high::FieldAccessOp>(
             op.getLoc(),
