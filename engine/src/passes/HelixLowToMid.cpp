@@ -1092,6 +1092,53 @@ struct HelixLowToMidPass
                          << converted << " CallOps\n";
         }
 
+        // ── Wave 22 Step 2.5 stopgap: variadic_call + bundle.create → mid.call ──
+        //
+        // Step 3 will add proper low→mid conversion carrying the bundle. Until
+        // then, collapse to plain mid::CallOp so the pipeline keeps working and
+        // the C output is unchanged. The bundle attributes/operand are dropped
+        // here (only matter once Step 4 emits opacity markers from High).
+        {
+            SmallVector<low::VariadicCallOp, 16> vcallsToConvert;
+            module.walk([&](low::VariadicCallOp v) {
+                vcallsToConvert.push_back(v);
+            });
+            for (auto vCall : vcallsToConvert) {
+                OpBuilder builder(vCall);
+                StringAttr calleeNameAttr = vCall.getTargetNameAttr();
+                uint64_t calleeAddr = 0;
+                if (auto targetVal = vCall.getTargetAddr()) {
+                    if (auto cOp = targetVal.getDefiningOp<LLVM::ConstantOp>()) {
+                        if (auto ia = dyn_cast<IntegerAttr>(cOp.getValue()))
+                            calleeAddr = ia.getValue().getZExtValue();
+                    } else if (auto cOp =
+                               targetVal.getDefiningOp<arith::ConstantOp>()) {
+                        if (auto ia = dyn_cast<IntegerAttr>(cOp.getValue()))
+                            calleeAddr = ia.getValue().getZExtValue();
+                    }
+                }
+                auto midCall = builder.create<mid::CallOp>(
+                    vCall.getLoc(), /*result=*/vCall->getResultTypes(),
+                    builder.getI64IntegerAttr(calleeAddr), calleeNameAttr,
+                    vCall.getFixedArgs(), vCall.getAddressAttr());
+                if (vCall->getNumResults() > 0) {
+                    vCall->getResult(0).replaceAllUsesWith(
+                        midCall->getResult(0));
+                }
+                vCall->erase();
+            }
+            SmallVector<low::BundleCreateOp, 16> bundlesToErase;
+            module.walk([&](low::BundleCreateOp b) {
+                if (b->use_empty()) bundlesToErase.push_back(b);
+            });
+            for (auto b : bundlesToErase) b->erase();
+            if (!vcallsToConvert.empty()) {
+                llvm::errs() << "[P0-DEBUG] Wave22-Step2.5 stopgap: "
+                             << vcallsToConvert.size()
+                             << " variadic_call->mid.call\n";
+            }
+        }
+
         // [P0-DEBUG] Final count
         {
             unsigned lowCalls = 0, midCalls = 0;

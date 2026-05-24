@@ -43,6 +43,48 @@ using namespace helix;
 
 namespace {
 
+// ─── Wave 22 Step 2 — variadic call detection (printk-family with zeroed fmt) ──
+//
+// callee name → format-string operand index in the post-`collectCallArgs` ABI
+// arg list. A literal 0 at that index means the format string was zeroed
+// upstream (Pathfinder/Remill before Helix); the call lifts as
+// `helix_low.variadic_call` + `bundle.create<Zeroed>`.
+struct VariadicCalleeEntry {
+    llvm::StringRef name;
+    unsigned fmtSlot;
+};
+
+static constexpr VariadicCalleeEntry kVariadicCallees[] = {
+    {"printk", 0}, {"pr_err", 0}, {"pr_warn", 0}, {"pr_info", 0},
+    {"pr_debug", 0}, {"pr_notice", 0}, {"pr_cont", 0},
+    {"_dev_err", 1}, {"_dev_warn", 1}, {"_dev_info", 1},
+    {"_dev_dbg", 1}, {"_dev_notice", 1},
+    {"__dynamic_dev_err", 2}, {"__dynamic_dev_warn", 2},
+    {"__dynamic_dev_info", 2}, {"__dynamic_dev_dbg", 2},
+    {"__dynamic_dev_notice", 2},
+    {"sprintf", 1}, {"vsprintf", 1}, {"seq_printf", 1}, {"kasprintf", 1},
+    {"fprintf", 1}, {"dprintf", 1}, {"sysfs_emit", 1},
+    {"snprintf", 2}, {"vsnprintf", 2},
+    {"panic", 0}, {"kprintf", 0},
+};
+
+static std::optional<unsigned> getVariadicFmtSlot(llvm::StringRef name) {
+    for (auto& e : kVariadicCallees)
+        if (name == e.name) return e.fmtSlot;
+    return std::nullopt;
+}
+
+static bool isLiteralZero(Value v) {
+    if (!v) return false;
+    if (auto c = v.getDefiningOp<LLVM::ConstantOp>())
+        if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+            return ia.getValue().isZero();
+    if (auto c = v.getDefiningOp<arith::ConstantOp>())
+        if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+            return ia.getValue().isZero();
+    return false;
+}
+
 /// Tracks which MLIR Values correspond to register GEP pointers.
 /// Built during the initial scan of the LLVM Dialect module by recognizing
 /// getelementptr operations that carry !remill_register metadata.
@@ -1534,6 +1576,37 @@ private:
                 // (e.g., kmalloc(size, flags) → RDI=size, RSI=flags on SysV).
                 auto callArgs = collectCallArgs(op);
 
+                // ── Wave 22 Step 2 — zeroed-fmt variadic detection ─────────
+                if (auto fmtSlot = getVariadicFmtSlot(calleeName)) {
+                    if (*fmtSlot < callArgs.size() &&
+                        isLiteralZero(callArgs[*fmtSlot])) {
+                        auto bundleType =
+                            helix::low::BundleType::get(builder.getContext());
+                        auto bundleOp =
+                            builder.create<helix::low::BundleCreateOp>(
+                                loc, bundleType,
+                                helix::low::BundleState::Zeroed,
+                                builder.getStringAttr(
+                                    "upstream_zeroed_before_helix"));
+                        auto vCall =
+                            builder.create<helix::low::VariadicCallOp>(
+                                loc, /*resultTypes=*/TypeRange{machineTy},
+                                zero, callArgs, bundleOp.getBundle(),
+                                builder.getStringAttr(calleeName), addrAttr);
+                        builder.create<helix::low::RegWriteOp>(
+                            loc, vCall.getResult(),
+                            builder.getStringAttr("RAX"),
+                            builder.getUI32IntegerAttr(machineIntWidth_),
+                            addrAttr);
+                        llvm::errs()
+                            << "[P0-DEBUG] Variadic call (zeroed fmt): name="
+                            << calleeName << " fmtSlot=" << *fmtSlot
+                            << " nArgs=" << callArgs.size() << "\n";
+                        eraseRemillCall();
+                        return;
+                    }
+                }
+
                 auto extCall = builder.create<helix::low::CallOp>(
                     loc,
                     /*resultTypes=*/TypeRange{machineTy},
@@ -2822,6 +2895,41 @@ private:
                     resultTy = machineIntTy(builder);
                 unsigned resultBits =
                     cast<IntegerType>(resultTy).getWidth();
+
+                // ── Wave 22 Step 2 — zeroed-fmt variadic detection (semantic) ──
+                if (targetName) {
+                    auto calleeName = targetName.getValue();
+                    if (auto fmtSlot = getVariadicFmtSlot(calleeName)) {
+                        if (*fmtSlot < callArgs.size() &&
+                            isLiteralZero(callArgs[*fmtSlot])) {
+                            auto bundleType =
+                                helix::low::BundleType::get(
+                                    builder.getContext());
+                            auto bundleOp =
+                                builder.create<helix::low::BundleCreateOp>(
+                                    loc, bundleType,
+                                    helix::low::BundleState::Zeroed,
+                                    builder.getStringAttr(
+                                        "upstream_zeroed_before_helix"));
+                            auto vCall =
+                                builder.create<helix::low::VariadicCallOp>(
+                                    loc, /*resultTypes=*/TypeRange{resultTy},
+                                    targetVal, callArgs, bundleOp.getBundle(),
+                                    targetName, addrAttr);
+                            builder.create<helix::low::RegWriteOp>(
+                                loc, vCall.getResult(),
+                                builder.getStringAttr("RAX"),
+                                builder.getUI32IntegerAttr(resultBits),
+                                addrAttr);
+                            llvm::errs()
+                                << "[P0-DEBUG] Variadic call (zeroed fmt)"
+                                << " [semantic]: name=" << calleeName
+                                << " fmtSlot=" << *fmtSlot
+                                << " nArgs=" << callArgs.size() << "\n";
+                            break;  // exit the RemillSemantic::CALL case
+                        }
+                    }
+                }
 
                 auto newCallOp = builder.create<helix::low::CallOp>(
                     loc,
