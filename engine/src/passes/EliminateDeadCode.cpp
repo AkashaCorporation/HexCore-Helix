@@ -524,17 +524,50 @@ static bool hasAnyUncertainFlags(Operation* op) {
 // Dead Variable Elimination (HelixHigh-level)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Returns true when an op has effects that prevent it from being treated as
+/// trivially dead by MLIR's standard rules. Mirrors `wouldOpBeTriviallyDead`:
+/// terminators always alive; ops with MemoryEffectOpInterface alive iff any
+/// declared effect is not a Read; ops without the interface alive (conservative).
+///
+/// Used by the Phase-7 trivial DCE walk so that any op declared with
+/// `MemoryEffects<[MemWrite]>` in TableGen is automatically preserved — no
+/// per-type allowlist to keep in sync. NOT used by the decompiler-specific
+/// liveness heuristics below (isLiveConsumer / isSideEffectingRhs), which
+/// intentionally exclude bookkeeping ops like RegWriteOp from their notion
+/// of "observable" even though those ops have a Write effect at the IR level.
+static bool hasObservableSideEffects(Operation* op) {
+    if (!op) return false;
+    if (op->hasTrait<OpTrait::IsTerminator>())
+        return true;
+    if (auto eff = dyn_cast<MemoryEffectOpInterface>(op)) {
+        SmallVector<MemoryEffects::EffectInstance, 4> effects;
+        eff.getEffects(effects);
+        for (auto& e : effects) {
+            if (!isa<MemoryEffects::Read>(e.getEffect()))
+                return true;
+        }
+        return false;
+    }
+    // No interface declared → can't characterise → preserve conservatively.
+    return true;
+}
+
 /// Check whether an operation is a "live" consumer — one that produces an
 /// observable side effect.  A variable is considered live if any of its
 /// references feed (directly or transitively) into one of these operations.
 ///
+/// Decompiler-specific: deliberately narrower than `hasObservableSideEffects`.
+/// Register writes have a Write memory effect at the IR level, but at the
+/// decompilation level they are bookkeeping — observable program behaviour
+/// happens at calls, returns, and memory writes. Including RegWriteOp here
+/// would keep many variables artificially live and bloat the output.
+///
 /// Live operations:
-///   - helix_low.jcc, helix_low.jmp  (branch — affects control flow)
-///   - helix_high.if / while / do_while / for (structured control flow)
-///   - helix_low.call, helix_high.call (function call — observable side effect)
-///   - helix_low.ret, helix_high.return (return — observable output)
-///   - helix_low.mem.write (memory write — observable side effect)
-///   - helix_high.assign where the LHS feeds a live variable
+///   - helix_low.jcc, helix_low.jmp                  (branch — affects control flow)
+///   - helix_high.if / while / do_while / for        (structured control flow)
+///   - helix_low.call / variadic_call, helix_high.call (function call — observable)
+///   - helix_low.ret, helix_high.return              (return — observable output)
+///   - helix_low.mem.write                           (memory write — observable)
 static bool isLiveConsumer(Operation* op) {
     return isa<helix::low::JccOp>(op) ||
            isa<helix::low::JmpOp>(op) ||
@@ -543,6 +576,7 @@ static bool isLiveConsumer(Operation* op) {
            isa<helix::high::DoWhileOp>(op) ||
            isa<helix::high::ForOp>(op) ||
            isa<helix::low::CallOp>(op) ||
+           isa<helix::low::VariadicCallOp>(op) ||
            isa<helix::high::CallOp>(op) ||
            isa<helix::low::RetOp>(op) ||
            isa<helix::high::ReturnOp>(op) ||
@@ -551,12 +585,16 @@ static bool isLiveConsumer(Operation* op) {
 
 /// Check whether an op, if found on the RHS of a now-dead assignment,
 /// must still be kept because it has observable side effects (calls,
-/// memory writes, returns).  Used by orphan-cleanup paths in Phase 7
+/// memory writes, returns). Used by orphan-cleanup paths in Phase 7
 /// so that `rax = sub_foo(); return;` — where the `rax` assignment is
 /// dead but the call is not — doesn't accidentally erase the call.
+///
+/// Decompiler-specific list. RegWriteOp is intentionally excluded for the
+/// same reason as in `isLiveConsumer`.
 static bool isSideEffectingRhs(Operation* op) {
     if (!op) return false;
     return isa<helix::low::CallOp>(op) ||
+           isa<helix::low::VariadicCallOp>(op) ||
            isa<helix::high::CallOp>(op) ||
            isa<helix::mid::CallOp>(op) ||
            isa<helix::low::MemWriteOp>(op) ||
@@ -873,7 +911,8 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp) {
         // A call clobbers volatile registers.  If the register is volatile
         // (RAX, RCX, RDX, R8, R9, R10, R11 on Win64), a call acts as an
         // overwrite.  If the register is non-volatile, the call preserves it.
-        if (isa<helix::low::CallOp>(&op)) {
+        // Both regular and variadic calls follow the same ABI clobber rules.
+        if (isa<helix::low::CallOp, helix::low::VariadicCallOp>(&op)) {
             if (helix::analysis::isWin64VolatileX86Register(normalizedReg)) {
                 foundOverwrite = true;
                 break;
@@ -1196,8 +1235,8 @@ private:
             });
 
             for (Operation* op : toErase) {
-                // [P0-DEBUG] Catch any CallOp being erased by infra removal
-                if (isa<helix::low::CallOp>(op)) {
+                // [P0-DEBUG] Catch any call-like op being erased by infra removal
+                if (isa<helix::low::CallOp, helix::low::VariadicCallOp>(op)) {
                     llvm::errs() << "[P0-DEBUG] WARNING: Phase 0 erasing a CallOp! "
                                  << *op << "\n";
                 }
@@ -1660,15 +1699,13 @@ private:
                 if (op->hasTrait<OpTrait::IsTerminator>())
                     return;
 
-                // Skip ops with side effects that we don't want to remove
-                // (calls, memory writes, etc.).
-                if (isa<helix::low::CallOp>(op) ||
-                    isa<helix::low::MemWriteOp>(op) ||
-                    isa<helix::low::RetOp>(op) ||
-                    isa<helix::low::RepMovsOp>(op) ||
-                    isa<helix::low::RepStosOp>(op)) {
+                // Skip ops with side effects that we don't want to remove.
+                // Uses the MemoryEffectOpInterface so any current or future
+                // op with declared MemEffects (Write/Allocate/Free) is
+                // automatically preserved — no type-enum allowlist to keep
+                // in sync.
+                if (hasObservableSideEffects(op))
                     return;
-                }
 
                 // Check if all results are unused.
                 bool allResultsUnused = true;
