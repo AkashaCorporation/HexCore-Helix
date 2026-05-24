@@ -5,11 +5,32 @@
 #define HELIX_LOW_TYPES_TD
 
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/EnumAttr.td"
 include "dialects/HelixLowDialect.td"
 
 class HelixLow_Type<string name, string typeMnemonic, list<Trait> traits = []>
     : TypeDef<HelixLow_Dialect, name, traits> {
   let mnemonic = typeMnemonic;
+}
+
+// ─── Bundle State Enum (Wave 22 — variadic call mini-ISA) ────────────────────
+//
+// Tracks the recovery state of a variadic argument bundle. The `zeroed` state
+// is critical: it records that some upstream pass (Pathfinder / Remill / etc.)
+// erased the args BEFORE Helix saw them. Without this distinction, opacity
+// markers would silently mask upstream bugs.
+//
+// Verifier rule (enforced in later steps): `zeroed` MUST NOT be silently
+// promoted to `recovered` — recovery requires explicit proof attached via the
+// bundle.recover op.
+def HelixLow_BundleState : I32EnumAttr<
+    "BundleState", "Variadic argument bundle recovery state", [
+      I32EnumAttrCase<"Opaque",             0>,  // unknown — generic uncertainty
+      I32EnumAttrCase<"PartiallyRecovered", 1>,  // some args recovered, others not
+      I32EnumAttrCase<"Recovered",          2>,  // fully recovered with proof
+      I32EnumAttrCase<"Zeroed",             3>,  // upstream erased before Helix
+    ]> {
+  let cppNamespace = "::helix::low";
 }
 
 // ─── Register Type ───────────────────────────────────────────────────────────
@@ -56,6 +77,21 @@ def HelixLow_FlagType : HelixLow_Type<"Flag", "flag"> {
   );
 
   let assemblyFormat = "`<` $name `>`";
+}
+
+// ─── Variadic Argument Bundle Type (Wave 22) ─────────────────────────────────
+
+def HelixLow_BundleType : HelixLow_Type<"Bundle", "bundle"> {
+  let summary = "First-class variadic argument bundle";
+  let description = [{
+    Represents the raw, opaque variadic argument bundle of a `helix_low.variadic_call`.
+    The bundle is produced by `helix_low.bundle.create` and carries evidence —
+    not just data — via its `state` attribute on the producer op.
+
+    No generic pass (DCE / CSE / Simplify) may decompose this type into
+    individual operands. Recovery requires `helix_low.bundle.recover` with
+    explicit proof.
+  }];
 }
 
 #endif // HELIX_LOW_TYPES_TD

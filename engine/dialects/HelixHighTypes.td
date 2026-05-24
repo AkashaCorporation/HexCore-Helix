@@ -75,4 +75,28 @@ def HelixHigh_StorageKind : I32EnumAttr<
   let cppNamespace = "::helix::high";
 }
 
+// ─── Variadic Bundle (Wave 22 — variadic call mini-ISA) ──────────────────────
+//
+// High-dialect carrier for the variadic-arg bundle. CAstBuilder consumes the
+// state of the bundle's producer op to choose between concrete args,
+// `__helix_arg(i)`, `__helix_opaque_va()`, or `__helix_opaque_va(/* upstream_zeroed */)`.
+def HelixHigh_BundleState : I32EnumAttr<
+    "BundleState", "Variadic argument bundle recovery state (High)", [
+      I32EnumAttrCase<"Opaque",             0>,
+      I32EnumAttrCase<"PartiallyRecovered", 1>,
+      I32EnumAttrCase<"Recovered",          2>,
+      I32EnumAttrCase<"Zeroed",             3>,
+    ]> {
+  let cppNamespace = "::helix::high";
+}
+
+def HelixHigh_BundleType : HelixHigh_Type<"Bundle", "bundle"> {
+  let summary = "High-dialect variadic argument bundle";
+  let description = [{
+    Final carrier for the variadic bundle before C-AST construction. The
+    CAstBuilder reads the producer op's state attribute to decide which
+    opacity marker (if any) to emit at the call site.
+  }];
+}
+
 #endif // HELIX_HIGH_TYPES_TD

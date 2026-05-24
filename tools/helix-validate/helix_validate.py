@@ -361,7 +361,16 @@ def _bounded(numer: int, denom: int) -> float:
 # `v\d+`, `param_\d+`, or `field_0xN` is a placeholder name carrying no
 # semantic information. Their fraction is a lower bound on the placeholder
 # rate. name_quality = 1 − placeholder_rate ∈ [0, 1].
-PLACEHOLDER_ID_RE = re.compile(r"\b(?:v\d+|var_\w+|param_\d+|field_0x[\dA-Fa-f]+)\b")
+#
+# Opacity markers (`__helix_opaque_va`, `__helix_zerod_va`, `__helix_arg`)
+# are intentional admissions of uncertainty, NOT recovered identifiers.
+# Without listing them here, the variadic-call mini-ISA would silently
+# inflate name_quality because the regex would treat each marker as a
+# real identifier (see feedback_validator_paralelo_a_isa.md, Wave 22).
+PLACEHOLDER_ID_RE = re.compile(
+    r"\b(?:v\d+|var_\w+|param_\d+|field_0x[\dA-Fa-f]+"
+    r"|__helix_opaque_va|__helix_zerod_va|__helix_arg)\b"
+)
 ALL_ID_RE = re.compile(r"\b[A-Za-z_][\w]*\b")
 C_KEYWORDS = {
     "if", "else", "for", "while", "do", "switch", "case", "default", "break",
@@ -390,10 +399,18 @@ def score_struct_recovery(body: str) -> float:
     return _bounded(named, len(fields))
 
 
-# Call resolution: a call to `sub_XXXX`, `__indirect_call`, or `vfunc_*` is
-# unresolved; anything else (named function) is resolved.
+# Call resolution: a call to `sub_XXXX`, `__indirect_call`, `vfunc_*`, or
+# any opacity marker is unresolved; anything else (named function) is
+# resolved. Opacity markers (`__helix_opaque_va`, `__helix_zerod_va`,
+# `__helix_arg`) are intentional admissions of uncertainty — they MUST
+# count as unresolved here, otherwise the variadic-call mini-ISA would
+# silently inflate call_resolution by re-emitting `printk(0)` as
+# `printk(__helix_opaque_va())` (see feedback_validator_paralelo_a_isa.md).
 def score_call_resolution(body: str) -> float:
-    unresolved_re = re.compile(r"\b(?:sub_[0-9a-fA-F]+|__indirect_call|vfunc_0x[\dA-Fa-f]+)\s*\(")
+    unresolved_re = re.compile(
+        r"\b(?:sub_[0-9a-fA-F]+|__indirect_call|vfunc_0x[\dA-Fa-f]+"
+        r"|__helix_opaque_va|__helix_zerod_va|__helix_arg)\s*\("
+    )
     calls = [m for m in CALL_RE.finditer(body) if m.group("callee") not in C_KEYWORDS]
     if not calls:
         return 1.0

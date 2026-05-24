@@ -330,6 +330,36 @@ def HelixMid_CallOp : HelixMid_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Variadic Call (Wave 22 — variadic call mini-ISA)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+def HelixMid_VariadicCallOp : HelixMid_Op<"variadic_call",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Typed variadic-signature call";
+  let description = [{
+    Mid-dialect variant of `helix_mid.call` for variadic callees. Carries the
+    bundle from Low through type propagation without decomposition. Recovery
+    requires explicit proof via `helix_mid.bundle.recover` (added in later
+    Wave 22 steps).
+  }];
+
+  let arguments = (ins
+    UI64Attr:$callee_addr,
+    OptionalAttr<StrAttr>:$callee_name,
+    Variadic<AnyType>:$fixed_args,
+    HelixMid_BundleType:$raw_bundle,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let results = (outs Optional<AnyType>:$result);
+
+  let assemblyFormat = [{
+    ($callee_name^)? `target` $callee_addr `(` $fixed_args `)` `bundle` $raw_bundle
+    (`at` $address^)? attr-dict
+    `:` functional-type(operands, results)
+  }];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Control Flow Operations (region-based, structured)
 // ═══════════════════════════════════════════════════════════════════════════════
 

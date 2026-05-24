@@ -131,6 +131,32 @@ def HelixMid_FuncPtrType : HelixMid_Type<"FuncPtr", "fptr"> {
   let assemblyFormat = "`<` $returnType `,` `(` $paramTypes `)` `>`";
 }
 
+// ─── Variadic Bundle (Wave 22 — variadic call mini-ISA) ──────────────────────
+//
+// Mirror of HelixLow_BundleState / HelixLow_BundleType lifted into the Mid
+// dialect. Lowering Low→Mid converts !helix_low.bundle → !helix_mid.bundle
+// preserving the state. See HelixLowTypes.td for the rationale on the
+// `Zeroed` state (load-bearing for upstream-erased-args detection).
+def HelixMid_BundleState : I32EnumAttr<
+    "BundleState", "Variadic argument bundle recovery state (Mid)", [
+      I32EnumAttrCase<"Opaque",             0>,
+      I32EnumAttrCase<"PartiallyRecovered", 1>,
+      I32EnumAttrCase<"Recovered",          2>,
+      I32EnumAttrCase<"Zeroed",             3>,
+    ]> {
+  let cppNamespace = "::helix::mid";
+}
+
+def HelixMid_BundleType : HelixMid_Type<"Bundle", "bundle"> {
+  let summary = "Mid-dialect variadic argument bundle";
+  let description = [{
+    Carries a variadic call's raw argument bundle through the Mid dialect.
+    No generic Mid pass (DCE / CSE / type propagation / call resolution)
+    may decompose this type — recovery requires explicit proof attached
+    via `helix_mid.bundle.recover`.
+  }];
+}
+
 // ─── Variable Slot Kind ──────────────────────────────────────────────────────
 
 def HelixMid_SlotKind : I32EnumAttr<

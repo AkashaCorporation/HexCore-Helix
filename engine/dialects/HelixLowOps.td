@@ -277,6 +277,65 @@ def HelixLow_CallOp : HelixLow_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
   }];
 }
 
+// ─── Variadic Call ops (Wave 22 — variadic call mini-ISA) ────────────────────
+//
+// `bundle.create` is the producer of a !helix_low.bundle SSA value carrying
+// a recovery state. `variadic_call` consumes the bundle as a first-class
+// operand alongside the fixed args. The bundle MUST NOT be eliminated by
+// generic DCE — the per-pass whitelists added in Wave 22 Step 3 enforce this.
+
+def HelixLow_BundleCreateOp : HelixLow_Op<"bundle.create", [Pure]> {
+  let summary = "Materialize a variadic-call argument bundle with a state";
+  let description = [{
+    Produces a `!helix_low.bundle` value carrying a recovery state and an
+    optional provenance string. Lifters emit this at variadic call sites
+    BEFORE generic DCE runs, so the bundle survives even when its fixed-arg
+    siblings get folded away.
+  }];
+
+  let arguments = (ins
+    HelixLow_BundleState:$state,
+    OptionalAttr<StrAttr>:$provenance
+  );
+  let results = (outs HelixLow_BundleType:$bundle);
+
+  let assemblyFormat = [{
+    $state (`provenance` $provenance^)? attr-dict `:` type($bundle)
+  }];
+}
+
+def HelixLow_VariadicCallOp : HelixLow_Op<"variadic_call",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Call into a variadic-signature function";
+  let description = [{
+    Variant of `helix_low.call` for variadic callees (printk family, sprintf,
+    dev_err, pr_debug, kernel logging macros, etc.).
+
+    The `raw_bundle` operand is a first-class `!helix_low.bundle` value that
+    carries the recovery state of the variadic-arg portion. Generic passes
+    must NOT decompose, fold, or eliminate the bundle.
+
+    `fixed_args` carries the non-variadic arg prefix (e.g. the format
+    pointer for printk). It can be normalized freely by generic passes.
+  }];
+
+  let arguments = (ins
+    AnyInteger:$target_addr,
+    Variadic<AnyType>:$fixed_args,
+    HelixLow_BundleType:$raw_bundle,
+    OptionalAttr<StrAttr>:$target_name,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let results = (outs Optional<AnyInteger>:$result);
+
+  let assemblyFormat = [{
+    $target_addr (`name` $target_name^)? `(` $fixed_args `)` `bundle` $raw_bundle
+    (`at` $address^)? attr-dict
+    `:` type($target_addr) (`,` type($fixed_args)^)? `,` type($raw_bundle)
+    (`->` type($result)^)?
+  }];
+}
+
 def HelixLow_RetOp : HelixLow_Op<"ret", [Terminator]> {
   let summary = "Function return";
   let description = [{

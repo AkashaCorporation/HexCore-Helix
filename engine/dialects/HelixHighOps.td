@@ -221,6 +221,39 @@ def HelixHigh_CallOp : HelixHigh_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]
   }];
 }
 
+// ─── Variadic Call (Wave 22 — variadic call mini-ISA) ────────────────────────
+
+def HelixHigh_VariadicCallOp : HelixHigh_Op<"variadic_call",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Variadic-signature call with recovered fixed-arg prefix";
+  let description = [{
+    High-dialect variant of `helix_high.call` for variadic callees. The fixed
+    arg prefix (e.g. format string for printk) has been resolved; the
+    `raw_bundle` operand still carries the variadic tail with its recovery
+    state attached via the producer op (set in Low and preserved through
+    Mid→High lowering).
+
+    CAstBuilder reads the producer op's `state` to choose between concrete
+    args, `__helix_arg(i)`, `__helix_opaque_va()`, or
+    `__helix_opaque_va(/* upstream_zeroed */)`.
+  }];
+
+  let arguments = (ins
+    UI64Attr:$target_addr,
+    StrAttr:$target_name,
+    Variadic<AnyType>:$fixed_args,
+    HelixHigh_BundleType:$raw_bundle,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let results = (outs Optional<AnyType>:$result);
+
+  let assemblyFormat = [{
+    $target_name `(` $fixed_args `)` `bundle` $raw_bundle `target` $target_addr
+    (`at` $address^)? attr-dict
+    `:` functional-type(operands, results)
+  }];
+}
+
 def HelixHigh_SubscriptOp : HelixHigh_Op<"subscript", [Pure]> {
   let summary = "Array or pointer subscript: base[index]";
 
