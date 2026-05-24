@@ -18,6 +18,7 @@
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
 #include "helix/analysis/SignatureDb.h"
+#include "helix/utils/CallOpHelpers.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -94,7 +95,7 @@ static bool hasReturnRegisterWriteInBlock(
         if (isReturnRegisterWrite(*it))
             return true;
 
-        if (isa<helix::low::CallOp>(&*it))
+        if (helix::isAnyCallOp(&*it))
             return false;
     }
 
@@ -178,7 +179,7 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
         // (which includes every ABI arg register on both Win64 and SysV).
         // Drop the recorded state so we only collect args written by the
         // code between the previous call and this one.
-        if (isa<helix::low::CallOp>(&op)) {
+        if (helix::isAnyCallOp(&op)) {
             regState.clear();
             continue;
         }

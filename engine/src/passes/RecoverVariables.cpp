@@ -54,6 +54,7 @@
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
+#include "helix/utils/CallOpHelpers.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -214,8 +215,8 @@ struct VariableTracker {
             }
 
             // If we hit a call or branch, stop scanning.
-            if (isa<helix::low::CallOp, helix::low::JmpOp,
-                    helix::low::JccOp>(&*it))
+            if (helix::isAnyCallOp(&*it) ||
+                isa<helix::low::JmpOp, helix::low::JccOp>(&*it))
                 return false;
         }
 
@@ -1353,7 +1354,7 @@ private:
                 // as the target_addr operand of a low-level call are not
                 // "arguments" in the calling-convention sense, but we still
                 // flag them for the comment.
-                if (isa<helix::low::CallOp>(user)) {
+                if (helix::isAnyCallOp(user)) {
                     callsNeedingComment.insert(user);
                 }
             }
@@ -1788,7 +1789,7 @@ private:
             std::set<Block*> callBlocks;
             body.walk([&](Operation* op) {
                 if (isa<helix::high::CallOp>(op) ||
-                    isa<helix::low::CallOp>(op)) {
+                    helix::isAnyCallOp(op)) {
                     if (auto* blk = op->getBlock())
                         callBlocks.insert(blk);
                 }
@@ -2132,7 +2133,7 @@ private:
                 Value assignedVal = theAssign.getValue();
                 if (auto* defOp = assignedVal.getDefiningOp()) {
                     if (isa<helix::high::CallOp>(defOp) ||
-                        isa<helix::low::CallOp>(defOp))
+                        helix::isAnyCallOp(defOp))
                         continue;
                 }
 
