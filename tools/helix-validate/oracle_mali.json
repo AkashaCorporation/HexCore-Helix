@@ -1,0 +1,4174 @@
+{
+  "schema_version": 1,
+  "corpus": "mali_kbase (r54p3-00eac0)",
+  "helix_dir": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2",
+  "ida_dir": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep",
+  "dramko_labels": {
+    "C0_names": "identifier names",
+    "C1_struct_shape": "struct/deref shape",
+    "C2_extra_missing_code": "extra/missing code",
+    "C3_typecast": "missing/wrong typecast",
+    "C4_nonequiv_args": "non-equivalent call args",
+    "C5_extra_missing_var": "extra/missing variables",
+    "C6_literals": "literals (string lost / neg)",
+    "C7_control_flow": "control-flow shape",
+    "C8_global_var": "global variable reference",
+    "C9_hexrays_macros": "hex-rays/MSVC macros",
+    "C10_decompiler_macros": "sub-register macros",
+    "C11_mem_layout": "memory-layout abuse",
+    "C12_void_return": "lost return value/type",
+    "C13_composite_decomp": "composite var decomposition",
+    "C14_typedep_expr": "type-dependent wrong expr"
+  },
+  "functions": {
+    "kbase_jit_allocate": {
+      "function": "kbase_jit_allocate",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_jit_allocate.c",
+        "loc": 306,
+        "reported_confidence": null,
+        "return_type": "kbase_va_region *",
+        "params": [
+          [
+            "kbase_context *",
+            "kctx"
+          ],
+          [
+            "const base_jit_alloc_info *",
+            "info"
+          ],
+          [
+            "bool",
+            "ignore_pressure_limit"
+          ]
+        ],
+        "decls": [
+          [
+            "u8",
+            "jit_current_allocations"
+          ],
+          [
+            "u8",
+            "jit_max_allocations"
+          ],
+          [
+            "__u8",
+            "max_allocations"
+          ],
+          [
+            "const base_jit_alloc_info *",
+            "v8"
+          ],
+          [
+            "kbase_va_region *",
+            "reasonable_region"
+          ],
+          [
+            "list_head *",
+            "v11"
+          ],
+          [
+            "list_head *",
+            "prev"
+          ],
+          [
+            "list_head *",
+            "p_jit_active_head"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "gpu_alloc"
+          ],
+          [
+            "list_head *",
+            "p_evict_node"
+          ],
+          [
+            "list_head *",
+            "v17"
+          ],
+          [
+            "list_head *",
+            "v18"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v19"
+          ],
+          [
+            "size_t",
+            "commit_pages"
+          ],
+          [
+            "size_t",
+            "nents"
+          ],
+          [
+            "size_t",
+            "v22"
+          ],
+          [
+            "kbase_mem_pool *",
+            "v23"
+          ],
+          [
+            "size_t",
+            "v24"
+          ],
+          [
+            "size_t",
+            "v25"
+          ],
+          [
+            "size_t",
+            "v26"
+          ],
+          [
+            "size_t",
+            "v27"
+          ],
+          [
+            "list_head *",
+            "v28"
+          ],
+          [
+            "list_head *",
+            "v29"
+          ],
+          [
+            "list_head *",
+            "v30"
+          ],
+          [
+            "__int64",
+            "v31"
+          ],
+          [
+            "__int64",
+            "jit_group_id"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v33"
+          ],
+          [
+            "u64",
+            "v34"
+          ],
+          [
+            "tagged_addr *",
+            "v35"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "cpu_alloc"
+          ],
+          [
+            "kbase_device *",
+            "kbdev"
+          ],
+          [
+            "u8",
+            "bin_id"
+          ],
+          [
+            "list_head *",
+            "next"
+          ],
+          [
+            "tagged_addr *",
+            "v41"
+          ],
+          [
+            "const base_jit_alloc_info *",
+            "v42"
+          ],
+          [
+            "size_t",
+            "v43"
+          ],
+          [
+            "size_t",
+            "v44"
+          ],
+          [
+            "kbase_va_region *",
+            "v45"
+          ],
+          [
+            "u64",
+            "v46"
+          ],
+          [
+            "list_head *",
+            "p_jit_pool_head"
+          ],
+          [
+            "mutex *",
+            "p_jit_evict_lock"
+          ],
+          [
+            "list_head *",
+            "p_jit_node"
+          ],
+          [
+            "spinlock_t *",
+            "p_pool_lock"
+          ],
+          [
+            "list_head *",
+            "v51"
+          ],
+          [
+            "spinlock_t *",
+            "p_mem_partials_lock"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "flags"
+          ],
+          [
+            "u64",
+            "gpu_addr"
+          ],
+          [
+            "unsigned __int64",
+            "v56"
+          ]
+        ],
+        "callees": [
+          "BUG",
+          "LODWORD",
+          "dev_err",
+          "dev_info",
+          "down_read",
+          "fentry__",
+          "find_reasonable_region",
+          "kbase_alloc_phy_pages_helper_locked",
+          "kbase_free_phy_pages_helper_locked",
+          "kbase_is_page_migration_enabled",
+          "kbase_mem_alloc",
+          "kbase_mem_evictable_unmake",
+          "kbase_mem_grow_gpu_mapping",
+          "kbase_mem_pool_grow",
+          "kbase_set_phy_alloc_page_status",
+          "kbase_tlstream_jit_alloc",
+          "kfree",
+          "list_add_valid_or_report",
+          "list_del_entry_valid_or_report",
+          "mutex_lock",
+          "mutex_unlock",
+          "raw_spin_lock",
+          "raw_spin_unlock",
+          "readgsqword",
+          "trace_jit_stats",
+          "up_read"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "__readgsqword",
+          "down_read",
+          "mutex_lock",
+          "mutex_lock",
+          "find_reasonable_region",
+          "find_reasonable_region",
+          "mutex_unlock",
+          "mutex_unlock",
+          "up_read",
+          "kbase_mem_alloc",
+          "mutex_lock",
+          "_list_add_valid_or_report",
+          "mutex_unlock",
+          "BUG",
+          "_list_del_entry_valid_or_report",
+          "_list_add_valid_or_report",
+          "BUG",
+          "_list_del_entry_valid_or_report",
+          "mutex_unlock",
+          "kbase_mem_evictable_unmake",
+          "raw_spin_lock",
+          "raw_spin_lock",
+          "raw_spin_unlock",
+          "raw_spin_unlock",
+          "mutex_unlock",
+          "LODWORD",
+          "kbase_mem_pool_grow",
+          "mutex_lock",
+          "raw_spin_lock",
+          "raw_spin_lock",
+          "raw_spin_unlock",
+          "raw_spin_unlock",
+          "dev_info",
+          "mutex_unlock",
+          "up_read",
+          "kbase_is_page_migration_enabled",
+          "mutex_lock",
+          "mutex_lock",
+          "kbase_set_phy_alloc_page_status",
+          "mutex_unlock",
+          "mutex_unlock",
+          "mutex_lock",
+          "_kbase_tlstream_jit_alloc",
+          "trace_jit_stats",
+          "mutex_unlock",
+          "mutex_unlock",
+          "dev_err",
+          "kbase_alloc_phy_pages_helper_locked",
+          "raw_spin_unlock",
+          "raw_spin_unlock",
+          "kbase_alloc_phy_pages_helper_locked",
+          "kbase_free_phy_pages_helper_locked",
+          "raw_spin_unlock",
+          "raw_spin_unlock",
+          "kbase_mem_grow_gpu_mapping",
+          "mutex_unlock",
+          "up_read",
+          "mutex_lock",
+          "_list_del_entry_valid_or_report",
+          "_list_add_valid_or_report",
+          "mutex_unlock",
+          "kfree",
+          "kfree"
+        ],
+        "named_field_count": 129,
+        "raw_field_count": 0,
+        "string_literals": [
+          "\"JIT alloc grown beyond the required number of initially required pages, this grow no longer needed.\"",
+          "\"JIT region has no_user_free_count > 1!\\n\""
+        ],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 2,
+        "decomp_macros": 1,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 6,
+        "suspicious_self_ref": 14,
+        "log_calls_with_string": 2,
+        "log_calls_lost_string": 0,
+        "if_count": 29,
+        "else_count": 1,
+        "goto_count": 10,
+        "return_count": 3,
+        "loop_count": 1,
+        "is_stub": false,
+        "placeholder_id_rate": 0.20430107526881722
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_jit_allocate.helix.c",
+        "loc": 182,
+        "reported_confidence": 35.3,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "int64_t",
+            "param_1"
+          ],
+          [
+            "int16_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ],
+          [
+            "int64_t",
+            "param_5"
+          ],
+          [
+            "int64_t",
+            "param_6"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "lock"
+          ],
+          [
+            "int64_t",
+            "lock_2"
+          ],
+          [
+            "int64_t",
+            "v5"
+          ],
+          [
+            "int64_t",
+            "region"
+          ],
+          [
+            "int64_t",
+            "v7"
+          ],
+          [
+            "int64_t",
+            "v8"
+          ],
+          [
+            "int64_t",
+            "v10"
+          ],
+          [
+            "int64_t",
+            "v16"
+          ],
+          [
+            "int64_t",
+            "v17"
+          ],
+          [
+            "int64_t",
+            "v18"
+          ]
+        ],
+        "callees": [
+          "atomic_test_and_set",
+          "dev_err",
+          "dev_info",
+          "down_read",
+          "kbase_alloc_phy_pages_helper_locked",
+          "kbase_free_phy_pages_helper_locked",
+          "kbase_is_page_migration_enabled",
+          "kbase_mem_alloc",
+          "kbase_mem_evictable_unmake",
+          "kbase_mem_grow_gpu_mapping",
+          "kbase_set_phy_alloc_page_status",
+          "kbase_tlstream_jit_alloc",
+          "kfree",
+          "list_add_valid_or_report",
+          "list_del_entry_valid_or_report",
+          "mutex_lock",
+          "mutex_unlock",
+          "raw_spin_lock",
+          "raw_spin_unlock",
+          "stack_chk_fail",
+          "sub_310",
+          "sub_b90",
+          "up_read"
+        ],
+        "callees_raw": [
+          "down_read",
+          "mutex_lock",
+          "mutex_lock",
+          "sub_310",
+          "sub_310",
+          "__list_del_entry_valid_or_report",
+          "__list_add_valid_or_report",
+          "__list_del_entry_valid_or_report",
+          "mutex_unlock",
+          "kbase_mem_evictable_unmake",
+          "mutex_unlock",
+          "up_read",
+          "_raw_spin_lock",
+          "_raw_spin_lock",
+          "mutex_unlock",
+          "up_read",
+          "kbase_is_page_migration_enabled",
+          "mutex_lock",
+          "__list_del_entry_valid_or_report",
+          "__list_add_valid_or_report",
+          "mutex_unlock",
+          "mutex_unlock",
+          "mutex_unlock",
+          "up_read",
+          "kbase_mem_alloc",
+          "kbase_alloc_phy_pages_helper_locked",
+          "kbase_alloc_phy_pages_helper_locked",
+          "_raw_spin_unlock",
+          "_raw_spin_unlock",
+          "kbase_mem_grow_gpu_mapping",
+          "mutex_lock",
+          "sub_b90",
+          "atomic_test_and_set",
+          "mutex_unlock",
+          "kfree",
+          "kfree",
+          "_raw_spin_unlock",
+          "_raw_spin_unlock",
+          "_dev_info",
+          "__kbase_tlstream_jit_alloc",
+          "mutex_lock",
+          "mutex_lock",
+          "kbase_set_phy_alloc_page_status",
+          "mutex_unlock",
+          "mutex_unlock",
+          "mutex_unlock",
+          "_dev_err",
+          "mutex_lock",
+          "__list_add_valid_or_report",
+          "mutex_unlock",
+          "__stack_chk_fail",
+          "kbase_free_phy_pages_helper_locked",
+          "_raw_spin_unlock",
+          "_raw_spin_unlock"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 59,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 24,
+        "suspicious_self_ref": 4,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 2,
+        "if_count": 12,
+        "else_count": 6,
+        "goto_count": 0,
+        "return_count": 5,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.5829268292682926
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 38,
+          "note": "helix placeholder 58% vs ida 20%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 59,
+          "note": "helix 59 raw fields; ida 129 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 24,
+          "note": "24 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 30,
+          "note": "ida recovered 30 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 4,
+          "note": "arity mismatch on: kbase_is_page_migration_enabled, kbase_mem_alloc, list_add_valid_or_report, raw_spin_lock"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 37,
+          "note": "helix 11 decls vs ida 48"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 2,
+          "note": "helix lost 2 fmt strings; ida kept 2"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 2 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 1 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no gsbase abuse"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": true,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 4,
+          "note": "4 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 182,
+        "loc_ida": 306,
+        "loc_ratio": 0.595,
+        "call_jaccard_distance": 0.367,
+        "ida_calls_recovered": 0.731,
+        "if_delta": -17,
+        "return_delta": 2,
+        "call_delta": -10,
+        "var_delta": -37
+      }
+    },
+    "kbase_mem_alloc": {
+      "function": "kbase_mem_alloc",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_mem_alloc.c",
+        "loc": 348,
+        "reported_confidence": null,
+        "return_type": "kbase_va_region *",
+        "params": [
+          [
+            "kbase_context *",
+            "kctx"
+          ],
+          [
+            "u64",
+            "va_pages"
+          ],
+          [
+            "u64",
+            "commit_pages"
+          ],
+          [
+            "u64",
+            "extension"
+          ],
+          [
+            "base_mem_alloc_flags *",
+            "flags"
+          ],
+          [
+            "u64 *",
+            "gpu_va"
+          ],
+          [
+            "kbase_caller_mmu_sync_info",
+            "mmu_sync_info"
+          ]
+        ],
+        "decls": [
+          [
+            "unsigned __int64 *",
+            "v7"
+          ],
+          [
+            "u64 *",
+            "v8"
+          ],
+          [
+            "u64 *",
+            "v9"
+          ],
+          [
+            "u64",
+            "v10"
+          ],
+          [
+            "u64",
+            "v11"
+          ],
+          [
+            "unsigned __int64 *",
+            "v12"
+          ],
+          [
+            "u64",
+            "v13"
+          ],
+          [
+            "unsigned __int64",
+            "v14"
+          ],
+          [
+            "unsigned __int64",
+            "v16"
+          ],
+          [
+            "unsigned __int64",
+            "v17"
+          ],
+          [
+            "unsigned int",
+            "v18"
+          ],
+          [
+            "kbase_va_region *",
+            "v19"
+          ],
+          [
+            "kbase_va_region *",
+            "v20"
+          ],
+          [
+            "unsigned __int64",
+            "v21"
+          ],
+          [
+            "size_t",
+            "nr_pages"
+          ],
+          [
+            "unsigned __int64",
+            "v23"
+          ],
+          [
+            "volatile signed __int32 *",
+            "p_counter"
+          ],
+          [
+            "signed __int32",
+            "v26"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v27"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "gpu_alloc"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v29"
+          ],
+          [
+            "unsigned __int64",
+            "v30"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v31"
+          ],
+          [
+            "u64 *",
+            "p_rb_parent_color"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v33"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v34"
+          ],
+          [
+            "__int64",
+            "v37"
+          ],
+          [
+            "kbase_device *",
+            "kbdev"
+          ],
+          [
+            "unsigned __int64",
+            "v39"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v40"
+          ],
+          [
+            "kbase_vmap_struct *",
+            "v41"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v42"
+          ],
+          [
+            "bool",
+            "is_large_pages_enabled"
+          ],
+          [
+            "u64",
+            "v44"
+          ],
+          [
+            "size_t",
+            "v45"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v46"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v48"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "cpu_alloc"
+          ],
+          [
+            "kbase_vmap_struct *",
+            "v53"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v54"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v55"
+          ],
+          [
+            "u64",
+            "v56"
+          ],
+          [
+            "device *",
+            "dev"
+          ]
+        ],
+        "callees": [
+          "BUG",
+          "BYTE1",
+          "InterlockedExchangeAdd",
+          "InterlockedIncrement64",
+          "bittestandreset64",
+          "dev_err",
+          "dev_warn",
+          "fentry__",
+          "kbase_alloc_create",
+          "kbase_alloc_phy_pages",
+          "kbase_check_alloc_flags",
+          "kbase_check_alloc_sizes",
+          "kbase_ctx_alloc_free_region",
+          "kbase_gpu_mmap",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_has_exec_va_zone",
+          "kbase_is_large_pages_enabled",
+          "kbase_mem_kref_free",
+          "kbase_tlstream_region_alloc",
+          "kbase_update_region_flags",
+          "kbase_vmap_phy_pages",
+          "kfree",
+          "kmalloc_trace",
+          "mutex_lock",
+          "mutex_unlock",
+          "refcount_warn_saturate"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "kbase_check_alloc_flags",
+          "dev_warn",
+          "BYTE1",
+          "BYTE1",
+          "dev_warn",
+          "dev_warn",
+          "kbase_check_alloc_sizes",
+          "kbase_has_exec_va_zone",
+          "kbase_ctx_alloc_free_region",
+          "dev_err",
+          "kbase_update_region_flags",
+          "kbase_alloc_create",
+          "kbase_alloc_create",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "dev_err",
+          "kfree",
+          "_InterlockedExchangeAdd",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "mutex_lock",
+          "mutex_unlock",
+          "BYTE1",
+          "BYTE1",
+          "kbase_alloc_phy_pages",
+          "dev_warn",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kmalloc_trace",
+          "kbase_vmap_phy_pages",
+          "kfree",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "_bittestandreset64",
+          "BUG",
+          "dev_err",
+          "kbase_is_large_pages_enabled",
+          "kbase_gpu_mmap",
+          "dev_warn",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "_InterlockedIncrement64",
+          "_InterlockedIncrement64",
+          "_kbase_tlstream_region_alloc"
+        ],
+        "named_field_count": 64,
+        "raw_field_count": 0,
+        "string_literals": [
+          "\"kbase_mem_alloc\"",
+          "\"kbase_mem_alloc\"",
+          "\"Failed to prepare region\"",
+          "\"Failed to map memory on GPU\"",
+          "\"Failed to map memory on GPU\"",
+          "\"Failed to map memory on GPU\""
+        ],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 8,
+        "decomp_macros": 4,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 19,
+        "suspicious_self_ref": 5,
+        "log_calls_with_string": 8,
+        "log_calls_lost_string": 0,
+        "if_count": 48,
+        "else_count": 6,
+        "goto_count": 16,
+        "return_count": 6,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.3967741935483871
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_mem_alloc.helix.c",
+        "loc": 165,
+        "reported_confidence": 42.3,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "void*",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ],
+          [
+            "int64_t",
+            "param_5"
+          ],
+          [
+            "int64_t",
+            "param_6"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v2"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ],
+          [
+            "bool",
+            "v7"
+          ],
+          [
+            "int64_t",
+            "v9"
+          ],
+          [
+            "int64_t",
+            "v11"
+          ],
+          [
+            "int64_t",
+            "v13"
+          ],
+          [
+            "int64_t",
+            "v14"
+          ],
+          [
+            "int64_t",
+            "v15"
+          ],
+          [
+            "int64_t",
+            "v16"
+          ],
+          [
+            "int64_t",
+            "v17"
+          ],
+          [
+            "int64_t",
+            "v18"
+          ],
+          [
+            "int64_t",
+            "v19"
+          ],
+          [
+            "int64_t",
+            "v22"
+          ],
+          [
+            "int64_t",
+            "v23"
+          ],
+          [
+            "int64_t",
+            "v24"
+          ],
+          [
+            "int64_t",
+            "v25"
+          ],
+          [
+            "int64_t",
+            "v26"
+          ],
+          [
+            "int64_t",
+            "v27"
+          ],
+          [
+            "int64_t",
+            "v28"
+          ],
+          [
+            "int64_t",
+            "v29"
+          ]
+        ],
+        "callees": [
+          "add_with_carry",
+          "atomic_fetch_add",
+          "atomic_test_and_reset",
+          "count_trailing_zeros",
+          "dev_err",
+          "dev_warn",
+          "dynamic_dev_dbg",
+          "kbase_alloc_phy_pages",
+          "kbase_check_alloc_flags",
+          "kbase_check_alloc_sizes",
+          "kbase_ctx_alloc_free_region",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_has_exec_va_zone",
+          "kbase_is_large_pages_enabled",
+          "kbase_mem_kref_free",
+          "kbase_tlstream_region_alloc",
+          "kbase_update_region_flags",
+          "kfree",
+          "kmalloc_caches",
+          "kmalloc_trace",
+          "mutex_lock",
+          "mutex_unlock",
+          "refcount_warn_saturate",
+          "sub_139f0",
+          "sub_142a0"
+        ],
+        "callees_raw": [
+          "kbase_check_alloc_flags",
+          "kbase_check_alloc_sizes",
+          "kbase_ctx_alloc_free_region",
+          "add_with_carry",
+          "kbase_update_region_flags",
+          "sub_142a0",
+          "atomic_fetch_add",
+          "sub_142a0",
+          "_dev_warn",
+          "__dynamic_dev_dbg",
+          "mutex_lock",
+          "mutex_unlock",
+          "kbase_alloc_phy_pages",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "count_trailing_zeros",
+          "atomic_test_and_reset",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "__kbase_tlstream_region_alloc",
+          "kbase_mem_kref_free",
+          "kfree",
+          "kbase_has_exec_va_zone",
+          "_dev_warn",
+          "_dev_warn",
+          "kmalloc_trace",
+          "sub_139f0",
+          "kbase_is_large_pages_enabled",
+          "kmalloc_caches",
+          "refcount_warn_saturate",
+          "_dev_warn",
+          "atomic_fetch_add",
+          "atomic_fetch_add",
+          "refcount_warn_saturate",
+          "_dev_err",
+          "refcount_warn_saturate",
+          "_dev_err",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_kref_free",
+          "kbase_mem_kref_free",
+          "_dev_err",
+          "kfree",
+          "refcount_warn_saturate",
+          "_dev_warn",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "atomic_fetch_add",
+          "refcount_warn_saturate"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 36,
+        "string_literals": [],
+        "raw_addr_derefs": 2,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 1,
+        "unreachable_after_return": 4,
+        "suspicious_self_ref": 2,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 8,
+        "if_count": 14,
+        "else_count": 1,
+        "goto_count": 0,
+        "return_count": 6,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.7710843373493976
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 37,
+          "note": "helix placeholder 77% vs ida 40%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 36,
+          "note": "helix 36 raw fields; ida 64 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 4,
+          "note": "4 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 17,
+          "note": "ida recovered 17 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 14,
+          "note": "arity mismatch on: dev_err, dev_warn, kbase_alloc_phy_pages, kbase_check_alloc_flags"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 23,
+          "note": "helix 20 decls vs ida 43"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 8,
+          "note": "helix lost 8 fmt strings; ida kept 8"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 1,
+          "note": "1 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 2,
+          "note": "2 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 8 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 4 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no gsbase abuse"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": true,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 2,
+          "note": "2 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 165,
+        "loc_ida": 348,
+        "loc_ratio": 0.474,
+        "call_jaccard_distance": 0.486,
+        "ida_calls_recovered": 0.667,
+        "if_delta": -34,
+        "return_delta": 0,
+        "call_delta": -5,
+        "var_delta": -23
+      }
+    },
+    "kbase_mem_free": {
+      "function": "kbase_mem_free",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_mem_free.c",
+        "loc": 76,
+        "reported_confidence": null,
+        "return_type": "__int64",
+        "params": [
+          [
+            "kbase_context *",
+            "kctx"
+          ],
+          [
+            "u64",
+            "gpu_addr"
+          ]
+        ],
+        "decls": [
+          [
+            "kbase_device *",
+            "kbdev"
+          ],
+          [
+            "mutex *",
+            "p_reg_lock"
+          ],
+          [
+            "kbase_va_region *",
+            "region_base_address"
+          ],
+          [
+            "unsigned __int64",
+            "flags"
+          ],
+          [
+            "unsigned int",
+            "v8"
+          ],
+          [
+            "unsigned __int64",
+            "v9"
+          ],
+          [
+            "__int64",
+            "v10"
+          ],
+          [
+            "kbase_va_region *",
+            "v11"
+          ],
+          [
+            "kbase_va_region *",
+            "v13"
+          ],
+          [
+            "u64",
+            "v14"
+          ]
+        ],
+        "callees": [
+          "bittestandset64",
+          "dev_warn",
+          "down_read",
+          "fentry__",
+          "kbase_bits_to_zone",
+          "kbase_free_alloced_region",
+          "kbase_mem_free_region",
+          "kbase_region_tracker_find_region_base_address",
+          "mutex_lock",
+          "mutex_unlock",
+          "up_read"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "down_read",
+          "mutex_lock",
+          "kbase_region_tracker_find_region_base_address",
+          "kbase_bits_to_zone",
+          "kbase_mem_free_region",
+          "dev_warn",
+          "dev_warn",
+          "dev_warn",
+          "dev_warn",
+          "down_read",
+          "mutex_lock",
+          "_bittestandset64",
+          "kbase_free_alloced_region",
+          "mutex_unlock",
+          "up_read"
+        ],
+        "named_field_count": 19,
+        "raw_field_count": 0,
+        "string_literals": [
+          "\"kbase_mem_free\"",
+          "\"kbase_mem_free\"",
+          "\"kbase_mem_free\"",
+          "\"kbase_mem_free\""
+        ],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 2,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 1,
+        "log_calls_with_string": 4,
+        "log_calls_lost_string": 0,
+        "if_count": 7,
+        "else_count": 3,
+        "goto_count": 2,
+        "return_count": 3,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.18115942028985507
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_mem_free.helix.c",
+        "loc": 46,
+        "reported_confidence": 49.5,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "int64_t",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "lock"
+          ],
+          [
+            "int64_t",
+            "v2"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ],
+          [
+            "int64_t",
+            "v9"
+          ],
+          [
+            "int64_t",
+            "v10"
+          ],
+          [
+            "int64_t",
+            "v11"
+          ],
+          [
+            "int64_t",
+            "v12"
+          ],
+          [
+            "int64_t",
+            "result"
+          ]
+        ],
+        "callees": [
+          "atomic_test_and_set",
+          "dev_warn",
+          "down_read",
+          "kbase_bits_to_zone",
+          "kbase_free_alloced_region",
+          "kbase_mem_free_region",
+          "kbase_region_tracker_find_region_base_address",
+          "mutex_lock",
+          "mutex_unlock",
+          "up_read"
+        ],
+        "callees_raw": [
+          "down_read",
+          "mutex_lock",
+          "kbase_region_tracker_find_region_base_address",
+          "_dev_warn",
+          "down_read",
+          "mutex_lock",
+          "atomic_test_and_set",
+          "kbase_free_alloced_region",
+          "mutex_unlock",
+          "up_read",
+          "kbase_bits_to_zone",
+          "kbase_mem_free_region",
+          "kbase_mem_free_region",
+          "_dev_warn",
+          "_dev_warn",
+          "_dev_warn"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 9,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 22,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 4,
+        "if_count": 1,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 3,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.6785714285714286
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 50,
+          "note": "helix placeholder 68% vs ida 18%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 9,
+          "note": "helix 9 raw fields; ida 19 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 22,
+          "note": "22 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 5,
+          "note": "ida recovered 5 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 1,
+          "note": "arity mismatch on: kbase_bits_to_zone"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 2,
+          "note": "helix 8 decls vs ida 10"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 4,
+          "note": "helix lost 4 fmt strings; ida kept 4"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 2 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 0 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no gsbase abuse"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 46,
+        "loc_ida": 76,
+        "loc_ratio": 0.605,
+        "call_jaccard_distance": 0.25,
+        "ida_calls_recovered": 0.818,
+        "if_delta": -6,
+        "return_delta": 0,
+        "call_delta": 0,
+        "var_delta": -2
+      }
+    },
+    "kbase_mem_import": {
+      "function": "kbase_mem_import",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_mem_import.c",
+        "loc": 508,
+        "reported_confidence": null,
+        "return_type": "__int64",
+        "params": [
+          [
+            "kbase_context *",
+            "kctx"
+          ],
+          [
+            "__int64",
+            "type"
+          ],
+          [
+            "void *",
+            "phandle"
+          ],
+          [
+            "u32",
+            "padding"
+          ],
+          [
+            "u64 *",
+            "gpu_va"
+          ],
+          [
+            "u64 *",
+            "va_pages"
+          ],
+          [
+            "base_mem_alloc_flags *",
+            "flags"
+          ]
+        ],
+        "decls": [
+          [
+            "size_t *",
+            "v8"
+          ],
+          [
+            "size_t *",
+            "v9"
+          ],
+          [
+            "__int64 *",
+            "v10"
+          ],
+          [
+            "__int64 *",
+            "v11"
+          ],
+          [
+            "__int64",
+            "v12"
+          ],
+          [
+            "unsigned int",
+            "v13"
+          ],
+          [
+            "unsigned __int64",
+            "v15"
+          ],
+          [
+            "bool",
+            "v16"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v17"
+          ],
+          [
+            "kbase_device *",
+            "kbdev"
+          ],
+          [
+            "__int64",
+            "result"
+          ],
+          [
+            "unsigned int",
+            "v20"
+          ],
+          [
+            "unsigned __int64",
+            "v21"
+          ],
+          [
+            "unsigned __int64",
+            "v22"
+          ],
+          [
+            "unsigned __int64",
+            "v23"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v24"
+          ],
+          [
+            "memory_group_manager_device *",
+            "mgm_dev"
+          ],
+          [
+            "bool",
+            "v27"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v28"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v29"
+          ],
+          [
+            "bool",
+            "v30"
+          ],
+          [
+            "unsigned int",
+            "v31"
+          ],
+          [
+            "kbase_va_region *",
+            "v32"
+          ],
+          [
+            "memory_group_manager_device *",
+            "v33"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v35"
+          ],
+          [
+            "signed __int32",
+            "v36"
+          ],
+          [
+            "u64 *",
+            "p_rb_parent_color"
+          ],
+          [
+            "unsigned __int64",
+            "v38"
+          ],
+          [
+            "unsigned __int64",
+            "v39"
+          ],
+          [
+            "__int64",
+            "v40"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "gpu_alloc"
+          ],
+          [
+            "__int64",
+            "v44"
+          ],
+          [
+            "__u64",
+            "ptr"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v46"
+          ],
+          [
+            "kbase_device *",
+            "v47"
+          ],
+          [
+            "__int64",
+            "v48"
+          ],
+          [
+            "unsigned __int64",
+            "v49"
+          ],
+          [
+            "unsigned __int64",
+            "v50"
+          ],
+          [
+            "base_mem_alloc_flags",
+            "v51"
+          ],
+          [
+            "bool",
+            "v52"
+          ],
+          [
+            "__u64",
+            "v53"
+          ],
+          [
+            "unsigned int",
+            "v54"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v55"
+          ],
+          [
+            "signed __int32",
+            "v56"
+          ],
+          [
+            "u64",
+            "v57"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v58"
+          ],
+          [
+            "unsigned __int64",
+            "v59"
+          ],
+          [
+            "mm_struct *",
+            "v60"
+          ],
+          [
+            "size_t",
+            "v61"
+          ],
+          [
+            "__int64",
+            "v62"
+          ],
+          [
+            "u64",
+            "v63"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v64"
+          ],
+          [
+            "unsigned __int64",
+            "v65"
+          ],
+          [
+            "unsigned __int64",
+            "v66"
+          ],
+          [
+            "size_t",
+            "v67"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v68"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v70"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v72"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "cpu_alloc"
+          ],
+          [
+            "unsigned __int64",
+            "v77"
+          ],
+          [
+            "u64",
+            "v79"
+          ],
+          [
+            "u64",
+            "v80"
+          ],
+          [
+            "u64",
+            "v81"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v82"
+          ],
+          [
+            "u64",
+            "v83"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v84"
+          ],
+          [
+            "__int64",
+            "v85"
+          ],
+          [
+            "_QWORD *",
+            "v86"
+          ],
+          [
+            "__u64",
+            "v87"
+          ],
+          [
+            "__u64",
+            "v88"
+          ],
+          [
+            "u64",
+            "v89"
+          ],
+          [
+            "unsigned __int64",
+            "v90"
+          ],
+          [
+            "unsigned __int64",
+            "v91"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v92"
+          ],
+          [
+            "volatile signed __int32 *",
+            "v93"
+          ],
+          [
+            "unsigned int",
+            "v94"
+          ],
+          [
+            "__u64",
+            "length"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v96"
+          ],
+          [
+            "__int64",
+            "user_pages"
+          ],
+          [
+            "base_mem_import_user_buffer",
+            "user_buffer"
+          ],
+          [
+            "unsigned __int64",
+            "v100"
+          ]
+        ],
+        "callees": [
+          "BUG",
+          "BYTE1",
+          "InterlockedExchangeAdd",
+          "InterlockedIncrement",
+          "LOBYTE",
+          "LODWORD",
+          "bittestandreset64",
+          "copy_from_user",
+          "dev_warn",
+          "dma_buf_attach",
+          "dma_buf_detach",
+          "dma_buf_get",
+          "dma_buf_put",
+          "down_read",
+          "fentry__",
+          "get_user_4",
+          "get_user_pages",
+          "kbase_add_va_region",
+          "kbase_alloc_create",
+          "kbase_check_import_flags",
+          "kbase_ctx_alloc_free_region",
+          "kbase_ctx_compat_mode",
+          "kbase_gpu_mmap",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_kref_free",
+          "kbase_mem_umm_map_attachment",
+          "kbase_update_region_flags",
+          "kbase_user_buf_empty_init",
+          "kfree",
+          "kmalloc",
+          "mgm_get_import_memory_cached_access_permitted",
+          "mgm_get_import_memory_id",
+          "readgsqword",
+          "refcount_warn_saturate",
+          "up_read",
+          "vmalloc"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "__readgsqword",
+          "kbase_check_import_flags",
+          "dev_warn",
+          "BYTE1",
+          "BYTE1",
+          "dev_warn",
+          "dev_warn",
+          "dev_warn",
+          "_get_user_4",
+          "dma_buf_get",
+          "dma_buf_attach",
+          "dma_buf_put",
+          "BYTE1",
+          "BYTE1",
+          "LODWORD",
+          "mgm_get_import_memory_cached_access_permitted",
+          "BYTE1",
+          "BYTE1",
+          "BYTE1",
+          "BYTE1",
+          "BYTE1",
+          "kbase_ctx_compat_mode",
+          "kbase_ctx_alloc_free_region",
+          "LODWORD",
+          "LOBYTE",
+          "mgm_get_import_memory_id",
+          "kbase_alloc_create",
+          "_InterlockedExchangeAdd",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "kbase_update_region_flags",
+          "kbase_mem_umm_map_attachment",
+          "dev_warn",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "kfree",
+          "dma_buf_detach",
+          "dma_buf_put",
+          "copy_from_user",
+          "LODWORD",
+          "LODWORD",
+          "dev_warn",
+          "dev_warn",
+          "BYTE1",
+          "BYTE1",
+          "BYTE1",
+          "kbase_ctx_compat_mode",
+          "kbase_ctx_compat_mode",
+          "kbase_ctx_alloc_free_region",
+          "kbase_alloc_create",
+          "kfree",
+          "_InterlockedExchangeAdd",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "kbase_update_region_flags",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "_InterlockedExchangeAdd",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "__readgsqword",
+          "kbase_user_buf_empty_init",
+          "_InterlockedIncrement",
+          "vmalloc",
+          "_kmalloc",
+          "__readgsqword",
+          "down_read",
+          "get_user_pages",
+          "up_read",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "_bittestandreset64",
+          "BUG",
+          "kbase_add_va_region",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_mmap",
+          "kbase_gpu_vm_unlock_with_pmode_sync"
+        ],
+        "named_field_count": 87,
+        "raw_field_count": 0,
+        "string_literals": [
+          "\"kbase_mem_import\"",
+          "\"kbase_mem_import\""
+        ],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 12,
+        "decomp_macros": 17,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 10,
+        "log_calls_with_string": 7,
+        "log_calls_lost_string": 0,
+        "if_count": 60,
+        "else_count": 9,
+        "goto_count": 29,
+        "return_count": 2,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.45054945054945056
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_mem_import.helix.c",
+        "loc": 242,
+        "reported_confidence": 15.8,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "void*",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ],
+          [
+            "int64_t",
+            "param_5"
+          ],
+          [
+            "int64_t",
+            "param_6"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ],
+          [
+            "int64_t",
+            "v8"
+          ],
+          [
+            "int64_t",
+            "v10"
+          ],
+          [
+            "bool",
+            "v12"
+          ],
+          [
+            "int64_t",
+            "v4"
+          ],
+          [
+            "int64_t",
+            "v15"
+          ],
+          [
+            "int64_t",
+            "v16"
+          ],
+          [
+            "int64_t",
+            "v18"
+          ],
+          [
+            "int64_t",
+            "v20"
+          ],
+          [
+            "int64_t",
+            "v21"
+          ],
+          [
+            "int64_t",
+            "v22"
+          ],
+          [
+            "int64_t",
+            "v23"
+          ],
+          [
+            "int64_t",
+            "v24"
+          ],
+          [
+            "int64_t",
+            "v25"
+          ],
+          [
+            "int64_t",
+            "v28"
+          ],
+          [
+            "int64_t",
+            "v29"
+          ],
+          [
+            "int64_t",
+            "v31"
+          ],
+          [
+            "int64_t",
+            "v32"
+          ],
+          [
+            "int64_t",
+            "v33"
+          ],
+          [
+            "int64_t",
+            "v34"
+          ],
+          [
+            "int64_t",
+            "v35"
+          ],
+          [
+            "int64_t",
+            "v36"
+          ],
+          [
+            "int64_t",
+            "v37"
+          ],
+          [
+            "int64_t",
+            "v38"
+          ],
+          [
+            "int64_t",
+            "v39"
+          ],
+          [
+            "int64_t",
+            "v40"
+          ],
+          [
+            "int64_t",
+            "v41"
+          ],
+          [
+            "int64_t",
+            "v42"
+          ],
+          [
+            "int64_t",
+            "v43"
+          ],
+          [
+            "int64_t",
+            "v44"
+          ],
+          [
+            "int64_t",
+            "v45"
+          ],
+          [
+            "int64_t",
+            "v46"
+          ],
+          [
+            "int64_t",
+            "v47"
+          ]
+        ],
+        "callees": [
+          "atomic_fetch_add",
+          "atomic_test_and_reset",
+          "copy_from_user",
+          "count_trailing_zeros",
+          "dev_warn",
+          "dma_buf_attach",
+          "dma_buf_detach",
+          "dma_buf_get",
+          "dma_buf_put",
+          "down_read",
+          "get_user_4",
+          "get_user_pages",
+          "kbase_add_va_region",
+          "kbase_check_import_flags",
+          "kbase_ctx_alloc_free_region",
+          "kbase_ctx_compat_mode",
+          "kbase_gpu_mmap",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_kref_free",
+          "kbase_update_region_flags",
+          "kbase_user_buf_empty_init",
+          "kfree",
+          "kmalloc",
+          "refcount_warn_saturate",
+          "stack_chk_fail",
+          "sub_10050",
+          "sub_142a0",
+          "sub_14e9f",
+          "sub_14f20",
+          "up_read",
+          "vmalloc"
+        ],
+        "callees_raw": [
+          "kbase_check_import_flags",
+          "_dev_warn",
+          "_dev_warn",
+          "__get_user_4",
+          "dma_buf_get",
+          "dma_buf_attach",
+          "sub_14e9f",
+          "kbase_ctx_compat_mode",
+          "kbase_ctx_alloc_free_region",
+          "sub_14f20",
+          "sub_142a0",
+          "atomic_fetch_add",
+          "kbase_update_region_flags",
+          "sub_10050",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "count_trailing_zeros",
+          "atomic_test_and_reset",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "_copy_from_user",
+          "kbase_ctx_compat_mode",
+          "kbase_ctx_alloc_free_region",
+          "sub_142a0",
+          "atomic_fetch_add",
+          "kbase_update_region_flags",
+          "kbase_user_buf_empty_init",
+          "vmalloc",
+          "down_read",
+          "get_user_pages",
+          "up_read",
+          "kbase_mem_kref_free",
+          "kfree",
+          "dma_buf_detach",
+          "dma_buf_put",
+          "kbase_ctx_compat_mode",
+          "kbase_gpu_mmap",
+          "kbase_add_va_region",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "atomic_fetch_add",
+          "atomic_fetch_add",
+          "kfree",
+          "dma_buf_put",
+          "__kmalloc",
+          "_dev_warn",
+          "kbase_mem_kref_free",
+          "kbase_mem_kref_free",
+          "_dev_warn",
+          "_dev_warn",
+          "atomic_fetch_add",
+          "atomic_fetch_add",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "_dev_warn",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "kbase_mem_kref_free",
+          "refcount_warn_saturate",
+          "_dev_warn",
+          "__stack_chk_fail"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 68,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 1,
+        "empty_if_blocks": 15,
+        "unreachable_after_return": 2,
+        "suspicious_self_ref": 2,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 7,
+        "if_count": 25,
+        "else_count": 2,
+        "goto_count": 0,
+        "return_count": 6,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.8033126293995859
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 35,
+          "note": "helix placeholder 80% vs ida 45%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 68,
+          "note": "helix 68 raw fields; ida 87 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 2,
+          "note": "2 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 26,
+          "note": "ida recovered 26 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 10,
+          "note": "arity mismatch on: dev_warn, dma_buf_put, kbase_check_import_flags, kbase_ctx_alloc_free_region"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 47,
+          "note": "helix 34 decls vs ida 81"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 7,
+          "note": "helix lost 7 fmt strings; ida kept 7"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 15,
+          "note": "15 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 12 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 17 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no gsbase abuse"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 1,
+          "note": "1 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": true,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 2,
+          "note": "2 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 242,
+        "loc_ida": 508,
+        "loc_ratio": 0.476,
+        "call_jaccard_distance": 0.467,
+        "ida_calls_recovered": 0.649,
+        "if_delta": -35,
+        "return_delta": 4,
+        "call_delta": -21,
+        "var_delta": -47
+      }
+    },
+    "kbase_mem_commit": {
+      "function": "kbase_mem_commit",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_mem_commit.c",
+        "loc": 178,
+        "reported_confidence": null,
+        "return_type": "__int64",
+        "params": [
+          [
+            "kbase_context *",
+            "kctx"
+          ],
+          [
+            "__int64",
+            "gpu_addr"
+          ],
+          [
+            "u64",
+            "new_pages"
+          ]
+        ],
+        "decls": [
+          [
+            "u64",
+            "v3"
+          ],
+          [
+            "u64",
+            "v5"
+          ],
+          [
+            "u64",
+            "v6"
+          ],
+          [
+            "kbase_va_region *",
+            "region_base_address"
+          ],
+          [
+            "kbase_va_region *",
+            "v8"
+          ],
+          [
+            "unsigned __int64",
+            "flags"
+          ],
+          [
+            "unsigned int",
+            "v10"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "gpu_alloc"
+          ],
+          [
+            "size_t",
+            "nr_pages"
+          ],
+          [
+            "u64",
+            "v14"
+          ],
+          [
+            "kbase_device *",
+            "kbdev"
+          ],
+          [
+            "size_t",
+            "v16"
+          ],
+          [
+            "size_t",
+            "v17"
+          ],
+          [
+            "__int64",
+            "v18"
+          ],
+          [
+            "kbase_va_region *",
+            "v20"
+          ],
+          [
+            "u64",
+            "v21"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v22"
+          ],
+          [
+            "__int64",
+            "v24"
+          ],
+          [
+            "unsigned int",
+            "v25"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v26"
+          ],
+          [
+            "u64",
+            "v27"
+          ],
+          [
+            "kbase_va_region *",
+            "v28"
+          ],
+          [
+            "kbase_va_region *",
+            "v29"
+          ],
+          [
+            "kbase_va_region *",
+            "v30"
+          ],
+          [
+            "u64",
+            "v31"
+          ]
+        ],
+        "callees": [
+          "dev_err",
+          "dev_warn",
+          "down_write",
+          "downgrade_write",
+          "fentry__",
+          "kbase_alloc_phy_pages_helper",
+          "kbase_free_phy_pages_helper",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_grow_gpu_mapping",
+          "kbase_mem_shrink",
+          "kbase_region_tracker_find_region_base_address",
+          "kbase_tlstream_region_commit",
+          "readgsqword",
+          "up_read",
+          "up_write"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "down_write",
+          "__readgsqword",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_region_tracker_find_region_base_address",
+          "_kbase_tlstream_region_commit",
+          "downgrade_write",
+          "__readgsqword",
+          "kbase_alloc_phy_pages_helper",
+          "kbase_alloc_phy_pages_helper",
+          "kbase_free_phy_pages_helper",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_grow_gpu_mapping",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "up_read",
+          "__readgsqword",
+          "kbase_free_phy_pages_helper",
+          "kbase_free_phy_pages_helper",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_shrink",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "dev_err",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "up_write",
+          "__readgsqword",
+          "dev_warn",
+          "dev_warn"
+        ],
+        "named_field_count": 27,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 5,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 4,
+        "log_calls_with_string": 3,
+        "log_calls_lost_string": 0,
+        "if_count": 21,
+        "else_count": 1,
+        "goto_count": 5,
+        "return_count": 3,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.4078014184397163
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_mem_commit.helix.c",
+        "loc": 83,
+        "reported_confidence": 87.0,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "int64_t",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v3"
+          ],
+          [
+            "int64_t",
+            "v4"
+          ],
+          [
+            "int64_t",
+            "v5"
+          ],
+          [
+            "int64_t",
+            "v7"
+          ],
+          [
+            "int64_t",
+            "v10"
+          ],
+          [
+            "int64_t",
+            "v12"
+          ],
+          [
+            "int64_t",
+            "v14"
+          ],
+          [
+            "bool",
+            "v15"
+          ],
+          [
+            "int64_t",
+            "v2"
+          ],
+          [
+            "int64_t",
+            "v16"
+          ],
+          [
+            "int64_t",
+            "v20"
+          ],
+          [
+            "int64_t",
+            "v21"
+          ],
+          [
+            "int64_t",
+            "v22"
+          ],
+          [
+            "int64_t",
+            "v24"
+          ],
+          [
+            "int64_t",
+            "v25"
+          ],
+          [
+            "int64_t",
+            "gsbase"
+          ],
+          [
+            "int64_t",
+            "v26"
+          ],
+          [
+            "int64_t",
+            "v27"
+          ],
+          [
+            "int64_t",
+            "v28"
+          ]
+        ],
+        "callees": [
+          "dev_err",
+          "dev_warn",
+          "down_write",
+          "downgrade_write",
+          "kbase_alloc_phy_pages_helper",
+          "kbase_free_phy_pages_helper",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_grow_gpu_mapping",
+          "kbase_mem_shrink",
+          "kbase_region_tracker_find_region_base_address",
+          "kbase_tlstream_region_commit",
+          "up_read",
+          "up_write"
+        ],
+        "callees_raw": [
+          "_dev_warn",
+          "down_write",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_region_tracker_find_region_base_address",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "up_write",
+          "downgrade_write",
+          "kbase_alloc_phy_pages_helper",
+          "kbase_alloc_phy_pages_helper",
+          "kbase_mem_grow_gpu_mapping",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "up_read",
+          "_dev_warn",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_mem_shrink",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "__kbase_tlstream_region_commit",
+          "kbase_free_phy_pages_helper",
+          "kbase_free_phy_pages_helper",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "_dev_err",
+          "kbase_free_phy_pages_helper",
+          "kbase_gpu_vm_unlock_with_pmode_sync"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 18,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 3,
+        "if_count": 6,
+        "else_count": 1,
+        "goto_count": 0,
+        "return_count": 4,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.8511904761904762
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 44,
+          "note": "helix placeholder 85% vs ida 41%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 18,
+          "note": "helix 18 raw fields; ida 27 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 10,
+          "note": "ida recovered 10 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 3,
+          "note": "arity mismatch on: kbase_free_phy_pages_helper, kbase_gpu_vm_lock_with_pmode_sync, kbase_gpu_vm_unlock_with_pmode_sync"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 6,
+          "note": "helix 19 decls vs ida 25"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 3,
+          "note": "helix lost 3 fmt strings; ida kept 3"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 5 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 0 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 1,
+          "note": "opaque gsbase per-cpu access"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 83,
+        "loc_ida": 178,
+        "loc_ratio": 0.466,
+        "call_jaccard_distance": 0.125,
+        "ida_calls_recovered": 0.875,
+        "if_delta": -15,
+        "return_delta": 1,
+        "call_delta": -5,
+        "var_delta": -6
+      }
+    },
+    "kbase_csf_queue_register": {
+      "function": "kbase_csf_queue_register",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_csf_queue_register.c",
+        "loc": 17,
+        "reported_confidence": null,
+        "return_type": "__int64",
+        "params": [
+          [
+            "kbase_context *",
+            "kctx"
+          ],
+          [
+            "kbase_ioctl_cs_queue_register *",
+            "reg"
+          ]
+        ],
+        "decls": [
+          [
+            "__u32",
+            "buffer_size"
+          ]
+        ],
+        "callees": [
+          "csf_queue_register_internal",
+          "fentry__"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "csf_queue_register_internal"
+        ],
+        "named_field_count": 3,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 1,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 1,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 1,
+        "else_count": 1,
+        "goto_count": 0,
+        "return_count": 2,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.0
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_csf_queue_register.helix.c",
+        "loc": 22,
+        "reported_confidence": 94.5,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "void*",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "v0"
+          ],
+          [
+            "int64_t",
+            "v2"
+          ]
+        ],
+        "callees": [
+          "sub_63150"
+        ],
+        "callees_raw": [
+          "sub_63150"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 1,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 4,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 3,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 1.0
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 100,
+          "note": "helix placeholder 100% vs ida 0%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 1,
+          "note": "helix 1 raw fields; ida 3 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 1,
+          "note": "ida recovered 1 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no arity mismatch on shared callees"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 2,
+          "note": "helix 3 decls vs ida 1"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix lost 0 fmt strings; ida kept 0"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 1 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 0 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no gsbase abuse"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 22,
+        "loc_ida": 17,
+        "loc_ratio": 1.294,
+        "call_jaccard_distance": 1.0,
+        "ida_calls_recovered": 0.0,
+        "if_delta": 3,
+        "return_delta": 1,
+        "call_delta": -1,
+        "var_delta": 2
+      }
+    },
+    "kbase_context_mmap": {
+      "function": "kbase_context_mmap",
+      "ground_truth_ida": {
+        "source": "ida",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\ida-jit-deep\\kbase_context_mmap.c",
+        "loc": 545,
+        "reported_confidence": null,
+        "return_type": "__int64",
+        "params": [
+          [
+            "kbase_context *const",
+            "kctx"
+          ],
+          [
+            "vm_area_struct *const",
+            "vma"
+          ]
+        ],
+        "decls": [
+          [
+            "kbase_device *",
+            "kbdev"
+          ],
+          [
+            "unsigned __int64",
+            "vm_end"
+          ],
+          [
+            "vm_area_struct *",
+            "v5"
+          ],
+          [
+            "unsigned __int64 *",
+            "nents"
+          ],
+          [
+            "device *",
+            "dev"
+          ],
+          [
+            "vm_flags_t",
+            "vm_flags"
+          ],
+          [
+            "unsigned int",
+            "v9"
+          ],
+          [
+            "unsigned __int64",
+            "vm_pgoff"
+          ],
+          [
+            "unsigned __int64",
+            "v14"
+          ],
+          [
+            "__int64",
+            "v15"
+          ],
+          [
+            "unsigned __int64",
+            "v16"
+          ],
+          [
+            "kbase_queue *",
+            "v17"
+          ],
+          [
+            "unsigned __int64",
+            "v18"
+          ],
+          [
+            "unsigned __int64",
+            "vm_start"
+          ],
+          [
+            "refcount_t *",
+            "p_refcount"
+          ],
+          [
+            "signed __int32",
+            "v21"
+          ],
+          [
+            "__int64",
+            "v22"
+          ],
+          [
+            "kbase_va_region *",
+            "region_enclosing_address"
+          ],
+          [
+            "kbase_va_region *",
+            "v24"
+          ],
+          [
+            "unsigned __int64",
+            "v25"
+          ],
+          [
+            "__int64",
+            "v26"
+          ],
+          [
+            "unsigned __int64",
+            "flags"
+          ],
+          [
+            "vm_flags_t",
+            "v28"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "cpu_alloc"
+          ],
+          [
+            "unsigned __int64",
+            "v30"
+          ],
+          [
+            "unsigned int",
+            "v31"
+          ],
+          [
+            "unsigned __int64",
+            "v32"
+          ],
+          [
+            "rb_node *",
+            "rb_left"
+          ],
+          [
+            "_QWORD *",
+            "v34"
+          ],
+          [
+            "size_t",
+            "v35"
+          ],
+          [
+            "__int64",
+            "v36"
+          ],
+          [
+            "vm_area_struct *",
+            "v37"
+          ],
+          [
+            "size_t",
+            "v38"
+          ],
+          [
+            "size_t",
+            "v39"
+          ],
+          [
+            "rb_node *",
+            "v40"
+          ],
+          [
+            "__int64",
+            "v41"
+          ],
+          [
+            "signed __int32",
+            "v43"
+          ],
+          [
+            "list_head *",
+            "v44"
+          ],
+          [
+            "signed __int32",
+            "v45"
+          ],
+          [
+            "list_head *",
+            "prev"
+          ],
+          [
+            "kbase_device *",
+            "v47"
+          ],
+          [
+            "mm_struct *",
+            "vm_mm"
+          ],
+          [
+            "vm_flags_t",
+            "v51"
+          ],
+          [
+            "u32",
+            "file_offset"
+          ],
+          [
+            "file *",
+            "filp"
+          ],
+          [
+            "unsigned __int64",
+            "v55"
+          ],
+          [
+            "pgprotval_t",
+            "pgprot"
+          ],
+          [
+            "unsigned int",
+            "v58"
+          ],
+          [
+            "file *",
+            "db_filp"
+          ],
+          [
+            "u64",
+            "start_pfn"
+          ],
+          [
+            "unsigned __int64",
+            "v61"
+          ],
+          [
+            "vm_flags_t",
+            "v62"
+          ],
+          [
+            "kbase_mem_phy_alloc *",
+            "v63"
+          ],
+          [
+            "kbase_memory_type",
+            "type"
+          ],
+          [
+            "unsigned __int64",
+            "v65"
+          ],
+          [
+            "size_t",
+            "v66"
+          ],
+          [
+            "list_head *",
+            "aliased_alloc"
+          ],
+          [
+            "__int64",
+            "v68"
+          ],
+          [
+            "list_head *",
+            "next"
+          ],
+          [
+            "size_t",
+            "v70"
+          ],
+          [
+            "vm_area_struct *",
+            "v71"
+          ],
+          [
+            "vm_area_struct *",
+            "v72"
+          ],
+          [
+            "list_head *",
+            "p_vm_page_prot"
+          ],
+          [
+            "vm_area_struct *",
+            "v74"
+          ],
+          [
+            "vm_area_struct *",
+            "v75"
+          ],
+          [
+            "vm_area_struct *",
+            "v76"
+          ],
+          [
+            "kbase_queue *",
+            "v78"
+          ],
+          [
+            "kbase_queue *",
+            "v79"
+          ],
+          [
+            "vm_area_struct *",
+            "v80"
+          ],
+          [
+            "kbase_queue *",
+            "v81"
+          ],
+          [
+            "vm_area_struct *",
+            "v82"
+          ],
+          [
+            "kbase_va_region *",
+            "v83"
+          ],
+          [
+            "kbase_va_region *",
+            "v84"
+          ]
+        ],
+        "callees": [
+          "BUG",
+          "BYTE1",
+          "HIDWORD",
+          "InterlockedExchangeAdd",
+          "InterlockedIncrement64",
+          "LOBYTE",
+          "LODWORD",
+          "bittest64",
+          "bittestandset64",
+          "cachemode2protval",
+          "dev_err",
+          "dev_warn",
+          "dma_buf_mmap",
+          "down_write",
+          "fentry__",
+          "get_aliased_alloc",
+          "kbase_csf_alloc_command_stream_user_pages",
+          "kbase_csf_queue_unbind_stopped",
+          "kbase_gpu_mmap",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_region_tracker_find_region_enclosing_address",
+          "kfree",
+          "kmalloc_trace",
+          "list_add_valid_or_report",
+          "mutex_lock",
+          "mutex_unlock",
+          "pgprot_writecombine",
+          "readgsqword",
+          "refcount_warn_saturate",
+          "up_write"
+        ],
+        "callees_raw": [
+          "_fentry__",
+          "__readgsqword",
+          "down_write",
+          "up_write",
+          "down_write",
+          "up_write",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "__readgsqword",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "BYTE1",
+          "cachemode2protval",
+          "down_write",
+          "up_write",
+          "down_write",
+          "up_write",
+          "BYTE1",
+          "mutex_lock",
+          "mutex_unlock",
+          "_InterlockedIncrement64",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "mutex_lock",
+          "mutex_unlock",
+          "_bittest64",
+          "BUG",
+          "_bittestandset64",
+          "kbase_csf_alloc_command_stream_user_pages",
+          "BUG",
+          "_InterlockedExchangeAdd",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "kbase_csf_queue_unbind_stopped",
+          "mutex_unlock",
+          "_InterlockedIncrement64",
+          "mutex_unlock",
+          "dev_err",
+          "kbase_gpu_mmap",
+          "dev_err",
+          "_bittestandset64",
+          "BUG",
+          "_list_add_valid_or_report",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_region_tracker_find_region_enclosing_address",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "dev_warn",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kmalloc_trace",
+          "pgprot_writecombine",
+          "HIDWORD",
+          "BUG",
+          "HIDWORD",
+          "BUG",
+          "_InterlockedExchangeAdd",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "_InterlockedExchangeAdd",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "LOBYTE",
+          "_list_add_valid_or_report",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "BUG",
+          "kmalloc_trace",
+          "LODWORD",
+          "get_aliased_alloc",
+          "kfree",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "dev_warn",
+          "dma_buf_mmap",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "dev_err",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "dev_err"
+        ],
+        "named_field_count": 149,
+        "raw_field_count": 0,
+        "string_literals": [
+          "\"%s:%d inconsistent VM flags\\n\"",
+          "\"%s:%d inconsistent VM flags\\n\"",
+          "\"%s:%d\\n\"",
+          "\"%s:%d\\n\"",
+          "\"%s:%d inconsistent VM flags\\n\"",
+          "\"%s:%d inconsistent VM flags\\n\"",
+          "\"mmap failed %d\\n\""
+        ],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 11,
+        "decomp_macros": 6,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 24,
+        "log_calls_with_string": 6,
+        "log_calls_lost_string": 0,
+        "if_count": 57,
+        "else_count": 11,
+        "goto_count": 19,
+        "return_count": 6,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.3304431599229287
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\Intigrity\\hexcore-reports\\fresh-helix-souper-2\\kbase_context_mmap.helix.c",
+        "loc": 193,
+        "reported_confidence": 37.5,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "void*",
+            "param_1"
+          ],
+          [
+            "void*",
+            "param_2"
+          ],
+          [
+            "uint64_t",
+            "param_3"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ],
+          [
+            "int64_t",
+            "v5"
+          ],
+          [
+            "int64_t",
+            "lock_3"
+          ],
+          [
+            "bool",
+            "v7"
+          ],
+          [
+            "int64_t",
+            "v15"
+          ],
+          [
+            "int64_t",
+            "v16"
+          ],
+          [
+            "int64_t",
+            "v21"
+          ],
+          [
+            "int64_t",
+            "v25"
+          ],
+          [
+            "int64_t",
+            "v28"
+          ],
+          [
+            "int64_t",
+            "v30"
+          ],
+          [
+            "int64_t",
+            "v32"
+          ],
+          [
+            "int64_t",
+            "v37"
+          ],
+          [
+            "int64_t",
+            "v42"
+          ],
+          [
+            "bool",
+            "v43"
+          ],
+          [
+            "int64_t",
+            "v47"
+          ],
+          [
+            "int64_t",
+            "v49"
+          ],
+          [
+            "int64_t",
+            "v50"
+          ],
+          [
+            "int64_t",
+            "v51"
+          ],
+          [
+            "int64_t",
+            "v52"
+          ],
+          [
+            "int64_t",
+            "v53"
+          ],
+          [
+            "int64_t",
+            "v54"
+          ],
+          [
+            "int64_t",
+            "v55"
+          ],
+          [
+            "int64_t",
+            "v56"
+          ],
+          [
+            "int64_t",
+            "v57"
+          ],
+          [
+            "int64_t",
+            "v58"
+          ],
+          [
+            "int64_t",
+            "v59"
+          ]
+        ],
+        "callees": [
+          "atomic_fetch_add",
+          "atomic_test_and_set",
+          "bit_test",
+          "cachemode2protval",
+          "dev_err",
+          "dev_warn",
+          "dma_buf_mmap",
+          "down_write",
+          "dynamic_dev_dbg",
+          "kbase_csf_alloc_command_stream_user_pages",
+          "kbase_csf_queue_unbind_stopped",
+          "kbase_gpu_mmap",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_region_tracker_find_region_enclosing_address",
+          "kfree",
+          "kmalloc_caches",
+          "kmalloc_trace",
+          "mutex_lock",
+          "mutex_unlock",
+          "pgprot_writecombine",
+          "refcount_warn_saturate",
+          "sub_10950",
+          "up_write"
+        ],
+        "callees_raw": [
+          "_dev_err",
+          "__dynamic_dev_dbg",
+          "down_write",
+          "up_write",
+          "down_write",
+          "up_write",
+          "kbase_gpu_vm_lock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "mutex_lock",
+          "bit_test",
+          "atomic_test_and_set",
+          "atomic_fetch_add",
+          "kbase_csf_queue_unbind_stopped",
+          "mutex_unlock",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_region_tracker_find_region_enclosing_address",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_mmap",
+          "atomic_test_and_set",
+          "kmalloc_trace",
+          "pgprot_writecombine",
+          "atomic_fetch_add",
+          "atomic_fetch_add",
+          "kmalloc_caches",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "down_write",
+          "up_write",
+          "down_write",
+          "up_write",
+          "mutex_lock",
+          "mutex_unlock",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "kmalloc_caches",
+          "cachemode2protval",
+          "kbase_csf_alloc_command_stream_user_pages",
+          "mutex_unlock",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "mutex_unlock",
+          "sub_10950",
+          "kfree",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "refcount_warn_saturate",
+          "_dev_err",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "_dev_warn",
+          "_dev_warn",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "dma_buf_mmap",
+          "kbase_gpu_vm_unlock_with_pmode_sync",
+          "_dev_err",
+          "kmalloc_trace",
+          "_dev_err"
+        ],
+        "named_field_count": 12,
+        "raw_field_count": 77,
+        "string_literals": [],
+        "raw_addr_derefs": 2,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 22,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 6,
+        "if_count": 0,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 1,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.8081023454157783
+      },
+      "defect_matrix": {
+        "C0_names": {
+          "label": "identifier names",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 48,
+          "note": "helix placeholder 81% vs ida 33%"
+        },
+        "C1_struct_shape": {
+          "label": "struct/deref shape",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 77,
+          "note": "helix 77 raw fields; ida 149 named"
+        },
+        "C2_extra_missing_code": {
+          "label": "extra/missing code",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 22,
+          "note": "22 unreachable stmts after return"
+        },
+        "C3_typecast": {
+          "label": "missing/wrong typecast",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 39,
+          "note": "ida recovered 39 struct-typed locals; helix 0"
+        },
+        "C4_nonequiv_args": {
+          "label": "non-equivalent call args",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 6,
+          "note": "arity mismatch on: dev_err, dev_warn, kbase_csf_queue_unbind_stopped, kbase_gpu_vm_lock_with_pmode_sync"
+        },
+        "C5_extra_missing_var": {
+          "label": "extra/missing variables",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 46,
+          "note": "helix 27 decls vs ida 73"
+        },
+        "C6_literals": {
+          "label": "literals (string lost / neg)",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 6,
+          "note": "helix lost 6 fmt strings; ida kept 6"
+        },
+        "C7_control_flow": {
+          "label": "control-flow shape",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 empty if-bodies"
+        },
+        "C8_global_var": {
+          "label": "global variable reference",
+          "helix_defect": true,
+          "ida_clean": true,
+          "fires": true,
+          "evidence": 2,
+          "note": "2 raw *0xADDR derefs"
+        },
+        "C9_hexrays_macros": {
+          "label": "hex-rays/MSVC macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 11 (IDA-only expected)"
+        },
+        "C10_decompiler_macros": {
+          "label": "sub-register macros",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "helix 0 vs ida 6 (IDA-only expected)"
+        },
+        "C11_mem_layout": {
+          "label": "memory-layout abuse",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "no gsbase abuse"
+        },
+        "C12_void_return": {
+          "label": "lost return value/type",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "return value present"
+        },
+        "C13_composite_decomp": {
+          "label": "composite var decomposition",
+          "helix_defect": false,
+          "ida_clean": true,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 double-deref (**) sites"
+        },
+        "C14_typedep_expr": {
+          "label": "type-dependent wrong expr",
+          "helix_defect": false,
+          "ida_clean": false,
+          "fires": false,
+          "evidence": 0,
+          "note": "0 suspicious self-referencing assigns"
+        }
+      },
+      "divergence_metric": {
+        "loc_helix": 193,
+        "loc_ida": 545,
+        "loc_ratio": 0.354,
+        "call_jaccard_distance": 0.514,
+        "ida_calls_recovered": 0.581,
+        "if_delta": -57,
+        "return_delta": -5,
+        "call_delta": -16,
+        "var_delta": -46
+      }
+    }
+  },
+  "problems": []
+}
