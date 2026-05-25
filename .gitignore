@@ -49,6 +49,9 @@ cmake_gen.log
 /projectile_constructor*.c
 /tests/remill-7/debug*.log
 
+# Claude Code — local agent docs, briefings, design notes, settings (keep private)
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
