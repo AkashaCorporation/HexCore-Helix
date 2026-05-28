@@ -2757,6 +2757,16 @@ static bool exprEqual(const CExpr* a, const CExpr* b) {
         auto& vb = static_cast<const CVarRefExpr&>(*b);
         return va.varName == vb.varName;
     }
+    case NodeKind::StringLitExpr: {
+        // String literals were previously unhandled and fell through to the
+        // `default: return false` below — so two structurally identical calls
+        // carrying a string literal argument never compared equal, defeating
+        // the bare+assign double-emit dedup in removeDuplicatesInList for any
+        // such call.  Compare by value.
+        auto& sa = static_cast<const CStringLitExpr&>(*a);
+        auto& sb = static_cast<const CStringLitExpr&>(*b);
+        return sa.value == sb.value;
+    }
     case NodeKind::BinaryExpr: {
         auto& ba = static_cast<const CBinaryExpr&>(*a);
         auto& bb = static_cast<const CBinaryExpr&>(*b);
