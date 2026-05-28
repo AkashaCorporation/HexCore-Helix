@@ -2672,40 +2672,64 @@ private:
 
         case RemillSemantic::MOVZX: {
             if (call.getNumOperands() >= 3) {
-                // ─── Memory source: MOVZX reg, [mem] ──────────────────
-                // For MnIh/MnIt/MnIj variants, operand(3) is the source
-                // ADDRESS, not a value. Without an explicit MemReadOp the
-                // byte/word load disappears from the IR entirely (e.g. the
-                // `MOVZX CL, [R8]` reload that drives every FNV hash loop).
-                // Mirrors the memory-source path in the MOV handler above.
-                //
-                // The MemRead's result is left unused for now; binding it
-                // through to the destination register is Commit B. Until
-                // then the unused MemReadOp gets eliminated by later DCE,
-                // so the C output stays byte-identical to before Commit A.
+                auto destRegPtr = safeGetOperand(call, 2, builder, loc);
+                auto destRegName = regs.getRegName(destRegPtr);
+
                 if (semInfo.has_memory_src && semInfo.src_width != 0 &&
                     call.getNumOperands() >= 4) {
+                    // ─── Memory source: MOVZX reg, [mem] ──────────────
+                    // Full lift: MemRead(address) → MovZx(narrow→64) →
+                    // RegWrite(destReg). Without the RegWrite the chain
+                    // is dead and DCE drops the byte/word load, which is
+                    // how rt_fnv's loop body lost its `*s++` reload.
                     auto addrValue = safeGetOperand(call, 3, builder, loc);
                     unsigned readWidth = semInfo.src_width;
                     auto readTy = builder.getIntegerType(readWidth);
-                    builder.create<helix::low::MemReadOp>(
+                    auto memRead = builder.create<helix::low::MemReadOp>(
                         loc, readTy,
                         ensureInt64(addrValue, builder, loc, &regs, &pcTracker),
                         builder.getUI32IntegerAttr(readWidth),
                         addrAttr);
+                    auto movZx = builder.create<helix::low::MovZxOp>(
+                        loc, i64Ty, memRead.getResult(),
+                        builder.getUI32IntegerAttr(64),
+                        addrAttr);
+                    if (destRegName) {
+                        unsigned destWidth =
+                            RegisterTracker::inferRegWidth(*destRegName);
+                        Value finalVal = movZx.getResult();
+                        if (destWidth < 64) {
+                            finalVal = builder.create<LLVM::TruncOp>(
+                                loc,
+                                builder.getIntegerType(destWidth),
+                                finalVal);
+                        }
+                        builder.create<helix::low::RegWriteOp>(
+                            loc, finalVal,
+                            builder.getStringAttr(*destRegName),
+                            builder.getUI32IntegerAttr(destWidth),
+                            addrAttr);
+                    }
+                } else {
+                    // ─── Register source: MOVZX reg, reg ─────────────
+                    // Preserved historical (dead-chain) behaviour: the
+                    // register-source form passes the value at
+                    // operand(3) but the lifter used the dest_ptr at
+                    // operand(2), so the MovZxOp's result is unused and
+                    // DCE removes it. Touching this would require
+                    // exposing the source width through the demangler;
+                    // tracked as a follow-up so this commit's blast
+                    // radius is limited to the memory-source path.
+                    Value operand = call.getOperand(2);
+                    if (isa<LLVM::LLVMPointerType>(operand.getType())) {
+                        operand = builder.create<LLVM::PtrToIntOp>(
+                            loc, builder.getI64Type(), operand);
+                    }
+                    builder.create<helix::low::MovZxOp>(
+                        loc, i64Ty, operand,
+                        builder.getUI32IntegerAttr(64),
+                        addrAttr);
                 }
-
-                Value operand = call.getOperand(2);
-                if (isa<LLVM::LLVMPointerType>(operand.getType())) {
-                    operand = builder.create<LLVM::PtrToIntOp>(
-                        loc, builder.getI64Type(), operand);
-                }
-                builder.create<helix::low::MovZxOp>(
-                    loc,
-                    i64Ty,
-                    operand,
-                    builder.getUI32IntegerAttr(64),
-                    addrAttr);
             }
             break;
         }
