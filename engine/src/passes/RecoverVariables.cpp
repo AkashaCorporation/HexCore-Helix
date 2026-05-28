@@ -1222,6 +1222,181 @@ private:
             }
         }
 
+        // ── Phase 2.5: Sweep reg ops surviving inside structured regions ──
+        //
+        // The per-block loop above only iterates top-level block ops; it
+        // never enters the regions of helix_high.if / do_while / while /
+        // for / switch that StructureControlFlow (pass 8, runs before this
+        // pass 9) wrapped around loop bodies and conditional branches. Any
+        // helix_low.reg.read / reg.write that ended up inside those regions
+        // therefore survives this pass entirely and gets picked up by the
+        // HelixLowToMid `RegReadToVarRef` fallback, which produces hash-
+        // based slot_ids the HelixMidToHigh naming map can't resolve. The
+        // C output then shows `v0 = 0; ...; v2 = *v0;` where the deref
+        // should have been `*param_3_1` (or whatever the parent register
+        // was bound to at the region's entry).
+        //
+        // Strategy B (post-loop sweep): walk the full function region —
+        // including nested helix_high regions — and bind each surviving
+        // reg.read/reg.write to the SSA version visible at the exit of the
+        // containing top-level block. The walk is keyed structurally
+        // (op → ancestor in funcBody) and the snapshot lookup is keyed by
+        // Block* address, but the resulting name choice is fully
+        // determined by `findTopLevelAncestor` (a fixed-shape walk) and
+        // `blockExitState[topBlock]` (a single keyed lookup), so the
+        // assignment is deterministic regardless of `funcBody.walk`
+        // iteration order.
+        //
+        // Loop-carried versioning is deliberately approximated: every
+        // in-region access of a given register binds to the same version
+        // (the one visible at the containing top-level block's exit).
+        // That loses per-iteration disambiguation but is a strict
+        // improvement over `v0 = 0` placeholders and matches what a
+        // reverse-engineer expects to see when reading the C output.
+        // Strategy A (proper region-aware SSA tracking with snapshot/
+        // restore at every region boundary) would recover per-iteration
+        // versions but is left as a follow-up.
+        if (!blockExitState.empty()) {
+            auto findTopLevelAncestor = [&](Operation* op) -> Operation* {
+                Operation* current = op;
+                while (current) {
+                    Block* block = current->getBlock();
+                    if (!block)
+                        return nullptr;
+                    if (block->getParent() == &funcBody)
+                        return current;
+                    current = block->getParentOp();
+                }
+                return nullptr;
+            };
+
+            auto snapshotForOp = [&](Operation* op)
+                -> const SSAVersionTracker::Snapshot* {
+                Operation* topOp = findTopLevelAncestor(op);
+                if (!topOp)
+                    return nullptr;
+                Block* topBlock = topOp->getBlock();
+                auto it = blockExitState.find(topBlock);
+                if (it == blockExitState.end())
+                    return nullptr;
+                return &it->second;
+            };
+
+            // Gather survivors first; mutating during a walk would
+            // invalidate iterators.
+            llvm::SmallVector<helix::low::RegReadOp, 16> survivingReads;
+            funcBody.walk([&](helix::low::RegReadOp r) {
+                // The main per-block loop only touches ops directly in
+                // funcBody's blocks. Anything whose immediate parent
+                // region is funcBody was already processed (and erased)
+                // by the main loop, so we'd never see those here — but
+                // guard anyway to keep this sweep strictly additive.
+                if (r->getBlock() && r->getBlock()->getParent() == &funcBody)
+                    return;
+                survivingReads.push_back(r);
+            });
+            llvm::SmallVector<helix::low::RegWriteOp, 16> survivingWrites;
+            funcBody.walk([&](helix::low::RegWriteOp w) {
+                if (w->getBlock() && w->getBlock()->getParent() == &funcBody)
+                    return;
+                survivingWrites.push_back(w);
+            });
+
+            // Reads first: a register's snapshot version is its NAMING
+            // identity. Writes don't bump the version here (Strategy B).
+            for (auto readOp : survivingReads) {
+                auto regName = readOp.getRegName();
+                auto subRegOpt = getSubRegInfo(regName);
+                if (!subRegOpt)
+                    continue;
+                auto& subReg = *subRegOpt;
+
+                const SSAVersionTracker::Snapshot* snap =
+                    snapshotForOp(readOp);
+                if (!snap)
+                    continue;
+                auto vit = snap->find(subReg.parent);
+                if (vit == snap->end())
+                    continue;
+                const SSAVersionTracker::Version& ver = vit->second;
+
+                OpBuilder b(readOp);
+                auto i64Ty = b.getIntegerType(64);
+                auto varRef = b.create<helix::high::VarRefOp>(
+                    readOp.getLoc(), i64Ty,
+                    ver.varId,
+                    b.getStringAttr(ver.varName),
+                    mlir::IntegerAttr{});
+
+                Value result;
+                if (subReg.width == 64 && subReg.bitOffset == 0) {
+                    result = varRef.getResult();
+                } else if (subReg.bitOffset == 0) {
+                    result = emitTruncation(varRef.getResult(),
+                                            subReg.width, b,
+                                            readOp.getLoc());
+                    ++NumAliasesResolved;
+                } else {
+                    result = emitHighByteExtract(
+                        varRef.getResult(), subReg.bitOffset,
+                        subReg.width, b, readOp.getLoc());
+                    ++NumAliasesResolved;
+                }
+
+                if (readOp->hasAttr("helix.infrastructure"))
+                    varRef->setAttr("helix.infrastructure",
+                                    b.getUnitAttr());
+
+                readOp.getResult().replaceAllUsesWith(result);
+                readOp.erase();
+                ++NumReadsReplaced;
+            }
+
+            // Writes: full-width only (sub-register writes need a read-
+            // modify-write of the current version, which Strategy B
+            // intentionally doesn't model inside regions). Sub-register
+            // writes that survive here continue to fall through to the
+            // HelixLowToMid path, matching prior behaviour.
+            for (auto writeOp : survivingWrites) {
+                auto regName = writeOp.getRegName();
+                auto subRegOpt = getSubRegInfo(regName);
+                if (!subRegOpt)
+                    continue;
+                auto& subReg = *subRegOpt;
+                if (!(subReg.width == 64 && subReg.bitOffset == 0))
+                    continue;
+
+                const SSAVersionTracker::Snapshot* snap =
+                    snapshotForOp(writeOp);
+                if (!snap)
+                    continue;
+                auto vit = snap->find(subReg.parent);
+                if (vit == snap->end())
+                    continue;
+                const SSAVersionTracker::Version& ver = vit->second;
+
+                OpBuilder b(writeOp);
+                auto targetRef = b.create<helix::high::VarRefOp>(
+                    writeOp.getLoc(),
+                    writeOp.getValue().getType(),
+                    ver.varId,
+                    b.getStringAttr(ver.varName),
+                    mlir::IntegerAttr{});
+                auto assignOp = b.create<helix::high::AssignOp>(
+                    writeOp.getLoc(),
+                    targetRef.getResult(),
+                    writeOp.getValue(),
+                    mlir::IntegerAttr{});
+
+                if (writeOp->hasAttr("helix.infrastructure"))
+                    assignOp->setAttr("helix.infrastructure",
+                                      b.getUnitAttr());
+
+                writeOp.erase();
+                ++NumWritesReplaced;
+            }
+        }
+
         // ── Phase 3: Replace __undef references ─────────────────────────
         //
         // Walk all operations looking for operands defined by LLVM::UndefOp
