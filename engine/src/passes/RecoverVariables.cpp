@@ -1302,6 +1302,80 @@ private:
                 survivingWrites.push_back(w);
             });
 
+            // ── Return-context fallback for in-region RAX writes ──────────
+            //
+            // For hash-loop style functions (FNV, CRC, etc.) the final RAX
+            // value is computed INSIDE a loop region and there is no
+            // top-level RegWrite to RAX after the loop — control just
+            // jumps to the return block.  The main per-block loop never
+            // sees those in-region writes, so `isReturnContext` never fires
+            // for them, no "result" VarDecl gets created, and the snapshot
+            // version at the loop's containing top-level block is the last
+            // pre-loop name (e.g. "rax_2").  The sweep below would then
+            // bind every in-region RAX write to "rax_2", and EliminateDeadCode
+            // — seeing nothing downstream that reads "rax_2" — drops the
+            // entire accumulator chain.  The C output then declares an
+            // unassigned `int64_t result;` and the loop body is empty
+            // except for the byte-load.
+            //
+            // Fix: when the function returns a value AND main-loop
+            // processing produced no "RAX__result" decl AND a surviving
+            // in-region RAX (full-width) write exists, synthesise a
+            // "result" VarDecl at function entry and use it as the
+            // override target for every full-width in-region RAX
+            // read/write below.  This gives the accumulator chain a
+            // user-visible consumer (the synthesised `return result`)
+            // and keeps it alive through DCE.
+            // Conservatism guard: only apply this fallback when the RAX
+            // chain lives inside a LOOP region (do_while / while / for).
+            // Hash-loop functions (FNV, CRC, …) match this shape; if-only
+            // RAX writes are conditional return paths whose pre-fix DCE
+            // behaviour is already what callers expect, and renaming them
+            // to "result" exposes raw-VA derefs that score worse without
+            // adding semantic content.
+            auto isInsideLoopRegion = [](Operation* op) {
+                for (Operation* cur = op->getParentOp(); cur;
+                     cur = cur->getParentOp()) {
+                    if (isa<helix::high::DoWhileOp,
+                            helix::high::WhileOp,
+                            helix::high::ForOp>(cur))
+                        return true;
+                }
+                return false;
+            };
+
+            SSAVersionTracker::Version resultOverride;
+            bool useResultOverrideForRAX = false;
+            if (tracker.hasReturnValue
+                && !tracker.regToDecl.count("RAX__result")) {
+                bool hasInRegionFullRaxWrite = false;
+                for (auto w : survivingWrites) {
+                    auto sr = getSubRegInfo(w.getRegName());
+                    if (sr && sr->parent == "RAX"
+                        && sr->width == 64 && sr->bitOffset == 0
+                        && isInsideLoopRegion(w)) {
+                        hasInRegionFullRaxWrite = true;
+                        break;
+                    }
+                }
+                if (hasInRegionFullRaxWrite) {
+                    auto declOp = declBuilder.create<helix::high::VarDeclOp>(
+                        funcLoc,
+                        /*var_id=*/tracker.varIdCounter++,
+                        /*var_name=*/"result",
+                        /*storage=*/helix::high::StorageKind::Register,
+                        /*stack_offset=*/IntegerAttr{},
+                        /*init=*/Value{},
+                        /*address=*/IntegerAttr{});
+                    tracker.regToDecl["RAX__result"] = declOp;
+                    resultOverride.decl = declOp;
+                    resultOverride.varId = declOp.getVarId();
+                    resultOverride.varName = "result";
+                    useResultOverrideForRAX = true;
+                    ++NumReturnVarsNamed;
+                }
+            }
+
             // Reads first: a register's snapshot version is its NAMING
             // identity. Writes don't bump the version here (Strategy B).
             for (auto readOp : survivingReads) {
@@ -1311,14 +1385,24 @@ private:
                     continue;
                 auto& subReg = *subRegOpt;
 
-                const SSAVersionTracker::Snapshot* snap =
-                    snapshotForOp(readOp);
-                if (!snap)
-                    continue;
-                auto vit = snap->find(subReg.parent);
-                if (vit == snap->end())
-                    continue;
-                const SSAVersionTracker::Version& ver = vit->second;
+                const SSAVersionTracker::Version* verPtr = nullptr;
+                if (useResultOverrideForRAX && subReg.parent == "RAX"
+                    && isInsideLoopRegion(readOp)) {
+                    // Hash-loop-style return-context fallback: every
+                    // in-loop RAX access shares the "result" identity
+                    // (sub-register narrowing still applies below).
+                    verPtr = &resultOverride;
+                } else {
+                    const SSAVersionTracker::Snapshot* snap =
+                        snapshotForOp(readOp);
+                    if (!snap)
+                        continue;
+                    auto vit = snap->find(subReg.parent);
+                    if (vit == snap->end())
+                        continue;
+                    verPtr = &vit->second;
+                }
+                const SSAVersionTracker::Version& ver = *verPtr;
 
                 OpBuilder b(readOp);
                 auto i64Ty = b.getIntegerType(64);
@@ -1366,14 +1450,21 @@ private:
                 if (!(subReg.width == 64 && subReg.bitOffset == 0))
                     continue;
 
-                const SSAVersionTracker::Snapshot* snap =
-                    snapshotForOp(writeOp);
-                if (!snap)
-                    continue;
-                auto vit = snap->find(subReg.parent);
-                if (vit == snap->end())
-                    continue;
-                const SSAVersionTracker::Version& ver = vit->second;
+                const SSAVersionTracker::Version* verPtr = nullptr;
+                if (useResultOverrideForRAX && subReg.parent == "RAX"
+                    && isInsideLoopRegion(writeOp)) {
+                    verPtr = &resultOverride;
+                } else {
+                    const SSAVersionTracker::Snapshot* snap =
+                        snapshotForOp(writeOp);
+                    if (!snap)
+                        continue;
+                    auto vit = snap->find(subReg.parent);
+                    if (vit == snap->end())
+                        continue;
+                    verPtr = &vit->second;
+                }
+                const SSAVersionTracker::Version& ver = *verPtr;
 
                 OpBuilder b(writeOp);
                 auto targetRef = b.create<helix::high::VarRefOp>(

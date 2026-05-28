@@ -1771,6 +1771,20 @@ private:
         unsigned totalAssigns = 0;
         unsigned totalUndef   = 0;
 
+        // Preserve the return-value variable: when the enclosing function
+        // declares `has_return_value`, the chain that feeds RAX at return
+        // is named "result" by RecoverVariables. For hash-loop functions
+        // (FNV, CRC, etc.) the chain lives entirely inside a loop region
+        // and has no out-of-region reader — the only "consumer" is the
+        // implicit `return result;` synthesised by CAstBuilder, which the
+        // dialect can't express on helix_low.ret. Skipping dead-assign and
+        // dead-decl elimination for "result" keeps the chain alive without
+        // changing the dialect or adding a fake live consumer op.
+        bool preserveResultVar = false;
+        if (Operation* parentOp = funcBody.getParentOp()) {
+            preserveResultVar = parentOp->hasAttr("has_return_value");
+        }
+
         bool changed = true;
         unsigned iteration = 0;
         // Budget: large functions (anti-cheat VMs, >5000 ops) get
@@ -1879,6 +1893,13 @@ private:
                         targetName.starts_with("YMM") || targetName.starts_with("ZMM"))
                         continue;
 
+                    // Never remove the return-value chain in a value-returning
+                    // function — `result` is read by the synthesised
+                    // `return result;` statement which exists only in the C
+                    // emitter, not as an SSA use the liveness walk can see.
+                    if (preserveResultVar && targetName == "result")
+                        continue;
+
                     // Check if the target variable has any live consumers
                     // (excluding this assignment's own LHS reference).
                     // Use the refMap to avoid re-walking the function body.
@@ -1927,6 +1948,12 @@ private:
                 llvm::SmallVector<helix::high::VarDeclOp, 16> deadDecls;
 
                 funcBody.walk([&](helix::high::VarDeclOp declOp) {
+                    // Mirror Step 2: keep "result" alive when the function
+                    // returns a value — the consumer is the CAstBuilder-
+                    // synthesised `return result;` and never an SSA use.
+                    if (preserveResultVar &&
+                        declOp.getVarName() == "result")
+                        return;
                     if (isDeadVarDecl(declOp, funcBody, &refMap))
                         deadDecls.push_back(declOp);
                 });
