@@ -3325,16 +3325,39 @@ CAstBuilder::precomputeDeadStores(Block& block) {
             //   rax = rax | rcx;  ← survives (final write)
             // Fix: rax reads in RHS of ② keep ① alive, reads in ③ keep ② alive.
             bool rhsReadsSelf = false;
-            if (valueDef) {
+            {
+                // Collect the variables read by the RHS by following SSA
+                // operands.  We must NOT use `Operation::walk` here: walk
+                // only descends an op's NESTED REGIONS, but a helix_high
+                // binary / cast / unary has no regions — it reads its
+                // operands as sibling SSA values.  The old walk therefore
+                // saw zero reads for any non-trivial RHS, so a self-update
+                // like `result = result ^ byte` registered neither its
+                // self-read (rhsReadsSelf) nor kept earlier writes alive,
+                // and the accumulator store was wrongly killed as dead.
+                // Recurse through defining ops so reads buried in nested
+                // expressions (e.g. `(a ^ b) * c`) are all counted.
                 std::vector<std::string> toRemove;
-                valueDef->walk([&](helix::high::VarRefOp ref) {
-                    auto refName = applyNameAliases(ref.getVarName().str());
-                    if (refName == targetStr) {
-                        rhsReadsSelf = true;
+                std::vector<mlir::Value> worklist;
+                std::unordered_set<Operation*> seen;
+                worklist.push_back(assign.getValue());
+                while (!worklist.empty()) {
+                    mlir::Value v = worklist.back();
+                    worklist.pop_back();
+                    auto* def = v.getDefiningOp();
+                    if (!def || !seen.insert(def).second)
+                        continue;
+                    if (auto ref = dyn_cast<helix::high::VarRefOp>(def)) {
+                        auto refName = applyNameAliases(ref.getVarName().str());
+                        if (refName == targetStr)
+                            rhsReadsSelf = true;
+                        if (writtenNotRead.count(refName))
+                            toRemove.push_back(refName);
+                        continue;  // a var.ref has no further operands to read
                     }
-                    if (writtenNotRead.count(refName))
-                        toRemove.push_back(refName);
-                });
+                    for (auto operand : def->getOperands())
+                        worklist.push_back(operand);
+                }
                 for (auto& r : toRemove)
                     writtenNotRead.erase(r);
             }
