@@ -2672,6 +2672,29 @@ private:
 
         case RemillSemantic::MOVZX: {
             if (call.getNumOperands() >= 3) {
+                // ─── Memory source: MOVZX reg, [mem] ──────────────────
+                // For MnIh/MnIt/MnIj variants, operand(3) is the source
+                // ADDRESS, not a value. Without an explicit MemReadOp the
+                // byte/word load disappears from the IR entirely (e.g. the
+                // `MOVZX CL, [R8]` reload that drives every FNV hash loop).
+                // Mirrors the memory-source path in the MOV handler above.
+                //
+                // The MemRead's result is left unused for now; binding it
+                // through to the destination register is Commit B. Until
+                // then the unused MemReadOp gets eliminated by later DCE,
+                // so the C output stays byte-identical to before Commit A.
+                if (semInfo.has_memory_src && semInfo.src_width != 0 &&
+                    call.getNumOperands() >= 4) {
+                    auto addrValue = safeGetOperand(call, 3, builder, loc);
+                    unsigned readWidth = semInfo.src_width;
+                    auto readTy = builder.getIntegerType(readWidth);
+                    builder.create<helix::low::MemReadOp>(
+                        loc, readTy,
+                        ensureInt64(addrValue, builder, loc, &regs, &pcTracker),
+                        builder.getUI32IntegerAttr(readWidth),
+                        addrAttr);
+                }
+
                 Value operand = call.getOperand(2);
                 if (isa<LLVM::LLVMPointerType>(operand.getType())) {
                     operand = builder.create<LLVM::PtrToIntOp>(
