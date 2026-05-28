@@ -945,6 +945,36 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         std::string compoundOp =
             detectCompoundOp(op, targetStr);
 
+        // When a compound op is synthesised because the target also appears
+        // as an operand of the RHS binary (`x = x OP y`), the emitted form
+        // must be `x OP= y` — so the value expression has to be ONLY the
+        // *other* operand.  detectCompoundOp matched the target against one
+        // side of the binary; if we keep the whole `x OP y` as the value the
+        // printer emits the malformed `x OP= x OP y` (the self-doubled form
+        // seen on FNV hash accumulators).  ++/-- carry no value operand.
+        if (!compoundOp.empty() && compoundOp != "++" && compoundOp != "--") {
+            if (auto highBin =
+                    assign.getValue().getDefiningOp<helix::high::BinaryOp>()) {
+                std::string lhsName, rhsName;
+                if (auto l = highBin.getLhs()
+                                 .getDefiningOp<helix::high::VarRefOp>())
+                    lhsName = applyNameAliases(l.getVarName().str());
+                if (auto r = highBin.getRhs()
+                                 .getDefiningOp<helix::high::VarRefOp>())
+                    rhsName = applyNameAliases(r.getVarName().str());
+                // Keep the operand that is NOT the target.  lhsMatch keeps
+                // the rhs; the commutative rhsMatch case keeps the lhs.
+                Value keep;
+                if (lhsName == targetStr)
+                    keep = highBin.getRhs();
+                else if (rhsName == targetStr)
+                    keep = highBin.getLhs();
+                if (keep)
+                    if (auto strippedVal = buildExpression(keep))
+                        valueExpr = std::move(strippedVal);
+            }
+        }
+
         return std::make_unique<CAssignStmt>(
             std::move(targetExpr), std::move(valueExpr), compoundOp, addr);
     }
