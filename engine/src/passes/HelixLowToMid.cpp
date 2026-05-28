@@ -1092,12 +1092,17 @@ struct HelixLowToMidPass
                          << converted << " CallOps\n";
         }
 
-        // ── Wave 22 Step 2.5 stopgap: variadic_call + bundle.create → mid.call ──
+        // ── Wave 22 Step 3-lite: variadic_call + bundle.create → mid.call ──────
         //
-        // Step 3 will add proper low→mid conversion carrying the bundle. Until
-        // then, collapse to plain mid::CallOp so the pipeline keeps working and
-        // the C output is unchanged. The bundle attributes/operand are dropped
-        // here (only matter once Step 4 emits opacity markers from High).
+        // Full Step 3 (a first-class variadic_call op carried through every
+        // tier with a bundle operand) is deferred as an architectural
+        // follow-up — see project_wave22_step3_full_carriage_followup. Until
+        // then we collapse to a plain mid::CallOp but, instead of dropping the
+        // bundle, carry its recovery state forward as `helix.*` attributes.
+        // HelixMidToHigh already forwards `helix.*` attrs onto the high::CallOp,
+        // so CAstBuilder (Step 4) can read `helix.variadic_state` to emit the
+        // opacity marker.  This attribute-based carriage is the trade-off
+        // catalogued as Divergence 1 in project_wave22_step1_divergences.
         {
             SmallVector<low::VariadicCallOp, 16> vcallsToConvert;
             module.walk([&](low::VariadicCallOp v) {
@@ -1121,6 +1126,35 @@ struct HelixLowToMidPass
                     vCall.getLoc(), /*result=*/vCall->getResultTypes(),
                     builder.getI64IntegerAttr(calleeAddr), calleeNameAttr,
                     vCall.getFixedArgs(), vCall.getAddressAttr());
+
+                // Carry the bundle's recovery state forward as helix.* attrs.
+                // These are auto-propagated mid→high by HelixMidToHigh's
+                // existing `helix.*` attribute forwarding, so they reach the
+                // high::CallOp that Step 4 (CAstBuilder) inspects.
+                if (auto bundleOp = vCall.getRawBundle()
+                                         .getDefiningOp<low::BundleCreateOp>()) {
+                    const char* stateStr = "opaque";
+                    switch (bundleOp.getState()) {
+                    case low::BundleState::Zeroed:
+                        stateStr = "zeroed"; break;
+                    case low::BundleState::PartiallyRecovered:
+                        stateStr = "partially_recovered"; break;
+                    case low::BundleState::Recovered:
+                        stateStr = "recovered"; break;
+                    case low::BundleState::Opaque:
+                        stateStr = "opaque"; break;
+                    }
+                    midCall->setAttr("helix.variadic_state",
+                                     builder.getStringAttr(stateStr));
+                    midCall->setAttr(
+                        "helix.variadic_fixed_args_count",
+                        builder.getI64IntegerAttr(
+                            static_cast<int64_t>(vCall.getFixedArgs().size())));
+                    if (auto prov = bundleOp.getProvenance())
+                        midCall->setAttr("helix.variadic_provenance",
+                                         builder.getStringAttr(*prov));
+                }
+
                 if (vCall->getNumResults() > 0) {
                     vCall->getResult(0).replaceAllUsesWith(
                         midCall->getResult(0));
