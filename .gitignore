@@ -55,3 +55,7 @@ cmake_gen.log
 # OS
 .DS_Store
 Thumbs.db
+
+
+# Internal RAG / agent context — never commit
+/rag/
