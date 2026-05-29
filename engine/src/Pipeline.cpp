@@ -450,7 +450,7 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     // ── Tier 1.7: Control Flow Structuring ───────────────────────────────
     //    [Nightly: enhanced with else detection (P0.3), break/continue
     //    recovery (P0.4), and switch op consumption from P0.2]
-    pm.addPass(createStructureControlFlowPass());
+    pm.addPass(createStructureControlFlowPass(preserve_cfg_));
 
     pm.addPass(createRecoverVariablesPass());
     pm.addPass(createEliminateDeadCodePass());          // [Nightly: +liveness-driven DCE]

@@ -1377,6 +1377,13 @@ struct StructureControlFlowPass
         registry.insert<mlir::cf::ControlFlowDialect>();
     }
 
+    // CFG-topology-preserving mode (callfuscation-deflatten path).  When true,
+    // the irreducibility guard does NOT fire on reducible single-entry SCCs
+    // whose header has many internal back-edges (the canonical VM-dispatch
+    // loop with one latch per opcode handler).  Default false → normal lifts
+    // keep the conservative guard and are byte-for-byte unchanged.
+    bool preserveCfg_ = false;
+
     void runOnOperation() override {
         auto module = getOperation();
 
@@ -1595,18 +1602,29 @@ private:
                 // the SCC is technically single-entry.  If any block
                 // inside the SCC has >=3 predecessors from within the
                 // SCC, the DomTree may assert.
-                for (Block* blk : scc.body) {
-                    unsigned internalPreds = 0;
-                    for (Block* pred : blk->getPredecessors()) {
-                        if (sccSet.contains(pred))
-                            ++internalPreds;
+                //
+                // SKIPPED in --preserve-cfg (callfuscation-deflatten) mode:
+                // a single-entry SCC whose header has many internal back-edges
+                // is a REDUCIBLE multi-latch loop — the canonical VM dispatch
+                // loop has one latch per opcode handler (observed: 13).  The
+                // entries>1 check above already rejected truly irreducible
+                // (multi-entry) SCCs, and LLVM's DomTree handles reducible
+                // CFGs regardless of latch count.  Without this skip the whole
+                // 980-block function was left unstructured (flat low.jmp).
+                if (!preserveCfg_) {
+                    for (Block* blk : scc.body) {
+                        unsigned internalPreds = 0;
+                        for (Block* pred : blk->getPredecessors()) {
+                            if (sccSet.contains(pred))
+                                ++internalPreds;
+                        }
+                        if (internalPreds >= 3) {
+                            hasIrreducible = true;
+                            break;
+                        }
                     }
-                    if (internalPreds >= 3) {
-                        hasIrreducible = true;
-                        break;
-                    }
+                    if (hasIrreducible) break;
                 }
-                if (hasIrreducible) break;
             }
 
             // Safety net: the old forward-edge heuristic (>= 3 fwd preds)
@@ -2802,6 +2820,8 @@ private:
 // Pass Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<mlir::Pass> helix::createStructureControlFlowPass() {
-    return std::make_unique<StructureControlFlowPass>();
+std::unique_ptr<mlir::Pass> helix::createStructureControlFlowPass(bool preserveCfg) {
+    auto pass = std::make_unique<StructureControlFlowPass>();
+    pass->preserveCfg_ = preserveCfg;
+    return pass;
 }

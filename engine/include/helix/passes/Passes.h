@@ -50,7 +50,7 @@ std::unique_ptr<mlir::Pass> createPropagateTypesPass();
 /// (helix_high.if, helix_high.while, helix_high.for) using dominance
 /// analysis and back-edge detection. Falls back to goto/label for
 /// irreducible control flow.
-std::unique_ptr<mlir::Pass> createStructureControlFlowPass();
+std::unique_ptr<mlir::Pass> createStructureControlFlowPass(bool preserveCfg = false);
 
 /// Create the variable recovery pass.
 ///
