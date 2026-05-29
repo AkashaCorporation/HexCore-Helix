@@ -19,7 +19,7 @@ namespace helix {
 ///
 /// Recognizes Remill IR patterns (State struct GEPs, mangled semantic calls,
 /// __remill_* intrinsics) and converts them to HelixLow dialect operations.
-std::unique_ptr<mlir::Pass> createRemillToHelixLowPass();
+std::unique_ptr<mlir::Pass> createRemillToHelixLowPass(bool preserveCfg = false);
 
 // ─── Analysis / Transform Passes (HelixLow → HelixHigh) ─────────────────────
 

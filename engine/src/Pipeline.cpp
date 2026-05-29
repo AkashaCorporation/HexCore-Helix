@@ -407,7 +407,7 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     // ── Tier 1: LLVM Dialect → HelixLow ─────────────────────────────────
     //    Remill pattern recognition: converts LLVM IR patterns to
     //    machine-level HelixLow operations (registers, flags, raw memory).
-    pm.addPass(createRemillToHelixLowPass());
+    pm.addPass(createRemillToHelixLowPass(preserve_cfg_));
 
     // ── Tier 1 Analysis: HelixLow-level passes ──────────────────────────
     //    These passes operate on machine-level IR to recover high-level

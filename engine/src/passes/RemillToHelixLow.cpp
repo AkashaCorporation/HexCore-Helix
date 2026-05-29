@@ -882,6 +882,14 @@ struct RemillToHelixLowPass
         registry.insert<helix::high::HelixHighDialect>();
     }
 
+    // CFG-topology-preserving mode (set on the callfuscation-deflatten lift
+    // path).  When true, a direct JMP to a constant in-buffer address is an
+    // INTRA-function edge (the lift already wired it as `br label %bb_X`), so
+    // it must NOT be reclassified as an external tail-call (which would erase
+    // the br edge and collapse the function to a stub).  Default false →
+    // normal lifts are byte-for-byte unchanged.
+    bool preserveCfg_ = false;
+
     void runOnOperation() override {
         auto module = getOperation();
 
@@ -3035,6 +3043,37 @@ private:
                 uint64_t targetAddr = 0;
                 bool addrResolved = false;
 
+                // ── CFG-topology-preserving deflatten path ──────────────────
+                // In this mode the lift guarantees every direct jmp target is
+                // in-buffer (intra-function) and already wired the edge as a
+                // real `br label %bb_X` terminator.  Honour that edge: emit a
+                // JmpOp to the block's real successor instead of reclassifying
+                // the jmp as an external tail-call (which would erase the br
+                // edge and collapse the whole function to a stub).  Genuine
+                // tail-call blocks have no intra-function successor, so this
+                // only fires on wired edges.
+                if (preserveCfg_) {
+                    Block* curBlock = call->getBlock();
+                    Block* dest = nullptr;
+                    if (curBlock) {
+                        auto* term = curBlock->getTerminator();
+                        if (term && term->getNumSuccessors() == 1)
+                            dest = term->getSuccessor(0);
+                    }
+                    if (dest) {
+                        deferredTerminator =
+                            [loc, dest](OpBuilder& b, IntegerAttr addr) {
+                                b.create<helix::low::JmpOp>(
+                                    loc, /*target_addr=*/IntegerAttr{},
+                                    /*address=*/addr, /*dest=*/dest);
+                            };
+                        break;  // edge preserved — skip tail-call reclassify
+                    }
+                    // No single intra-function successor (e.g. unresolved
+                    // indirect jmp / ret-shaped block) → fall through to the
+                    // standard handling below.
+                }
+
                 // Tail-call detection is INTENTIONALLY conservative here:
                 // we only treat the JMP as a tail call when the operand is
                 // a *direct* constant (Remill's shape for `jmp <abs_addr>`
@@ -4075,6 +4114,8 @@ private:
 // Pass Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<mlir::Pass> helix::createRemillToHelixLowPass() {
-    return std::make_unique<RemillToHelixLowPass>();
+std::unique_ptr<mlir::Pass> helix::createRemillToHelixLowPass(bool preserveCfg) {
+    auto pass = std::make_unique<RemillToHelixLowPass>();
+    pass->preserveCfg_ = preserveCfg;
+    return pass;
 }

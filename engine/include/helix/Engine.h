@@ -95,6 +95,11 @@ public:
     /// Controls Tier 2.5 passes (magic division, devirtualization).
     void setSkipOptimization(bool skip);
 
+    /// Enable CFG-topology-preserving lowering (callfuscation-deflatten path).
+    /// Must be called BEFORE the first decompile call.  Default off → normal
+    /// lifts are byte-for-byte unchanged.
+    void setPreserveCfg(bool v);
+
     /// Enable a specific nightly pass by name (for debugging/testing).
     /// Call before first decompile. Enables selective mode.
     void enablePass(const char* name);
@@ -143,6 +148,7 @@ public:
 
 private:
     HelixArch arch_;
+    bool preserve_cfg_ = false;
     std::string last_error_;
 
     // Phase 2: MLIR context and pipeline
@@ -216,6 +222,10 @@ int helix_engine_decompile_ir_text(
 
 /// Set whether to skip optimization passes. Call before first decompile.
 void helix_engine_set_skip_optimization(HelixEngineHandle* engine, int skip);
+
+/// Enable CFG-topology-preserving lowering (callfuscation-deflatten path).
+/// Call before the first decompile.  Default off → normal lifts unchanged.
+void helix_engine_set_preserve_cfg(HelixEngineHandle* engine, int v);
 
 /// Enable a specific nightly pass by name. Call before first decompile.
 /// Valid names: HelixLowSimplify, SwitchRecovery, HelixMidSimplify,

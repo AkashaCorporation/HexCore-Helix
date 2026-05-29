@@ -110,6 +110,12 @@ void helix_engine_set_skip_optimization(HelixEngineHandle* handle, int skip) {
     }
 }
 
+void helix_engine_set_preserve_cfg(HelixEngineHandle* handle, int v) {
+    if (handle) {
+        to_engine(handle)->setPreserveCfg(v != 0);
+    }
+}
+
 void helix_engine_enable_pass(HelixEngineHandle* handle, const char* name) {
     if (handle && name) {
         to_engine(handle)->enablePass(name);

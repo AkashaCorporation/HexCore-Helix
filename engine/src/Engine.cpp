@@ -102,6 +102,15 @@ void Engine::setSkipOptimization(bool skip) {
     // Recreate pipeline with new optimization flag.
     // Safe to call before first decompile (pipeline is lazily built).
     pipeline_ = std::make_unique<Pipeline>(mlir_context_.get(), arch_, skip);
+    // Re-apply preserve-cfg onto the fresh pipeline (rebuild loses state).
+    if (preserve_cfg_)
+        pipeline_->setPreserveCfg(true);
+}
+
+void Engine::setPreserveCfg(bool v) {
+    preserve_cfg_ = v;
+    if (pipeline_)
+        pipeline_->setPreserveCfg(v);
 }
 
 void Engine::enablePass(const char* name) {

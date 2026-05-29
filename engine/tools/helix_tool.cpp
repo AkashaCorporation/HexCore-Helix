@@ -59,6 +59,7 @@ static int detectArch(std::string_view ir_text) {
 /// Decompile a single .ll file and return pseudo-C text.
 /// Uses helix_engine_decompile_ir_text() — the text API.
 static std::string decompileFile(const fs::path& input_path, bool skip_opt = false,
+                                  bool preserve_cfg = false,
                                   const std::vector<std::string>& enabled_passes = {},
                                   bool legacy_emitter = false) {
     std::string ir_text = readFile(input_path);
@@ -77,6 +78,12 @@ static std::string decompileFile(const fs::path& input_path, bool skip_opt = fal
     // Apply skip_optimization if requested (--no-opt flag)
     if (skip_opt) {
         helix_engine_set_skip_optimization(handle, 1);
+    }
+
+    // Apply CFG-topology preservation if requested (--preserve-cfg flag).
+    // Use only on the callfuscation-deflatten lift path.
+    if (preserve_cfg) {
+        helix_engine_set_preserve_cfg(handle, 1);
     }
 
     // Enable specific passes if requested (--enable-pass=Name)
@@ -142,6 +149,7 @@ static void printUsage(const char* argv0) {
         << "  " << argv0 << " --version               Show version\n\n"
         << "Flags:\n"
         << "  --no-opt              Skip optimization passes\n"
+        << "  --preserve-cfg        Preserve intra-function jmp edges (deflatten path)\n"
         << "  --legacy-emitter      Use legacy PseudoCEmitter instead of C AST\n"
         << "  --enable-pass=Name    Enable a specific pass\n\n"
         << "Examples:\n"
@@ -158,6 +166,7 @@ int main(int argc, char* argv[]) {
 
     // Parse flags
     bool skip_opt = false;
+    bool preserve_cfg = false;
     bool legacy_emitter = false;
     std::vector<std::string> enabled_passes;
     std::vector<std::string_view> positional;
@@ -165,6 +174,8 @@ int main(int argc, char* argv[]) {
         std::string_view a = argv[i];
         if (a == "--no-opt" || a == "--skip-optimization") {
             skip_opt = true;
+        } else if (a == "--preserve-cfg") {
+            preserve_cfg = true;
         } else if (a == "--legacy-emitter") {
             legacy_emitter = true;
         } else if (a == "--use-cast-layer") {
@@ -210,7 +221,7 @@ int main(int argc, char* argv[]) {
 
             std::cerr << "  " << entry.path().filename() << " ... ";
 
-            std::string result = decompileFile(entry.path(), skip_opt, enabled_passes, legacy_emitter);
+            std::string result = decompileFile(entry.path(), skip_opt, preserve_cfg, enabled_passes, legacy_emitter);
             if (result.empty()) {
                 std::cerr << "FAILED\n";
                 failed++;
@@ -235,7 +246,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string result = decompileFile(input_path, skip_opt, enabled_passes, legacy_emitter);
+    std::string result = decompileFile(input_path, skip_opt, preserve_cfg, enabled_passes, legacy_emitter);
     if (result.empty())
         return 1;
 

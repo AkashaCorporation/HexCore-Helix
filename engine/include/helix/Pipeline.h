@@ -71,6 +71,12 @@ public:
     /// instead of PseudoCEmitter.
     void setUseCastLayer(bool use) { use_cast_layer_ = use; }
 
+    /// Enable CFG-topology-preserving lowering (callfuscation-deflatten path).
+    /// When true, RemillToHelixLow honours intra-function `br` edges for
+    /// constant-target direct jumps instead of reclassifying them as external
+    /// tail-calls.  Forces a pipeline rebuild so the flag reaches the pass.
+    void setPreserveCfg(bool v) { preserve_cfg_ = v; pipeline_built_ = false; }
+
     /// Add a variable rename mapping (old_name → new_name).
     /// Applied during the C AST phase to all CVarRefExpr nodes.
     /// Call before decompile(). Multiple renames can be added.
@@ -167,6 +173,10 @@ private:
 
     /// When true, skip optimization passes (Tier 2.5 optimizations).
     bool skip_optimization_ = false;
+
+    /// When true, RemillToHelixLow preserves intra-function jmp edges
+    /// (callfuscation-deflatten path).  Default false → normal lifts unchanged.
+    bool preserve_cfg_ = false;
 
     /// Per-pass enable flags for nightly debugging.
     /// When all are false + skip_optimization=false, ALL nightly passes run.
