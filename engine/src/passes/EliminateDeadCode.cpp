@@ -707,7 +707,8 @@ static VarRefMap buildVarRefMap(Region& funcBody) {
 /// @param refMap   Pre-built map from var_id to all VarRefOps.
 /// @return         True if the variable is dead and can be removed.
 static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody,
-                          const VarRefMap* refMap = nullptr) {
+                          const VarRefMap* refMap = nullptr,
+                          bool isAapcs64 = false) {
     auto varId = declOp.getVarId();
     auto varName = declOp.getVarName();
 
@@ -735,10 +736,37 @@ static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody,
         return true;
 
     // Check if any reference is consumed by a live operation.
+    //
+    // A reference used as the RHS *value* of a surviving assignment keeps the
+    // variable alive: the assignment will be emitted to C and reads this
+    // variable.  Without this, the operand decl of a name-preserved
+    // assignment (e.g. AArch64 `result = sp`, where the "result" assign is
+    // kept by name but has no SSA consumer) is wrongly deleted, leaving a
+    // dangling var.ref that crashes the C-AST emitter.
+    //
+    // NOTE: iterate `refs` once and inspect each ref's *recorded* uses
+    // through the live walk; the RHS-of-assign check below uses the refMap
+    // entry's own users (never a raw getUses() on a possibly-stale handle).
     for (auto refOp : refs) {
         llvm::SmallPtrSet<Operation*, 16> visited;
         if (isValueLive(refOp.getResult(), visited, refMap))
             return false;  // at least one live use — variable is alive
+
+        // AArch64-only: keep a variable alive when it feeds the RHS *value* of
+        // a surviving assignment (e.g. `result = sp`).  This protects the
+        // operand decls of name-preserved AAPCS64 return assignments from
+        // being deleted, which would otherwise leave a dangling var.ref that
+        // crashes the C-AST emitter.  Gated to AAPCS64 so x86 liveness/DCE is
+        // byte-for-byte unchanged.
+        if (isAapcs64) {
+            for (Operation* user : refOp.getResult().getUsers()) {
+                if (auto assign = dyn_cast<helix::high::AssignOp>(user)) {
+                    if (assign.getTarget().getDefiningOp() !=
+                        refOp.getOperation())
+                        return false;
+                }
+            }
+        }
     }
 
     return true;  // no live uses found
@@ -921,10 +949,14 @@ static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp) {
 
         // A return uses RAX (return value).  If we're writing to RAX and
         // there's a return ahead, the write is NOT dead.
+        // AArch64 AAPCS64 returns in X0 (integer) / V0 (FP/SIMD); treat those
+        // as implicitly read by RET so the return-value write survives DCE.
         if (isa<helix::low::RetOp>(&op)) {
+            auto upperReg = regName.upper();
             if (helix::analysis::isX86GeneralPurposeReturnRegister(normalizedReg) ||
-                helix::analysis::isX86VectorRegister(regName)) {
-                foundRead = true;  // RAX and Vector Registers are implicitly read by RET.
+                helix::analysis::isX86VectorRegister(regName) ||
+                upperReg == "X0" || upperReg == "V0") {
+                foundRead = true;  // Return-value register implicitly read by RET.
                 break;
             }
             // For other registers at return, the write is dead (callee-saved
@@ -1781,8 +1813,12 @@ private:
         // dead-decl elimination for "result" keeps the chain alive without
         // changing the dialect or adding a fake live consumer op.
         bool preserveResultVar = false;
+        bool isAapcs64 = false;
         if (Operation* parentOp = funcBody.getParentOp()) {
             preserveResultVar = parentOp->hasAttr("has_return_value");
+            if (auto cc = parentOp->getAttrOfType<StringAttr>(
+                    "calling_convention"))
+                isAapcs64 = (cc.getValue() == "aapcs64");
         }
 
         bool changed = true;
@@ -1954,7 +1990,7 @@ private:
                     if (preserveResultVar &&
                         declOp.getVarName() == "result")
                         return;
-                    if (isDeadVarDecl(declOp, funcBody, &refMap))
+                    if (isDeadVarDecl(declOp, funcBody, &refMap, isAapcs64))
                         deadDecls.push_back(declOp);
                 });
 

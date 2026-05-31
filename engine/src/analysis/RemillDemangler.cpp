@@ -84,6 +84,14 @@ RemillSemantic classifyJcc(std::string_view name) {
 RemillSemantic classifySemantic(std::string_view name) {
     // ---- Data movement ------------------------------------------------------
     if (name == "MOV"   || name == "MOVI")   return RemillSemantic::MOV;
+    // AArch64 operand-accessor template: `Load<RnW<T>, In<T>>` is how Remill
+    // models `MOV Xd, #imm` / register-from-immediate moves. It carries the
+    // same (mem, state, dest_reg_ptr, value) operand layout as x86 MOV, so it
+    // routes through the MOV handler. NOTE: this matches the bare "Load"
+    // accessor only -- "LoadPair*" / "StorePair*" (load/store-pair with
+    // writeback) are distinct raw names and are intentionally NOT mapped here
+    // (their addressing-mode semantics are a separate, deferred model).
+    if (name == "Load")                      return RemillSemantic::MOV;
     if (name == "MOVZX" || name == "MOVZXI") return RemillSemantic::MOVZX;
     if (name == "MOVSX" || name == "MOVSXI" || name == "MOVSXD")
                                               return RemillSemantic::MOVSX;

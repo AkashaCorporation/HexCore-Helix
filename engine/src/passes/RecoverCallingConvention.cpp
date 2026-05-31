@@ -50,6 +50,20 @@ constexpr std::array<std::string_view, 6> kSysVIntArgs = {
     "RDI", "RSI", "RDX", "RCX", "R8", "R9"
 };
 
+/// AAPCS64 (AArch64) integer argument registers in order: X0..X7.
+/// Uppercase to match the register names Remill emits (the lowercase
+/// "x0" spec lives in CallingConventionDb; this pass uses uppercase
+/// throughout because RegisterTracker resolves GEPs to "X0".. names).
+constexpr std::array<std::string_view, 8> kAapcs64IntArgs = {
+    "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7"
+};
+
+/// Callee-saved registers (AAPCS64): X19..X28, plus FP (X29) and LR (X30).
+constexpr std::array<std::string_view, 12> kAapcs64CalleeSaved = {
+    "X19", "X20", "X21", "X22", "X23", "X24",
+    "X25", "X26", "X27", "X28", "X29", "X30"
+};
+
 /// Callee-saved registers (Win64).
 constexpr std::array<std::string_view, 7> kWin64CalleeSaved = {
     "RBX", "RBP", "RDI", "RSI", "R12", "R13", "R14"
@@ -65,7 +79,7 @@ constexpr std::array<std::string_view, 5> kSysVCalleeSaved = {
 /// the stack, no register arg slots.  Used for legacy PE binaries like
 /// GTA San Andreas (`target triple = "i386-unknown-windows-msvc-coff"`).
 /// x86 Linux also defaults to cdecl for the same reason (stack-only args).
-enum class CallingConv { Win64, SysV, Cdecl32 };
+enum class CallingConv { Win64, SysV, Cdecl32, Aapcs64 };
 
 static uint32_t getNextAvailableVarId(helix::low::FuncOp func) {
     uint32_t nextId = 0;
@@ -80,9 +94,14 @@ static bool isReturnRegisterWrite(Operation& op) {
     if (!regWrite)
         return false;
 
+    auto name = regWrite.getRegName().upper();
+    // AArch64 AAPCS64: integer return in X0, FP/SIMD return in V0.
+    if (name == "X0" || name == "V0")
+        return true;
+
     return helix::analysis::isX86GeneralPurposeReturnRegister(
                regWrite.getRegName()) ||
-           regWrite.getRegName().upper() == "XMM0";
+           name == "XMM0";
 }
 
 static bool hasReturnRegisterWriteInBlock(
@@ -267,7 +286,14 @@ private:
                 const bool is32BitX86 =
                     t.contains("i386") || t.contains("i486") ||
                     t.contains("i586") || t.contains("i686");
-                if (is32BitX86) {
+                const bool isAArch64 =
+                    t.contains("aarch64") || t.contains("arm64");
+                // AArch64 must be checked BEFORE the linux/elf/gnu branch:
+                // an "aarch64-pc-linux-gnu-elf" triple also matches those
+                // substrings, but AArch64 uses AAPCS64 (X0..X7), not x86 SysV.
+                if (isAArch64) {
+                    cc = CallingConv::Aapcs64;
+                } else if (is32BitX86) {
                     cc = CallingConv::Cdecl32;
                 } else if (t.contains("linux") || t.contains("elf") ||
                            t.contains("gnu") || t.contains("freebsd") ||
@@ -285,6 +311,7 @@ private:
         const char* ccDebugName =
             (cc == CallingConv::Win64)   ? "Win64"   :
             (cc == CallingConv::SysV)    ? "SysV"    :
+            (cc == CallingConv::Aapcs64) ? "Aapcs64" :
             /* Cdecl32 */                  "Cdecl32";
         llvm::errs() << "[P0-DEBUG] RecoverCC: using " << ccDebugName << "\n";
 
@@ -298,6 +325,7 @@ private:
         case CallingConv::Win64:   argRegs = kWin64IntArgs;   break;
         case CallingConv::SysV:    argRegs = kSysVIntArgs;    break;
         case CallingConv::Cdecl32: argRegs = kCdecl32IntArgs; break;
+        case CallingConv::Aapcs64: argRegs = kAapcs64IntArgs; break;
         }
 
         // --- Win64 entry-point detection ---
@@ -588,6 +616,7 @@ private:
         const char* ccStr =
             (cc == CallingConv::Win64)   ? "win64"   :
             (cc == CallingConv::SysV)    ? "sysv"    :
+            (cc == CallingConv::Aapcs64) ? "aapcs64" :
             /* Cdecl32 */                  "cdecl";
         func->setAttr("calling_convention",
             StringAttr::get(func->getContext(), ccStr));

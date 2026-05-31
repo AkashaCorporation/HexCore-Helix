@@ -112,7 +112,42 @@ namespace {
 
 using SubRegInfo = helix::analysis::X86SubRegInfo;
 
+/// Stable storage for AArch64 X-register names ("X0".."X30") so SubRegInfo
+/// can hold a StringRef parent that outlives the call (mirrors how the x86
+/// table uses string literals).
+static llvm::StringRef aarch64XRegName(unsigned n) {
+    static const std::array<std::string, 31> kNames = [] {
+        std::array<std::string, 31> a;
+        for (unsigned i = 0; i < 31; ++i)
+            a[i] = "X" + std::to_string(i);
+        return a;
+    }();
+    return kNames[n];
+}
+
+/// AArch64 GPR sub-register info: Xn is the 64-bit register, Wn its low
+/// 32-bit view (parent Xn).  Returns nullopt for names that are not AArch64
+/// GPRs so x86 resolution is reached unchanged.
+///
+/// Deliberately does NOT match "SP": (1) AArch64 SP is intentionally left on
+/// the non-register path (see aarch64GprName in RemillToHelixLow), and (2)
+/// "SP" is ALSO a valid x86 register name (16-bit stack pointer), so matching
+/// it here would corrupt x86 sub-register resolution.
+static std::optional<SubRegInfo> getAArch64SubRegInfo(llvm::StringRef reg) {
+    auto upper = reg.upper();
+    if (upper.size() >= 2 && (upper[0] == 'X' || upper[0] == 'W')) {
+        unsigned n;
+        if (!llvm::StringRef(upper).drop_front().getAsInteger(10, n) && n <= 30) {
+            unsigned width = (upper[0] == 'W') ? 32 : 64;
+            return SubRegInfo{aarch64XRegName(n), width, 0};
+        }
+    }
+    return std::nullopt;
+}
+
 static std::optional<SubRegInfo> getSubRegInfo(llvm::StringRef reg) {
+    if (auto a64 = getAArch64SubRegInfo(reg))
+        return a64;
     return helix::analysis::getX86SubRegInfo(reg);
 }
 
@@ -166,6 +201,12 @@ struct VariableTracker {
     /// Whether the function has a return value (set by RecoverCallingConvention).
     bool hasReturnValue = false;
 
+    /// Whether the current function uses the AArch64 AAPCS64 ABI.  Gates the
+    /// AArch64-specific return-register (X0) and "result" naming/coalescing
+    /// behaviour so x86 (SysV/Win64/cdecl) output stays byte-for-byte
+    /// unchanged.
+    bool isAapcs64 = false;
+
     /// Initialize the argument register position map based on calling convention.
     ///
     /// @param isWin64  true for Win64 ABI, false for SysV AMD64 ABI.
@@ -184,6 +225,13 @@ struct VariableTracker {
             argRegPositions["R8"]  = 5;
             argRegPositions["R9"]  = 6;
         }
+    }
+
+    /// AArch64 AAPCS64 integer argument registers: X0..X7 -> positions 1..8.
+    void initArgRegPositionsAapcs64() {
+        argRegPositions.clear();
+        for (unsigned i = 0; i < 8; ++i)
+            argRegPositions["X" + std::to_string(i)] = i + 1;
     }
 
     /// Check if an operation is in a return context — i.e., the register
@@ -232,19 +280,29 @@ struct VariableTracker {
     /// @param canonicalReg  The canonical 64-bit register name (e.g., "RAX").
     /// @param contextOp     The operation context (for return detection).
     /// @return              The semantic variable name and storage kind.
+    /// True if `reg` is the integer return register for the active ABI:
+    /// RAX on x86, X0 on AArch64 AAPCS64.
+    static bool isIntegerReturnRegister(llvm::StringRef reg) {
+        return reg == "RAX" || reg == "X0";
+    }
+
     std::pair<std::string, helix::high::StorageKind>
     getSemanticName(llvm::StringRef canonicalReg, Operation* contextOp) {
+        // Return context takes priority over the argument-register name.
+        // This matters on AArch64 AAPCS64, where X0 is BOTH the first
+        // argument register AND the integer return register: a write to X0
+        // in return context is the return value ("result"), not param_1.
+        // (On x86 RAX is never an argument register, so order is moot there.)
+        if (isIntegerReturnRegister(canonicalReg) && hasReturnValue && contextOp &&
+            isReturnContext(contextOp, canonicalReg)) {
+            return {"result", helix::high::StorageKind::Register};
+        }
+
         // Check if this is an argument register.
         auto argIt = argRegPositions.find(canonicalReg);
         if (argIt != argRegPositions.end()) {
             std::string name = llvm::formatv("param_{0}", argIt->second);
             return {name, helix::high::StorageKind::Parameter};
-        }
-
-        // Check if RAX in return context.
-        if (canonicalReg == "RAX" && hasReturnValue && contextOp &&
-            isReturnContext(contextOp, canonicalReg)) {
-            return {"result", helix::high::StorageKind::Register};
         }
 
         // Default: lowercase register name.
@@ -265,11 +323,12 @@ struct VariableTracker {
     Operation* getOrDeclareRegVar(llvm::StringRef canonicalReg,
                                   OpBuilder& builder, Location loc,
                                   Operation* contextOp = nullptr) {
-        // For RAX, check return context to decide between "result" and "rax".
-        // We use a separate key for the return-context variant.
-        bool isRetCtx = (canonicalReg == "RAX" && hasReturnValue &&
+        // For the integer return register (RAX / X0), check return context to
+        // decide between "result" and the plain register name.  We use a
+        // separate key for the return-context variant.
+        bool isRetCtx = (isIntegerReturnRegister(canonicalReg) && hasReturnValue &&
                          contextOp && isReturnContext(contextOp, canonicalReg));
-        llvm::StringRef lookupKey = isRetCtx ? "RAX__result" : canonicalReg;
+        llvm::StringRef lookupKey = isRetCtx ? "__ret_result" : canonicalReg;
 
         auto it = regToDecl.find(lookupKey);
         if (it != regToDecl.end())
@@ -423,7 +482,13 @@ struct SSAVersionTracker {
         auto [baseName, storage] = tracker.getSemanticName(canonReg, contextOp);
 
         std::string varName;
-        if (ver == 0) {
+        // On AArch64, X0's param-init version 0 ("param_1") is followed by a
+        // return-context write that must still be named exactly "result" (no
+        // SSA suffix) so the C emitter / DCE preservation recognise it. This
+        // is gated to AAPCS64 so x86 version naming (rax_1, etc.) is byte-for
+        // -byte unchanged.
+        if (ver == 0 ||
+            (tracker.isAapcs64 && baseName == "result")) {
             varName = baseName;
         } else {
             varName = llvm::formatv("{0}_{1}", baseName, ver).str();
@@ -668,13 +733,18 @@ private:
         // are recovered by RecoverStackLayout instead.
         bool isWin64 = true;
         bool isCdecl32 = false;
+        bool isAapcs64 = false;
         if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention")) {
             auto ccVal = ccAttr.getValue();
             isWin64   = (ccVal == "win64");
             isCdecl32 = (ccVal == "cdecl");
+            isAapcs64 = (ccVal == "aapcs64");
         }
+        tracker.isAapcs64 = isAapcs64;
         if (isCdecl32) {
             tracker.argRegPositions.clear();
+        } else if (isAapcs64) {
+            tracker.initArgRegPositionsAapcs64();
         } else {
             tracker.initArgRegPositions(isWin64);
         }
@@ -1789,6 +1859,18 @@ private:
                 for (size_t vi = 1; vi < versions.size(); ++vi) {
                     auto& ver = versions[vi];
                     if (!ver.decl)
+                        continue;
+
+                    // ── Preserve the "result" return-value identity ───────
+                    // On AArch64 AAPCS64, X0 is both the first argument and
+                    // the integer return register: version 0 is the param
+                    // ("param_1") and a return-context write produces a
+                    // distinct "result" version. Coalescing "result" into the
+                    // param base would erase the return-value name that the C
+                    // emitter and DCE preservation key on. Keep them separate.
+                    // Gated to AAPCS64 so x86 coalescing is unchanged.
+                    if (tracker.isAapcs64 &&
+                        ver.varName == "result" && base.varName != "result")
                         continue;
 
                     // ── Type compatibility check ──────────────────────────

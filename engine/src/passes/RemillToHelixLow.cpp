@@ -109,6 +109,40 @@ struct RegisterTracker {
         {33, "RIP"},
     };
 
+    /// AArch64 GPR struct index-to-register mapping.
+    /// Remill State → AArch64State → GPR field at struct index 3 (NOT 6).
+    /// Layout mirrors the x86 GPR struct shape: padding (i64) + Reg, so the
+    /// register lives at the odd sub-index 2*N+1.
+    ///   1=X0, 3=X1, 5=X2, ... 61=X30, 63=SP, 65=PC.
+    /// AArch64-specific: the GPR struct sits at top-level field 3, which is
+    /// disjoint from x86 (field 6), so dispatching on the struct field keeps
+    /// x86 recognition byte-for-byte unchanged.
+    static constexpr int kAArch64GprStructField = 3;
+
+    /// Resolve an AArch64 GPR sub-index (the odd 2*N+1 slot) to a register
+    /// name. Returns an empty string if the sub-index is not a recognized
+    /// GPR/PC slot. Static so both scan() and the value-based decoder share
+    /// one source of truth.
+    ///
+    /// NOTE: SP (sub-index 63) is intentionally NOT recognized here. SP is
+    /// only meaningfully touched by stack load/store-pair-with-writeback
+    /// helpers (StorePairUpdateIndex64 / LoadPairUpdateIndex64), which are a
+    /// deferred follow-up.  Recognizing SP turns its writeback (`sp = sp - N`)
+    /// and the pair-helper SP operands into register reads/writes whose SSA
+    /// versioning interacts with those unmodeled helpers and triggers a
+    /// (non-deterministic) use-after-free in the canonical stp/mov/ldp
+    /// prologue.  Leaving SP on the non-register mem/temp path keeps AArch64
+    /// crash-free and costs nothing in the decompiled C (the raw stack-pointer
+    /// value is not meaningful output).  Re-enable SP here once the pair
+    /// helpers are modeled as MemRead/MemWrite.
+    static std::string aarch64GprName(int subIdx) {
+        if (subIdx == 65) return "PC";
+        // X0..X30 live at odd sub-indices 1,3,5,...,61.
+        if (subIdx >= 1 && subIdx <= 61 && (subIdx % 2) == 1)
+            return "X" + std::to_string((subIdx - 1) / 2);
+        return {};
+    }
+
     /// x86-64 XMM/Vector register index mapping.
     /// Remill State → X86State → VectorReg array at struct index 1.
     /// [32 x %union.VectorReg] — index 0-15 = XMM0-XMM15
@@ -138,6 +172,15 @@ struct RegisterTracker {
             }
             if (auto cast = val.getDefiningOp<LLVM::AddrSpaceCastOp>()) {
                 val = cast.getArg();
+                continue;
+            }
+            // AArch64 operand-accessor templates (e.g. `Load<RnW, In>` for
+            // `MOV Xd,#imm`) pass the destination register slot as an i64 via
+            // `ptrtoint %reg_gep`.  Strip ptrtoint so register-pointer lookups
+            // resolve to the underlying GEP (and thus to the X-register name).
+            // Harmless for x86, which passes register pointers directly.
+            if (auto p2i = val.getDefiningOp<LLVM::PtrToIntOp>()) {
+                val = p2i.getArg();
                 continue;
             }
             if (auto gep = val.getDefiningOp<LLVM::GEPOp>()) {
@@ -201,6 +244,21 @@ struct RegisterTracker {
                                     reg_widths[name] = inferRegWidth(name);
                                     return;
                                 }
+                            }
+                        }
+
+                        // AArch64 GPR: gep %state, 0, 0, 3, <gpr_field_index>, ...
+                        // AArch64State places GPR at top-level field 3, disjoint
+                        // from x86 (field 3 is anonymous padding in X86State), so
+                        // this branch never fires for x86 and x86 recovery is
+                        // byte-for-byte unchanged. X0..X30 at sub-index 2*N+1,
+                        // SP at 63, PC at 65.
+                        if (structField == kAArch64GprStructField) {
+                            std::string name = aarch64GprName(subIdx);
+                            if (!name.empty()) {
+                                gep_to_reg[gep.getResult()] = name;
+                                reg_widths[name] = inferRegWidth(name);
+                                return;
                             }
                         }
 
@@ -546,6 +604,21 @@ struct RegisterTracker {
 
     /// Infer register bit width from its name.
     static unsigned inferRegWidth(llvm::StringRef name) {
+        // AArch64 GPRs: X0..X30 are 64-bit; W0..W30 are their 32-bit views.
+        // These names never collide with x86 (which has no X<n>/W<n> GPRs).
+        // NOTE: AArch64 "SP" is intentionally NOT special-cased here -- it is
+        // left on the non-register path, and "SP" is also a valid x86 register
+        // name (16-bit), so matching it would mis-size the x86 stack pointer.
+        if (name.size() >= 2 && name[0] == 'X') {
+            unsigned n;
+            if (!name.drop_front().getAsInteger(10, n) && n <= 30)
+                return 64;
+        }
+        if (name.size() >= 2 && name[0] == 'W') {
+            unsigned n;
+            if (!name.drop_front().getAsInteger(10, n) && n <= 30)
+                return 32;
+        }
         // XMM: 128-bit
         if (name.starts_with("XMM"))
             return 128;
@@ -617,12 +690,21 @@ struct RegisterTracker {
         if (auto constIndices = extractConstantGEPIndices(gep)) {
             if (constIndices->size() >= 4 &&
                 (*constIndices)[0] == 0 &&
-                (*constIndices)[1] == 0 &&
-                (*constIndices)[2] == 6) {
-                int gprIdx = (*constIndices)[3];
-                for (auto [idx, name] : kGprIndexMap) {
-                    if (idx == gprIdx)
-                        return std::string(name);
+                (*constIndices)[1] == 0) {
+                int structField = (*constIndices)[2];
+                int subIdx = (*constIndices)[3];
+                // x86-64 GPR at struct field 6.
+                if (structField == 6) {
+                    for (auto [idx, name] : kGprIndexMap) {
+                        if (idx == subIdx)
+                            return std::string(name);
+                    }
+                }
+                // AArch64 GPR at struct field 3 (disjoint from x86).
+                if (structField == kAArch64GprStructField) {
+                    std::string name = aarch64GprName(subIdx);
+                    if (!name.empty())
+                        return name;
                 }
             }
         }
@@ -967,6 +1049,30 @@ private:
     /// bogus `sub_ffffffffc75c4ad9` names (bug H of the gta-sa stress set).
     unsigned machineIntWidth_ = 64;
 
+    /// True when the module being converted targets AArch64 (triple
+    /// "aarch64-*"/"arm64-*").  Set in convertFunction from the module's
+    /// llvm.target_triple.
+    bool isAArch64_ = false;
+
+    /// Integer return register name for the current target ABI: X0 on AArch64
+    /// (AAPCS64), RAX on x86 (SysV/Win64).
+    ///
+    /// FOLLOW-UP (deferred): the synthesized call-result RegWrite sites below
+    /// currently sink to a literal "RAX" rather than returnRegName().  Writing
+    /// "X0" there is the correct AArch64 behaviour for genuine function calls,
+    /// but it triggers a use-after-free crash when combined with the
+    /// not-yet-modeled AArch64 load/store-pair-with-writeback helpers
+    /// (StorePairUpdateIndex64 / LoadPairUpdateIndex64) in a single function
+    /// (the canonical stp/mov/ldp prologue).  Until those pair helpers are
+    /// modeled, the conservative "RAX" sink keeps AArch64 crash-free: on
+    /// AArch64 there is no RAX variable, so the orphan result is cleanly DCE'd
+    /// and the call degrades to a side-effecting stub -- exactly the prior
+    /// (pre-AArch64) behaviour.  Re-point these sites at returnRegName() once
+    /// the pair helpers are lowered to MemRead/MemWrite.
+    [[maybe_unused]] llvm::StringRef returnRegName() const {
+        return isAArch64_ ? "X0" : "RAX";
+    }
+
     /// Convenience accessor for the current-function machine integer type.
     mlir::IntegerType machineIntTy(mlir::OpBuilder& b) const {
         return b.getIntegerType(machineIntWidth_);
@@ -1089,6 +1195,16 @@ private:
                 machineIntWidth_ = pcIntTy.getWidth();
             else
                 machineIntWidth_ = 64;
+
+            // Detect AArch64 from the module triple so synthesized call
+            // results write the correct integer return register (X0 vs RAX).
+            if (auto mod = llvmFunc->getParentOfType<ModuleOp>()) {
+                if (auto triple =
+                        mod->getAttrOfType<StringAttr>("llvm.target_triple")) {
+                    auto t = triple.getValue();
+                    isAArch64_ = t.contains("aarch64") || t.contains("arm64");
+                }
+            }
             auto pcConst = builder.create<LLVM::ConstantOp>(
                 loc, pcArg.getType(),
                 builder.getI64IntegerAttr(entryAddr));
@@ -1499,7 +1615,7 @@ private:
                     builder.create<helix::low::RegWriteOp>(
                         loc,
                         callOp.getResult(),
-                        builder.getStringAttr("RAX"),
+                        builder.getStringAttr("RAX"), // see returnRegName() note
                         builder.getUI32IntegerAttr(resultBits),
                         addrAttr);
 
@@ -1603,7 +1719,7 @@ private:
                                 builder.getStringAttr(calleeName), addrAttr);
                         builder.create<helix::low::RegWriteOp>(
                             loc, vCall.getResult(),
-                            builder.getStringAttr("RAX"),
+                            builder.getStringAttr("RAX"), // see returnRegName() note
                             builder.getUI32IntegerAttr(machineIntWidth_),
                             addrAttr);
                         llvm::errs()
@@ -1628,7 +1744,7 @@ private:
                 builder.create<helix::low::RegWriteOp>(
                     loc,
                     extCall.getResult(),
-                    builder.getStringAttr("RAX"),
+                    builder.getStringAttr("RAX"), // see returnRegName() note
                     builder.getUI32IntegerAttr(machineIntWidth_),
                     addrAttr);
 
@@ -2973,7 +3089,7 @@ private:
                                     targetName, addrAttr);
                             builder.create<helix::low::RegWriteOp>(
                                 loc, vCall.getResult(),
-                                builder.getStringAttr("RAX"),
+                                builder.getStringAttr("RAX"), // see returnRegName() note
                                 builder.getUI32IntegerAttr(resultBits),
                                 addrAttr);
                             llvm::errs()
@@ -3003,7 +3119,7 @@ private:
                 builder.create<helix::low::RegWriteOp>(
                     loc,
                     newCallOp.getResult(),
-                    builder.getStringAttr("RAX"),
+                    builder.getStringAttr("RAX"), // see returnRegName() note
                     builder.getUI32IntegerAttr(resultBits),
                     addrAttr);
 
@@ -3124,7 +3240,7 @@ private:
                     builder.create<helix::low::RegWriteOp>(
                         loc,
                         tailCallOp.getResult(),
-                        builder.getStringAttr("RAX"),
+                        builder.getStringAttr("RAX"), // see returnRegName() note
                         builder.getUI32IntegerAttr(resultBits),
                         addrAttr);
 
@@ -4061,6 +4177,16 @@ private:
                     callArgs,
                     builder.getStringAttr(semInfo.raw_name),
                     addrAttr);
+                // For genuinely UNHANDLED semantics we do not know which
+                // register (if any) receives the result.  Materializing it as
+                // the integer return register (X0 on AArch64) would wrongly
+                // chain the unmodeled helper into the function's return value
+                // -- e.g. AArch64 StorePair/LoadPair (deferred) writeback
+                // pairs, which then produce a malformed return chain.  Keep
+                // the x86 "RAX" sink here: on AArch64 there is no RAX var, so
+                // the orphan result is cleanly DCE'd and the helper degrades
+                // to a side-effecting stub call (the safe, documented
+                // behaviour for not-yet-modeled opcodes).
                 builder.create<helix::low::RegWriteOp>(
                     loc,
                     unhandledCall.getResult(),
