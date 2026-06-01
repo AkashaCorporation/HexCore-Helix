@@ -3,9 +3,76 @@
 All notable changes to HexCore Helix are documented here.
 
 
-## [v0.9.3-nightly] — 2026-05-20
+## [v0.9.2-nightly] — 2026-05-31
 
-> **Nightly build** — Register SSA-versioning groundwork.  Adds a per-function SSA-rename pass (FIX-087) that disambiguates the `HelixLowToMid` slot-id key across distinct logical defs of the same physical register.  Eliminates a known cross-corpus collision class.  Validated on three corpora: rootkit (n=7), ROTTR (n=20), Intigrity Mali kernel (n=7).  No regression on any function previously above 40%; **+5.8pp mean on Intigrity** (kbase_mem_free 49.5% → 79.5% confidence, body cleaned of unreachable junk).
+> **Nightly build (rolling).** This is the single active nightly line; it now spans Wave 19 → Wave 24, newest work first. The earlier Wave 21 (FIX-087) groundwork is included below under this same version.
+>
+> **Since the FIX-087 SSA-versioning groundwork (Wave 21):** byte/word memory-source `MOVZX` lift, register-as-address variable binding (in-region + in-loop RAX→`result`), the first-class variadic-call mini-ISA carriage (Wave 22 Step 3-lite), two C-AST dataflow-fidelity fixes that recover the FNV accumulator chain, an `exprEqual` completeness fix, and the opt-in `--preserve-cfg` callfuscation-deflatten path (Wave 23, Stages 1+2). All `--preserve-cfg` work is gated **default OFF** — normal lifts are byte-for-byte unchanged, confirmed by a quad-corpus tripwire (rootkit / ROTTR / Intigrity-Mali / Akasha).
+
+### Wave 24: AArch64 (AAPCS64) register recovery and decompilation (2026-05-31)
+
+> First working AArch64 decompilation path for the Helix MLIR pipeline, now that Remill AArch64 lifting works (FIX-053). Helix was previously x86-only: AArch64 register GEPs were unrecognized, so the pipeline leaked Remill operand-accessor helpers (e.g. `return Load();`) instead of real values. All changes are AArch64-gated; x86 output is proven byte-identical (13/13 deterministic gta-sa stress functions diff-clean vs main; the 2 remaining diffs are pre-existing pipeline non-determinism present in clean main).
+
+- **Root cause** (`passes/RemillToHelixLow.cpp`): `RegisterTracker` decoded register GEPs using the x86-64 Remill State struct layout only (GPR at struct field 6). The AArch64 State struct places GPR at field 3 with a different sub-index scheme (X0..X30 at odd slots 1..61), so no AArch64 register was ever recognized and all downstream naming / CC / ABI logic stayed x86-tuned.
+- **`RemillToHelixLow`**: recognize AArch64 GPR GEPs at struct field 3 (X0..X30) in both `RegisterTracker::scan()` and `extractRegisterNameFromValue()`; strip `ptrtoint` in `stripPointerAliases` so operand-accessor register pointers resolve; `inferRegWidth` understands `X<n>` / `W<n>`; map the bare Remill `Load` operand accessor (`Load<RnW,In>`) to MOV so `MOV Xd,#imm` lowers to a real register write. Field 3 is disjoint from x86 (field 6), so x86 recognition is byte-for-byte unchanged.
+- **`RecoverCallingConvention`**: add the `Aapcs64` calling convention (X0..X7 args, X0/V0 return, X19..X30 callee-saved) and select it for `aarch64` / `arm64` triples before the linux/elf/gnu branch.
+- **`RecoverVariables`**: AAPCS64 arg-register positions (X0..X7 -> param_1..8); AArch64 sub-register info (`X<n>` 64-bit, `W<n>` the 32-bit view of `X<n>`); X0 dual-role (arg + return) so a return-context X0 write names `result` over `param_1`.
+- **`RecoverVariables` / `EliminateDeadCode`**: X0/V0 are implicitly read by RET, so the return-value write survives DCE.
+- **`RemillDemangler`**: classify the bare AArch64 `Load` operand accessor as MOV.
+- **Validated** (real native engine via `helix_tool --use-cast-layer` and the deployed `.node`): `mov x0,#1; ret` -> `return 1;` (was `return Load();`); `mov w0,#0x2a; ret` -> `return 42;`; `add x0,x0,#1; ret` -> `param_1 + 1` (AAPCS64 param + return); x86 `mov eax,1; ret` -> `return 1;` (`| sysv`, unchanged).
+- **Deferred follow-ups** (reported, not regressions): SP recognition plus the load/store-pair-with-writeback helpers (`StorePairUpdateIndex64` / `LoadPairUpdateIndex64`) are still side-effecting stubs -- recognizing SP together with these unmodeled pair helpers exposed a latent use-after-free in the stp/mov/ldp prologue, so SP is intentionally left on the non-register path to stay crash-free (0/20 runs); AArch64 conditional-branch decomposition (`cbz` / `cbnz` / `b.cond` still emit `__native_*`); AArch64 call-result dataflow keeps the x86 RAX sink (cleanly DCE'd on AArch64) pending the pair-helper modeling.
+
+### Wave 23 — Callfuscation deflatten structural recovery (`--preserve-cfg`, 2026-05-29)
+
+> Opt-in `--preserve-cfg` mode (default **OFF** — normal lifts byte-for-byte unchanged) for the callfuscation-deflatten lift path: an anti-analysis flattened dispatcher, deflattened upstream into a single ~980-block function, that previously **collapsed to a 4-line stub** inside Helix. Validated end-to-end on `crackme.deflat2` (a stack-VM interpreter). Quad-tripwire with the flag OFF is byte-identical (rootkit 27.0% / ROTTR 20.4% / Intigrity-Mali 24.0% / Akasha 22.9%; oracle mali 35.8%, oracle akasha 32.3%). Flag plumbing mirrors `skip_optimization`: `helix_tool --preserve-cfg` → `helix_engine_set_preserve_cfg` → `Engine::setPreserveCfg` → `Pipeline::setPreserveCfg` → `createRemillToHelixLowPass(bool)` / `createStructureControlFlowPass(bool)`.
+
+#### Stage 1 — `RemillToHelixLow`: keep intra-function jmp edges under `--preserve-cfg` (`passes/RemillToHelixLow.cpp`, commit `f394fbb`)
+
+- **Problem**: every deflattened block carries a constant-target `JMPI` PC-bookkeeping semantic *alongside* its real `br label %bb_X` edge. The `JMP` case treated the constant target as an external tail-call (`low.call sub_<target>` + deferred `RetOp`), and the deferred-terminator logic **erased the `br` edge** — truncating the function at its first block and collapsing the whole 980-block VM to `sub_40b65f(); return`. The code's assumption ("a constant-target jmp is always an external tail-call; intra-function jumps are plain `br`") is false for the CFG-preserving lift (0 out-of-buffer jmp targets).
+- **Fix (gated)**: when `--preserve-cfg` is set and the JMP block has a single intra-function `br`/`cond_br` successor, emit a `low.jmp` to that successor instead of reclassifying the jump as a tail-call. Genuine external tail-call blocks have no intra-function successor, so they are unaffected; with the flag OFF the original behaviour is byte-identical.
+- **Result**: stub → full body survives (11891 ops after RemillToHelixLow, 7513 at HelixHigh, **0** tail-calls, no crash); all six MBA arithmetic helpers visible.
+
+#### Stage 2 — `StructureControlFlow`: structure reducible multi-latch dispatch loops under `--preserve-cfg` (commit `cdd747c`)
+
+- **Problem**: with Stage 1 the body survives but the structurer left it **entirely unstructured** (946 raw `helix_low.jmp`, 0 high-level regions). Its irreducibility guard declared the function irreducible because the VM dispatch-loop header (`0x4096ab`, **13 internal back-edge predecessors** — one latch per opcode handler) tripped the "any SCC block with ≥3 internal predecessors → irreducible" heuristic. That SCC is single-entry, hence **reducible**; the `entries > 1` check above it is the authoritative test, and LLVM's DomTree handles reducible multi-latch loops fine (verified: no assert).
+- **Fix (gated)**: in `--preserve-cfg` mode the `≥3-internal-preds` sub-guard is skipped (the `entries > 1` multi-entry check still rejects truly irreducible SCCs). Default OFF → conservative guard retained, normal lifts unchanged.
+- **Result**: structuring proceeds (no crash); **23 loop regions** recovered; pseudo-C 51 → 328 lines with the dispatch logic visible (opcode values, `prog[]`/value-stack accesses, MBA helpers).
+- **Known follow-ups (not in this build)**: the multi-latch dispatch loop + opcode if-chain still emit as nested `while(true)` + goto rather than a clean `while { switch }` (Stage 2b — loop-coalescing + switch recovery); and the dataflow (array-index recovery `prog[idx]`/`stack[sp]`, call arg/return recovery, `var_950` desconflation) is still raw (Stage 3, in progress).
+
+### Wave 22 — Variadic-call mini-ISA: Step 3-lite carriage (`passes/HelixLowToMid.cpp`, commit `088d624`)
+
+- **Problem**: Wave 22 Step 2 (`RemillToHelixLow`) emits a first-class `helix_low.variadic_call` + `bundle.create<state>` for zeroed printk-family calls (`printk(0)`, `dev_err(0)`, …), but the "Step 2.5 stopgap" in `HelixLowToMid` collapsed each to a plain `mid::call` and **dropped the bundle**, so the upstream-zeroed recovery state never reached HelixHigh and a downstream opacity marker had nothing to key off.
+- **Fix**: instead of dropping the bundle, carry its recovery state forward as discardable attributes on the resulting `mid::call` — `helix.variadic_state` (`zeroed`/`opaque`/`partially_recovered`/`recovered`), `helix.variadic_fixed_args_count`, `helix.variadic_provenance`. `HelixMidToHigh` already forwards `helix.*` attributes onto the `high::call` (both the conversion pattern and the manual `low::FuncOp` walk), so the state reaches CAstBuilder for free. This is the attribute-based carriage trade-off catalogued as Divergence 1 of the Step-1 design; the fully first-class `variadic_call` op carried through every tier is deferred as an architectural follow-up.
+- **Result**: no C-output change (the marker emission itself, Step 4, is deferred); carriage verified on rootkit `fh_install_hook` — 6 zeroed-fmt variadic calls detected at lift == 6 `high::call` ops carrying `helix.variadic_state="zeroed"` in the post-pipeline IR. All baselines hold.
+
+### Wave 20 — C-AST dataflow fidelity: FNV accumulator chain + compound assignment (`cast/`, commits `d67b37d`, `6d30a55`, `22fbba1`)
+
+> Honesty corrections (criteria per the protocol: ground-truth oracle holds, the defect is silent data loss / fabricated output, the score movement is pre-existing defects becoming visible). Surfaced on the Akasha `rt_fnv` runtime FNV-1a hash (`while (*s) { h = (h ^ byte) * prime; }`).
+
+#### Bug A — `precomputeDeadStores` traverses SSA operands, not regions (`cast/CAstBuilder.cpp`, commit `d67b37d`)
+
+- **Problem**: CAstBuilder's per-block dead-store pre-scan detected RHS variable reads with `valueDef->walk([](VarRefOp){…})`. `Operation::walk` descends an op's *nested regions*, but a `helix_high.binary`/`cast`/`unary` reads its operands as *sibling SSA values* (no regions) — so the walk saw zero reads for any non-trivial RHS. A self-update like `result = result ^ byte` registered neither its self-read (`rhsReadsSelf`) nor kept earlier writes alive, so the FNV xor-accumulator store was wrongly judged dead and dropped — silently deleting a live computation.
+- **Fix**: replace the `walk` with a recursive `getDefiningOp` traversal of the value's operand tree (handles reads buried in nested expressions like `(a ^ b) * c`), mirroring the already-correct direct-operand logic in the cross-block pre-scan. The XOR store now survives to the C output.
+
+#### Bug B — `detectCompoundOp` strips the matched operand (`cast/CAstBuilder.cpp`, commit `6d30a55`)
+
+- **Problem**: when the assign target also appeared as an operand of the RHS binary (`x = x OP y`), `detectCompoundOp` returned a compound operator (e.g. `*=`) but the caller never replaced `valueExpr` with the *other* operand — emitting the self-doubled `result *= result * prime` instead of `result *= prime` (and `result ^= result ^ byte`).
+- **Fix**: when the compound op matches via `lhsMatch`, set `valueExpr = build(binary.rhs)` (commutative `rhsMatch` keeps `binary.lhs`). `rt_fnv` loop now emits the faithful FNV step `result ^= byte; result *= prime;`.
+
+#### `exprEqual` completeness — `StringLitExpr` case (`cast/CAstOptimizer.cpp`, commit `22fbba1`)
+
+- **Problem**: `exprEqual` had no `StringLitExpr` case and fell through to `default: return false`, so two structurally identical calls carrying a string-literal argument never compared equal — defeating the bare+assign double-emit dedup in `removeDuplicatesInList` for any such call.
+- **Fix**: compare string literals by value. Latent correctness fix — baseline-neutral on all four corpora (no call in the current corpora is double-emitted with a string-literal argument today; surfaced while prototyping the variadic opacity marker).
+
+### Wave 20b — Register-as-address variable binding (`passes/RecoverVariables.cpp`, commits `10491f7`, `53efe35`)
+
+- **`10491f7` — in-region reg-op binding**: a post-loop sweep ("Strategy B") in `RecoverVariables` walks the full function region (including the `helix_high.if`/`do_while`/… regions that `StructureControlFlow` created) and binds each `reg.read`/`reg.write` that survived inside a structured region to the SSA snapshot at its containing top-level block's exit. Replaces `v0 = 0; … v2 = *v0;` placeholders with the real parameter-derived base (e.g. `*param_3_1`). Akasha `rt_fnv` source-oracle 14.2% → 29.2%; `sv2` 36.6% → 54.9%.
+- **`53efe35` — in-loop RAX → `result`**: for hash-loop functions (FNV, CRC, …) the final RAX value is computed *inside* a loop region with no top-level post-loop RegWrite, so `isReturnContext` never fired and the accumulator chain was DCE'd (empty loop body + unassigned `int64_t result;`). Fix: when the function returns a value, no `RAX__result` decl exists, and a full-width in-*loop*-region RAX write survives, synthesise a `result` VarDecl at entry and route the in-loop RAX reads/writes through it; mirror this in `EliminateDeadCode::removeDeadVariables` so the `result` chain is pinned (skips dead-assign/dead-decl removal for `result` when the function has a return value). Loop-region guard avoids regressing if-region conditional-return paths. Intigrity-Mali +5.9pp mean, no >40% function regressed.
+
+### Wave 18b — MOVZX memory-source lift (`passes/RemillToHelixLow.cpp`, commits `4bf7198`, `5c05016`)
+
+- **Problem**: the `MOVZX reg, [mem]` variant (`MOVZXI…MnIh`) was orphaning the byte/word memory load — the value never reached the C output.
+- **Fix**: `RemillToHelixLow` now emits `MemReadOp → MovZxOp → RegWriteOp` for the memory-source MOVZX (`4bf7198` adds the `MemReadOp`; `5c05016` adds the `RegWriteOp` follow-up), so byte/word loads from memory reach the output. **Honesty correction**: this exposed a pre-existing register-as-address binding gap (addressed by Wave 20b), so some corpus means moved as the now-visible derefs were scored — not new defects, pre-existing ones becoming visible.
 
 ### Wave 21 — Register SSA versioning (2026-05-20)
 
@@ -49,9 +116,7 @@ All notable changes to HexCore Helix are documented here.
   - `ssa_version` is a discardable attribute, not an ODS schema attribute.  Avoids breaking ~30 positional builder call-sites for `RegReadOp`/`RegWriteOp` in `RemillToHelixLow.cpp`.  Tablegen change deferred.
   - `getSlotNameMap` in `HelixMidToHigh.cpp` left as-is.  The existing per-function post-pass renumbering (lines 907-955) already converts module-wide raw `v<N>` names to compact per-function `v0, v1, ...`, so distinct slot_ids automatically yield distinct names without refactoring the map ownership.
 
-## [v0.9.2-nightly] — 2026-05-18
-
-> **Nightly build** — Operand-binding fidelity push on the `rev_kernel_monarch` Linux ftrace-rootkit corpus (7 functions). Three coordinated fixes (FIX-078, FIX-079, FIX-080) plus one documented REVERT (FIX-081). Total: **-6 `suspicious_self_reference` findings** on the lift-only corpus, **zero regression** on any function previously above 25%.
+> **Wave 19 scope note (2026-05-18):** operand-binding fidelity push on the `rev_kernel_monarch` Linux ftrace-rootkit corpus (7 functions). Three coordinated fixes (FIX-078, FIX-079, FIX-080) plus one documented REVERT (FIX-081). Total: **-6 `suspicious_self_reference` findings** on the lift-only corpus, **zero regression** on any function previously above 25%.
 
 ### Wave 19 — Operand binding + spurious-self-reference cleanup (2026-05-17 / 2026-05-18)
 
