@@ -5,9 +5,32 @@ All notable changes to HexCore Helix are documented here.
 
 ## [v0.9.2-nightly] — 2026-05-31
 
-> **Nightly build (rolling).** This is the single active nightly line; it now spans Wave 19 → Wave 24, newest work first. The earlier Wave 21 (FIX-087) groundwork is included below under this same version.
+> **Nightly build (rolling).** This is the single active nightly line; it now spans Wave 19 → Wave 25, newest work first. The earlier Wave 21 (FIX-087) groundwork is included below under this same version.
 >
 > **Since the FIX-087 SSA-versioning groundwork (Wave 21):** byte/word memory-source `MOVZX` lift, register-as-address variable binding (in-region + in-loop RAX→`result`), the first-class variadic-call mini-ISA carriage (Wave 22 Step 3-lite), two C-AST dataflow-fidelity fixes that recover the FNV accumulator chain, an `exprEqual` completeness fix, and the opt-in `--preserve-cfg` callfuscation-deflatten path (Wave 23, Stages 1+2). All `--preserve-cfg` work is gated **default OFF** — normal lifts are byte-for-byte unchanged, confirmed by a quad-corpus tripwire (rootkit / ROTTR / Intigrity-Mali / Akasha).
+
+### Wave 25 — AArch64 stp/ldp prologue: pair-helper lowering + X0 call-result sink (2026-06-02)
+
+> Follow-up to Wave 24. The AArch64 load/store-pair-with-writeback helpers (`StorePairUpdateIndex*` / `LoadPairUpdateIndex*`) were leaking into the decompiled C as side-effecting stub calls, and — worse — the LoadPair stub was being chained into the function return, so the canonical GCC prologue `stp x29,x30,[sp,#-N]! ; mov x29,sp ; ... ; ldp x29,x30,[sp],#N ; ret` decompiled to `StorePairUpdateIndex64(); return LoadPairUpdateIndex64();` instead of the real body. This wave models the pair helpers so prologues/epilogues disappear and the straight-line body survives DCE. All changes are AArch64-gated (`isAArch64_` / the `aarch64`/`arm64` triple); x86 is provably untouched (15/15 gta-sa stress functions crash-clean with 0 pair-helper leaks and 0 `/* unhandled */`).
+
+#### FIX-088 — AArch64 stp/ldp-with-writeback lowering and AAPCS64 X0 call-result sink (`passes/RemillToHelixLow.cpp`)
+
+- **Problem**: the canonical AArch64 prologue (synthetic `stp x29,x30,[sp,#-0x10]! ; mov x29,sp ; mov w0,#0x2a ; ldp x29,x30,[sp],#0x10 ; ret`) decompiled to `StorePairUpdateIndex64(); return LoadPairUpdateIndex64();` — the `mov w0,#42` body was lost and the stp/ldp frame helpers leaked as side-effecting stubs. Reproduced via `helix_tool --use-cast-layer rag/_arm64_prologue.ll` and on four real GCC AArch64 prologues in the HTB `poly` binary (`sub_40002f04` MD5, `sub_40003db4` hash-compare, `sub_40002fc4` MT19937-64 init, `sub_400030b8` MT19937-64 extract).
+- **Root cause**: `StorePairUpdateIndex*` / `LoadPairUpdateIndex*` demangle to `RemillSemantic::Unknown` and fell through to the UNHANDLED-default emission path, which materializes a side-effecting `helix_low.call` stub (and, for the load, chains its result into the return via the call-result sink). They were never modeled as memory ops, so the prologue/epilogue never collapsed.
+- **Fix**: new `tryLowerAArch64PairHelper()` (intercepts in `convertOperation`, right after the `__remill_*`/`llvm.` skip block and before `convertSemantic`). Operand layout verified against `remill/lib/Arch/AArch64/Semantics/DATAXFER.cpp`: `(...,src/dst1, src/dst2, mem_addr, writeback_reg, next_addr)`. When the writeback register is SP the pair is a callee-saved frame save/restore (x29=frame-pointer, x30=link-register) and is **elided** exactly like x86 `push rbp`/`pop rbp` (new `isAArch64StackPtr()` detects SP via `!remill_register "SP"` metadata or the field-3/sub-index-63 GEP). Non-frame pairs fall through to real `MemWriteOp`/`MemReadOp` pairs (`base` + `base+elemBytes`), with loads written to their destination registers but never chained into the return value. Separately, the six genuine call-result RegWrite sinks now use `returnRegName()` (X0 on AArch64, RAX on x86) instead of a hard-coded `"RAX"`; on x86 this evaluates to the same literal, so x86 codegen is byte-identical.
+- **SP re-enable — attempted, reverted (still crashes)**: with the pair helpers now modeled, re-enabling SP in `RegisterTracker::aarch64GprName` (sub-index 63 → "SP") was tried and **still reintroduces a non-deterministic use-after-free** (~52 segfaults / 100 runs across the synthetic prologue and the poly prologues). The crash is therefore not confined to the pair helpers: turning SP into an SSA register surfaces it in `mov x29,sp` and `sp +/- N` frame arithmetic that the downstream AArch64 liveness/structuring path mishandles. SP is left on the non-register path; with the pair helpers elided those SP reads are dead and drop out anyway, so the output is already clean. SP re-enable is now a separate, deeper task (the comment in `aarch64GprName` records the empirical finding).
+- **Impact** (real native engine via `helix_tool --use-cast-layer` and the deployed `.node`):
+  - Synthetic `arm64_prologue`: `StorePairUpdateIndex64(); return LoadPairUpdateIndex64();` → **`return 42;`** (0 pair-helper leaks, 0 `unhandled`/`undef`).
+  - `poly` MD5 `sub_40002f04`: StorePair leak 1 → **0**; epilogue body now visible (`sub_40000f30(...)`, `sub_40000fe0(...)`).
+  - `poly` MT-extract `sub_400030b8`: StorePair leak 1 → **0**.
+  - `poly` hash-compare `sub_40003db4` + MT-init `sub_40002fc4`: already 0, still **0**.
+  - Regression guards unchanged: `arm64_leaf` → `return 1;`; x86 `x64_control` → `return 1;` (`| sysv`); `arm64_bl_cbz_ret` → `sub_1008(); return __native_CBZ();` (cbz structuring is a separate deferred task).
+  - Stability: **0 crashes** across 20× the synthetic suite (140 runs) and 15/15 gta-sa x86 stress functions crash-clean.
+- **Still deferred** (not regressions): bare AArch64 `Store` operand accessor, `ADRP`, and `cbz`/`cbnz`/`b.cond` structuring (`__native_SUBS` / `DirectCondBranch` / `DoDirectBranch`) — separate opcodes/CFG tasks; AArch64 SP recognition (see above).
+
+| File | Change |
+| --- | --- |
+| `engine/src/passes/RemillToHelixLow.cpp` | New `isAArch64StackPtr()` + `tryLowerAArch64PairHelper()`; dispatch interception in `convertOperation`; six call-result sinks switched from `"RAX"` to `returnRegName()`; expanded the `aarch64GprName` SP note with the SP re-enable crash finding. |
 
 ### Wave 24: AArch64 (AAPCS64) register recovery and decompilation (2026-05-31)
 

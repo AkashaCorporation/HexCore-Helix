@@ -124,17 +124,22 @@ struct RegisterTracker {
     /// GPR/PC slot. Static so both scan() and the value-based decoder share
     /// one source of truth.
     ///
-    /// NOTE: SP (sub-index 63) is intentionally NOT recognized here. SP is
-    /// only meaningfully touched by stack load/store-pair-with-writeback
-    /// helpers (StorePairUpdateIndex64 / LoadPairUpdateIndex64), which are a
-    /// deferred follow-up.  Recognizing SP turns its writeback (`sp = sp - N`)
-    /// and the pair-helper SP operands into register reads/writes whose SSA
-    /// versioning interacts with those unmodeled helpers and triggers a
-    /// (non-deterministic) use-after-free in the canonical stp/mov/ldp
-    /// prologue.  Leaving SP on the non-register mem/temp path keeps AArch64
-    /// crash-free and costs nothing in the decompiled C (the raw stack-pointer
-    /// value is not meaningful output).  Re-enable SP here once the pair
-    /// helpers are modeled as MemRead/MemWrite.
+    /// NOTE: SP (sub-index 63) is intentionally NOT recognized here.  The
+    /// stp/ldp-with-writeback helpers (StorePairUpdateIndex* / LoadPair*) are
+    /// now lowered/elided (see tryLowerAArch64PairHelper), so the original
+    /// "pair helper" trigger is gone — yet re-enabling SP STILL reintroduces a
+    /// non-deterministic use-after-free / segfault (empirically ~50% of runs on
+    /// the stp/mov/ldp prologue and the poly GCC prologues).  The crash is
+    /// therefore NOT confined to the pair helpers: turning SP into an SSA
+    /// register surfaces it in `mov x29, sp` and the `sp +/- N` frame
+    /// arithmetic, which the downstream liveness/structuring path mishandles on
+    /// AArch64.  Leaving SP on the non-register mem/temp path keeps AArch64
+    /// crash-free AND costs nothing in the decompiled C: with the pair helpers
+    /// elided, the SP reads/arithmetic become dead and drop out, so the body
+    /// (e.g. `mov w0,#42`) already decompiles to a clean `return 42;`.
+    /// Re-enabling SP is a separate, deeper task (fix the AArch64 SP liveness
+    /// crash first); the raw stack-pointer value is not meaningful output, so
+    /// there is no decompilation-quality reason to rush it.
     static std::string aarch64GprName(int subIdx) {
         if (subIdx == 65) return "PC";
         // X0..X30 live at odd sub-indices 1,3,5,...,61.
@@ -1368,6 +1373,182 @@ private:
         return success();
     }
 
+    /// Detect whether an SSA Value is the AArch64 stack-pointer register slot.
+    ///
+    /// SP is deliberately NOT recognized by RegisterTracker::aarch64GprName
+    /// (sub-index 63) so it stays off the register/SSA path — see the long note
+    /// there.  But the load/store-pair-with-writeback lowering below needs to
+    /// know whether a pair's writeback destination is SP, because an SP-based
+    /// pair is a frame save/restore (callee-saved spill of x29/x30 et al.) and
+    /// is elided as a compiler artifact, exactly like x86 `push rbp`/`pop rbp`.
+    ///
+    /// We accept three encodings of "this is SP":
+    ///   • the !remill_register metadata string "SP" (survives MLIR import as a
+    ///     `remill_register` StringAttr or under an `llvm.metadata` dict), or
+    ///   • the AArch64 GPR GEP at struct field 3, sub-index 63, or
+    ///   • a ptrtoint of either of the above.
+    static bool isAArch64StackPtr(Value val) {
+        // Strip ptrtoint / bitcast / addrspacecast aliases.
+        while (true) {
+            if (auto p2i = val.getDefiningOp<LLVM::PtrToIntOp>()) {
+                val = p2i.getArg();
+                continue;
+            }
+            if (auto cast = val.getDefiningOp<LLVM::BitcastOp>()) {
+                val = cast.getArg();
+                continue;
+            }
+            if (auto cast = val.getDefiningOp<LLVM::AddrSpaceCastOp>()) {
+                val = cast.getArg();
+                continue;
+            }
+            break;
+        }
+        auto gep = val.getDefiningOp<LLVM::GEPOp>();
+        if (!gep)
+            return false;
+        if (auto regAttr = gep->getAttrOfType<StringAttr>("remill_register"))
+            return regAttr.getValue() == "SP";
+        if (auto metaDict = gep->getAttrOfType<DictionaryAttr>("llvm.metadata"))
+            if (auto regAttr = metaDict.getAs<StringAttr>("remill_register"))
+                return regAttr.getValue() == "SP";
+        if (auto idx = RegisterTracker::extractConstantGEPIndices(gep)) {
+            if (idx->size() >= 4 && (*idx)[0] == 0 && (*idx)[1] == 0 &&
+                (*idx)[2] == RegisterTracker::kAArch64GprStructField &&
+                (*idx)[3] == 63)
+                return true;
+        }
+        return false;
+    }
+
+    /// Lower the AArch64 load/store-pair-with-writeback helpers
+    /// (StorePairUpdateIndex{32,64} / LoadPairUpdateIndex{32,64}) to real
+    /// HelixLow memory ops instead of leaving them as side-effecting stub
+    /// calls.  Returns true if the call was handled (and queued for erasure).
+    ///
+    /// Remill DEF_SEM operand layout (verified against
+    /// remill/lib/Arch/AArch64/Semantics/DATAXFER.cpp), after the leading
+    /// (Memory*, State&) pair that every semantic call carries:
+    ///   StorePairUpdateIndexN(src1, src2, dst_mem, dst_reg, next_addr)
+    ///     store src1 -> [dst_mem]; store src2 -> [dst_mem + N/8];
+    ///     dst_reg = next_addr            (the pre/post-index writeback)
+    ///   LoadPairUpdateIndexN(dst1, dst2, src_mem, dst_reg, next_addr)
+    ///     dst1 = [src_mem]; dst2 = [src_mem + N/8];
+    ///     dst_reg = next_addr
+    /// So the call operands are:
+    ///   [0]=memory [1]=state [2]=src1/dst1 [3]=src2/dst2
+    ///   [4]=mem_addr [5]=writeback_reg_ptr [6]=next_addr
+    ///
+    /// Frame save/restore fast-path:  when the writeback register is SP the
+    /// pair is a prologue/epilogue frame spill of callee-saved registers
+    /// (x29=frame-pointer, x30=link-register, ...).  These have no meaning in
+    /// decompiled C — the saved values are private to the frame and are never
+    /// observed — so we ELIDE the whole helper, mirroring how
+    /// EliminateDeadCode drops x86 `push rbp`/`mov rbp,rsp`/`pop rbp`.  This is
+    /// also what lets the straight-line body (e.g. `mov w0,#42`) survive DCE
+    /// and become a clean `return 42;`, and it sidesteps the SP-writeback /
+    /// pair-helper use-after-free that the prior wave contained by stubbing.
+    ///
+    /// Non-frame pairs (a genuine spill/fill at some other base) fall through
+    /// to a real MemWrite/MemRead lowering so the data movement is preserved;
+    /// the loaded values are written to their destination registers but are
+    /// never chained into the function return value.
+    bool tryLowerAArch64PairHelper(LLVM::CallOp call,
+                                   llvm::StringRef rawSemantic,
+                                   OpBuilder& builder,
+                                   const RegisterTracker& regs,
+                                   PCTracker& pcTracker,
+                                   IntegerAttr addrAttr,
+                                   Location loc) {
+        // AArch64-only: gate on the module triple so x86 is provably untouched.
+        if (!isAArch64_)
+            return false;
+
+        bool isStore = rawSemantic.starts_with("StorePairUpdateIndex");
+        bool isLoad  = rawSemantic.starts_with("LoadPairUpdateIndex");
+        if (!isStore && !isLoad)
+            return false;
+
+        // Element width: ...64 -> 8 bytes, ...32 -> 4 bytes.
+        unsigned elemBits = rawSemantic.ends_with("32") ? 32 : 64;
+        unsigned elemBytes = elemBits / 8;
+
+        // Need the full (memory, state, a, b, mem_addr, writeback, next) shape.
+        if (call.getNumOperands() < 7)
+            return false;
+
+        Value opA       = call.getOperand(2); // src1 / dst1
+        Value opB       = call.getOperand(3); // src2 / dst2
+        Value memAddr   = call.getOperand(4); // pair base address
+        Value writeback = call.getOperand(5); // base register being updated
+
+        // ── Frame save/restore fast-path: SP-based pair → elide ────────────
+        // Recognized as a prologue/epilogue frame spill; emit nothing.  The
+        // SP read/writeback and the saved register values become dead and are
+        // cleaned up downstream.
+        if (isAArch64StackPtr(writeback)) {
+            return true; // handled: erase the call, emit nothing
+        }
+
+        auto i64Ty = builder.getIntegerType(64);
+        auto elemTy = builder.getIntegerType(elemBits);
+
+        // Base address as i64 (strip ptrtoint, materialize reg reads, etc.).
+        Value baseAddr = ensureInt64(memAddr, builder, loc, &regs, &pcTracker);
+        // Second-half address = base + elemBytes.  Use a plain LLVM add (pure,
+        // single i64 result) for the pointer arithmetic so the downstream
+        // MemRead/MemWrite address decoder recognizes it; the flag-producing
+        // HelixLow BinOp is reserved for arithmetic that defines CPU flags.
+        auto elemOff = builder.create<LLVM::ConstantOp>(
+            loc, i64Ty, builder.getI64IntegerAttr(elemBytes));
+        Value secondAddr =
+            builder.create<LLVM::AddOp>(loc, baseAddr, elemOff.getResult());
+
+        if (isStore) {
+            Value v1 = ensureInt64(opA, builder, loc, &regs, &pcTracker);
+            Value v2 = ensureInt64(opB, builder, loc, &regs, &pcTracker);
+            if (elemBits < 64) {
+                v1 = builder.create<LLVM::TruncOp>(loc, elemTy, v1);
+                v2 = builder.create<LLVM::TruncOp>(loc, elemTy, v2);
+            }
+            builder.create<helix::low::MemWriteOp>(
+                loc, baseAddr, v1, builder.getUI32IntegerAttr(elemBits),
+                addrAttr);
+            builder.create<helix::low::MemWriteOp>(
+                loc, secondAddr, v2, builder.getUI32IntegerAttr(elemBits),
+                addrAttr);
+        } else {
+            // Load: read both halves and write them to their destination regs.
+            auto read1 = builder.create<helix::low::MemReadOp>(
+                loc, elemTy, baseAddr, builder.getUI32IntegerAttr(elemBits),
+                addrAttr);
+            auto read2 = builder.create<helix::low::MemReadOp>(
+                loc, elemTy, secondAddr, builder.getUI32IntegerAttr(elemBits),
+                addrAttr);
+            if (auto n1 = regs.getRegName(opA)) {
+                Value rv = read1.getResult();
+                if (elemBits < 64)
+                    rv = builder.create<LLVM::ZExtOp>(loc, i64Ty, rv);
+                builder.create<helix::low::RegWriteOp>(
+                    loc, rv, builder.getStringAttr(*n1),
+                    builder.getUI32IntegerAttr(
+                        RegisterTracker::inferRegWidth(*n1)),
+                    addrAttr);
+            }
+            if (auto n2 = regs.getRegName(opB)) {
+                Value rv = read2.getResult();
+                if (elemBits < 64)
+                    rv = builder.create<LLVM::ZExtOp>(loc, i64Ty, rv);
+                builder.create<helix::low::RegWriteOp>(
+                    loc, rv, builder.getStringAttr(*n2),
+                    builder.getUI32IntegerAttr(
+                        RegisterTracker::inferRegWidth(*n2)),
+                    addrAttr);
+            }
+        }
+        return true;
+    }
+
     /// Convert a single LLVM Dialect operation to HelixLow.
     void convertOperation(Operation* op, OpBuilder& builder,
                           const RegisterTracker& regs,
@@ -1615,7 +1796,7 @@ private:
                     builder.create<helix::low::RegWriteOp>(
                         loc,
                         callOp.getResult(),
-                        builder.getStringAttr("RAX"), // see returnRegName() note
+                        builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                         builder.getUI32IntegerAttr(resultBits),
                         addrAttr);
 
@@ -1719,7 +1900,7 @@ private:
                                 builder.getStringAttr(calleeName), addrAttr);
                         builder.create<helix::low::RegWriteOp>(
                             loc, vCall.getResult(),
-                            builder.getStringAttr("RAX"), // see returnRegName() note
+                            builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                             builder.getUI32IntegerAttr(machineIntWidth_),
                             addrAttr);
                         llvm::errs()
@@ -1744,7 +1925,7 @@ private:
                 builder.create<helix::low::RegWriteOp>(
                     loc,
                     extCall.getResult(),
-                    builder.getStringAttr("RAX"), // see returnRegName() note
+                    builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                     builder.getUI32IntegerAttr(machineIntWidth_),
                     addrAttr);
 
@@ -1762,6 +1943,20 @@ private:
 
             if (semInfo->is_helper) {
                 ++liftStats.helpers;
+                eraseRemillCall();
+                return;
+            }
+
+            // ── AArch64 load/store-pair-with-writeback (stp/ldp) ───────────
+            // These demangle to RemillSemantic::Unknown (raw names
+            // StorePairUpdateIndex* / LoadPairUpdateIndex*) and would otherwise
+            // leak as side-effecting stub calls.  Lower them to real memory ops
+            // (or elide the SP-based frame save/restore) so prologues/epilogues
+            // disappear and the straight-line body survives DCE.  Strictly
+            // AArch64-gated, so x86 lowering is untouched.
+            if (tryLowerAArch64PairHelper(call, semInfo->raw_name, builder,
+                                          regs, pcTracker, addrAttr, loc)) {
+                ++liftStats.converted;
                 eraseRemillCall();
                 return;
             }
@@ -3089,7 +3284,7 @@ private:
                                     targetName, addrAttr);
                             builder.create<helix::low::RegWriteOp>(
                                 loc, vCall.getResult(),
-                                builder.getStringAttr("RAX"), // see returnRegName() note
+                                builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                                 builder.getUI32IntegerAttr(resultBits),
                                 addrAttr);
                             llvm::errs()
@@ -3119,7 +3314,7 @@ private:
                 builder.create<helix::low::RegWriteOp>(
                     loc,
                     newCallOp.getResult(),
-                    builder.getStringAttr("RAX"), // see returnRegName() note
+                    builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                     builder.getUI32IntegerAttr(resultBits),
                     addrAttr);
 
@@ -3240,7 +3435,7 @@ private:
                     builder.create<helix::low::RegWriteOp>(
                         loc,
                         tailCallOp.getResult(),
-                        builder.getStringAttr("RAX"), // see returnRegName() note
+                        builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                         builder.getUI32IntegerAttr(resultBits),
                         addrAttr);
 
