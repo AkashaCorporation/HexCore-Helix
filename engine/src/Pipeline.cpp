@@ -27,6 +27,8 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/BuiltinAttributes.h" // FIX-089: ArrayAttr / IntegerAttr
+#include "mlir/IR/BuiltinTypes.h"      // FIX-089: IntegerType
 #include "mlir/Pass/PassInstrumentation.h"
 
 // Helix dialect ops for P0 debug counting
@@ -42,6 +44,8 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Metadata.h"   // FIX-089: NamedMDNode / MDNode / ConstantAsMetadata
+#include "llvm/IR/Constants.h"  // FIX-089: ConstantInt
 
 #include <cassert>
 #include <format>
@@ -255,6 +259,32 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
     // Capture the target triple before the LLVM module is moved.
     std::string targetTriple = llvm_module->getTargetTriple();
 
+    // FIX-089: capture the Pathfinder function-start table BEFORE the LLVM
+    // module is moved.  The MLIR LLVM-IR importer drops named metadata, so —
+    // exactly like the target triple below — we lift it out by hand and
+    // re-stamp it as an MLIR module attribute the C-AST address registry
+    // reads (CAstBuilder::buildFunctionRegistry).  The lifter / NAPI emits
+    //
+    //     !helix.function_starts = !{!{i64 0x140001000}, !{i64 0x140001090}, …}
+    //
+    // from `analyzeAll`.  When absent (e.g. raw .ll with no side-channel),
+    // the registry still works from FuncOp entry addresses — just non-
+    // authoritative for an isolated single-function lift (D2 stays
+    // regression-safe).  This is the single channel D3/D4/#30 reuse next.
+    std::vector<uint64_t> functionStarts;
+    if (auto* nmd = llvm_module->getNamedMetadata("helix.function_starts")) {
+        for (const llvm::MDNode* node : nmd->operands()) {
+            for (const llvm::MDOperand& op : node->operands()) {
+                if (auto* cam =
+                        llvm::dyn_cast<llvm::ConstantAsMetadata>(op.get())) {
+                    if (auto* ci =
+                            llvm::dyn_cast<llvm::ConstantInt>(cam->getValue()))
+                        functionStarts.push_back(ci->getZExtValue());
+                }
+            }
+        }
+    }
+
     // Install a diagnostic capture so we can report MLIR-level errors that
     // occur during translation (e.g., unsupported LLVM IR constructs).
     DiagnosticCapture capture(mlir_ctx_);
@@ -282,6 +312,21 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
         (*mlir_module)->setAttr(
             "llvm.target_triple",
             mlir::StringAttr::get(mlir_ctx_, targetTriple));
+    }
+
+    // FIX-089: re-stamp the captured function-start table as an i64 array
+    // attribute on the MLIR ModuleOp.  Read by CAstBuilder's address
+    // registry to gate code-typed constants (D1) and call names (D2).
+    if (!functionStarts.empty()) {
+        llvm::SmallVector<mlir::Attribute> starts;
+        starts.reserve(functionStarts.size());
+        auto i64Ty = mlir::IntegerType::get(mlir_ctx_, 64);
+        for (uint64_t a : functionStarts)
+            starts.push_back(mlir::IntegerAttr::get(
+                i64Ty, static_cast<int64_t>(a)));
+        (*mlir_module)->setAttr(
+            "helix.function_starts",
+            mlir::ArrayAttr::get(mlir_ctx_, starts));
     }
 
     // Run the MLIR verifier to catch structural problems early (invalid

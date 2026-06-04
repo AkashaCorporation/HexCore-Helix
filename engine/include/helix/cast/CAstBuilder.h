@@ -60,6 +60,41 @@ public:
     /// Analyze function quality and compute confidence score + issues.
     void analyzeConfidence(CFuncDecl& func, mlir::Operation* op);
 
+    // ── Address registry (FIX-089 — the shared P0 honesty primitive) ────
+    //
+    // ONE authoritative function/block-address registry, reachable from the
+    // whole C-AST layer.  It answers two questions that the P0 honesty quad
+    // (D1/D2 this increment; D3/D4/#30 next) all need:
+    //
+    //   • isKnownFunctionStart(addr) — is `addr` a real lifted function entry?
+    //   • isKnownBlockStart(addr)    — is `addr` a basic-block leader of the
+    //                                  function currently being built?
+    //
+    // The function half is module-scoped (populated once per module); the
+    // block half is function-scoped (rebuilt per `buildFunction`, sharing the
+    // exact same walk that fills `blockLabels_`).  Ghidra's analogue is
+    // `Database::queryFunction` (printc.cc pushPtrCodeConstant) for the
+    // function half and the address-space label map for the block half.
+    //
+    // FUTURE HOOKS (next increment):
+    //   • D3 (unreachable removal) queries isKnownBlockStart to decide which
+    //     orphan labels are real CFG leaders vs. structuring debris.
+    //   • D4 (confidence score-gate) reads `hasDamningHonestyDefect_` (set
+    //     when D1/D2 emit a located honest marker) to cap the score at 50%.
+    //   • #30 (on-demand lift) queries isKnownFunctionStart on an omitted-but-
+    //     valid address to decide between a real lift attempt and an honest
+    //     failure object.
+
+    /// True iff `addr` is a registered function entry (real lifted function).
+    bool isKnownFunctionStart(uint64_t addr) const;
+
+    /// True iff `addr` is a basic-block leader of the current function.
+    bool isKnownBlockStart(uint64_t addr) const;
+
+    /// Block label string (`loc_xxxx`) for a known block-start address, or
+    /// empty if `addr` is not a block start of the current function.
+    std::string blockLabelForAddr(uint64_t addr) const;
+
 private:
     // ── Pre-scans (ported from PseudoCEmitter) ──────────────────────────
 
@@ -117,6 +152,39 @@ private:
 
     /// Extract the address attribute from an MLIR operation, if present.
     uint64_t extractAddress(mlir::Operation* op) const;
+
+    // ── Address registry population (FIX-089) ───────────────────────────
+
+    /// Populate the module-scoped function-start table.  Sourced from every
+    /// FuncOp entry address in the module PLUS the optional module attribute
+    /// `helix.function_starts` (an i64 array stamped by the lifter / NAPI
+    /// from Pathfinder `analyzeAll`).  Sets `functionTableIsAuthoritative_`.
+    void buildFunctionRegistry(mlir::ModuleOp moduleOp);
+
+    /// Populate the function-scoped block-start table from the same per-block
+    /// `address` attribute walk that fills `blockLabels_`.
+    void buildBlockRegistry(mlir::Operation* funcOp);
+
+    // ── D1 — code-typed constant resolution (FIX-089) ───────────────────
+
+    /// Build a C expression for an integer constant, resolving code-typed
+    /// values through the address registry (Ghidra `pushPtrCodeConstant`):
+    ///   • value == known block start    → `&loc_xxxx`  (address-of label)
+    ///   • value == known function start → the function symbol
+    ///   • otherwise                     → a plain integer literal
+    /// `code` addresses never leak as bare `= 0x<addr>;` data.
+    ExprPtr buildIntegerConstant(int64_t value, CTypePtr type, uint64_t addr);
+
+    // ── D2 — honest callee gating (FIX-089/FIX-090) ─────────────────────
+
+    /// Resolve a (calleeName, targetAddr) pair against the address registry
+    /// and write the honest call form into `outName`.  Returns true if the
+    /// callee should be emitted as a NAMED call (`outName(...)`); returns
+    /// false and rewrites `outName` to the honest indirect form
+    /// `(*(code *)0xADDR)` when the target is provably not a function start.
+    /// Mirrors Ghidra's `queryFunction`-gated call-name emission.
+    bool gateCalleeName(const std::string& calleeName, uint64_t targetAddr,
+                        std::string& outName);
 
     // ── Function-level state (cleared per buildFunction) ────────────────
 
@@ -188,6 +256,28 @@ private:
 
     /// Labels that are only followed by other labels and a final `return`.
     std::unordered_set<std::string> returnOnlyLabels_;
+
+    // ── Address registry state (FIX-089 — shared P0 honesty primitive) ──
+
+    /// Module-scoped set of known function-start addresses (real lifted
+    /// function entries + any `helix.function_starts` table entries).
+    std::unordered_set<uint64_t> knownFunctionStarts_;
+
+    /// True iff a real function table was supplied (more than just the
+    /// current function's own entry).  The D2 cross-function rewrite only
+    /// fires when this is true, so isolated single-function lifts — where
+    /// the table holds only the self-entry and cannot list siblings — never
+    /// regress legitimate cross-function `sub_xxxx` calls into indirect form.
+    bool functionTableIsAuthoritative_ = false;
+
+    /// Function-scoped map of basic-block leader address -> `loc_xxxx` label.
+    /// The block half of the registry; built next to `blockLabels_`.
+    std::unordered_map<uint64_t, std::string> blockStartToLabel_;
+
+    /// Set when D1/D2 emit a located honest marker (resolved code constant or
+    /// honest indirect call).  Reserved for the D4 score-gate hook (next
+    /// increment): a function carrying a damning honesty defect caps at 50%.
+    bool hasDamningHonestyDefect_ = false;
 };
 
 } // namespace helix::cast

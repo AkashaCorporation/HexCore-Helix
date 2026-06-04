@@ -260,6 +260,17 @@ static std::optional<int64_t> tryExtractIntLiteral(Value value) {
         return std::nullopt;
     if (auto intLit = dyn_cast<helix::high::IntLitOp>(defOp))
         return intLit.getValue();
+    if (auto midConst = dyn_cast<helix::mid::ConstantOp>(defOp))
+        return midConst.getValue();
+    // LLVM / arith constants store their value in a typed attribute.
+    if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+            return intAttr.getValue().getSExtValue();
+    }
+    if (auto arithConst = dyn_cast<arith::ConstantOp>(defOp)) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(arithConst.getValue()))
+            return intAttr.getValue().getSExtValue();
+    }
     if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value"))
         return intAttr.getValue().getSExtValue();
     return std::nullopt;
@@ -314,6 +325,11 @@ std::vector<std::unique_ptr<CFuncDecl>>
 CAstBuilder::buildModule(ModuleOp moduleOp) {
     std::vector<std::unique_ptr<CFuncDecl>> result;
 
+    // FIX-089: populate the module-scoped function-start table ONCE, before
+    // any function is built.  Every per-function call/constant emit then
+    // gates code-typed values through this single authoritative registry.
+    buildFunctionRegistry(moduleOp);
+
     // Walk helix_low.func ops — the pipeline keeps functions as low::FuncOp
     // even after internal ops are raised to HelixHigh.
     // This matches PseudoCEmitter's behavior.
@@ -325,6 +341,236 @@ CAstBuilder::buildModule(ModuleOp moduleOp) {
     });
 
     return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Address registry — FIX-089 (the shared P0 honesty primitive)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void CAstBuilder::buildFunctionRegistry(ModuleOp moduleOp) {
+    knownFunctionStarts_.clear();
+    functionTableIsAuthoritative_ = false;
+
+    // Source 1 — every lifted function entry present in the module.  For a
+    // whole-binary lift this is the full function table; for an isolated
+    // single-function lift (the entire current validation corpus) it holds
+    // exactly the one entry being decompiled.
+    unsigned funcOpCount = 0;
+    moduleOp.walk([&](Operation* op) {
+        uint64_t entry = 0;
+        if (auto lowFunc = dyn_cast<helix::low::FuncOp>(op))
+            entry = lowFunc.getEntryAddress();
+        else if (auto highFunc = dyn_cast<helix::high::FuncOp>(op))
+            entry = highFunc.getEntryAddress();
+        else
+            return;
+        if (entry != 0)
+            knownFunctionStarts_.insert(entry);
+        ++funcOpCount;
+    });
+
+    // Source 2 — the authoritative `helix.function_starts` side-table.  The
+    // lifter / NAPI stamps this (in `Pipeline::translateToMLIR`) from the
+    // Pathfinder `analyzeAll` function list.  When present it lets the D2
+    // gate distinguish a real cross-function call (`sub_140001190`, in the
+    // table) from an IAT-thunk / non-function address (`sub_140002008`, not
+    // in the table) even though neither is a FuncOp in an isolated lift.
+    if (auto starts = moduleOp->getAttrOfType<ArrayAttr>("helix.function_starts")) {
+        for (Attribute a : starts) {
+            if (auto i = dyn_cast<IntegerAttr>(a))
+                knownFunctionStarts_.insert(i.getValue().getZExtValue());
+        }
+        if (!starts.empty())
+            functionTableIsAuthoritative_ = true;
+    }
+
+    // A whole-module lift (more than one FuncOp) is itself an authoritative
+    // table: every legitimate intra-module call target is a FuncOp entry, so
+    // a miss genuinely means "not a function".
+    if (funcOpCount > 1)
+        functionTableIsAuthoritative_ = true;
+}
+
+void CAstBuilder::buildBlockRegistry(Operation* funcOp) {
+    blockStartToLabel_.clear();
+
+    // Parse a `loc_<hex>` label string back to its leader address.
+    auto parseLocLabel = [](StringRef name) -> std::optional<uint64_t> {
+        if (!name.starts_with("loc_"))
+            return std::nullopt;
+        uint64_t addr = 0;
+        if (name.substr(4).getAsInteger(/*radix=*/16, addr))
+            return std::nullopt; // getAsInteger returns true on FAILURE
+        return addr;
+    };
+
+    // Register a block leader, keyed by its FULL leader address.
+    //
+    // NOTE (deferred, see report "Known gaps"): some lift paths narrow a code
+    // constant to i32 *via constant folding inside the optimizer* (a win64
+    // image-based 0x14064daf3 surfaces as a bare 0x4064daf3 that never reaches
+    // buildIntegerConstant).  Registering the low-32 truncation here does NOT
+    // catch those — they bypass the constant-emit hook entirely — and only
+    // adds false-positive risk against legitimate 32-bit data, so we register
+    // the full address only.  Catching the folded-truncation leak belongs to a
+    // follow-up that intercepts the narrowing op, not the registry.
+    auto registerLeader = [&](uint64_t full) {
+        if (full == 0)
+            return;
+        blockStartToLabel_[full] = std::format("loc_{:x}", full);
+    };
+
+    // Source 1 — the per-block leader `address` attribute.  Mirrors the
+    // `blockLabels_` walk (buildFunction below) but keys by ADDRESS so the
+    // registry can answer integer queries.
+    funcOp->walk([&](Block* block) {
+        if (block->empty())
+            return;
+        if (auto addrAttr =
+                block->front().getAttrOfType<IntegerAttr>("address"))
+            registerLeader(addrAttr.getUInt());
+    });
+
+    // Source 2 — surviving `loc_<hex>` LabelOp / GotoOp names.  After
+    // structuring moves ops into nested regions the per-block `address`
+    // attribute is frequently gone, but the structurer's `loc_<hex>` label
+    // strings still encode the real block-leader address.  This is the
+    // authoritative block half in practice (the source-1 walk is empty on
+    // every structured function — see #30 registry-miss).
+    funcOp->walk([&](helix::high::LabelOp labelOp) {
+        if (auto a = parseLocLabel(labelOp.getName()))
+            registerLeader(*a);
+    });
+    funcOp->walk([&](helix::high::GotoOp gotoOp) {
+        if (auto a = parseLocLabel(gotoOp.getLabel()))
+            registerLeader(*a);
+    });
+}
+
+bool CAstBuilder::isKnownFunctionStart(uint64_t addr) const {
+    return addr != 0 && knownFunctionStarts_.count(addr) != 0;
+}
+
+bool CAstBuilder::isKnownBlockStart(uint64_t addr) const {
+    return addr != 0 && blockStartToLabel_.count(addr) != 0;
+}
+
+std::string CAstBuilder::blockLabelForAddr(uint64_t addr) const {
+    auto it = blockStartToLabel_.find(addr);
+    return it == blockStartToLabel_.end() ? std::string{} : it->second;
+}
+
+// ── D1 — code-typed constant resolution ─────────────────────────────────────
+//
+// Ghidra reference: PrintC::pushPtrCodeConstant (printc.cc:1793) resolves a
+// code-typed constant to a function symbol (queryFunction) and NEVER emits a
+// bare int; on a miss it falls through to a TYPECAST, not a label.  Helix has
+// no full TYPE_CODE inference chain, so we transfer the *narrow* pragmatic
+// test the plan prescribes: a constant whose value equals a known block-start
+// / function-start IS a leaked code pointer.  Resolve it through an honest,
+// always-compilable form; everything else stays a plain literal (we must not
+// rewrite ordinary arithmetic constants).
+//
+// EMISSION CHOICE — why a cast atom, not `&loc_xxxx`:
+//   `&loc_xxxx` is only legal when the label `loc_xxxx:` is actually emitted
+//   in the body.  At constant-build time we cannot guarantee that — a block
+//   leader frequently has NO surviving `CLabelStmt` (it was structured into an
+//   `if`/loop with no goto referencing it), so `&loc_xxxx` would reference an
+//   UNDEFINED label and the output would not compile.  We therefore mirror
+//   Ghidra's actual fallback: an honest code-pointer cast `(void *)0xADDR`.
+//   It is always compilable, unambiguously signals "this is a code address,
+//   not data", and never leaks a bare `= 0x<addr>;`.  When the label is a
+//   confirmed-referenced goto target (so it WILL be emitted) we prefer the
+//   sharper `&loc_xxxx`.  (FUTURE: once D3 guarantees label emission for every
+//   registry block start, the `&loc_xxxx` branch can widen.)
+ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
+                                          uint64_t addr) {
+    const uint64_t uval = static_cast<uint64_t>(value);
+
+    // (a) Block-start address of THIS function.  Prefer `&loc_xxxx` ONLY when
+    //     the label is a referenced goto target (guaranteed emitted); else the
+    //     honest code-pointer cast.
+    if (isKnownBlockStart(uval)) {
+        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        auto label = blockLabelForAddr(uval);
+        if (!label.empty() && referencedLabelNames_.count(label)) {
+            auto labelRef = std::make_unique<CVarRefExpr>(
+                0, label, CType::voidPtr(), addr);
+            return std::make_unique<CUnaryExpr>(
+                UnaryOp::AddressOf, std::move(labelRef),
+                CType::voidPtr(), addr);
+        }
+        // Label not guaranteed emitted → honest code-pointer cast.
+        return std::make_unique<CAddrLitExpr>(uval, CType::voidPtr(), addr);
+    }
+
+    // (b) Function-start address → honest code-pointer cast.  A bare integer
+    //     equal to a real function entry is a leaked function pointer, not
+    //     data.  We use the cast form rather than a bare `sub_<hex>` symbol
+    //     because that symbol is not declared in the single-function output
+    //     and would itself become an auto-declared placeholder.
+    if (isKnownFunctionStart(uval)) {
+        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        return std::make_unique<CAddrLitExpr>(
+            uval, CType::voidPtr(), addr);
+    }
+
+    // (c) Not a code address → ordinary integer literal, unchanged.
+    return std::make_unique<CIntLitExpr>(value, std::move(type), addr);
+}
+
+// ── D2 — honest callee gating ───────────────────────────────────────────────
+//
+// Ghidra reference: call-name emission is gated by queryFunction; with no
+// symbol Ghidra emits an indirect expression, never a fabricated named call.
+// Helix synthesised `sub_<addr>` unconditionally.  We gate the name through
+// the registry:
+//   • target IS a function start            → keep the named call.
+//   • target is a block start of THIS fn     → tail-jump / computed-goto that
+//                                              was mis-lowered as a call →
+//                                              honest indirect (NOT a fake
+//                                              named call to our own block).
+//   • table is authoritative AND target miss → honest indirect call
+//                                              `(*(code *)0xADDR)`.
+//   • otherwise (no authoritative table)      → keep the name (regression-safe:
+//                                              an isolated lift cannot list
+//                                              sibling functions, so we must
+//                                              not destroy legitimate
+//                                              cross-function `sub_xxxx` calls).
+bool CAstBuilder::gateCalleeName(const std::string& calleeName,
+                                 uint64_t targetAddr, std::string& outName) {
+    outName = calleeName;
+
+    // A real function entry → named call is honest.
+    if (isKnownFunctionStart(targetAddr))
+        return true;
+
+    // Vtable / resolved-name / external-symbol callees carry no numeric code
+    // address we can refute (targetAddr == 0, or a non-`sub_` name).  Leave
+    // them to their existing dedicated handling.
+    if (targetAddr == 0 || !calleeName.starts_with("sub_"))
+        return true;
+
+    // Target resolves to one of OUR basic blocks: the lifter mis-lowered a
+    // tail jump / computed goto as a `call sub_<block>`.  Emit the honest
+    // indirect form rather than fabricating a call to our own label.
+    if (isKnownBlockStart(targetAddr)) {
+        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        outName = std::format("(*(code *)0x{:x})", targetAddr);
+        return false;
+    }
+
+    // Target is not a function start.  Only refute it when we hold an
+    // authoritative table — otherwise an isolated single-function lift would
+    // wrongly rewrite every legitimate cross-function call.
+    if (functionTableIsAuthoritative_) {
+        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        outName = std::format("(*(code *)0x{:x})", targetAddr);
+        return false;
+    }
+
+    // No authoritative table — keep the named call (regression-safe default).
+    return true;
 }
 
 std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
@@ -386,6 +632,11 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         else
             blockLabels_[block] = std::format("block_{}", globalBlockCounter_++);
     });
+
+    // FIX-089: build the address-keyed block half of the registry from the
+    // same leader-address attributes.  Done here (not lazily) so D1/D2 can
+    // answer `isKnownBlockStart` for every constant/call in this function.
+    buildBlockRegistry(op);
 
     // ── Collect goto label references ───────────────────────────────────
     op->walk([&](helix::high::GotoOp gotoOp) {
@@ -700,6 +951,11 @@ void CAstBuilder::clearFunctionState() {
     referencedBlocks_.clear();
     referencedLabelNames_.clear();
     returnOnlyLabels_.clear();
+    // FIX-089: per-function registry state.  The function-start table
+    // (knownFunctionStarts_ / functionTableIsAuthoritative_) is module-scoped
+    // and intentionally NOT cleared here — it survives across functions.
+    blockStartToLabel_.clear();
+    hasDamningHonestyDefect_ = false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1036,8 +1292,14 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             return std::make_unique<CExprStmt>(std::move(callExpr), addr);
         }
 
+        // FIX-089 (D2): gate the named callee through the registry.  A target
+        // that is not a function start becomes the honest indirect form
+        // `(*(code *)0xADDR)(...)` instead of a fabricated `sub_<addr>(...)`.
+        std::string gatedName;
+        gateCalleeName(calleeName, targetAddr, gatedName);
+
         auto callExpr = std::make_unique<CCallExpr>(
-            calleeName, targetAddr, std::move(callArgs),
+            gatedName, targetAddr, std::move(callArgs),
             CType::voidTy(), addr);
 
         return std::make_unique<CExprStmt>(std::move(callExpr), addr);
@@ -1262,6 +1524,14 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             calleeName = std::format("sub_{}", "indirect");
         }
 
+        // FIX-089 (D2): low::CallOp carries `target_addr` as an SSA operand,
+        // not an attribute.  Recover the numeric address when it is a
+        // constant so the registry gate below can refute non-functions.
+        if (Value taVal = call.getTargetAddr()) {
+            if (auto c = tryExtractIntLiteral(taVal))
+                targetAddrVal = static_cast<uint64_t>(*c);
+        }
+
         std::vector<ExprPtr> callArgs;
         for (auto operand : call.getArgs()) {
             auto argExpr = buildExpression(operand);
@@ -1273,8 +1543,12 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         lastRegValue_.clear();
         exprToBestName_.clear();
 
+        // FIX-089 (D2): gate the callee name through the registry.
+        std::string gatedName;
+        gateCalleeName(calleeName, targetAddrVal, gatedName);
+
         auto callExpr = std::make_unique<CCallExpr>(
-            calleeName, targetAddrVal, std::move(callArgs),
+            gatedName, targetAddrVal, std::move(callArgs),
             CType::voidTy(), addr);
         return std::make_unique<CExprStmt>(std::move(callExpr), addr);
     }
@@ -1612,7 +1886,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── Integer literal ────────────────────────────────────────────────
     if (auto intLit = dyn_cast<helix::high::IntLitOp>(defOp)) {
-        return std::make_unique<CIntLitExpr>(
+        // FIX-089 (D1): resolve a code-typed constant through the registry.
+        return buildIntegerConstant(
             intLit.getValue(), convertType(val.getType()), addr);
     }
 
@@ -1752,8 +2027,15 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
                 returnType, addr);
         }
 
+        // FIX-089 (D2): gate the named callee through the registry.  An
+        // out-of-table target becomes `(*(code *)0xADDR)(...)` rather than a
+        // fabricated `sub_<addr>(...)`.  The honest indirect form is what the
+        // Akasha `hc_entry` IAT-thunk case (rag/06 #19) actually needs.
+        std::string gatedName;
+        gateCalleeName(calleeName, targetAddr, gatedName);
+
         return std::make_unique<CCallExpr>(
-            calleeName, targetAddr, std::move(callArgs), returnType, addr);
+            gatedName, targetAddr, std::move(callArgs), returnType, addr);
     }
 
     // ─── Ternary expression ─────────────────────────────────────────────
@@ -1806,7 +2088,9 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── mid.constant ──────────────────────────────────────────────────
     if (auto midConst = dyn_cast<helix::mid::ConstantOp>(defOp)) {
-        return std::make_unique<CIntLitExpr>(
+        // FIX-089 (D1): resolve a code-typed constant through the registry.
+        // This is the primary `var = 0x<block-addr>;` leak path.
+        return buildIntegerConstant(
             midConst.getValue(), convertType(val.getType()), addr);
     }
 
@@ -1913,8 +2197,11 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             if (argExpr)
                 callArgs.push_back(std::move(argExpr));
         }
+        // FIX-089 (D2): gate the named callee through the registry.
+        std::string gatedName;
+        gateCalleeName(calleeName, midCall.getCalleeAddr(), gatedName);
         return std::make_unique<CCallExpr>(
-            calleeName, midCall.getCalleeAddr(), std::move(callArgs),
+            gatedName, midCall.getCalleeAddr(), std::move(callArgs),
             convertType(val.getType()), addr);
     }
 
@@ -2122,7 +2409,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.mlir.constant ────────────────────────────────────────────
     if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
         if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-            return std::make_unique<CIntLitExpr>(
+            // FIX-089 (D1): resolve a code-typed constant through the registry.
+            return buildIntegerConstant(
                 intAttr.getValue().getSExtValue(),
                 convertType(constOp.getType()), addr);
         }
@@ -2604,7 +2892,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── arith.constant ────────────────────────────────────────────────
     if (auto arithConst = dyn_cast<arith::ConstantOp>(defOp)) {
         if (auto intAttr = dyn_cast<IntegerAttr>(arithConst.getValue())) {
-            return std::make_unique<CIntLitExpr>(
+            // FIX-089 (D1): resolve a code-typed constant through the registry.
+            return buildIntegerConstant(
                 intAttr.getValue().getSExtValue(),
                 convertType(arithConst.getType()), addr);
         }

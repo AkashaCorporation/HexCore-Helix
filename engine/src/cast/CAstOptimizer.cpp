@@ -44,6 +44,23 @@ namespace helix::cast {
 
 namespace {
 
+/// True if `name` is a `loc_<hex>` code-label reference (FIX-089).  The D1
+/// address-registry resolution emits `&loc_xxxx` for a block-start constant;
+/// the `loc_xxxx` identifier names a code label (a CLabelStmt), not a data
+/// variable, so the undeclared-var passes must skip it.
+static bool isCodeLabelName(std::string_view n) {
+    if (!n.starts_with("loc_") || n.size() <= 4)
+        return false;
+    for (size_t i = 4; i < n.size(); ++i) {
+        char c = n[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F');
+        if (!hex)
+            return false;
+    }
+    return true;
+}
+
 /// True if the expression is a CVarRefExpr with the given name.
 static bool isVarRef(const CExpr* e, std::string_view name) {
     if (!e || e->getKind() != NodeKind::VarRefExpr)
@@ -2372,6 +2389,11 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
             if (n == "rsp" || n == "rbp" || n == "esp" || n == "ebp")
                 continue;
             if (!isValidCIdent(n))
+                continue;
+            // FIX-089: `loc_<hex>` is a code-label reference, not a data
+            // variable — kept in lockstep with declareUndeclaredVars so the
+            // D1 `&loc_xxxx` form does not inflate the undeclared-var count.
+            if (isCodeLabelName(n))
                 continue;
             if (!declaredNames.count(n))
                 ++undeclared;
@@ -7879,6 +7901,13 @@ void CAstOptimizer::declareUndeclaredVars(CFuncDecl& func) {
         if (n == "rsp" || n == "rbp" || n == "esp" || n == "ebp")
             continue;
         if (!isValidCIdent(n))
+            continue;
+        // FIX-089: `loc_<hex>` is a CODE LABEL reference emitted by the D1
+        // address-registry resolution (`&loc_xxxx`).  The label is defined
+        // elsewhere as a CLabelStmt — it is NOT a data variable and must
+        // never be auto-declared as `int64_t loc_xxxx = 0;` (that both
+        // shadows the label and inflates the placeholder count).
+        if (isCodeLabelName(n))
             continue;
         if (!declared.count(n))
             orphans.push_back(n);
