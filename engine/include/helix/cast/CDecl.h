@@ -95,6 +95,17 @@ public:
     /// gaps (bug C) or data-as-code lift artefacts (bug J).
     unsigned synthesizedVarDecls = 0;
 
+    /// D4 (charter exit-metric 4): set by CAstBuilder::analyzeConfidence from
+    /// the builder's per-function hasDamningHonestyDefect_ member, raised on
+    /// the D1 (code-address-as-data leak) and D2 (out-of-table / own-block
+    /// tail-jump indirect) emission paths.  Carried on the decl so the
+    /// post-optimization rescorer (CAstOptimizer::reanalyzeConfidence, which
+    /// overwrites confidenceScore and cannot see the builder member) can honor
+    /// the same hard cap.  When true, confidence is capped at 50%: a function
+    /// that demonstrably leaked a code address or called an out-of-table
+    /// target is not allowed to self-report as plausible.
+    bool hasDamningHonestyDefect = false;
+
     CFuncDecl(std::string name, uint64_t entryAddr, CTypePtr returnType,
               std::vector<CParamDecl> params = {},
               bool isVariadic = false,

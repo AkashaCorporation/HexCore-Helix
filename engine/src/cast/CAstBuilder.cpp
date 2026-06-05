@@ -1049,6 +1049,15 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         entryAddr);
 
     // ── Confidence analysis ───────────────────────────────────────────
+    // D4 (charter exit-metric 4): stamp the damning-honesty flag onto the decl
+    // the moment it is created.  The builder member hasDamningHonestyDefect_ is
+    // final here (the body is fully built and moved into funcDecl above), and
+    // this point is GUARANTEED to run for every function -- unlike the tail of
+    // analyzeConfidence, which has earlier return paths a function may take.
+    // CAstOptimizer::reanalyzeConfidence reads this decl flag to apply the 50%
+    // cap on the score that actually survives to the user.
+    funcDecl->hasDamningHonestyDefect = hasDamningHonestyDefect_;
+
     analyzeConfidence(*funcDecl, op);
 
     return funcDecl;
@@ -4447,4 +4456,25 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
     }
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
+
+    // -- D4 (charter exit-metric 4): damning-defect hard cap --
+    // The score above is SYNTACTIC plausibility (100 - penalties).  A function
+    // that leaked a code address as data (D1) or emitted a call to an
+    // out-of-table target (D2) is not merely "penalized" -- it is provably
+    // dishonest, and must not self-report above 50% regardless of how clean
+    // the rest of its syntax is.  hasDamningHonestyDefect_ is reset at function
+    // entry (clearFunctionState) and fully raised by the time the body has been
+    // built (D1/D2 emission paths run during buildRegionBody, before this
+    // call), so reading it here is safe.  Carry it onto the decl so the
+    // post-optimization rescorer (reanalyzeConfidence) applies the identical
+    // cap on the score that ultimately survives.
+    // The decl flag is stamped at decl-creation time in buildFunction (a
+    // guaranteed-run point); this tail cap is defensive for any path that
+    // reaches it.  reanalyzeConfidence is the authoritative final cap.
+    if (func.hasDamningHonestyDefect && func.confidenceScore > 50.0) {
+        func.confidenceScore = 50.0;
+        issues.push_back(
+            "damning honesty defect (code-address leak or out-of-table call)"
+            " - confidence capped at 50%");
+    }
 }

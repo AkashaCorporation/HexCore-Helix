@@ -2620,6 +2620,21 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
     }
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
+
+    // -- D4 (charter exit-metric 4): damning-defect hard cap --
+    // This rescorer overwrites confidenceScore AFTER all optimizations and is
+    // the value that actually survives to the user; it must honor the same cap
+    // CAstBuilder::analyzeConfidence applied.  It cannot see the builder's
+    // hasDamningHonestyDefect_ member, so the signal is carried on the decl
+    // (set in analyzeConfidence).  Robust even when a later pass cosmetically
+    // erases the tail that motivated a damning marker: the flag records that
+    // the function HAD a damning honesty defect at build time.
+    if (func.hasDamningHonestyDefect && func.confidenceScore > 50.0) {
+        func.confidenceScore = 50.0;
+        func.confidenceIssues.push_back(
+            "damning honesty defect (code-address leak or out-of-table call)"
+            " - confidence capped at 50%");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
