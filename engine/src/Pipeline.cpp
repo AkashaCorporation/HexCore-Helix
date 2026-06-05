@@ -272,6 +272,16 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
     // authoritative for an isolated single-function lift (D2 stays
     // regression-safe).  This is the single channel D3/D4/#30 reuse next.
     std::vector<uint64_t> functionStarts;
+    // Side-channel seed (additive): an isolated single-function lift carries no
+    // `!helix.function_starts` named metadata in its .ll, so the NAPI/IDE path
+    // supplies the authoritative table directly via setFunctionStarts().  Seed
+    // it FIRST; the named-metadata sweep below then unions in any in-IR entries
+    // (whole-binary .ll).  Empty when no caller set it -> behaviour unchanged.
+    if (!function_starts_.empty()) {
+        functionStarts.insert(functionStarts.end(),
+                              function_starts_.begin(),
+                              function_starts_.end());
+    }
     if (auto* nmd = llvm_module->getNamedMetadata("helix.function_starts")) {
         for (const llvm::MDNode* node : nmd->operands()) {
             for (const llvm::MDOperand& op : node->operands()) {

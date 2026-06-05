@@ -97,6 +97,17 @@ extern "C" {
     /// Clear all variable renames.
     pub fn helix_engine_clear_variable_renames(engine: *mut HelixEngineHandle);
 
+    /// Provide the authoritative function-start table (entry addresses).
+    /// Stamped as the `helix.function_starts` module attribute so the C-AST
+    /// address registry treats the table as authoritative (D2 / #30 honesty).
+    /// Addresses are copied into the engine; the caller may free immediately.
+    /// Replaces the full set on each call.
+    pub fn helix_engine_set_function_starts(
+        engine: *mut HelixEngineHandle,
+        starts: *const i64,
+        len: usize,
+    );
+
     /// Register raw bytes for a virtual-address range so passes can read
     /// from the original binary (jump tables, vtables, string literals).
     /// Bytes are copied into the engine; the caller may free immediately.
@@ -183,6 +194,21 @@ impl EngineHandle {
     pub fn clear_variable_renames(&mut self) {
         unsafe {
             helix_engine_clear_variable_renames(self.handle);
+        }
+    }
+
+    /// Provide the authoritative function-start table (entry addresses) to the
+    /// engine.  Stamped as `helix.function_starts` in Pipeline::translateToMLIR
+    /// so CAstBuilder::buildFunctionRegistry marks the table authoritative.
+    /// Replaces the full set on each call.  Addresses are copied; caller may
+    /// free immediately.  An empty slice clears the side-channel.
+    pub fn set_function_starts(&mut self, starts: &[i64]) {
+        unsafe {
+            helix_engine_set_function_starts(
+                self.handle,
+                starts.as_ptr(),
+                starts.len(),
+            );
         }
     }
 

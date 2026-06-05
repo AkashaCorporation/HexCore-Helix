@@ -137,6 +137,12 @@ void Engine::clearVariableRenames() {
     }
 }
 
+void Engine::setFunctionStarts(const int64_t* starts, size_t len) {
+    if (pipeline_ && starts && len > 0) {
+        pipeline_->setFunctionStarts(starts, len);
+    }
+}
+
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;

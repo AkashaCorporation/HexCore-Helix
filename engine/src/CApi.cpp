@@ -149,6 +149,14 @@ void helix_engine_clear_variable_renames(HelixEngineHandle* handle) {
     }
 }
 
+void helix_engine_set_function_starts(HelixEngineHandle* handle,
+                                       const int64_t* starts,
+                                       size_t len) {
+    if (handle && starts && len > 0) {
+        to_engine(handle)->setFunctionStarts(starts, len);
+    }
+}
+
 void helix_engine_add_data_section(HelixEngineHandle* handle,
                                     uint64_t va_start,
                                     const uint8_t* bytes,

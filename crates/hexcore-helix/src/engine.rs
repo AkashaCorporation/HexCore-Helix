@@ -181,6 +181,25 @@ impl HelixEngine {
         Ok(())
     }
 
+    /// Provide the authoritative function-start table (entry addresses from
+    /// the Pathfinder `analyzeAll` function list) to the engine BEFORE
+    /// decompileIr().  Stamped as the `helix.function_starts` module attribute
+    /// in `Pipeline::translateToMLIR`, this is what makes
+    /// `functionTableIsAuthoritative_` true for an isolated/IDE single-function
+    /// lift, so the D2 callee-gate and the #30 registry-miss honesty path fire
+    /// instead of degrading to the regression-safe non-gating fallback.
+    /// Additive: callers that never call it keep today's behaviour (table
+    /// derived from FuncOp entries only, non-authoritative for a lone lift).
+    /// Replaces the full set on each call; pass the complete table.
+    #[napi]
+    pub fn set_function_starts(&mut self, starts: Vec<i64>) -> Result<()> {
+        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
+            Error::from_reason("Engine is disposed")
+        })?;
+        handle.set_function_starts(&starts);
+        Ok(())
+    }
+
     /// Register a virtual-address range with the engine's data-section
     /// store.  REQUIRED for switch-table recovery — without at least one
     /// section, `RecoverSwitchTables` skips itself and every `switch (...)`

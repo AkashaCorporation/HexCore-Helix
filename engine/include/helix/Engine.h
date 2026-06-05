@@ -118,6 +118,16 @@ public:
     /// Clear all variable renames.
     void clearVariableRenames();
 
+    /// Provide the authoritative function-start table (entry addresses from
+    /// the Pathfinder `analyzeAll` function list).  Forwarded to the Pipeline,
+    /// which stamps it as the `helix.function_starts` module attribute in
+    /// translateToMLIR BEFORE the C-AST address registry is built.  This is
+    /// what makes `functionTableIsAuthoritative_` true for an isolated
+    /// single-function lift, so the D2 callee-gate and the #30 registry-miss
+    /// honesty path fire instead of the regression-safe non-gating fallback.
+    /// Call before decompile.  Replaces the full set on each call.
+    void setFunctionStarts(const int64_t* starts, size_t len);
+
     /// Register raw bytes for a virtual-address range so passes can read from
     /// the original binary (jump tables, vtables, string literals, etc.).
     ///
@@ -253,6 +263,17 @@ void helix_engine_add_variable_rename(
 /// Clear all variable renames. Call between decompile invocations
 /// if the rename set changes.
 void helix_engine_clear_variable_renames(HelixEngineHandle* engine);
+
+/// Provide the authoritative function-start table (entry addresses) so the
+/// C-AST address registry treats the table as authoritative (D2 / #30).
+/// Stamped as the `helix.function_starts` module attribute before the registry
+/// is built.  Addresses are copied; the caller may free immediately.  Call
+/// before decompile.  Replaces the full set on each call.
+void helix_engine_set_function_starts(
+    HelixEngineHandle* engine,
+    const int64_t* starts,
+    size_t len
+);
 
 // ─── Helix-Nightly: Data Section Access ──────────────────────────────────────
 

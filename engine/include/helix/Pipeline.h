@@ -91,6 +91,22 @@ public:
     [[nodiscard]] const std::unordered_map<std::string, std::string>&
     variableRenames() const { return variable_renames_; }
 
+    /// Provide the authoritative function-start table (entry addresses).
+    /// Seeded into the `helix.function_starts` module attribute by
+    /// translateToMLIR BEFORE the C-AST address registry is built, so an
+    /// isolated single-function lift becomes authoritative (D2 / #30 honesty).
+    /// Call before decompile().  Replaces the full set on each call.
+    void setFunctionStarts(const int64_t* starts, size_t len) {
+        function_starts_.assign(
+            reinterpret_cast<const uint64_t*>(starts),
+            reinterpret_cast<const uint64_t*>(starts) + len);
+    }
+
+    /// Get the externally-supplied function-start table (const access for
+    /// translateToMLIR's attribute stamping).
+    [[nodiscard]] const std::vector<uint64_t>&
+    functionStarts() const { return function_starts_; }
+
     // ─── Stage 1: LLVM IR Parsing ────────────────────────────────────────
 
     /// Parse LLVM IR text into an llvm::Module.
@@ -196,6 +212,13 @@ private:
     /// Variable rename map: original name → user-chosen name.
     /// Populated by setVariableRename(), consumed by CAstOptimizer.
     std::unordered_map<std::string, std::string> variable_renames_;
+
+    /// Externally-supplied authoritative function-start table (entry
+    /// addresses).  Populated by setFunctionStarts() from the NAPI/IDE
+    /// `analyzeAll` function list; seeded into the local `functionStarts`
+    /// vector in translateToMLIR before the `helix.function_starts` attribute
+    /// is stamped.  Empty by default -> behaviour identical to today.
+    std::vector<uint64_t> function_starts_;
 
     /// Build the pass manager if not already built.
     void ensurePipelineBuilt();
