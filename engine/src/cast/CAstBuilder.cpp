@@ -394,6 +394,58 @@ void CAstBuilder::buildFunctionRegistry(ModuleOp moduleOp) {
 void CAstBuilder::buildBlockRegistry(Operation* funcOp) {
     blockStartToLabel_.clear();
 
+    // FIX-091 (issue #15 C1): harvest the current function's in-function code
+    // address registry — every instruction `address` attribute, plus the
+    // [min, end) span.  This is the authoritative set `resolveFoldedCodeLabel`
+    // consults to distinguish a leaked in-function block/branch target (a
+    // folded NEXT_PC like 0x1409B9F77) from an ordinary data constant.  Block
+    // leaders are a SUBSET of instruction addresses, and on a structured
+    // function the per-block `address` walk below is empty (the #30
+    // registry-miss), so this broader instruction-address sweep is what makes
+    // the C1 gate fire while staying false-positive-proof (a value that is not
+    // a real instruction boundary is never recovered).
+    inFunctionCodeAddrs_.clear();
+    currentFunctionMinAddr_ = 0;
+    currentFunctionEndAddr_ = 0;
+    {
+        uint64_t minA = 0, maxA = 0;
+        bool any = false;
+        funcOp->walk([&](Operation* op) {
+            auto a = op->getAttrOfType<IntegerAttr>("address");
+            if (!a)
+                return;
+            uint64_t v = a.getUInt();
+            // Guard against synthetic/sentinel addresses (e.g. address=64 on
+            // importer-inserted ops): only span values plausibly co-located
+            // with the function entry (same 4 GiB image window).
+            if (v == 0)
+                return;
+            if (currentFunctionEntryAddr_ != 0 &&
+                (v & ~0xFFFFFFFFull) !=
+                    (currentFunctionEntryAddr_ & ~0xFFFFFFFFull))
+                return;
+            inFunctionCodeAddrs_.insert(v);
+            if (!any) { minA = maxA = v; any = true; }
+            else { if (v < minA) minA = v; if (v > maxA) maxA = v; }
+        });
+        if (any) {
+            currentFunctionMinAddr_ = minA;
+            // `end` is one past the highest instruction address.  +1 is a
+            // conservative lower bound (the real last instruction is wider),
+            // but the in-function address-set test is the precise gate, so a
+            // tight end only risks rejecting a true positive that lands ON the
+            // last instruction — never a false positive.  Use the max instr
+            // address inclusive by setting end = max + 1.
+            currentFunctionEndAddr_ = maxA + 1;
+        }
+        // If the entry address itself is below the harvested min, widen the
+        // span downward so the function entry is always inside [min, end).
+        if (currentFunctionEntryAddr_ != 0 &&
+            (currentFunctionMinAddr_ == 0 ||
+             currentFunctionEntryAddr_ < currentFunctionMinAddr_))
+            currentFunctionMinAddr_ = currentFunctionEntryAddr_;
+    }
+
     // Parse a `loc_<hex>` label string back to its leader address.
     auto parseLocLabel = [](StringRef name) -> std::optional<uint64_t> {
         if (!name.starts_with("loc_"))
@@ -515,8 +567,85 @@ ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
             uval, CType::voidPtr(), addr);
     }
 
-    // (c) Not a code address → ordinary integer literal, unchanged.
+    // (c) FIX-091 (issue #15 C1) — folded in-function block address.
+    //
+    // A win64 image-based in-function code address (e.g. a NEXT_PC/branch
+    // target like 0x1409B9F77) is computed in the cast layer as
+    // `add(base_const, small_offset)`, then printed truncated to the low 32
+    // bits (CAstPrinter::formatIntLiteral narrows through 32-bit `unsigned
+    // long` on MSVC) — surfacing as the bare data leak `var_0 = 0x409B9F77;`.
+    // The full-width (a)/(b) gates above never fire because the *folded*
+    // value never matched the (empty-on-structured-functions) block label
+    // registry, and the low-32 form is not a registry key at all.
+    //
+    // Recovery (base/ASLR-agnostic): rebuild the 64-bit candidate by OR-ing
+    // the CURRENT function's high 32 bits onto the constant's low 32 bits —
+    // never a hardcoded ImageBase.  Treat it as a folded label ONLY when the
+    // candidate is a real in-function code address: inside the current
+    // function's [start, end) span AND a recorded instruction/block address
+    // of THIS function (the FIX-091 in-function address registry).  Either
+    // miss → genuine immediate/data, left EXACTLY as before — this is what
+    // keeps `0x42E63080` (a reconstructed-but-out-of-range IEEE-754 float)
+    // and every ordinary constant untouched.
+    if (auto label = resolveFoldedCodeLabel(uval))
+        return std::move(*label);
+
+    // (d) Not a code address → ordinary integer literal, unchanged.
     return std::make_unique<CIntLitExpr>(value, std::move(type), addr);
+}
+
+// ── FIX-091 (issue #15 C1) — folded in-function code-address discriminator ───
+//
+// Shared by `buildIntegerConstant` (the FIX-089 D1 path) and the `llvm.add` /
+// `llvm.sub` constant-fold short-circuit in `buildExpression` (so the folded
+// `add(base_const, off_const)` form is gated at build time, before the cast
+// optimizer re-folds and the printer truncates it).  Returns the honest code
+// form (`&loc_<hex>` when a referenced label exists, else `(void *)0xADDR`)
+// when `rawValue` resolves to a genuine in-function code address, or nullopt
+// when it is an ordinary immediate/data constant (left EXACTLY as today).
+std::optional<ExprPtr>
+CAstBuilder::resolveFoldedCodeLabel(uint64_t rawValue, uint64_t addr) {
+    // Only meaningful when we know which function we are decompiling.
+    if (currentFunctionEntryAddr_ == 0)
+        return std::nullopt;
+
+    // Full-width code addresses are already resolved by the FIX-089 (a)/(b)
+    // gates in `buildIntegerConstant`; here we recover the FOLDED form whose
+    // high 32 bits were dropped.  Reconstruct base/ASLR-agnostically by
+    // OR-ing the current function's high 32 bits onto the value's low 32 —
+    // a no-op when the value already carries the right high bits.
+    const uint64_t high = currentFunctionEntryAddr_ & ~0xFFFFFFFFull;
+    const uint64_t candidate = high | (rawValue & 0xFFFFFFFFull);
+
+    // HARD gate: candidate must be inside the current function's [start, end)
+    // span AND be a recorded instruction/block address of THIS function.
+    // Both conditions guard against false positives — a reconstructed value
+    // that lands outside the function (the `0x42E63080` float reconstructs to
+    // 0x142E63080, above this function's end) fails the range test, and a
+    // value inside the span but not a real instruction boundary fails the
+    // address-set test.
+    if (candidate < currentFunctionMinAddr_ ||
+        candidate >= currentFunctionEndAddr_)
+        return std::nullopt;
+    if (!isKnownBlockStart(candidate) &&
+        !isKnownFunctionStart(candidate) &&
+        inFunctionCodeAddrs_.count(candidate) == 0)
+        return std::nullopt;
+
+    hasDamningHonestyDefect_ = true; // D4 hook (shared with D1/D2)
+
+    // Prefer the sharp `&loc_<hex>` when the label is a confirmed-referenced
+    // goto target (guaranteed emitted); otherwise the always-compilable
+    // honest code-pointer cast — identical emission policy to FIX-089 (a).
+    auto label = blockLabelForAddr(candidate);
+    if (!label.empty() && referencedLabelNames_.count(label)) {
+        auto labelRef = std::make_unique<CVarRefExpr>(
+            0, label, CType::voidPtr(), addr);
+        return std::optional<ExprPtr>(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf, std::move(labelRef), CType::voidPtr(), addr));
+    }
+    return std::optional<ExprPtr>(
+        std::make_unique<CAddrLitExpr>(candidate, CType::voidPtr(), addr));
 }
 
 // ── D2 — honest callee gating ───────────────────────────────────────────────
@@ -956,6 +1085,10 @@ void CAstBuilder::clearFunctionState() {
     // and intentionally NOT cleared here — it survives across functions.
     blockStartToLabel_.clear();
     hasDamningHonestyDefect_ = false;
+    // FIX-091 (issue #15 C1): per-function in-function code-address registry.
+    inFunctionCodeAddrs_.clear();
+    currentFunctionMinAddr_ = 0;
+    currentFunctionEndAddr_ = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2431,6 +2564,21 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.add ──────────────────────────────────────────────────────
     if (auto addOp = dyn_cast<LLVM::AddOp>(defOp)) {
+        // FIX-091 (issue #15 C1): a folded in-function code address surfaces
+        // as `add(base_const, off_const)` (e.g. a NEXT_PC 0x1409B9F77 =
+        // 0x1409B9F5B + 0x1C).  The cast optimizer would re-fold this and the
+        // printer would truncate it to the bare data leak `0x409B9F77`.
+        // Short-circuit ONLY when both operands are integer literals AND the
+        // sum resolves to a genuine in-function code address; otherwise build
+        // the ordinary binary (the optimizer's general const-fold path stays
+        // byte-identical for all non-code-address arithmetic).
+        if (auto l = tryExtractIntLiteral(addOp.getLhs()))
+            if (auto r = tryExtractIntLiteral(addOp.getRhs())) {
+                uint64_t sum = static_cast<uint64_t>(*l) +
+                               static_cast<uint64_t>(*r);
+                if (auto label = resolveFoldedCodeLabel(sum, addr))
+                    return std::move(*label);
+            }
         auto lhs = buildExpression(addOp.getLhs());
         auto rhs = buildExpression(addOp.getRhs());
         return std::make_unique<CBinaryExpr>(
@@ -2440,6 +2588,15 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.sub ──────────────────────────────────────────────────────
     if (auto subOp = dyn_cast<LLVM::SubOp>(defOp)) {
+        // FIX-091 (issue #15 C1): same folded-code-address recovery as add,
+        // for the `sub(base_const, off_const)` shape.
+        if (auto l = tryExtractIntLiteral(subOp.getLhs()))
+            if (auto r = tryExtractIntLiteral(subOp.getRhs())) {
+                uint64_t diff = static_cast<uint64_t>(*l) -
+                                static_cast<uint64_t>(*r);
+                if (auto label = resolveFoldedCodeLabel(diff, addr))
+                    return std::move(*label);
+            }
         auto lhs = buildExpression(subOp.getLhs());
         auto rhs = buildExpression(subOp.getRhs());
         return std::make_unique<CBinaryExpr>(

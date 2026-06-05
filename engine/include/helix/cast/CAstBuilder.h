@@ -175,6 +175,22 @@ private:
     /// `code` addresses never leak as bare `= 0x<addr>;` data.
     ExprPtr buildIntegerConstant(int64_t value, CTypePtr type, uint64_t addr);
 
+    // ── FIX-091 (issue #15 C1) — folded in-function code-address recovery ──
+    //
+    // A win64 image-based in-function code address that the cast layer folds
+    // (`add(base_const, off_const)`) and the printer truncates to its low 32
+    // bits surfaces as a bare data leak (`var_0 = 0x409B9F77;`).  This helper
+    // recovers it: it rebuilds the full 64-bit candidate from the CURRENT
+    // function's high 32 bits OR the value's low 32 bits (base/ASLR-agnostic),
+    // then returns the honest code form (`&loc_<hex>` / `(void *)0xADDR`) ONLY
+    // when the candidate is a genuine in-function code address (inside
+    // [start, end) AND a recorded instruction/block address of this function).
+    // Returns nullopt for ordinary immediate/data constants, which are left
+    // exactly as today.  Shared by `buildIntegerConstant` and the `llvm.add` /
+    // `llvm.sub` constant-fold short-circuit in `buildExpression`.
+    std::optional<ExprPtr> resolveFoldedCodeLabel(uint64_t rawValue,
+                                                  uint64_t addr = 0);
+
     // ── D2 — honest callee gating (FIX-089/FIX-090) ─────────────────────
 
     /// Resolve a (calleeName, targetAddr) pair against the address registry
@@ -273,6 +289,17 @@ private:
     /// Function-scoped map of basic-block leader address -> `loc_xxxx` label.
     /// The block half of the registry; built next to `blockLabels_`.
     std::unordered_map<uint64_t, std::string> blockStartToLabel_;
+
+    // ── FIX-091 (issue #15 C1) — in-function code-address registry ─────────
+    //
+    // Every instruction `address` attribute harvested from the current
+    // function, plus the function's address span.  Used by
+    // `resolveFoldedCodeLabel` to decide whether a reconstructed candidate is
+    // a real in-function code address (a leaked block/branch target) or an
+    // ordinary data constant.  Function-scoped; rebuilt per `buildFunction`.
+    std::unordered_set<uint64_t> inFunctionCodeAddrs_;
+    uint64_t currentFunctionMinAddr_ = 0;
+    uint64_t currentFunctionEndAddr_ = 0; // one past the highest instr address
 
     /// Set when D1/D2 emit a located honest marker (resolved code constant or
     /// honest indirect call).  Reserved for the D4 score-gate hook (next
