@@ -27,6 +27,7 @@ add_executable(helix_tests
     Remill7IntegrationTest.cpp
     IntegrationPipelineTest.cpp
     EmitterTest.cpp
+    RegistryMissTest.cpp
 )
 
 target_include_directories(helix_tests PRIVATE

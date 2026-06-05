@@ -5,9 +5,53 @@ All notable changes to HexCore Helix are documented here.
 
 ## [v0.9.2-nightly] — 2026-05-31
 
-> **Nightly build (rolling).** This is the single active nightly line; it now spans Wave 19 → Wave 25, newest work first. The earlier Wave 21 (FIX-087) groundwork is included below under this same version.
+> **Nightly build (rolling).** This is the single active nightly line; it now spans Wave 19 → Wave 27, newest work first. The earlier Wave 21 (FIX-087) groundwork is included below under this same version.
 >
 > **Since the FIX-087 SSA-versioning groundwork (Wave 21):** byte/word memory-source `MOVZX` lift, register-as-address variable binding (in-region + in-loop RAX→`result`), the first-class variadic-call mini-ISA carriage (Wave 22 Step 3-lite), two C-AST dataflow-fidelity fixes that recover the FNV accumulator chain, an `exprEqual` completeness fix, and the opt-in `--preserve-cfg` callfuscation-deflatten path (Wave 23, Stages 1+2). All `--preserve-cfg` work is gated **default OFF** — normal lifts are byte-for-byte unchanged, confirmed by a quad-corpus tripwire (rootkit / ROTTR / Intigrity-Mali / Akasha).
+
+### Wave 27 — Honesty layer (leave-nightly P0), increment 2: function_starts NAPI channel + D4 confidence cap + #30 registry-miss (2026-06-05)
+
+> Second increment of the leave-nightly honesty layer (`rag/08_leave_nightly_plan.md`): the consumers of the Wave 26 address registry. Three additive fixes, each gated to stay **inert on the current non-authoritative single-function corpus** (`functionTableIsAuthoritative_` stays false → byte-identical output, confirmed on the akasha / SOTTR-`UpdatePosition` / x64 corpus) and validated engine-direct on freshly-lifted `.ll` plus a bundled GoogleTest. The first wires the channel that lets an isolated/IDE single-function lift become authoritative; the other two are the D4 and #30 honesty gates that fire once it is. The cross-repo IDE caller (`analyzeAll` → `setFunctionStarts`) and the residual folded cross-function leak (A-D1) are deliberately deferred to a follow-up so they land where they can be validated end-to-end against a real multi-window authoritative table.
+
+#### FIX-092 — NAPI `set_function_starts` channel: the keystone that lets D2/#30 fire on a single-function lift (`crates/hexcore-helix`, `crates/helix-core`, `engine/{include,src}`)
+
+- **Problem**: D2 (out-of-table callee → honest indirect, FIX-090) and the #30 registry-miss path can fire only when `functionTableIsAuthoritative_` is true, which Wave 26 sets only when the `helix.function_starts` side-table is non-empty OR more than one FuncOp is present. An isolated / IDE single-function lift (`decompileIr(irText)`) carries neither, and the NAPI `HelixEngine` had **no way to supply the table** — so it always degraded to the regression-safe non-gating fallback.
+- **Fix** (additive, plumbing-only — no caller in this patch): a new `set_function_starts(Vec<i64>)` NAPI setter mirroring `add_variable_rename`, threaded `engine.rs` → `ffi.rs` → `Engine.h` / `CApi.cpp` → `Engine.cpp` → `Pipeline.{h,cpp}`. `Pipeline::translateToMLIR` seeds the externally-supplied table into the local `functionStarts` vector **before** the existing `helix.function_starts` named-metadata sweep, so a whole-binary `.ll` (in-IR entries) and an IDE single-function lift (NAPI-supplied entries) converge on the same authoritative attribute. Empty by default → behaviour identical to today.
+- **Impact**: 0 output movement from the plumbing alone (no caller); enables D2 / #30 / the folded-leak residual to fire once the deferred IDE caller supplies the full `analyzeAll` table. Validated: full corpus byte-identical with no setter; `cargo check -p helix-core -p hexcore-helix` green.
+
+| File | Symbol(s) |
+|---|---|
+| `crates/hexcore-helix/src/engine.rs` | `#[napi] set_function_starts` |
+| `crates/helix-core/src/ffi.rs` | `helix_engine_set_function_starts` extern + safe wrapper |
+| `engine/include/helix/Engine.h`, `engine/src/CApi.cpp`, `engine/src/Engine.cpp` | `setFunctionStarts` decl + C-API + forward |
+| `engine/include/helix/Pipeline.h`, `engine/src/Pipeline.cpp` | `function_starts_` member + setter/accessor + `translateToMLIR` seed |
+
+#### FIX-093 — D4 damning-defect confidence cap: a function that leaked a code address or called out-of-table cannot self-report above 50% (`cast/CAstBuilder.cpp`, `cast/CAstOptimizer.cpp`, `cast/CDecl.h`)
+
+- **Problem**: `analyzeConfidence` (and the post-optimization rescorer `reanalyzeConfidence`, which OVERWRITES the score) computed confidence as `100 − syntactic penalties` — plausibility, not honesty. A function carrying a damning defect (`hasDamningHonestyDefect_`: a D1 code-address leak, or a D2 out-of-table / own-block tail-jump call) could still report Medium/High — exactly the "sometimes high on a clean-looking but wrong function" defect.
+- **Root cause**: the damning signal lived only on a builder member; `reanalyzeConfidence` (the value the user actually sees) could not read it, and `analyzeConfidence` has early-return paths a function may take before its tail.
+- **Fix**: the builder member `hasDamningHonestyDefect_` is stamped onto the decl (`CFuncDecl::hasDamningHonestyDefect`) at decl-creation in `buildFunction` (a guaranteed-run point, before any `analyzeConfidence` early-return), and BOTH `analyzeConfidence` and the authoritative `reanalyzeConfidence` hard-cap a flagged function's score at 50% with an honest issue string. The post-opt rescorer's cap is the one that survives to the user.
+- **Impact**: SOTTR `UpdatePosition` (a real D1 leak) **60.5% Medium → 50.0% Low** + `damning honesty defect ... capped at 50%`; clean `simple_add` stays **85% High** (the `>50` guard + default-false flag keep clean functions byte-identical). Akasha out-of-table functions capped only under an authoritative table.
+
+| File | Symbol(s) |
+|---|---|
+| `engine/include/helix/cast/CDecl.h` | `CFuncDecl::hasDamningHonestyDefect` |
+| `engine/src/cast/CAstBuilder.cpp` | decl-flag stamp in `buildFunction`; cap in `analyzeConfidence` |
+| `engine/src/cast/CAstOptimizer.cpp` | authoritative cap in `reanalyzeConfidence` |
+
+#### FIX-094 — #30 registry-miss honest failure: a stub-shaped function absent from an authoritative table is scored 0, never a silent stub (`cast/CAstBuilder.{h,cpp}`, `cast/CAstOptimizer.cpp`, `cast/CDecl.h`, `test/RegistryMissTest.cpp`)
+
+- **Problem**: a stub-shaped function whose address did not really lift was emitted as a silent 50–90% stub. Wave 26's `knownFunctionStarts_` always contains the lone self-entry of a single-function lift, so it cannot tell a "real self-entry" from "an address the authoritative Pathfinder table never listed".
+- **Fix**: a new narrower set `authoritativeFunctionStarts_` (and query `isAuthoritativeFunctionStart`) populated ALWAYS from the `helix.function_starts` side-table, plus FuncOp entries ONLY when more than one function is present — it deliberately EXCLUDES the lone self-entry. In `analyzeConfidence`'s stub branch, an authoritative table + a non-zero entry NOT in that set raises a sticky `CFuncDecl::registryMissHonestFailure`; `reanalyzeConfidence` forces the surviving score to 0 with a `registry miss` issue. The mandatory `entryAddr != 0` guard keeps a whole-module FuncOp whose entry is structurally 0 from being false-flagged.
+- **Impact**: inert (byte-identical) on the non-authoritative corpus; on real authoritative-table fixtures (akasha-with-table) every in-table entry is correctly NOT flagged (0 false registry-misses, scores unchanged). The #30 contract is proven by the bundled `RegistryMissTest` (GoogleTest, **3/3**): omitted-self-under-authoritative → score 0; in-table self → normal stub score; entry==0 → never forced to 0.
+
+| File | Symbol(s) |
+|---|---|
+| `engine/include/helix/cast/CAstBuilder.h` | `isAuthoritativeFunctionStart` decl; `authoritativeFunctionStarts_` member |
+| `engine/src/cast/CAstBuilder.cpp` | populate the set in `buildFunctionRegistry`; define the query; #30 flag in `analyzeConfidence` |
+| `engine/src/cast/CAstOptimizer.cpp` | sticky registry-miss early-return in `reanalyzeConfidence` |
+| `engine/include/helix/cast/CDecl.h` | `CFuncDecl::registryMissHonestFailure` |
+| `engine/test/RegistryMissTest.cpp` | GoogleTest #30 contract (3 cases) |
 
 ### Wave 26 — Honesty layer (leave-nightly P0), increment 1: address registry + D1/D2 (2026-06-04)
 

@@ -88,6 +88,17 @@ public:
     /// True iff `addr` is a registered function entry (real lifted function).
     bool isKnownFunctionStart(uint64_t addr) const;
 
+    /// True iff `addr` is an AUTHORITATIVE function entry.  Unlike
+    /// isKnownFunctionStart (which holds every FuncOp entry, including the
+    /// lone self-entry of an isolated single-function lift), this queries the
+    /// narrower `authoritativeFunctionStarts_` set, which is built ONLY from
+    /// the Pathfinder `helix.function_starts` side-table (always) plus FuncOp
+    /// entries when more than one function is present (whole-module lift).  It
+    /// is the #30 oracle: when an authoritative table exists and a stub-shaped
+    /// function's entry is NOT in this set, the address did not really lift.
+    /// Returns false whenever the table is non-authoritative.
+    bool isAuthoritativeFunctionStart(uint64_t addr) const;
+
     /// True iff `addr` is a basic-block leader of the current function.
     bool isKnownBlockStart(uint64_t addr) const;
 
@@ -278,6 +289,16 @@ private:
     /// Module-scoped set of known function-start addresses (real lifted
     /// function entries + any `helix.function_starts` table entries).
     std::unordered_set<uint64_t> knownFunctionStarts_;
+
+    /// Module-scoped AUTHORITATIVE function-start set (the #30 honesty
+    /// primitive).  Populated ALWAYS from the `helix.function_starts`
+    /// side-table, plus FuncOp entries ONLY when more than one function is
+    /// present.  Unlike knownFunctionStarts_, it deliberately EXCLUDES the
+    /// lone self-entry of an isolated single-function lift, so a stub-shaped
+    /// function whose entry is absent here under an authoritative table is a
+    /// mis-lift (decompiled as a FuncOp but the Pathfinder table says this is
+    /// NOT a real function start) rather than a legitimate self-entry.
+    std::unordered_set<uint64_t> authoritativeFunctionStarts_;
 
     /// True iff a real function table was supplied (more than just the
     /// current function's own entry).  The D2 cross-function rewrite only

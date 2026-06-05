@@ -349,13 +349,22 @@ CAstBuilder::buildModule(ModuleOp moduleOp) {
 
 void CAstBuilder::buildFunctionRegistry(ModuleOp moduleOp) {
     knownFunctionStarts_.clear();
+    authoritativeFunctionStarts_.clear();
     functionTableIsAuthoritative_ = false;
 
     // Source 1 — every lifted function entry present in the module.  For a
     // whole-binary lift this is the full function table; for an isolated
     // single-function lift (the entire current validation corpus) it holds
     // exactly the one entry being decompiled.
+    //
+    // #30: collect the FuncOp entries into a temp so they can be folded into
+    // the AUTHORITATIVE set ONLY when more than one function is present (a
+    // whole-module lift).  The lone self-entry of a single-function lift is
+    // deliberately kept OUT of authoritativeFunctionStarts_, so a stub-shaped
+    // function whose entry is absent under an authoritative side-table reads
+    // as a mis-lift rather than as its own legitimate entry.
     unsigned funcOpCount = 0;
+    std::vector<uint64_t> funcOpEntries;
     moduleOp.walk([&](Operation* op) {
         uint64_t entry = 0;
         if (auto lowFunc = dyn_cast<helix::low::FuncOp>(op))
@@ -364,8 +373,10 @@ void CAstBuilder::buildFunctionRegistry(ModuleOp moduleOp) {
             entry = highFunc.getEntryAddress();
         else
             return;
-        if (entry != 0)
+        if (entry != 0) {
             knownFunctionStarts_.insert(entry);
+            funcOpEntries.push_back(entry);
+        }
         ++funcOpCount;
     });
 
@@ -377,8 +388,12 @@ void CAstBuilder::buildFunctionRegistry(ModuleOp moduleOp) {
     // in the table) even though neither is a FuncOp in an isolated lift.
     if (auto starts = moduleOp->getAttrOfType<ArrayAttr>("helix.function_starts")) {
         for (Attribute a : starts) {
-            if (auto i = dyn_cast<IntegerAttr>(a))
-                knownFunctionStarts_.insert(i.getValue().getZExtValue());
+            if (auto i = dyn_cast<IntegerAttr>(a)) {
+                uint64_t v = i.getValue().getZExtValue();
+                knownFunctionStarts_.insert(v);
+                // #30: the Pathfinder side-table is ALWAYS authoritative.
+                authoritativeFunctionStarts_.insert(v);
+            }
         }
         if (!starts.empty())
             functionTableIsAuthoritative_ = true;
@@ -387,8 +402,14 @@ void CAstBuilder::buildFunctionRegistry(ModuleOp moduleOp) {
     // A whole-module lift (more than one FuncOp) is itself an authoritative
     // table: every legitimate intra-module call target is a FuncOp entry, so
     // a miss genuinely means "not a function".
-    if (funcOpCount > 1)
+    if (funcOpCount > 1) {
         functionTableIsAuthoritative_ = true;
+        // #30: only fold the FuncOp entries into the AUTHORITATIVE set in the
+        // whole-module case.  A lone self-entry (funcOpCount == 1) is excluded
+        // on purpose -- see buildFunctionRegistry head.
+        for (uint64_t e : funcOpEntries)
+            authoritativeFunctionStarts_.insert(e);
+    }
 }
 
 void CAstBuilder::buildBlockRegistry(Operation* funcOp) {
@@ -501,6 +522,11 @@ void CAstBuilder::buildBlockRegistry(Operation* funcOp) {
 
 bool CAstBuilder::isKnownFunctionStart(uint64_t addr) const {
     return addr != 0 && knownFunctionStarts_.count(addr) != 0;
+}
+
+bool CAstBuilder::isAuthoritativeFunctionStart(uint64_t addr) const {
+    return functionTableIsAuthoritative_ && addr != 0 &&
+           authoritativeFunctionStarts_.count(addr) != 0;
 }
 
 bool CAstBuilder::isKnownBlockStart(uint64_t addr) const {
@@ -4329,6 +4355,21 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
     if (func.body.size() <= 1 && opCount < 5) {
         deduction += 40.0;
         issues.push_back("stub function (< 5 ops)");
+        // #30 (registry-miss honest failure): a stub-shaped function under an
+        // AUTHORITATIVE table whose (non-zero) entry is NOT an authoritative
+        // function start did not honestly lift -- it was decompiled as a FuncOp
+        // but the Pathfinder table says this is not a real function start.
+        // The entryAddr != 0 guard is MANDATORY: a real whole-module FuncOp
+        // whose getEntryAddress()==0 is structurally excluded from
+        // authoritativeFunctionStarts_ (the `if (entry != 0)` guards in
+        // buildFunctionRegistry), so without it such a function would be
+        // wrongly forced to confidence 0 under an authoritative table.  Set
+        // only the sticky flag here; the score-zeroing that survives to the
+        // user is enforced in CAstOptimizer::reanalyzeConfidence.
+        if (functionTableIsAuthoritative_ && func.entryAddr != 0 &&
+            !isAuthoritativeFunctionStart(func.entryAddr)) {
+            func.registryMissHonestFailure = true;
+        }
     } else if (func.body.size() <= 3 && opCount < 10) {
         deduction += 15.0;
         issues.push_back("very short function");

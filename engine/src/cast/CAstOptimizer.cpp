@@ -2070,6 +2070,22 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
     double deduction = 0.0;
     func.confidenceIssues.clear();
 
+    // #30 (registry-miss honest failure): this rescorer overwrites
+    // confidenceScore AFTER all optimizations and is the value the user
+    // actually sees.  If CAstBuilder::analyzeConfidence flagged that this
+    // function's entry is NOT in the authoritative function table, the address
+    // did not honestly lift -- force confidence to 0 and report it.  Placed
+    // AFTER confidenceIssues.clear() so the message survives, and BEFORE any
+    // positive scoring: a registry miss is a harder honesty failure than the
+    // A-D4 50% damning cap, so 0 correctly beats 50.
+    if (func.registryMissHonestFailure) {
+        func.confidenceScore = 0.0;
+        func.confidenceIssues.push_back(
+            "registry miss: function entry not in the authoritative function "
+            "table (no honest lift)");
+        return;
+    }
+
     // ── Native opcodes (check for unmapped native call targets) ──────
     // After decomposeNativeOpcodes runs, any remaining native instructions
     // are renamed with __native_ prefix.  Anything else with the native-

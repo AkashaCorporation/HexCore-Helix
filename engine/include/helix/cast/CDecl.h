@@ -106,6 +106,17 @@ public:
     /// target is not allowed to self-report as plausible.
     bool hasDamningHonestyDefect = false;
 
+    /// #30 (registry-miss honest failure): set by CAstBuilder::analyzeConfidence
+    /// when an AUTHORITATIVE function table exists and this stub-shaped
+    /// function's (non-zero) entry address is NOT an authoritative function
+    /// start -- i.e. the address was decompiled as a FuncOp but the Pathfinder
+    /// table says it is not a real function start, so it did not honestly lift.
+    /// Carried on the decl because the post-optimization rescorer
+    /// (CAstOptimizer::reanalyzeConfidence) overwrites confidenceScore and is
+    /// the value the user actually sees.  When true, confidence is forced to 0
+    /// (a registry miss is a harder honesty failure than the 50% damning cap).
+    bool registryMissHonestFailure = false;
+
     CFuncDecl(std::string name, uint64_t entryAddr, CTypePtr returnType,
               std::vector<CParamDecl> params = {},
               bool isVariadic = false,
