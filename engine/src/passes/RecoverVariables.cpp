@@ -955,11 +955,20 @@ private:
                 // Compute RPO via post-order DFS + reverse
                 llvm::SmallVector<Block*, 32> postOrder;
                 llvm::SmallPtrSet<Block*, 32> visited;
+                // FIX-095b: RPO over funcBody's OWN region only. A top-level block's
+                // terminator can carry a successor edge that crosses INTO a nested
+                // structured region (do_while/while) after StructureControlFlow; if
+                // the DFS follows it, a foreign-region block lands in blockOrder and
+                // the per-block loop both null-derefs domInfoPtr->getNode (foreign
+                // region has no dom tree) AND steals in-region ops that Phase-2.5 is
+                // meant to bind. Stay in-region; the Phase-2.5 sweep handles nested
+                // ops. No-op for region-free CFGs (byte-identical).
                 std::function<void(Block*)> postOrderDFS =
                     [&](Block* blk) {
                         if (!visited.insert(blk).second) return;
                         for (Block* succ : blk->getSuccessors())
-                            postOrderDFS(succ);
+                            if (succ->getParent() == &funcBody)
+                                postOrderDFS(succ);
                         postOrder.push_back(blk);
                     };
                 postOrderDFS(&funcBody.front());
@@ -967,6 +976,11 @@ private:
                 for (auto it = postOrder.rbegin(); it != postOrder.rend();
                      ++it)
                     blockOrder.push_back(*it);
+                // Safety net: append any funcBody top-level block the same-region
+                // DFS did not reach, so its top-level reg ops are still processed.
+                for (auto& blk : funcBody)
+                    if (!visited.count(&blk))
+                        blockOrder.push_back(&blk);
 
                 LLVM_DEBUG(llvm::dbgs() << "  Using RPO ordering ("
                                         << blockOrder.size()
@@ -991,8 +1005,12 @@ private:
             Block& block = *blockPtr;
 
             // ── Seed SSA state at block entry ──────────────────────────
-            if (useRPO && &block != &funcBody.front()) {
-                // Restore from immediate dominator's exit state
+            if (useRPO && &block != &funcBody.front()
+                && block.getParent() == &funcBody) {
+                // Restore from immediate dominator's exit state.
+                // FIX-095b guard: domInfoPtr = DominanceInfo(func) only has a tree
+                // for funcBody's own region; never call getNode on a block from a
+                // nested structured region (would null-deref).
                 auto* domNode = domInfoPtr->getNode(&block);
                 if (domNode && domNode->getIDom()) {
                     Block* idom = domNode->getIDom()->getBlock();

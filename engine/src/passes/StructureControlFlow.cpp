@@ -2027,6 +2027,12 @@ private:
             // the loop becomes infinite and code after it is unreachable.
             //
             // Reference: No More Gotos (Yakdan et al., NDSS 2015) §IV-C2
+            //
+            // FIX-095c: record the loop's exit target(s) while walking the body so
+            // the leftover do_while back-edge terminator can be rewired to the real
+            // exit afterwards (the do_while path otherwise leaves the original latch
+            // JccOp dangling -- contrast the while path which replaces it).
+            llvm::SmallPtrSet<Block*, 4> exitTargets;
             auto emitBreakOnExit = [&](Block* block) {
                 auto* term = block->getTerminator();
                 if (!term) return;
@@ -2040,6 +2046,10 @@ private:
 
                     // Both inside or both outside — not an exit edge.
                     if (trueOutside == falseOutside) return;
+
+                    // FIX-095c: the real exit target (captured here, during loop
+                    // structuring, before any if-recovery can consume it).
+                    exitTargets.insert(trueOutside ? trueDest : falseDest);
 
                     Value condValue = jccOp.getFlagValue();
                     if (!condValue) return;
@@ -2087,6 +2097,7 @@ private:
                 } else if (auto jmpOp = dyn_cast<helix::low::JmpOp>(term)) {
                     Block* dest = jmpOp.getDest();
                     if (!loopBodySet.count(dest)) {
+                        exitTargets.insert(dest);  // FIX-095c
                         // Unconditional jump out of the loop → emit break.
                         bodyBuilder.setInsertionPointToEnd(&bodyBlock);
                         bodyBuilder.create<helix::high::BreakOp>(
@@ -2138,6 +2149,40 @@ private:
             auto trueConst = condBuilder.create<arith::ConstantOp>(
                 loc, i1Ty, condBuilder.getBoolAttr(true));
             condBuilder.create<helix::high::YieldOp>(loc, trueConst.getResult());
+
+            // FIX-095c: rewire the do_while latch's leftover back-edge terminator.
+            // The do_while now encapsulates the loop body + its break(s); the
+            // original loop block still carries its back-edge JccOp (self-edge +
+            // exit-edge), leaving a spurious low-level loop in funcBody. The WHILE
+            // path replaces its latch terminator with a Continue; the do_while path
+            // did not. For a single-block / single-exit post-tested loop: if the
+            // exit is a TRIVIAL (bare) return block, CLONE that return here so the
+            // loop gets its OWN exit `return;` and does not depend on the (possibly
+            // shared) ret block surviving if-recovery (which would consume it and
+            // orphan this edge -> lost accumulator). Otherwise branch to the exit.
+            // Conservative: only the unambiguous single-block/single-exit shape.
+            if (loop.body.size() == 1 && exitTargets.size() == 1) {
+                Block* exitTarget = *exitTargets.begin();
+                if (auto* oldTerm = loop.header->getTerminator()) {
+                    auto termLoc = oldTerm->getLoc();
+                    Operation* exitTerm = exitTarget->getTerminator();
+                    bool exitIsTrivialReturn =
+                        exitTerm &&
+                        (isa<helix::high::ReturnOp>(exitTerm) ||
+                         isa<helix::low::RetOp>(exitTerm)) &&
+                        exitTerm->getNumOperands() == 0;
+                    OpBuilder tb(builder.getContext());
+                    tb.setInsertionPointToEnd(loop.header);
+                    oldTerm->erase();
+                    if (exitIsTrivialReturn) {
+                        tb.clone(*exitTerm);
+                    } else {
+                        tb.create<helix::low::JmpOp>(
+                            termLoc, /*target_addr=*/IntegerAttr{},
+                            /*address=*/IntegerAttr{}, /*dest=*/exitTarget);
+                    }
+                }
+            }
 
             ++NumDoWhileRecovered;
 

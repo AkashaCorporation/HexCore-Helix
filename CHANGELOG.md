@@ -9,6 +9,30 @@ All notable changes to HexCore Helix are documented here.
 >
 > **Since the FIX-087 SSA-versioning groundwork (Wave 21):** byte/word memory-source `MOVZX` lift, register-as-address variable binding (in-region + in-loop RAX→`result`), the first-class variadic-call mini-ISA carriage (Wave 22 Step 3-lite), two C-AST dataflow-fidelity fixes that recover the FNV accumulator chain, an `exprEqual` completeness fix, and the opt-in `--preserve-cfg` callfuscation-deflatten path (Wave 23, Stages 1+2). All `--preserve-cfg` work is gated **default OFF** — normal lifts are byte-for-byte unchanged, confirmed by a quad-corpus tripwire (rootkit / ROTTR / Intigrity-Mali / Akasha).
 
+### Wave 28 — G1 branch-polarity: the Remill `.not` successor mismatch + the structurer/DSE bugs it unmasked (2026-06-06)
+
+> Surfaced by a 3-way ground-truth audit (real C++ source vs IDA Hex-Rays vs Helix, `rag/16`). The lift mis-read Remill's InstCombine-canonicalized conditional-branch form, INVERTING every structured `if`/`while`/`break`; fixing the polarity then unmasked a chain of latent structurer + dead-store bugs that only manifest once loops structure correctly. Four additive fixes; the FNV-1a test function `sub_140001000` now decompiles to the correct `do { result ^= *s; result *= prime; } while (*s); return result;` and all 7 Akasha functions + the 3 engine test fixtures decompile crash-free.
+
+#### FIX-095 — Jcc successor polarity: pair the taken condition with the taken edge (`passes/RemillToHelixLow.cpp`)
+
+- **Problem**: Remill emits every conditional branch in the canonical `.not` form (`%bt.not = icmp eq i8 %branch_taken, 0; br %bt.not, ^not_taken, ^taken`) after its own InstCombine pipeline, so `successor(0)` is the NOT-taken edge. The lift synthesized `condValue` as the *taken* condition (ZF for JZ, ...) but paired it with `successor(0)` — inverting the sense of EVERY structured branch downstream.
+- **Fix**: when the cond-branch operand is the `icmp eq <x>, 0` `.not` shape, swap so `trueDest` is the taken successor. Gated on the shape, so an un-canonicalized `icmp ne` form is left untouched (correct under both the optimized and unoptimized lift pipelines).
+- **Impact**: `rt_fnv` / `sv2` / `sv_url_finalize` loop + early-exit branch polarities now match Hex-Rays.
+
+#### FIX-095b — RecoverVariables: never `getNode` a foreign-region block (`passes/RecoverVariables.cpp`)
+
+- FIX-095 makes loops structure into real `do_while` regions; the per-block RPO then followed a cross-region successor edge into a nested region and `DominanceInfo(func)->getNode()` null-dereffed (0xC0000005). Guard the RPO post-order DFS to same-region successors + the idom-seed call to `block.getParent() == &funcBody`. No-op for region-free CFGs (byte-identical).
+
+#### FIX-095c — do_while latch: clone the exit return instead of orphaning the shared block (`passes/StructureControlFlow.cpp`)
+
+- The `do_while` builder left the original latch back-edge terminator dangling (unlike the `while` path, which replaces it with a `Continue`). For a single-block / single-exit post-tested loop whose exit is a trivial `return`, CLONE that return at the latch so the loop owns its exit; the shared ret block then becomes single-pred and the entry-`if` consumes it normally — no spurious back-edge-to-entry, no `loc_irr` mis-label, no lost post-loop return.
+
+#### FIX-095d — dead-store elimination: loop-carried + compound-target liveness (`cast/CAstOptimizer.{cpp,h}`)
+
+- `eliminateDeadStores` was dropping the FNV accumulator. Two bugs: (1) `dseStmtList` ran loop bodies with an empty initial live-set, so a loop-carried store looked dead — now `dseStmtList` takes an optional `seedLive` and each loop body is seeded with every variable read in it (the back-edge makes a top read consume a bottom write); (2) a compound assign (`x ^= ...`, `x *= ...`) was treated as a pure write — it READS its target, so it is never dead and stays live for earlier writes.
+- **Impact**: `rt_fnv` keeps the full `result ^= *s; result *= prime` accumulator. General + conservative (only ever keeps more stores).
+- **Known remaining**: a MULTI-exit unrolled loop (`sv_url_finalize`, 6 breaks) still emits one `goto loc_irr_0` — FIX-095c's single-exit guard does not fire — unchanged vs polarity-only output, a future multi-exit FIX-095c extension. The `rt_fnv` init/prime CONSTANTS remain abstract (G5, a separate constant-reconstruction gap, not structure).
+
 ### Wave 27 — Honesty layer (leave-nightly P0), increment 2: function_starts NAPI channel + D4 confidence cap + #30 registry-miss (2026-06-05)
 
 > Second increment of the leave-nightly honesty layer (`rag/08_leave_nightly_plan.md`): the consumers of the Wave 26 address registry. Three additive fixes, each gated to stay **inert on the current non-authoritative single-function corpus** (`functionTableIsAuthoritative_` stays false → byte-identical output, confirmed on the akasha / SOTTR-`UpdatePosition` / x64 corpus) and validated engine-direct on freshly-lifted `.ll` plus a bundled GoogleTest. The first wires the channel that lets an isolated/IDE single-function lift become authoritative; the other two are the D4 and #30 honesty gates that fire once it is. The cross-repo IDE caller (`analyzeAll` → `setFunctionStarts`) and the residual folded cross-function leak (A-D1) are deliberately deferred to a follow-up so they land where they can be validated end-to-end against a real multi-window authoritative table.

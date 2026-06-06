@@ -4448,10 +4448,13 @@ bool CAstOptimizer::isUnsafeTarget(const CExpr* expr) {
 }
 
 // Backward liveness DSE on a flat statement list.
-void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts) {
+void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
+                                const std::unordered_set<std::string>* seedLive) {
     // live_set: variables that have been read "after" the current position
-    // (since we scan backwards).
+    // (since we scan backwards). FIX-095d: loop bodies seed this with every
+    // variable read in the body, so loop-carried stores survive.
     std::unordered_set<std::string> live;
+    if (seedLive) live = *seedLive;
 
     // Mark all statements to be removed.
     std::unordered_set<size_t> toRemove;
@@ -4488,14 +4491,25 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts) {
                 break;
             }
 
+            // A COMPOUND assign (op=, e.g. `x ^= ...`, `x *= ...`) also READS the
+            // target, so the target is never dead at a compound store, and after
+            // processing the store the target stays live for earlier writes
+            // (FIX-095d: this is what keeps a multi-step loop accumulator like
+            // `h ^= b; h *= prime;` intact -- without it, the later `*=` erased the
+            // accumulator from the live-set and the earlier `^=` was dropped).
+            const bool compoundReadsTarget = !a.compoundOp.empty();
+
             // If target is not in the live set, the store is dead.
-            if (live.find(tgt) == live.end()) {
+            if (!compoundReadsTarget && live.find(tgt) == live.end()) {
                 toRemove.insert(i);
                 // Do NOT add value reads — they're also dead.
             } else {
                 // Target is consumed; add value reads to live set.
                 live.erase(tgt);
                 collectVarRefs(a.value.get(), live);
+                // The compound target is itself a use → keep it live.
+                if (compoundReadsTarget)
+                    live.insert(tgt);
             }
             break;
         }
@@ -4583,6 +4597,77 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts) {
 
 void CAstOptimizer::eliminateDeadStores(CFuncDecl& func) {
     dseStmtList(func.body);
+
+    // FIX-095d: collect every variable READ anywhere in a loop body. Seeding the
+    // loop's DSE with this set keeps loop-carried stores alive (the loop back-edge
+    // means a read at the top consumes a write from a previous iteration; without
+    // the seed, dseStmtList scans the body as a flat list with an empty live-set
+    // and wrongly drops e.g. an FNV `h = (h ^ b) * prime` accumulator).
+    std::function<void(const std::vector<StmtPtr>&,
+                       std::unordered_set<std::string>&)> collectLoopReads =
+        [&](const std::vector<StmtPtr>& body,
+            std::unordered_set<std::string>& reads) {
+            for (const auto& sp : body) {
+                if (!sp) continue;
+                switch (sp->getKind()) {
+                case NodeKind::AssignStmt: {
+                    const auto& a = static_cast<const CAssignStmt&>(*sp);
+                    collectVarRefs(a.value.get(), reads);
+                    if (!a.compoundOp.empty())
+                        collectVarRefs(a.target.get(), reads);
+                    else if (a.target &&
+                             a.target->getKind() != NodeKind::VarRefExpr)
+                        collectVarRefs(a.target.get(), reads);
+                    break;
+                }
+                case NodeKind::ReturnStmt:
+                    collectVarRefs(
+                        static_cast<const CReturnStmt&>(*sp).value.get(), reads);
+                    break;
+                case NodeKind::ExprStmt:
+                    collectVarRefs(
+                        static_cast<const CExprStmt&>(*sp).expr.get(), reads);
+                    break;
+                case NodeKind::IfStmt: {
+                    const auto& s = static_cast<const CIfStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectLoopReads(s.thenBody, reads);
+                    collectLoopReads(s.elseBody, reads);
+                    break;
+                }
+                case NodeKind::WhileStmt: {
+                    const auto& s = static_cast<const CWhileStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectLoopReads(s.body, reads);
+                    break;
+                }
+                case NodeKind::DoWhileStmt: {
+                    const auto& s = static_cast<const CDoWhileStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectLoopReads(s.body, reads);
+                    break;
+                }
+                case NodeKind::ForStmt: {
+                    const auto& s = static_cast<const CForStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectLoopReads(s.body, reads);
+                    break;
+                }
+                case NodeKind::SwitchStmt:
+                    for (const auto& c :
+                         static_cast<const CSwitchStmt&>(*sp).cases)
+                        collectLoopReads(c.body, reads);
+                    break;
+                case NodeKind::BlockStmt:
+                    collectLoopReads(
+                        static_cast<const CBlockStmt&>(*sp).stmts, reads);
+                    break;
+                default:
+                    break;
+                }
+            }
+        };
+
     // Recurse into nested scopes.
     for (auto& sp : func.body) {
         if (!sp) continue;
@@ -4593,15 +4678,27 @@ void CAstOptimizer::eliminateDeadStores(CFuncDecl& func) {
             dseStmtList(s.elseBody);
             break;
         }
-        case NodeKind::WhileStmt:
-            dseStmtList(static_cast<CWhileStmt&>(*sp).body);
+        case NodeKind::WhileStmt: {
+            auto& body = static_cast<CWhileStmt&>(*sp).body;
+            std::unordered_set<std::string> seed;
+            collectLoopReads(body, seed);
+            dseStmtList(body, &seed);
             break;
-        case NodeKind::DoWhileStmt:
-            dseStmtList(static_cast<CDoWhileStmt&>(*sp).body);
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& body = static_cast<CDoWhileStmt&>(*sp).body;
+            std::unordered_set<std::string> seed;
+            collectLoopReads(body, seed);
+            dseStmtList(body, &seed);
             break;
-        case NodeKind::ForStmt:
-            dseStmtList(static_cast<CForStmt&>(*sp).body);
+        }
+        case NodeKind::ForStmt: {
+            auto& body = static_cast<CForStmt&>(*sp).body;
+            std::unordered_set<std::string> seed;
+            collectLoopReads(body, seed);
+            dseStmtList(body, &seed);
             break;
+        }
         case NodeKind::SwitchStmt:
             for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
                 dseStmtList(c.body);

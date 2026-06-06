@@ -181,7 +181,11 @@ private:
     static void compoundStmtList(std::vector<StmtPtr>& stmts);
 
     /// Apply dead-store elimination to a statement list (flat, one scope).
-    static void dseStmtList(std::vector<StmtPtr>& stmts);
+    /// `seedLive` (optional) seeds the initial backward live-set; loop bodies
+    /// pass the set of all variables read in the body so loop-carried stores
+    /// (e.g. an FNV accumulator) are not falsely eliminated (FIX-095d).
+    static void dseStmtList(std::vector<StmtPtr>& stmts,
+                            const std::unordered_set<std::string>* seedLive = nullptr);
 
     /// Apply copy propagation substitution to a statement list.
     static void copyPropStmtList(

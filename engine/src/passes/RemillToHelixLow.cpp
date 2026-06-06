@@ -3776,16 +3776,59 @@ private:
             }
 
             // Resolve branch destinations from the LLVM br terminator.
-            // The block's terminator is `br i1 true, label %taken, label %fallthrough`
-            // which has the correct successor blocks even though the condition is wrong.
+            //
+            // FIX-095 (G1 branch-polarity): Remill lifts every conditional
+            // branch in the canonical ".not" form
+            //     %bt.not = icmp eq i8 %branch_taken, 0
+            //     br i1 %bt.not, label %not_taken, label %taken
+            // i.e. successor(0) is reached when %bt.not is TRUE (branch_taken==0
+            // => the jump is NOT taken / fall-through) and successor(1) is the
+            // TAKEN edge. The condValue synthesized above is the *taken*
+            // condition (ZF for JZ, !ZF for JNZ, ...), so the historical
+            // `trueBlock = successor(0)` pairing associated the taken condition
+            // with the not-taken block -- inverting the sense of EVERY structured
+            // branch (loop-entry guards, back-edges, if/else) downstream. Detect
+            // the canonical .not shape and pair condValue with the real taken
+            // successor. If the shape is anything other than the `icmp eq <x>, 0`
+            // Remill emits (defensive / future arches), fall back to the legacy
+            // ordering so behaviour is never worse than before.
             Block* trueBlock = dummyBlock;
             Block* falseBlock = dummyBlock;
             Block* currentBlock = call->getBlock();
             if (currentBlock) {
                 auto* term = currentBlock->getTerminator();
                 if (term && term->getNumSuccessors() >= 2) {
-                    trueBlock = term->getSuccessor(0);
-                    falseBlock = term->getSuccessor(1);
+                    Block* succ0 = term->getSuccessor(0);
+                    Block* succ1 = term->getSuccessor(1);
+                    bool notForm = false;
+                    if (term->getNumOperands() >= 1) {
+                        if (auto icmp = term->getOperand(0)
+                                            .getDefiningOp<LLVM::ICmpOp>()) {
+                            if (icmp.getPredicate() == LLVM::ICmpPredicate::eq) {
+                                auto isZeroConst = [](Value v) -> bool {
+                                    if (auto c = v.getDefiningOp<LLVM::ConstantOp>())
+                                        if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+                                            return ia.getValue().isZero();
+                                    if (auto c = v.getDefiningOp<arith::ConstantOp>())
+                                        if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+                                            return ia.getValue().isZero();
+                                    return false;
+                                };
+                                if (isZeroConst(icmp.getRhs()) ||
+                                    isZeroConst(icmp.getLhs()))
+                                    notForm = true;
+                            }
+                        }
+                    }
+                    if (notForm) {
+                        // .not canonical form: successor(1) is the taken edge.
+                        trueBlock = succ1;
+                        falseBlock = succ0;
+                    } else {
+                        // Unknown branch shape: preserve historical ordering.
+                        trueBlock = succ0;
+                        falseBlock = succ1;
+                    }
                 } else if (term && term->getNumSuccessors() == 1) {
                     // If canonicalized to a single-successor branch,
                     // the false block (fallthrough) is the NEXT block in layout order.
