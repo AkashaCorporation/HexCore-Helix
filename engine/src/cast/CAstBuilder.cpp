@@ -9,6 +9,7 @@
 #include "helix/cast/CDecl.h"
 #include "helix/cast/CStmt.h"
 #include "helix/cast/CExpr.h"
+#include "helix/cast/DamningDefect.h"  // FIX-092: final-AST damning re-derivation
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/dialects/HelixHighTypes.h"
 #include "helix/dialects/HelixHighDialect.h"
@@ -569,7 +570,14 @@ ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
     //     the label is a referenced goto target (guaranteed emitted); else the
     //     honest code-pointer cast.
     if (isKnownBlockStart(uval)) {
-        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        // FIX-092: D1 is NO LONGER build-time-latched.  The damning cap for the
+        // code-address-leak category is re-derived at confidence time from the
+        // FINAL AST (see surviving-code-addr-leak walk in analyzeConfidence /
+        // reanalyzeConfidence).  The `&loc_xxxx` branch below is the honest,
+        // guaranteed-emitted SHARP form -- a real label-address, not a leak --
+        // so it is deliberately NOT tagged.  Only the `(void*)0xADDR` cast form
+        // is a leaked code pointer; we tag it so the survivor walk can find it
+        // (or confirm DSE erased it, in which case it is not damning).
         auto label = blockLabelForAddr(uval);
         if (!label.empty() && referencedLabelNames_.count(label)) {
             auto labelRef = std::make_unique<CVarRefExpr>(
@@ -578,8 +586,10 @@ ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
                 UnaryOp::AddressOf, std::move(labelRef),
                 CType::voidPtr(), addr);
         }
-        // Label not guaranteed emitted → honest code-pointer cast.
-        return std::make_unique<CAddrLitExpr>(uval, CType::voidPtr(), addr);
+        // Label not guaranteed emitted → honest code-pointer cast (D1 leak).
+        auto leak = std::make_unique<CAddrLitExpr>(uval, CType::voidPtr(), addr);
+        leak->isCodeAddrLeak = true;
+        return leak;
     }
 
     // (b) Function-start address → honest code-pointer cast.  A bare integer
@@ -588,9 +598,12 @@ ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
     //     because that symbol is not declared in the single-function output
     //     and would itself become an auto-declared placeholder.
     if (isKnownFunctionStart(uval)) {
-        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
-        return std::make_unique<CAddrLitExpr>(
+        // FIX-092: D1 NOT build-time-latched; tag the leak so the final-AST
+        // survivor walk in analyzeConfidence re-derives the cap honestly.
+        auto leak = std::make_unique<CAddrLitExpr>(
             uval, CType::voidPtr(), addr);
+        leak->isCodeAddrLeak = true;
+        return leak;
     }
 
     // (c) FIX-091 (issue #15 C1) — folded in-function block address.
@@ -658,7 +671,10 @@ CAstBuilder::resolveFoldedCodeLabel(uint64_t rawValue, uint64_t addr) {
         inFunctionCodeAddrs_.count(candidate) == 0)
         return std::nullopt;
 
-    hasDamningHonestyDefect_ = true; // D4 hook (shared with D1/D2)
+    // FIX-092: D1 (folded form) NOT build-time-latched.  Same emit-time-survival
+    // policy as the (a)/(b) gates: the `&loc_<hex>` sharp form is an honest
+    // emitted label-address (NOT a leak, NOT tagged); only the `(void*)0xADDR`
+    // cast form is tagged so the final-AST survivor walk can re-derive the cap.
 
     // Prefer the sharp `&loc_<hex>` when the label is a confirmed-referenced
     // goto target (guaranteed emitted); otherwise the always-compilable
@@ -670,8 +686,9 @@ CAstBuilder::resolveFoldedCodeLabel(uint64_t rawValue, uint64_t addr) {
         return std::optional<ExprPtr>(std::make_unique<CUnaryExpr>(
             UnaryOp::AddressOf, std::move(labelRef), CType::voidPtr(), addr));
     }
-    return std::optional<ExprPtr>(
-        std::make_unique<CAddrLitExpr>(candidate, CType::voidPtr(), addr));
+    auto leak = std::make_unique<CAddrLitExpr>(candidate, CType::voidPtr(), addr);
+    leak->isCodeAddrLeak = true;
+    return std::optional<ExprPtr>(std::move(leak));
 }
 
 // ── D2 — honest callee gating ───────────────────────────────────────────────
@@ -710,7 +727,9 @@ bool CAstBuilder::gateCalleeName(const std::string& calleeName,
     // tail jump / computed goto as a `call sub_<block>`.  Emit the honest
     // indirect form rather than fabricating a call to our own label.
     if (isKnownBlockStart(targetAddr)) {
-        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        hasDamningHonestyDefect_ = true; // D4 (D2 out-of-table call) -- KEPT
+                                         // build-time-latched: a side-effecting
+                                         // call erased by DSE is still a defect.
         outName = std::format("(*(code *)0x{:x})", targetAddr);
         return false;
     }
@@ -719,7 +738,8 @@ bool CAstBuilder::gateCalleeName(const std::string& calleeName,
     // authoritative table — otherwise an isolated single-function lift would
     // wrongly rewrite every legitimate cross-function call.
     if (functionTableIsAuthoritative_) {
-        hasDamningHonestyDefect_ = true; // D4 hook (next increment)
+        hasDamningHonestyDefect_ = true; // D4 (D2 out-of-table call) -- KEPT
+                                         // build-time-latched (see above).
         outName = std::format("(*(code *)0x{:x})", targetAddr);
         return false;
     }
@@ -4498,24 +4518,34 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
 
-    // -- D4 (charter exit-metric 4): damning-defect hard cap --
+    // -- D4 (charter exit-metric 4): damning-defect hard cap (FIX-092) --
     // The score above is SYNTACTIC plausibility (100 - penalties).  A function
-    // that leaked a code address as data (D1) or emitted a call to an
-    // out-of-table target (D2) is not merely "penalized" -- it is provably
-    // dishonest, and must not self-report above 50% regardless of how clean
-    // the rest of its syntax is.  hasDamningHonestyDefect_ is reset at function
-    // entry (clearFunctionState) and fully raised by the time the body has been
-    // built (D1/D2 emission paths run during buildRegionBody, before this
-    // call), so reading it here is safe.  Carry it onto the decl so the
-    // post-optimization rescorer (reanalyzeConfidence) applies the identical
-    // cap on the score that ultimately survives.
-    // The decl flag is stamped at decl-creation time in buildFunction (a
-    // guaranteed-run point); this tail cap is defensive for any path that
-    // reaches it.  reanalyzeConfidence is the authoritative final cap.
-    if (func.hasDamningHonestyDefect && func.confidenceScore > 50.0) {
+    // carrying a damning honesty defect is not merely "penalized" -- it is
+    // provably non-faithful and must not self-report above 50% regardless of
+    // how clean the rest of its syntax looks.  Two SOURCES of the cap:
+    //   * D2 out-of-table CALL -- build-time-latched on the decl
+    //     (func.hasDamningHonestyDefect, raised only by the 713/722 call hooks
+    //     after the D1 un-latch).  A side-effecting call erased by DSE is still
+    //     a defect, so it must cap even when no call node survives emission.
+    //   * D1 code-address LEAK / uninitialized return / irreducible no-return
+    //     -- RE-DERIVED from the FINAL AST here, so a benign PC/NEXT_PC/RIP
+    //     constant that merely coincided with a function-start table entry and
+    //     was then erased by DSE does NOT trip the cap (it leaks nothing).
+    // The reason string names the ACTUAL surviving category, not a fixed
+    // mis-attributed phrase (rag/16 G3).  This build-time scorer is defensive;
+    // CAstOptimizer::reanalyzeConfidence applies the authoritative final cap on
+    // the score the user sees and runs the identical re-derivation.
+    auto damning = detectDamningDefects(func);
+    bool d2Call = func.hasDamningHonestyDefect;
+    if ((damning.any() || d2Call) && func.confidenceScore > 50.0) {
         func.confidenceScore = 50.0;
+        std::string reason = damning.reason();
+        if (d2Call) {
+            if (!reason.empty()) reason += "; ";
+            reason += "out-of-table call";
+        }
         issues.push_back(
-            "damning honesty defect (code-address leak or out-of-table call)"
-            " - confidence capped at 50%");
+            "damning honesty defect (" + reason +
+            ") - confidence capped at 50%");
     }
 }

@@ -16,6 +16,7 @@
 #include "helix/cast/CExpr.h"
 #include "helix/cast/CStmt.h"
 #include "helix/cast/CType.h"
+#include "helix/cast/DamningDefect.h"  // FIX-092: final-AST damning re-derivation
 
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Casting.h"
@@ -2637,19 +2638,32 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
 
-    // -- D4 (charter exit-metric 4): damning-defect hard cap --
+    // -- D4 (charter exit-metric 4): damning-defect hard cap (FIX-092) --
     // This rescorer overwrites confidenceScore AFTER all optimizations and is
-    // the value that actually survives to the user; it must honor the same cap
-    // CAstBuilder::analyzeConfidence applied.  It cannot see the builder's
-    // hasDamningHonestyDefect_ member, so the signal is carried on the decl
-    // (set in analyzeConfidence).  Robust even when a later pass cosmetically
-    // erases the tail that motivated a damning marker: the flag records that
-    // the function HAD a damning honesty defect at build time.
-    if (func.hasDamningHonestyDefect && func.confidenceScore > 50.0) {
+    // the value that actually survives to the user; it is the AUTHORITATIVE
+    // final cap.  Two sources, matching analyzeConfidence:
+    //   * D2 out-of-table CALL -- build-time-latched on the decl
+    //     (func.hasDamningHonestyDefect, raised only by the 713/722 call hooks).
+    //     A side-effecting call erased here is still a defect, so cap on the
+    //     flag even if no call node survives.
+    //   * D1 code-address LEAK / uninitialized return / irreducible no-return
+    //     -- RE-DERIVED from the FINAL (post-optimization) AST, so a benign PC/
+    //     NEXT_PC/RIP constant that coincided with a function-start entry and
+    //     was then erased by this pass's DSE/dead-store removal does NOT trip
+    //     the cap.  The reason string names the ACTUAL surviving category
+    //     (rag/16 G3: kill the mis-attributed fixed phrase on leaf fns).
+    auto damning = detectDamningDefects(func);
+    bool d2Call = func.hasDamningHonestyDefect;
+    if ((damning.any() || d2Call) && func.confidenceScore > 50.0) {
         func.confidenceScore = 50.0;
+        std::string reason = damning.reason();
+        if (d2Call) {
+            if (!reason.empty()) reason += "; ";
+            reason += "out-of-table call";
+        }
         func.confidenceIssues.push_back(
-            "damning honesty defect (code-address leak or out-of-table call)"
-            " - confidence capped at 50%");
+            "damning honesty defect (" + reason +
+            ") - confidence capped at 50%");
     }
 }
 
@@ -4827,8 +4841,12 @@ ExprPtr CAstOptimizer::cloneExpr(const CExpr* expr) {
     }
     case NodeKind::AddrLitExpr: {
         const auto& e = static_cast<const CAddrLitExpr&>(*expr);
-        return std::make_unique<CAddrLitExpr>(e.addrValue, e.type,
-                                              e.getAddress());
+        auto cloned = std::make_unique<CAddrLitExpr>(e.addrValue, e.type,
+                                                     e.getAddress());
+        // FIX-092: preserve the D1 code-address-leak tag across clones so the
+        // final-AST survivor walk sees a surviving leak even if it was copied.
+        cloned->isCodeAddrLeak = e.isCodeAddrLeak;
+        return cloned;
     }
     case NodeKind::VarRefExpr: {
         const auto& e = static_cast<const CVarRefExpr&>(*expr);

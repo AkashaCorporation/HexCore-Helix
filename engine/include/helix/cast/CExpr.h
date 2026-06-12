@@ -107,6 +107,18 @@ class CAddrLitExpr : public CExpr {
 public:
     uint64_t addrValue;
 
+    // FIX-092 (D4 emit-time survival): true ONLY for the D1 code-address-leak
+    // nodes the registry-resolution path (buildIntegerConstant (a)/(b),
+    // resolveFoldedCodeLabel) produces -- a bare integer that equalled a known
+    // code (block/function) start, surfaced as the honest `(void*)0xADDR`
+    // code-pointer cast.  Generic dialect-sourced address literals
+    // (high.addr_lit / mid.addr_const) leave this false: they are data/known
+    // addresses, not a leaked code pointer, and must not trip the D4 cap.
+    // The D4 damning cap re-derives the D1 category at confidence time by
+    // checking whether any such tagged node SURVIVED into the final AST
+    // (DSE/dead-store removal may have erased it).
+    bool isCodeAddrLeak = false;
+
     explicit CAddrLitExpr(uint64_t addrValue, CTypePtr type = CType::voidPtr(),
                           uint64_t address = 0)
         : CExpr(NodeKind::AddrLitExpr, std::move(type), address),
