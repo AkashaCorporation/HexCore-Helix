@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-v0.9.2--nightly-b8860b">
+  <img alt="version" src="https://img.shields.io/badge/version-v0.9.2-2e7d32">
   <img alt="engine" src="https://img.shields.io/badge/engine-C%2B%2B23%20%2F%20MLIR%2018-8a6d3b">
   <img alt="lifter" src="https://img.shields.io/badge/lifter-Remill%20(LLVM%20IR)-8a6d3b">
   <img alt="bridge" src="https://img.shields.io/badge/bridge-Rust%20%2F%20N--API-8a6d3b">
@@ -47,7 +47,7 @@ The whole pipeline runs natively in C++23. It ships into the HexCore IDE as a pr
 
 The guiding principle is **fidelity over polish**: correct C, or an *honestly flagged* approximation when the lift cannot be trusted &mdash; never a clean-looking lie. See [The Honesty Layer](#the-honesty-layer).
 
-> **Status:** `v0.9.2-nightly`. The engine is in active development toward a stable `v0.9.2` cut (the *honesty layer*); the architectural `v1.0` track (MemEffects-based DCE, universal op semantics, full structured-CFG recovery) runs alongside and does not gate the stable cut. See [CHANGELOG](CHANGELOG.md).
+> **Status:** `v0.9.2` &mdash; the stable cut. The leave-nightly *honesty layer* is complete (D1, D2, D4, #30; see below). The architectural `v1.0` track (MemEffects-based DCE, universal op semantics, full structured-CFG recovery) runs alongside and does not gate this cut. See [CHANGELOG](CHANGELOG.md).
 
 ---
 
@@ -106,20 +106,20 @@ Most decompilers optimize for *clean-looking* output. Helix optimizes for *trust
 | **D1** | A recovered **code address never leaks as a bare data constant** (`var = 0x401050;`). It resolves to a label or an honest code-pointer cast. |
 | **D2** | A call target **not in the function table** is emitted as an honest indirect call `(*(code *)0xADDR)(...)`, never a fabricated `sub_XXX` symbol. |
 | **D3** | **Unreachable code** is removed and located-marked, never silently shown as live. |
-| **D4** | **Confidence tracks honesty.** A function carrying a damning defect (a leaked code address, an out-of-table call) is hard-capped &mdash; it is not allowed to self-report as plausible. |
+| **D4** | **Confidence tracks honesty.** A function is hard-capped only when a genuine defect *survives into the emitted output* &mdash; a leaked code address, an out-of-table call, an uninitialized return, an irreducible no-return &mdash; and the cap names the located reason. It cannot self-report as plausible while hiding one. |
 | **#30** | No **silent high-confidence stub** for an address that did not actually lift. |
 
-These live in the C-AST layer as one authoritative function/block-address registry plus located honest markers &mdash; a focused honesty pass, not a rewrite.
+These live in the C-AST layer as one authoritative function/block-address registry plus located honest markers &mdash; a focused honesty pass, not a rewrite. `v0.9.2` ships **D1, D2, D4, and #30**; D3 (general unreachable-code removal) is maturing on the structured-CFG track and does not gate the cut.
 
-A concrete example &mdash; the same function before and after the D4 gate:
+A concrete example &mdash; a function that *looked* clean but returns an uninitialized value, before and after the D4 gate:
 
 ```diff
-- // Confidence: 60.5% (Medium)
+- // Confidence: 92.0% (High)
 + // Confidence: 50.0% (Low)
-+ // Issues: ... damning honesty defect (code-address leak or out-of-table call) - confidence capped at 50%
++ // Issues: ... damning honesty defect (uninitialized return value 'result') - confidence capped at 50%
 ```
 
-The decompiler refuses to claim *Medium* confidence on a function that leaked a code address, and tells you exactly why.
+The body has zero gotos and reads cleanly, so a surface-plausibility score rated it *High* &mdash; but it returns a `result` that is never assigned. Helix caps it to *Low* and names the exact located reason, re-derived from the final emitted code so the flag always points at a real defect in the output.
 
 ---
 
