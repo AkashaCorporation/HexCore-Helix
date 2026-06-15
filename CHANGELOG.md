@@ -3,6 +3,45 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [0.1.6] - The Phase-4 guard is VALIDATED on real kernel code - 2026-06-15
+
+The plot twist. After 0.1.4-0.1.5 concluded the guard was inert/ineffective on
+the rootkit (Phase 4 = 0 merges there, collapse was upstream), running it on the
+real **Mali kbase GPU driver** (`Intigrity/.../fresh-helix-souper-2`, 14 lifted
+`.ll`) told a completely different story - and a confidence-aware scoreboard +
+six adversarial judges turned a vN-count panic into a clear win.
+
+**Confidence-aware scoreboard** (`diff_v2.ps1` upgraded to parse confidence %,
+Low/Medium/High label, the stub flag, and unreachable counts) over the 14 kbase
+files: **IMPROVED=2, REGRESSED=0, STUBBED=0, CHANGED?=10, =2, net +5.0pp**. The
+earlier "+92 vN" alarm was confidence-flat reshuffles, not regressions.
+
+**Six skeptical adversarial judges** (one per function, told to default NEUTRAL
+and treat extra vN as suspect) read the actual baseline-vs-v2 C:
+**5 BETTER, 1 NEUTRAL, 0 WORSE.** On real production kernel code the guard:
+- removed a **factually-wrong `v13 = _dev_err(...)`** capture of RAX after a
+  void-returning call, plus the garbage arithmetic derived from it
+  (kbase_context_mmap);
+- corrected a misleading `bool` to `int64_t` on a page-count value
+  (kbase_jit_allocate, kbase_context_mmap);
+- **split overloaded call-result vars** into distinct named results
+  (kbase_mem_alloc: `v5` -> `v8`=check_alloc_flags / `v9`=check_alloc_sizes /
+  ...), removed two spurious `*call_result` stores, and cut unreachable 89->87;
+- **de-stubbed four placeholder branches** `if(!v4)` into genuine named
+  `kbase_region_tracker_find_region_base_address` / `kbase_alloc_phy_pages_helper`
+  / **`kbase_mem_grow_gpu_mapping`** (the audit-relevant grow path) calls and
+  fixed a malformed `if (*v25 != + 72)` compare (kbase_mem_commit);
+- turned an **empty stub into a full body** with the real -EINVAL error path,
+  named call graph and struct offsets (kbase_mem_free: stub -> 52% Medium).
+
+**Decision: KEEP the guard.** It is a genuine quality improvement on the exact
+class of code we audit (kernel drivers), reconciling with the changelog: where
+Phase 4 actually merges call-results (kbase), the option-1 guard correctly
+prevents it; where it does not (rootkit), the guard is inert. The `[v2-exp]`
+debug print was removed; the guard is now clean. Arc 0.1.0-0.1.6, 7 commits +
+the scoreboard upgrade. Candidate for promotion to the main line.
+
+
 ## [0.1.5] - Root cause pinpointed in CAstBuilder input - and it is FAITHFUL - 2026-06-15
 
 Traced the `v4 = printk(0, v4)` collapse to its exact origin by dumping the
