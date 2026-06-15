@@ -3,6 +3,47 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [0.1.1 - 0.1.3] - Phase-4 call-result identity experiment - 2026-06-15
+
+First experiment arc in the v2 sandbox: attack the FIX-081 / Phase-4
+cross-register coalescing debt (the `v3 = printk(0, v3)` x4 defect). Measured
+engine-direct (Release) against the v0.9.2 baseline exe with `diff_v2.ps1`.
+
+- **0.1.1 (diagnose).** Implemented FIX-081 follow-up **option 1** in
+  `RecoverVariables.cpp` Phase 4: a `definedByCall` flag on `VarInfo` (a variable
+  assigned directly from a `CallOp` result, detected the same way the Phase-5
+  single-use guard does) plus a merge-loop gate that refuses to merge such a
+  variable away. Instrumented with stderr probes to answer "does it fire?".
+  Finding: **detection FIRES correctly** (marks the `rax` call-result var), but
+  the guard **never refuses a merge on any synthetic input** - the engine
+  DCE/CSE's hand-crafted call chains before Phase 4 (3 identical no-arg calls
+  collapse to one; Helix does not recover the call args from a synthetic `.ll`).
+  Conclusion, now **proven not just suspected**: the mechanism is wired and the
+  detection works, but the cross-register call-result merge cannot be reproduced
+  synthetically. It needs a real-binary `.ll` (the rootkit corpus, not on disk).
+- **0.1.2 (harness).** Quieted the instrumentation; added
+  `tools/helix-validate/diff_v2.ps1` - the differential **scoreboard**: baseline
+  exe vs v2 exe over a `.ll` directory, reporting per-function identical/changed
+  + the **vN-placeholder delta** (the option-1 regression metric the changelog
+  warns about) + confidence delta. Scoreboard on the 5 available fixtures:
+  **5/5 identical, total vN delta 0** - the guard is safe (no extra placeholders)
+  on every input we can run.
+- **0.1.3 (refine to spec).** Scoped the guard to **cross-register only**
+  (`registerBase(victim) != registerBase(canon)`): same-register coalescing is
+  Phase 3.5's correct domain, so the guard now protects call-return identity
+  only when Phase 4 would fold it into a *different* register's variable. This
+  matches the FIX-081 option-1 wording exactly and keeps the regression surface
+  minimal.
+
+**Status:** low-risk, well-targeted, mechanism wired + detection proven, harness
+ready. **Effectiveness on the real defect remains UNPROVEN** pending a triggering
+input. **Next:** generate the rootkit corpus `.ll` (via the disassembler+remill
+on the real binary), run `diff_v2.ps1` over it, and check whether the guard turns
+`v3 = printk(0, v3)` x4 into distinct call results without inflating vN counts
+elsewhere. Alternative to try: FIX-081 **option 2** (reorder `inferSemanticNames`
+before Phase 4).
+
+
 ## [0.1.0] - Helix v2 sandbox baseline - 2026-06-15
 
 > **Fork point.** HexCore Helix v2 is a redesign sandbox cloned from the main-line `v0.9.2`
