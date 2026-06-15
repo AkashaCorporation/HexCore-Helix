@@ -267,6 +267,16 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     // a real lvalue if `v` was a simple alias of a real pointer).
     removeNullDerefPlaceholderStores(func);
     removeUnreachableAfterFirstReturn(func);
+    // FIX-v2-CAST-001: the late DCE passes above (removeDeadStoresBeforeReturn,
+    // removeNullDerefPlaceholderStores, removeUnreachableAfterFirstReturn) can
+    // empty an if-body that was non-empty when removeEmptyIfStatements last ran
+    // (lines ~242/254), leaving an `if (cond) { }` shell that the scorer then
+    // penalises as an "empty if/else block".  Re-run the empty-if sweep here,
+    // after all body-emptying passes and before reanalyzeConfidence, so those
+    // late-created dead shells are stripped instead of counted.  Safe: it only
+    // erases ifs whose then AND else bodies are both empty (same predicate the
+    // earlier sweeps use).
+    removeEmptyIfStatements(func);
     removeUnusedDeclarations(func);
     reanalyzeConfidence(func);
 }

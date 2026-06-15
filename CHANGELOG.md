@@ -3,6 +3,35 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [0.1.7] - Empty-if sweep ordering fix: +10pp on kbase_mem_import - 2026-06-15
+
+A localized, structurer-INDEPENDENT C-AST win (the kind to keep chasing while the
+structuring layer waits for its v1.0 rewrite). `kbase_mem_import` was the only
+kbase function NOT capped by the premature-return bug, so its issues were purely
+local: **45.8% (Low) -> 55.8% (Medium), +10pp**, with the "5 empty if/else
+block(s)" issue category eliminated.
+
+**Root cause (ordering):** `removeEmptyIfStatements` ran at `optimize()` lines
+~242 and ~254, but the LATE dead-code passes that run after it -
+`removeDeadStoresBeforeReturn`, `removeNullDerefPlaceholderStores`,
+`removeUnreachableAfterFirstReturn` - can empty an if-body that was non-empty at
+sweep time, leaving an `if (cond) { }` shell that nothing re-checks, so
+`reanalyzeConfidence` counted it as an empty block.
+
+**Fix (FIX-v2-CAST-001):** one extra `removeEmptyIfStatements(func)` call after
+the last body-emptying pass and before `reanalyzeConfidence`. Provably safe -
+`removeEmptyIfsInList` only erases an `IfStmt` whose then AND else bodies are both
+empty; it cannot touch a non-empty statement.
+
+**Validation:** scoreboard vs the ORIGINAL 0.9.2 over the 7-function kbase corpus:
+**0 REGRESSED, 0 STUBBED, 1 IMPROVED (mem_import +10pp), 1 RESCUED, net jumps from
++2.5pp to +12.0pp in v2's favor.** Fixtures 5/5 byte-identical. Adversarial check:
+the before/after body churn (real statements moving) was confirmed to be the
+pre-existing structuring NON-DETERMINISM noise floor (same exe, two runs = 107
+differing lines, same 55.8% confidence, empty-if issue gone on BOTH runs), not the
+patch dropping code. **v2 is now +12pp ahead of 0.9.2.**
+
+
 ## [Investigation] - Premature-return structurer: root cause PROVEN, fix hits a v1.0 wall - 2026-06-15
 
 Two focused sessions attacking the highest-leverage gap: every kbase function with
