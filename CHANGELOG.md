@@ -3,6 +3,115 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [Investigation] - Premature-return structurer: root cause PROVEN, fix hits a v1.0 wall - 2026-06-15
+
+Two focused sessions attacking the highest-leverage gap: every kbase function with
+branches gets a premature `return` at the top that strands the real body as
+"N unreachable statement(s) after return" and caps confidence at 33-52% (vs
+85-100% on clean functions). No code landed (master stays PRISTINE 0.1.6); the
+deliverable is a proven root cause + a hard architectural finding. ALL the
+experimental code + the diagnostic harness live on the local branch
+`wip-structurer-premature-return` (DO NOT MERGE).
+
+### Baseline: v2 0.1.6 vs the ORIGINAL 0.9.2 (the number to remember)
+
+`diff_v2.ps1` with Baseline = the real 0.9.2 exe (`HexCore-Helix-Original`,
+confirmed `--version`=0.9.2) vs Experiment = v2 master 0.1.6, over the 7-function
+kbase corpus: **0 REGRESSED, 1 IMPROVED (mem_free 49.5 -> 52), 4 CHANGED?(flat),
+2 = ; net +2.5pp in v2's favor.** Fixtures 5/5 byte-identical. So **v2 is NOT
+behind 0.9.2 - it is marginally AHEAD**, and the entire lead is the one landed
+[0.1.6] Phase-4 call-result guard. (An earlier "20-40% behind" impression was a
+misremember of a HexCore-vs-IDA / 0.9.1-vs-0.9.2 delta, not this one.)
+
+### Root cause of the premature return (PROVEN at the IR level)
+
+Added a `HELIX_DUMP_IR`-gated per-pass IR dump (Pipeline.cpp
+`CallOpCountInstrumentation::runAfterPass` writes `helix_ir_NN_<pass>.mlir` +
+`[v2-dbg]` block counts). On `kbase_mem_free.ll` the block count drops 20 -> 15
+at **StructureControlFlow** = where the premature `ret` is born. Mechanism:
+`recoverIfElse` classifies the entry block `bb0` (`jcc[bb6,bb1]`) as an if/else
+(both targets dominated, merge = `bb19` which is a trivial shared `ret`).
+`collectPathBlocks` can only collect `{bb6}` / `{bb1}` (its conservative `{start}`
+fallback) because the then/else paths **re-converge through a shared MULTI-ENTRY
+block** `bb3` (preds `bb2` from the else side + `bb7` from the then side).
+`structureIf` then moves those single blocks - which still carry CONDITIONAL `jcc`
+terminators escaping to top-level - into the IfOp; `rewriteStructuredRegionExits`
+ignores them (it only fixes 1-successor branches); then it replaces `bb0`'s
+branch with `helix_low.ret` because `findTrivialReturnOp(bb19)` succeeds. Net:
+`bb0` returns, the whole body `bb1..bb14` is stranded UNREACHABLE = the
+`return result;` stub.
+
+### Root cause of the crash (when the naive fix is applied)
+
+A guard that makes `recoverIfElse` SKIP these degenerate if-regions (route them to
+the goto/label fallback) **cleanly fixes the simple cases**: mem_free 52 -> 71.5
+(+19.5pp, body recovered, "21 unreachable after return" -> "9 gotos"); mem_commit
+52 -> 74.5 (+22.5pp). **But on complex functions it CRASHES** (exit 0xC0000409 =
+the LLVM `GenericDomTreeConstruction.h:481 "(Total+1==Num)"` assert). Per-Dom-site
+markers (`V2DBG_DOMSITE`) + a pre-construction func IR dump pinned it: the assert
+fires on a `helix_high.if` then-region whose ENTRY block is
+`^bb0(%arg0: !llvm.ptr): // pred: ^bb0` = a **region-entry block that HAS A
+PREDECESSOR + a block-argument = MALFORMED MLIR** (it violates the region-entry-
+has-no-preds invariant; the verifier is OFF in the pipeline so it slips through).
+It is NOT plain unreachability (forward AND reverse BFS both pass). It is a
+structurally invalid region created by structuring a residual LOOP block (hence
+the block-arg) into an IfOp.
+
+### The 5 attempts and the META-FINDING (why this is a v1.0 wall)
+
+Each attempt below was built + run on the full kbase corpus; each one cascaded:
+1. `regionEscapes` (reject if-regions whose moved blocks escape to a non-merge
+   block) - fixes mem_free/commit, crashes mem_alloc/import.
+2. + reverse-reachability inside `hasIrreducibleSCCs` - crash persists.
+3. + func-scope `hasUnreachableBlocks(func.getBody())` guard - crash persists
+   (wrong scope: the bad block is in a nested region).
+4. + region-scope `hasUnreachableBlocks(region)` - crash persists (the bad block
+   is reachable both ways; it is malformed, not unreachable).
+5. full SESE (single-entry + multi-entry + back-edge-into-entry + single-exit) -
+   NEWLY crashes `kbase_csf_queue_register` (a clean 100% function!); narrowing
+   to escape + back-edge-into-entry fixes csf but mem_alloc/import STILL crash.
+6. + "entry has a foreign (non-branchBlock) predecessor" check (to catch the
+   shared multi-entry block being moved AS a region entry) - re-crashes csf AND
+   still does not fix mem_alloc/import.
+
+**Source of the malformation, pinpointed** (a `[v2-malf]` scan that reports any
+region whose entry block has predecessors, run after each structuring phase):
+**nothing is malformed after Phase 2 (loops); the entry-with-predecessor region
+is born during Phase 3 (if-recovery), as a SIDE EFFECT of `structureIf` moving
+blocks** (the shared multi-entry block - kbase `bb3(%137): 2 preds` with its
+block-arg phi - ends up as an IfOp region entry, dragging its external preds).
+Crucially it is a side effect of the MOVE, not a property of the proposed
+if-region, so no pre-move per-region check in `recoverIfElse` can see it coming.
+
+**META-FINDING (decisive): the structurer is NOT robust to changing WHICH regions
+get structured.** Every tweak to the structured-region set produces a different
+malformed-IR / DomTree-crash somewhere else, because `structureIf`'s block-moving
+creates malformations as side effects that no pre-move per-region check can
+predict. The block-moving + lazy-dominance machinery has deep, tangled invariant
+dependencies. **The premature return cannot be fixed by guarding `recoverIfElse`
+/ `structureIf` (6 distinct attempts, all cascade).** This aligns with the
+leave-nightly plan: the structuring layer is a v1.0 (rev.ng-style) rewrite
+concern, not a v0.9.x patch.
+
+### What WORKED (carry these to 0.9.2)
+
+- The **Phase-4 call-result guard** ([0.1.6], the +2.5pp lead). Already validated,
+  promotion-ready. THIS is the migration-worthy win.
+- The **diagnostic harness**: the `HELIX_DUMP_IR` per-pass IR dump, the
+  `V2DBG_DOMSITE` markers, and the confidence-aware `diff_v2.ps1` scoreboard.
+  Reusable for the v1.0 structurer work. (On the WIP branch.)
+- The **proven root causes** above - they are the spec for the real fix.
+
+### What the REAL fix needs (the v1.0 structurer rewrite)
+
+A ground-up, dominance-SAFE structurer: collect if/loop regions as proper
+single-entry/single-exit from the start (Yakdan "No More Gotos" / Ghidra
+collapse-first), keep the IR well-formed at every step (no entry-with-predecessor,
+no escaping cross-region branches), and make EVERY Dom/PostDom construction
+provably safe before it runs. Until then, pursue OTHER localized safe wins (like
+the Phase-4 guard), NOT the fragile structurer.
+
+
 ## [0.1.6] - The Phase-4 guard is VALIDATED on real kernel code - 2026-06-15
 
 The plot twist. After 0.1.4-0.1.5 concluded the guard was inert/ineffective on
