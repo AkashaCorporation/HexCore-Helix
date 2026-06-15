@@ -1,0 +1,108 @@
+// ─────────────────────────────────────────────────────────────
+// sub_53b501 (0x53b501)
+// Confidence: 50.0% (Low)  |  cdecl
+// Issues: damning honesty defect (code-address leak or out-of-table call) - confidence capped at 50%
+// ─────────────────────────────────────────────────────────────
+int64_t sub_53b501(void)
+{
+    int64_t v1 = 0;
+
+    fp_compare();
+    __vtable_0xd();
+    __vtable_0x19();
+    vfunc_0x27(v1 - 40);
+    vfunc_0x3c(v1 - 40, v1 - 40);
+    vfunc_0x4a(v1 - 40, v1 - 40);
+    vfunc_0x5c(v1 - 40, v1 - 40);
+    vfunc_0x6a(v1 - 40, v1 - 40);
+    vfunc_0x7c(v1 - 40, v1 - 40);
+    vfunc_0x8a(v1 - 40, v1 - 40);
+    vfunc_0x9c(v1 - 40, v1 - 40);
+    vfunc_0xad(v1 - 40, v1 - 40);
+    vfunc_0xbf(v1 - 40, v1 - 40);
+    vfunc_0xcd(v1 - 40, v1 - 40);
+    vfunc_0xdf(v1 - 40, v1 - 40);
+    vfunc_0xed(v1 - 40, v1 - 40);
+    vfunc_0xff(v1 - 40, v1 - 40);
+    vfunc_0x10d(v1 - 40, v1 - 40);
+    vfunc_0x122(v1 - 40, v1 - 40);
+    vfunc_0x130(v1 - 40, v1 - 40);
+    vfunc_0x142(v1 - 40, v1 - 40);
+    vfunc_0x150(v1 - 40, v1 - 40);
+    vfunc_0x162(v1 - 40, v1 - 40);
+    vfunc_0x170(v1 - 40, v1 - 40);
+    vfunc_0x182(v1 - 40, v1 - 40);
+    vfunc_0x193(v1 - 40, v1 - 40);
+    vfunc_0x1a5(v1 - 40, v1 - 40);
+    vfunc_0x1b3(v1 - 40, v1 - 40);
+    vfunc_0x1c5(v1 - 40, v1 - 40);
+    vfunc_0x1d3(v1 - 40, v1 - 40);
+    vfunc_0x1e5(v1 - 40, v1 - 40);
+    vfunc_0x1f3(v1 - 40, v1 - 40);
+    vfunc_0x208(v1 - 40, v1 - 40);
+    vfunc_0x216(v1 - 40, v1 - 40);
+    vfunc_0x228(v1 - 40, v1 - 40);
+    vfunc_0x236(v1 - 40, v1 - 40);
+    vfunc_0x248(v1 - 40, v1 - 40);
+    vfunc_0x256(v1 - 40, v1 - 40);
+    vfunc_0x268(v1 - 40, v1 - 40);
+    vfunc_0x279(v1 - 40, v1 - 40);
+    vfunc_0x28b(v1 - 40, v1 - 40);
+    vfunc_0x299(v1 - 40, v1 - 40);
+    vfunc_0x2ab(v1 - 40, v1 - 40);
+    vfunc_0x2b9(v1 - 40, v1 - 40);
+    vfunc_0x2cb(v1 - 40, v1 - 40);
+    vfunc_0x2d9(v1 - 40, v1 - 40);
+    vfunc_0x2ee(v1 - 40, v1 - 40);
+    vfunc_0x2fc(v1 - 40, v1 - 40);
+    vfunc_0x30e(v1 - 40, v1 - 40);
+    vfunc_0x31c(v1 - 40, v1 - 40);
+    vfunc_0x32e(v1 - 40, v1 - 40);
+    vfunc_0x33c(v1 - 40, v1 - 40);
+    vfunc_0x34e(v1 - 40, v1 - 40);
+    vfunc_0x35f(v1 - 40, v1 - 40);
+    vfunc_0x371(v1 - 40, v1 - 40);
+    vfunc_0x37f(v1 - 40, v1 - 40);
+    vfunc_0x391(v1 - 40, v1 - 40);
+    vfunc_0x39f(v1 - 40, v1 - 40);
+    vfunc_0x3b1(v1 - 40, v1 - 40);
+    vfunc_0x3bf(v1 - 40, v1 - 40);
+    vfunc_0x3d4(v1 - 40, v1 - 40);
+    vfunc_0x3e2(v1 - 40, v1 - 40);
+    vfunc_0x3f4(v1 - 40, v1 - 40);
+    vfunc_0x402(v1 - 40, v1 - 40);
+    vfunc_0x414(v1 - 40, v1 - 40);
+    vfunc_0x422(v1 - 40, v1 - 40);
+    vfunc_0x434(v1 - 40, v1 - 40);
+    vfunc_0x445(v1 - 40, v1 - 40);
+    vfunc_0x457(v1 - 40, v1 - 40);
+    vfunc_0x465(v1 - 40, v1 - 40);
+    vfunc_0x477(v1 - 40, v1 - 40);
+    vfunc_0x485(v1 - 40, v1 - 40);
+    vfunc_0x497(v1 - 40, v1 - 40);
+    vfunc_0x4a5(v1 - 40, v1 - 40);
+    vfunc_0x4ba(v1 - 40, v1 - 40);
+    vfunc_0x4c8(v1 - 40, v1 - 40);
+    vfunc_0x4da(v1 - 40, v1 - 40);
+    vfunc_0x4e8(v1 - 40, v1 - 40);
+    vfunc_0x4fa(v1 - 40, v1 - 40);
+    vfunc_0x508(v1 - 40, v1 - 40);
+    vfunc_0x51a(v1 - 40, v1 - 40);
+    vfunc_0x52b(v1 - 40, v1 - 40);
+    vfunc_0x53d(v1 - 40, v1 - 40);
+    vfunc_0x54b(v1 - 40, v1 - 40);
+    vfunc_0x55d(v1 - 40, v1 - 40);
+    vfunc_0x56b(v1 - 40, v1 - 40);
+    vfunc_0x57d(v1 - 40, v1 - 40);
+    vfunc_0x58b(v1 - 40, v1 - 40);
+    vfunc_0x5a0(v1 - 40, v1 - 40);
+    vfunc_0x5ae(v1 - 40, v1 - 40);
+    vfunc_0x5c0(v1 - 40, v1 - 40);
+    vfunc_0x5ce(v1 - 40, v1 - 40);
+    vfunc_0x5e0(v1 - 40, v1 - 40);
+    vfunc_0x5ee(v1 - 40, v1 - 40);
+    vfunc_0x600(v1 - 40, v1 - 40);
+    vfunc_0x611(v1 - 40, v1 - 40);
+    return vfunc_0x623(v1 - 40, v1 - 40);
+}
+

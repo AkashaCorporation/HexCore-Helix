@@ -1,0 +1,70 @@
+// HexCore Helix — Common Types Schema
+// Shared types used across CFG and AST schemas.
+
+namespace helix.schema;
+
+/// Target CPU architecture.
+enum Arch : byte {
+    X86 = 0,
+    X86_64 = 1,
+    Arm = 2,
+    Aarch64 = 3,
+    Mips = 4,
+    Mips64 = 5,
+    PowerPc = 6,
+    PowerPc64 = 7,
+    Sparc = 8,
+    Sparc64 = 9,
+    Riscv32 = 10,
+    Riscv64 = 11,
+}
+
+/// A virtual memory address.
+struct Address {
+    value: uint64;
+}
+
+/// An architecture register.
+table Register {
+    id: uint16;
+    name: string;
+    size_bits: uint16;
+}
+
+/// Instruction operand types.
+union OperandKind {
+    RegOperand,
+    ImmOperand,
+    MemOperand,
+    FpOperand,
+}
+
+table RegOperand {
+    reg: Register;
+}
+
+table ImmOperand {
+    value: int64;
+}
+
+table MemOperand {
+    base: Register;
+    index: Register;
+    scale: ubyte;
+    disp: int64;
+    size_bits: uint16;
+}
+
+table FpOperand {
+    value: float64;
+}
+
+/// A single disassembled instruction.
+table Instruction {
+    address: Address;
+    bytes: [ubyte];
+    mnemonic: string;
+    op_str: string;
+    operands: [OperandKind];
+    flags: uint32;
+}

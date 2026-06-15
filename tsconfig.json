@@ -1,0 +1,21 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "commonjs",
+        "moduleResolution": "node",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "declaration": true,
+        "outDir": "./dist",
+        "rootDir": "."
+    },
+    "include": [
+        "index.d.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "target",
+        "engine"
+    ]
+}

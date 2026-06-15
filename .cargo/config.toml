@@ -1,0 +1,22 @@
+# HexCore Helix — Cargo Configuration
+# Cross-language LTO and linker settings for C++ interop
+
+[build]
+# Use LLD linker for faster linking when available
+# Uncomment when LLVM/LLD is in PATH:
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.x86_64-pc-windows-msvc]
+# Windows: use clang-cl compatible settings
+# rustflags = ["-C", "linker=lld-link"]
+
+[target.x86_64-unknown-linux-gnu]
+# Linux: enable cross-language LTO with clang
+# rustflags = ["-C", "linker=clang", "-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-apple-darwin]
+# macOS ARM: default linker works fine
+
+[env]
+# LLVM 18 installation path — override per-machine
+# LLVM_DIR = { value = "", force = false }

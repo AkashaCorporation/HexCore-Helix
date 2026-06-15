@@ -1,0 +1,324 @@
+{
+  "oracle": "C:\\Users\\Mazum\\Desktop\\HexCore-Helix-Original\\HexCore-Helix\\tools\\helix-validate\\oracle_akasha.json",
+  "rows": [
+    {
+      "function": "0x140001000_sub_140001000",
+      "address": "0x140001000",
+      "source_function": "rt_fnv",
+      "helix_function": "sub_140001000",
+      "helix_file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001000_sub_140001000.helix.c",
+      "helix_validate_score": 0.3356418918918919,
+      "source_oracle_score": 0.2175,
+      "components": {
+        "semantic_recovery": 0.0,
+        "signature_recovery": 0.5667,
+        "flow_fidelity": 0.85,
+        "quality": 0.65
+      },
+      "quality_details": {
+        "is_stub": false,
+        "suspicious_self_ref": 0,
+        "unreachable_after_return": 0,
+        "placeholder_id_rate": 0.9048,
+        "null_like_deref_count": 1
+      },
+      "correctness_penalty": 0.06,
+      "checks": [
+        {
+          "id": "fnv64_offset_basis",
+          "label": "recovers the 64-bit FNV offset basis or its XOR-split halves",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "fnv64_prime",
+          "label": "recovers the 64-bit FNV prime or its XOR-split halves",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "nul_terminated_loop",
+          "label": "keeps the loop over the input bytes until NUL",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "byte_xor_update",
+          "label": "keeps the byte-wise xor into the FNV accumulator",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "hash_accumulator_return",
+          "label": "returns the computed hash accumulator, not an uninitialized result",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        }
+      ],
+      "main_divergence": "semantic_recovery",
+      "main_divergence_label": "source semantic features absent",
+      "gap": 0.1181
+    },
+    {
+      "function": "0x140001090_sub_140001090",
+      "address": "0x140001090",
+      "source_function": "sv_fnv32",
+      "helix_function": "sub_140001090",
+      "helix_file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001090_sub_140001090.helix.c",
+      "helix_validate_score": 0.5333333333333333,
+      "source_oracle_score": 0.4562,
+      "components": {
+        "semantic_recovery": 0.3333,
+        "signature_recovery": 0.675,
+        "flow_fidelity": 0.5,
+        "quality": 0.8
+      },
+      "quality_details": {
+        "is_stub": false,
+        "suspicious_self_ref": 0,
+        "unreachable_after_return": 0,
+        "placeholder_id_rate": 1.0,
+        "null_like_deref_count": 0
+      },
+      "correctness_penalty": 0.0,
+      "checks": [
+        {
+          "id": "fnv32_offset_basis",
+          "label": "recovers the 32-bit FNV offset basis",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "fnv32_prime",
+          "label": "recovers the 32-bit FNV prime",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "0x1000193"
+          ]
+        },
+        {
+          "id": "bounded_byte_loop",
+          "label": "keeps the loop bounded by n",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "indexed_byte_read",
+          "label": "reads p[i] / input byte from memory",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "xor_then_multiply",
+          "label": "keeps the xor/multiply FNV update pair",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "\\^",
+            "\\*"
+          ]
+        },
+        {
+          "id": "fnv32_accumulator_return",
+          "label": "returns the FNV accumulator, not the length/boolean parameter",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        }
+      ],
+      "main_divergence": "semantic_recovery",
+      "main_divergence_label": "source semantic features absent",
+      "gap": 0.0771
+    },
+    {
+      "function": "0x140001190_sub_140001190",
+      "address": "0x140001190",
+      "source_function": "sv1",
+      "helix_function": "sub_140001190",
+      "helix_file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001190_sub_140001190.helix.c",
+      "helix_validate_score": 0.37499999999999994,
+      "source_oracle_score": 0.0,
+      "components": {
+        "semantic_recovery": 0.0,
+        "signature_recovery": 0.3375,
+        "flow_fidelity": 0.0667,
+        "quality": 0.35
+      },
+      "quality_details": {
+        "is_stub": false,
+        "suspicious_self_ref": 0,
+        "unreachable_after_return": 0,
+        "placeholder_id_rate": 0.7,
+        "null_like_deref_count": 3
+      },
+      "correctness_penalty": 0.18,
+      "checks": [
+        {
+          "id": "peb_ldr_guard",
+          "label": "keeps the PEB/Ldr null guard",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "module_list_walk",
+          "label": "walks the InMemoryOrder module list",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "full_dll_name_read",
+          "label": "reads FullDllName.Buffer/Length from each module entry",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "basename_slash_scan",
+          "label": "keeps the basename scan over slash/backslash",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "ascii_lowercase_fold",
+          "label": "keeps the A-Z to lowercase fold",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "module_hash_compare",
+          "label": "hashes the normalized module name and compares to target",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "dllbase_return",
+          "label": "returns the matching module base",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        }
+      ],
+      "main_divergence": "semantic_recovery",
+      "main_divergence_label": "source semantic features absent",
+      "gap": 0.375
+    },
+    {
+      "function": "0x140001350_sub_140001350",
+      "address": "0x140001350",
+      "source_function": "sv2",
+      "helix_function": "sub_140001350",
+      "helix_file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001350_sub_140001350.helix.c",
+      "helix_validate_score": 0.0,
+      "source_oracle_score": 0.3659,
+      "components": {
+        "semantic_recovery": 0.75,
+        "signature_recovery": 0.6083,
+        "flow_fidelity": 0.631,
+        "quality": 0.1
+      },
+      "quality_details": {
+        "is_stub": false,
+        "suspicious_self_ref": 5,
+        "unreachable_after_return": 0,
+        "placeholder_id_rate": 0.9464,
+        "null_like_deref_count": 3
+      },
+      "correctness_penalty": 0.28,
+      "checks": [
+        {
+          "id": "module_null_guard",
+          "label": "keeps the module null guard",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "!\\s*param_1",
+            "return\\s+(?:nullptr|0)"
+          ]
+        },
+        {
+          "id": "mz_signature_check",
+          "label": "checks IMAGE_DOS_SIGNATURE",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "0x5A4D"
+          ]
+        },
+        {
+          "id": "pe_signature_check",
+          "label": "checks IMAGE_NT_SIGNATURE",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "0x4550"
+          ]
+        },
+        {
+          "id": "export_directory_rva",
+          "label": "reads the export directory RVA",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "field_0x88",
+            "0x88"
+          ]
+        },
+        {
+          "id": "export_name_tables",
+          "label": "recovers AddressOfNames/Ordinals/Functions tables",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        },
+        {
+          "id": "export_name_loop",
+          "label": "iterates across exported names",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "field_0x18",
+            "\\bwhile\\s*\\("
+          ]
+        },
+        {
+          "id": "export_hash_compare",
+          "label": "hashes each export name and compares to target",
+          "weight": 1.0,
+          "passed": true,
+          "matched_patterns": [
+            "\\bsub_140001000\\s*\\("
+          ]
+        },
+        {
+          "id": "function_pointer_return",
+          "label": "returns the resolved function pointer, not a boolean/result",
+          "weight": 1.0,
+          "passed": false,
+          "matched_patterns": []
+        }
+      ],
+      "main_divergence": "quality",
+      "main_divergence_label": "Helix-internal output damage",
+      "gap": -0.3659
+    }
+  ],
+  "mean": {
+    "helix_validate_score": 0.311,
+    "source_oracle_score": 0.2599,
+    "gap": 0.0511
+  }
+}

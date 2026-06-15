@@ -1,0 +1,2276 @@
+/// @file EliminateDeadCode.cpp
+/// @brief MLIR pass: dead code elimination tailored for decompilation.
+///
+/// This pass removes operations that are artifacts of the compilation and
+/// lifting process and do not contribute to the program's observable
+/// semantics.  Unlike general-purpose DCE (which MLIR provides via
+/// `createCSEPass()` and `createCanonicalizerPass()`), this pass targets
+/// patterns specific to decompiled x86-64 code:
+///
+///   1. **NOP / INT3 markers**: helix_low.nop and helix_low.int3 ops are
+///      padding/debug markers with no semantic effect.
+///
+///   2. **Prologue/epilogue boilerplate**: The standard function prologue
+///      (push rbp; mov rbp, rsp) and epilogue (mov rsp, rbp; pop rbp) are
+///      frame pointer setup that has no meaning at the source level.
+///      Non-volatile register saves (push rbx ... pop rbx) are similarly
+///      removed.
+///
+///   3. **Stack pointer bookkeeping**: Instructions like `sub rsp, 0x28`
+///      (stack allocation) and `add rsp, 0x28` (deallocation) are compiler
+///      artifacts.  The stack layout has already been recovered by the
+///      RecoverStackLayout pass.
+///
+///   4. **Dead register writes**: A write to a register whose value is never
+///      read before the next write to the same register is dead.  This
+///      leverages MLIR's built-in Liveness analysis.
+///
+///   5. **Trivially dead ops**: After the targeted removals above, we run
+///      MLIR's `isOpTriviallyDead()` to clean up any ops whose results
+///      have become unused.
+///
+/// ## References
+///
+///   - Rust implementation: crates/helix-core/src/analysis/data_flow.rs
+///   - MLIR Liveness analysis: mlir/Analysis/Liveness.h
+///   - Cooper & Torczon, "Engineering a Compiler", Ch. 10 (Dead Code)
+
+#include "helix/passes/Passes.h"
+#include "helix/dialects/HelixLowOps.h"
+#include "helix/dialects/HelixHighOps.h"
+#include "helix/dialects/HelixMidOps.h"
+#include "helix/analysis/X86RegisterInfo.h"
+
+#include "mlir/Analysis/Liveness.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Debug.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <format>
+#include <optional>
+#include <string>
+#include <string_view>
+
+#define DEBUG_TYPE "eliminate-dead-code"
+
+using namespace mlir;
+using namespace helix;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Statistics
+// ═══════════════════════════════════════════════════════════════════════════════
+
+STATISTIC(NumNopsRemoved,          "Number of NOP ops removed");
+STATISTIC(NumInt3sRemoved,         "Number of INT3 ops removed");
+STATISTIC(NumPrologueOpsRemoved,   "Number of prologue/epilogue ops removed");
+STATISTIC(NumStackAdjustsRemoved,  "Number of RSP bookkeeping ops removed");
+STATISTIC(NumDeadWritesRemoved,    "Number of dead register writes removed");
+STATISTIC(NumTriviallyDeadRemoved, "Number of trivially dead ops removed");
+STATISTIC(NumDeadFlagsRemoved,     "Number of dead flag computations removed");
+STATISTIC(NumDeadCmpTestRemoved,   "Number of dead CMP/TEST ops removed");
+STATISTIC(NumDeadVarsRemoved,      "Number of dead variable decls removed");
+STATISTIC(NumDeadAssignsRemoved,   "Number of dead assignments removed");
+STATISTIC(NumDeadUndefRemoved,     "Number of dead __undef assignments removed");
+STATISTIC(NumEscapeDeadStores,     "Number of dead stores to non-escaping vars removed (P2.10)");
+STATISTIC(NumEscapeDeadAssigns,    "Number of dead assigns to non-escaping vars removed (P2.10)");
+STATISTIC(NumInfraOpsRemoved,      "Number of infrastructure ops removed (Phase 0)");
+
+namespace {
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Prologue/Epilogue Pattern Detection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Describes a matched push/pop pair for a non-volatile register save.
+struct PushPopPair {
+    /// The push operation (in the prologue).
+    Operation* pushOp = nullptr;
+
+    /// The corresponding pop operation (in the epilogue).
+    Operation* popOp = nullptr;
+
+    /// The register being saved/restored.
+    llvm::StringRef reg;
+};
+
+/// Check whether an operation is a `helix_low.push` of a specific register.
+///
+/// The push pattern from RemillToHelixLow is:
+///   helix_low.push %value {addr = ...}
+/// where the value originates from a reg.read of the target register.
+///
+/// @param op   The operation to check.
+/// @param reg  If non-empty, only match pushes of this register.
+///             If empty, match any push and return the register name.
+/// @return     The register name if this is a matching push, std::nullopt otherwise.
+static std::optional<std::string> isPushOf(Operation* op,
+                                           llvm::StringRef reg = "") {
+    auto pushOp = dyn_cast<helix::low::PushOp>(op);
+    if (!pushOp)
+        return std::nullopt;
+
+    // Trace the pushed value back to a RegReadOp to determine which register
+    // is being saved.
+    Value pushed = pushOp.getValue();
+    if (auto readOp = pushed.getDefiningOp<helix::low::RegReadOp>()) {
+        auto pushReg = readOp.getRegName();
+        if (reg.empty() || pushReg == reg)
+            return pushReg.str();
+    }
+
+    return std::nullopt;
+}
+
+/// Check whether an operation is a `helix_low.pop` that restores a register.
+///
+/// @param op   The operation to check.
+/// @param reg  If non-empty, only match pops that restore this register.
+/// @return     The register name if this is a matching pop, std::nullopt otherwise.
+static std::optional<std::string> isPopOf(Operation* op,
+                                          llvm::StringRef reg = "") {
+    auto popOp = dyn_cast<helix::low::PopOp>(op);
+    if (!popOp)
+        return std::nullopt;
+
+    // A pop that restores a register is followed by a reg.write of the same
+    // register.  Check all users of the pop result.
+    for (auto* user : popOp.getResult().getUsers()) {
+        if (auto writeOp = dyn_cast<helix::low::RegWriteOp>(user)) {
+            auto popReg = writeOp.getRegName();
+            if (reg.empty() || popReg == reg)
+                return popReg.str();
+        }
+    }
+
+    return std::nullopt;
+}
+
+/// Check if an operation is the frame pointer setup: `push rbp`.
+///
+/// This is the first instruction of the standard x86-64 prologue:
+///   push rbp
+///   mov rbp, rsp
+///
+/// @param op  The operation to check.
+/// @return    True if this is `push rbp`.
+static bool isFramePointerPush(Operation* op) {
+    return isPushOf(op, "RBP").has_value();
+}
+
+/// Check if an operation is a `mov rbp, rsp` (frame pointer setup).
+///
+/// In HelixLow IR, this manifests as:
+///   %rsp = helix_low.reg.read "RSP"
+///   helix_low.reg.write %rsp, "RBP"
+///
+/// @param op  The operation to check.
+/// @return    True if this is a frame pointer setup mov.
+static bool isFramePointerMov(Operation* op) {
+    auto writeOp = dyn_cast<helix::low::RegWriteOp>(op);
+    if (!writeOp)
+        return false;
+
+    // Check: destination is RBP and the source value comes from reading RSP.
+    if (writeOp.getRegName() != "RBP")
+        return false;
+
+    auto readOp = writeOp.getValue().getDefiningOp<helix::low::RegReadOp>();
+    if (!readOp)
+        return false;
+
+    return readOp.getRegName() == "RSP";
+}
+
+/// Check if an operation is a `mov rsp, rbp` (frame pointer teardown).
+///
+/// The reverse of the setup: reads RBP and writes to RSP.
+///
+/// @param op  The operation to check.
+/// @return    True if this is a frame pointer teardown.
+static bool isFramePointerTeardown(Operation* op) {
+    auto writeOp = dyn_cast<helix::low::RegWriteOp>(op);
+    if (!writeOp)
+        return false;
+
+    if (writeOp.getRegName() != "RSP")
+        return false;
+
+    auto readOp = writeOp.getValue().getDefiningOp<helix::low::RegReadOp>();
+    if (!readOp)
+        return false;
+
+    return readOp.getRegName() == "RBP";
+}
+
+/// Check if an operation is a frame pointer pop: `pop rbp`.
+///
+/// @param op  The operation to check.
+/// @return    True if this is `pop rbp`.
+static bool isFramePointerPop(Operation* op) {
+    return isPopOf(op, "RBP").has_value();
+}
+
+/// Scan the function for prologue/epilogue push/pop pairs.
+///
+/// Identifies the standard patterns:
+///   - Frame pointer setup/teardown: push rbp / mov rbp, rsp ... mov rsp, rbp / pop rbp
+///   - Non-volatile register saves: push rbx ... pop rbx (and other callee-saved regs)
+///
+/// Non-volatile registers for Win64 ABI: RBX, RBP, RDI, RSI, R12-R15
+/// Non-volatile registers for SysV ABI:  RBX, RBP, R12-R15
+///
+/// @param func  The function to scan.
+/// @return      A list of matched push/pop pairs to remove.
+static llvm::SmallVector<PushPopPair, 8>
+findPrologueEpiloguePairs(helix::low::FuncOp func) {
+    llvm::SmallVector<PushPopPair, 8> pairs;
+
+    auto& body = func.getBody();
+    if (body.empty())
+        return pairs;
+
+    // Non-volatile registers that may be saved/restored.
+    static constexpr std::string_view kNonVolatile[] = {
+        "RBX", "RBP", "RDI", "RSI", "R12", "R13", "R14", "R15"
+    };
+
+    // Collect all push and pop ops in the function.
+    llvm::SmallVector<Operation*, 16> pushOps;
+    llvm::SmallVector<Operation*, 16> popOps;
+
+    body.walk([&](helix::low::PushOp push) {
+        pushOps.push_back(push);
+    });
+    body.walk([&](helix::low::PopOp pop) {
+        popOps.push_back(pop);
+    });
+
+    // For each non-volatile register, check if there's a matching
+    // push at the function entry and pop at the function exit.
+    for (auto nvReg : kNonVolatile) {
+        Operation* matchedPush = nullptr;
+        Operation* matchedPop  = nullptr;
+
+        // Find the first push of this register (should be in the prologue).
+        for (auto* op : pushOps) {
+            if (isPushOf(op, nvReg)) {
+                matchedPush = op;
+                break;
+            }
+        }
+
+        // Find the last pop of this register (should be in the epilogue).
+        for (auto it = popOps.rbegin(); it != popOps.rend(); ++it) {
+            if (isPopOf(*it, nvReg)) {
+                matchedPop = *it;
+                break;
+            }
+        }
+
+        if (matchedPush && matchedPop) {
+            pairs.push_back({matchedPush, matchedPop, nvReg});
+
+            LLVM_DEBUG(llvm::dbgs() << "  Matched push/pop pair for "
+                                    << nvReg << "\n");
+        }
+    }
+
+    return pairs;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Stack Pointer Bookkeeping Detection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Check whether an operation is RSP bookkeeping: `rsp = rsp +/- N`.
+///
+/// These are stack allocation/deallocation instructions that have no
+/// meaning in decompiled code (the stack layout is recovered separately).
+///
+/// Patterns detected:
+///   - helix_low.bin (Add/Sub) where both operands involve RSP
+///   - helix_low.reg.write to RSP where the value is RSP +/- constant
+///
+/// @param op  The operation to check.
+/// @return    True if this is RSP bookkeeping that should be removed.
+static bool isStackPointerBookkeeping(Operation* op) {
+    // Pattern 1: a RegWriteOp to RSP.
+    if (auto writeOp = dyn_cast<helix::low::RegWriteOp>(op)) {
+        if (writeOp.getRegName() != "RSP")
+            return false;
+
+        // Check if the value being written is derived from RSP arithmetic.
+        auto* defOp = writeOp.getValue().getDefiningOp();
+        if (!defOp)
+            return false;
+
+        // BinOp with RSP as one operand and a constant as the other.
+        if (auto binOp = dyn_cast<helix::low::BinOp>(defOp)) {
+            auto kind = binOp.getKind();
+            // Only Add and Sub are stack adjustments.
+            auto kindVal = static_cast<int32_t>(kind);
+            bool isAddOrSub = (kindVal == static_cast<int32_t>(
+                                   helix::low::BinOpKind::Add)) ||
+                              (kindVal == static_cast<int32_t>(
+                                   helix::low::BinOpKind::Sub));
+            if (!isAddOrSub)
+                return false;
+
+            // Check if one of the operands is an RSP read.
+            auto lhsDef = binOp.getLhs().getDefiningOp<helix::low::RegReadOp>();
+            auto rhsDef = binOp.getRhs().getDefiningOp<helix::low::RegReadOp>();
+
+            bool lhsIsRsp = lhsDef && lhsDef.getRegName() == "RSP";
+            bool rhsIsRsp = rhsDef && rhsDef.getRegName() == "RSP";
+
+            return lhsIsRsp || rhsIsRsp;
+        }
+
+        // Direct copy from RSP (mov rsp, rsp — pathological but possible).
+        if (auto readOp =
+                writeOp.getValue().getDefiningOp<helix::low::RegReadOp>()) {
+            return readOp.getRegName() == "RSP";
+        }
+
+        return false;
+    }
+
+    // Pattern 2: a BinOp (Add/Sub) whose result is only used by an RSP write.
+    // This catches the intermediate arithmetic node.
+    if (auto binOp = dyn_cast<helix::low::BinOp>(op)) {
+        // Check if ALL users of the result are RSP writes.
+        // (If any user is not an RSP write, we can't remove this op.)
+        auto result = binOp.getResult();
+        if (!result.hasOneUse())
+            return false;
+
+        auto* user = *result.getUsers().begin();
+        if (auto writeOp = dyn_cast<helix::low::RegWriteOp>(user)) {
+            if (writeOp.getRegName() == "RSP")
+                return true;
+        }
+
+        return false;
+    }
+
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Flag Liveness Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracks which CPU flags produced by an operation are actually consumed
+/// by downstream conditional operations (jcc, cmov).
+///
+/// Flag-producing operations:
+///   - helix_low.binop: carry, zero, sign, overflow
+///   - helix_low.cmp:   carry, zero, sign, overflow
+///   - helix_low.test:  zero, sign (no carry/overflow)
+///
+/// Flag-consuming operations:
+///   - helix_low.jcc:  conditional branch based on flag condition
+///   - helix_low.cmov: conditional move based on flag condition
+///
+/// A flag is "live" if its SSA result value has at least one user.
+/// A flag is "dead" if its SSA result has no users.
+/// If ALL flags of a CMP/TEST are dead, the entire operation is dead.
+///
+/// When a flag's liveness is uncertain (e.g., it flows through a block
+/// argument or phi), we conservatively mark it as live and emit a warning.
+struct FlagLiveness {
+    bool carry_live    = false;
+    bool zero_live     = false;
+    bool sign_live     = false;
+    bool overflow_live = false;
+
+    /// Returns true if any flag is live.
+    bool any_live() const {
+        return carry_live || zero_live || sign_live || overflow_live;
+    }
+
+    /// Mark flags as live based on a JccOp's condition code.
+    ///
+    /// x86 condition codes and the flags they read:
+    ///   z/nz (ZF), b/nb (CF), be/nbe (CF|ZF), l/nl (SF^OF),
+    ///   le/nle (ZF|(SF^OF)), s/ns (SF), o/no (OF), p/np (PF — not modeled)
+    void mark_from_jcc(llvm::StringRef condition) {
+        markFlagsForCondition(condition);
+    }
+
+    /// Mark flags as live based on a CMovOp's condition code.
+    void mark_from_cmov(llvm::StringRef condition) {
+        markFlagsForCondition(condition);
+    }
+
+private:
+    void markFlagsForCondition(llvm::StringRef cond) {
+        // Normalize to lowercase for comparison.
+        auto c = cond.lower();
+
+        if (c == "z" || c == "e" || c == "nz" || c == "ne") {
+            zero_live = true;
+        } else if (c == "b" || c == "c" || c == "nb" || c == "nc" ||
+                   c == "nae" || c == "ae") {
+            carry_live = true;
+        } else if (c == "be" || c == "na" || c == "nbe" || c == "a") {
+            carry_live = true;
+            zero_live  = true;
+        } else if (c == "l" || c == "nge" || c == "nl" || c == "ge") {
+            sign_live     = true;
+            overflow_live = true;
+        } else if (c == "le" || c == "ng" || c == "nle" || c == "g") {
+            zero_live     = true;
+            sign_live     = true;
+            overflow_live = true;
+        } else if (c == "s" || c == "ns") {
+            sign_live = true;
+        } else if (c == "o" || c == "no") {
+            overflow_live = true;
+        } else {
+            // Unknown condition — conservatively mark all flags as live.
+            carry_live    = true;
+            zero_live     = true;
+            sign_live     = true;
+            overflow_live = true;
+        }
+    }
+};
+
+/// Check whether a flag SSA value has uncertain consumption.
+///
+/// A flag value is "uncertain" if it is used by an operation that is not
+/// a recognized flag consumer (jcc, cmov) — for example, if it flows
+/// through a block argument or is used by an unknown operation.
+///
+/// @param flagValue  The SSA value of a flag result.
+/// @return           True if the flag has uncertain consumption.
+static bool hasUncertainFlagConsumption(Value flagValue) {
+    for (auto* user : flagValue.getUsers()) {
+        if (!isa<helix::low::JccOp>(user) &&
+            !isa<helix::low::CMovOp>(user)) {
+            // Used by something other than jcc/cmov — uncertain.
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Compute flag liveness for a flag-producing operation by examining
+/// which of its flag results have consumers.
+///
+/// @param op  A flag-producing operation (BinOp, CmpOp, or TestOp).
+/// @return    The FlagLiveness indicating which flags are live.
+static FlagLiveness computeFlagLiveness(Operation* op) {
+    FlagLiveness liveness;
+
+    if (auto binOp = dyn_cast<helix::low::BinOp>(op)) {
+        // BinOp results: [0]=result, [1]=carry, [2]=zero, [3]=sign, [4]=overflow
+        liveness.carry_live    = !binOp.getCarryFlag().use_empty();
+        liveness.zero_live     = !binOp.getZeroFlag().use_empty();
+        liveness.sign_live     = !binOp.getSignFlag().use_empty();
+        liveness.overflow_live = !binOp.getOverflowFlag().use_empty();
+    } else if (auto cmpOp = dyn_cast<helix::low::CmpOp>(op)) {
+        // CmpOp results: [0]=carry, [1]=zero, [2]=sign, [3]=overflow
+        liveness.carry_live    = !cmpOp.getCarryFlag().use_empty();
+        liveness.zero_live     = !cmpOp.getZeroFlag().use_empty();
+        liveness.sign_live     = !cmpOp.getSignFlag().use_empty();
+        liveness.overflow_live = !cmpOp.getOverflowFlag().use_empty();
+    } else if (auto testOp = dyn_cast<helix::low::TestOp>(op)) {
+        // TestOp results: [0]=zero, [1]=sign (no carry/overflow)
+        liveness.zero_live = !testOp.getZeroFlag().use_empty();
+        liveness.sign_live = !testOp.getSignFlag().use_empty();
+    }
+
+    return liveness;
+}
+
+/// Check whether a flag-producing operation has any uncertain flag
+/// consumption (flags used by non-jcc/cmov operations).
+///
+/// @param op  A flag-producing operation.
+/// @return    True if any flag has uncertain consumption.
+static bool hasAnyUncertainFlags(Operation* op) {
+    if (auto binOp = dyn_cast<helix::low::BinOp>(op)) {
+        return hasUncertainFlagConsumption(binOp.getCarryFlag()) ||
+               hasUncertainFlagConsumption(binOp.getZeroFlag()) ||
+               hasUncertainFlagConsumption(binOp.getSignFlag()) ||
+               hasUncertainFlagConsumption(binOp.getOverflowFlag());
+    } else if (auto cmpOp = dyn_cast<helix::low::CmpOp>(op)) {
+        return hasUncertainFlagConsumption(cmpOp.getCarryFlag()) ||
+               hasUncertainFlagConsumption(cmpOp.getZeroFlag()) ||
+               hasUncertainFlagConsumption(cmpOp.getSignFlag()) ||
+               hasUncertainFlagConsumption(cmpOp.getOverflowFlag());
+    } else if (auto testOp = dyn_cast<helix::low::TestOp>(op)) {
+        return hasUncertainFlagConsumption(testOp.getZeroFlag()) ||
+               hasUncertainFlagConsumption(testOp.getSignFlag());
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dead Variable Elimination (HelixHigh-level)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Returns true when an op has effects that prevent it from being treated as
+/// trivially dead by MLIR's standard rules. Mirrors `wouldOpBeTriviallyDead`:
+/// terminators always alive; ops with MemoryEffectOpInterface alive iff any
+/// declared effect is not a Read; ops without the interface alive (conservative).
+///
+/// Used by the Phase-7 trivial DCE walk so that any op declared with
+/// `MemoryEffects<[MemWrite]>` in TableGen is automatically preserved — no
+/// per-type allowlist to keep in sync. NOT used by the decompiler-specific
+/// liveness heuristics below (isLiveConsumer / isSideEffectingRhs), which
+/// intentionally exclude bookkeeping ops like RegWriteOp from their notion
+/// of "observable" even though those ops have a Write effect at the IR level.
+static bool hasObservableSideEffects(Operation* op) {
+    if (!op) return false;
+    if (op->hasTrait<OpTrait::IsTerminator>())
+        return true;
+    if (auto eff = dyn_cast<MemoryEffectOpInterface>(op)) {
+        SmallVector<MemoryEffects::EffectInstance, 4> effects;
+        eff.getEffects(effects);
+        for (auto& e : effects) {
+            if (!isa<MemoryEffects::Read>(e.getEffect()))
+                return true;
+        }
+        return false;
+    }
+    // No interface declared → can't characterise → preserve conservatively.
+    return true;
+}
+
+/// Check whether an operation is a "live" consumer — one that produces an
+/// observable side effect.  A variable is considered live if any of its
+/// references feed (directly or transitively) into one of these operations.
+///
+/// Decompiler-specific: deliberately narrower than `hasObservableSideEffects`.
+/// Register writes have a Write memory effect at the IR level, but at the
+/// decompilation level they are bookkeeping — observable program behaviour
+/// happens at calls, returns, and memory writes. Including RegWriteOp here
+/// would keep many variables artificially live and bloat the output.
+///
+/// Live operations:
+///   - helix_low.jcc, helix_low.jmp                  (branch — affects control flow)
+///   - helix_high.if / while / do_while / for        (structured control flow)
+///   - helix_low.call / variadic_call, helix_high.call (function call — observable)
+///   - helix_low.ret, helix_high.return              (return — observable output)
+///   - helix_low.mem.write                           (memory write — observable)
+static bool isLiveConsumer(Operation* op) {
+    return isa<helix::low::JccOp>(op) ||
+           isa<helix::low::JmpOp>(op) ||
+           isa<helix::high::IfOp>(op) ||
+           isa<helix::high::WhileOp>(op) ||
+           isa<helix::high::DoWhileOp>(op) ||
+           isa<helix::high::ForOp>(op) ||
+           isa<helix::low::CallOp>(op) ||
+           isa<helix::low::VariadicCallOp>(op) ||
+           isa<helix::high::CallOp>(op) ||
+           isa<helix::low::RetOp>(op) ||
+           isa<helix::high::ReturnOp>(op) ||
+           isa<helix::low::MemWriteOp>(op);
+}
+
+/// Check whether an op, if found on the RHS of a now-dead assignment,
+/// must still be kept because it has observable side effects (calls,
+/// memory writes, returns). Used by orphan-cleanup paths in Phase 7
+/// so that `rax = sub_foo(); return;` — where the `rax` assignment is
+/// dead but the call is not — doesn't accidentally erase the call.
+///
+/// Decompiler-specific list. RegWriteOp is intentionally excluded for the
+/// same reason as in `isLiveConsumer`.
+static bool isSideEffectingRhs(Operation* op) {
+    if (!op) return false;
+    return isa<helix::low::CallOp>(op) ||
+           isa<helix::low::VariadicCallOp>(op) ||
+           isa<helix::high::CallOp>(op) ||
+           isa<helix::mid::CallOp>(op) ||
+           isa<helix::low::MemWriteOp>(op) ||
+           isa<helix::low::RetOp>(op) ||
+           isa<helix::high::ReturnOp>(op) ||
+           isa<helix::low::PushOp>(op) ||
+           isa<helix::low::PopOp>(op) ||
+           isa<helix::low::RepMovsOp>(op) ||
+           isa<helix::low::RepStosOp>(op);
+}
+
+/// Map from var_id to all VarRefOps that reference it.
+/// Pre-built once per function to avoid repeated walks during liveness analysis.
+using VarRefMap = llvm::DenseMap<uint32_t,
+                                 llvm::SmallVector<helix::high::VarRefOp, 4>>;
+
+/// Check whether a Value is consumed (directly or transitively) by a live
+/// operation.  Walks the use-chain forward, stopping at live consumers.
+///
+/// When a VarRefMap is provided, the function can cross assignment
+/// boundaries: if a value flows into an AssignOp whose target is
+/// VarRef(var_id=N), ALL other VarRefs with var_id=N are checked for
+/// liveness.  This is critical for SSA-split variables where each
+/// definition gets a unique var_id — without the map, the chain breaks
+/// at every assignment because the target VarRef's only SSA user is
+/// the AssignOp itself.
+///
+/// @param value     The SSA value to check.
+/// @param visited   Set of already-visited operations (cycle protection).
+/// @param refMap    Optional pre-built map from var_id to all VarRefOps.
+/// @return          True if the value reaches a live consumer.
+static bool isValueLive(Value value,
+                        llvm::SmallPtrSetImpl<Operation*>& visited,
+                        const VarRefMap* refMap = nullptr,
+                        unsigned depth = 0) {
+    // Depth limit: for very large functions (anti-cheat, VMs),
+    // recursive liveness tracing can be O(n^2).  If we exceed
+    // the budget, conservatively assume live (safe — keeps the
+    // assignment rather than risk deleting live code).
+    if (depth > 64)
+        return true;
+
+    for (auto* user : value.getUsers()) {
+        if (!visited.insert(user).second)
+            continue;  // already visited — avoid infinite loops
+
+        // Direct live consumer.
+        if (isLiveConsumer(user))
+            return true;
+
+        // helix_high.assign: the value is live if the target VARIABLE
+        // has any live reads.  With SSA-split variables, each definition
+        // gets a unique var_id.  We need to check all VarRefs with the
+        // target's var_id (not just the target VarRef's SSA users).
+        if (auto assignOp = dyn_cast<helix::high::AssignOp>(user)) {
+            if (refMap) {
+                // SSA-aware path: look up all refs for the target variable.
+                if (auto targetRef = assignOp.getTarget()
+                        .getDefiningOp<helix::high::VarRefOp>()) {
+                    uint32_t targetVarId = targetRef.getVarId();
+                    auto it = refMap->find(targetVarId);
+                    if (it != refMap->end()) {
+                        for (auto refOp : it->second) {
+                            // Skip the target ref itself.
+                            if (refOp.getOperation() ==
+                                targetRef.getOperation())
+                                continue;
+                            if (isValueLive(refOp.getResult(), visited,
+                                            refMap, depth + 1))
+                                return true;
+                        }
+                    }
+                }
+            } else {
+                // Legacy path: trace the target's SSA value.
+                if (isValueLive(assignOp.getTarget(), visited,
+                                nullptr, depth + 1))
+                    return true;
+            }
+            continue;
+        }
+
+        // For any other operation that produces results, check if those
+        // results are live.
+        for (auto result : user->getResults()) {
+            if (isValueLive(result, visited, refMap, depth + 1))
+                return true;
+        }
+    }
+    return false;
+}
+
+/// Build a VarRefMap for all VarRefOps in a function body.
+static VarRefMap buildVarRefMap(Region& funcBody) {
+    VarRefMap refMap;
+    funcBody.walk([&](helix::high::VarRefOp refOp) {
+        refMap[refOp.getVarId()].push_back(refOp);
+    });
+    return refMap;
+}
+
+/// Determine whether a helix_high.var.decl is dead.
+///
+/// A variable declaration is dead if none of its var.ref operations are
+/// consumed by a live operation (branch, call, return, memory write, or
+/// an assignment whose target is itself live).
+///
+/// @param declOp   The var.decl operation.
+/// @param funcBody The function's region (to scan for var.ref ops).
+/// @param refMap   Pre-built map from var_id to all VarRefOps.
+/// @return         True if the variable is dead and can be removed.
+static bool isDeadVarDecl(helix::high::VarDeclOp declOp, Region& funcBody,
+                          const VarRefMap* refMap = nullptr,
+                          bool isAapcs64 = false) {
+    auto varId = declOp.getVarId();
+    auto varName = declOp.getVarName();
+
+    // Never remove SIMD vector variables — their reads aren't fully modeled yet,
+    // but they contain critical offset calculations (e.g., Entity->Position at +0x70).
+    if (varName.starts_with("XMM") || varName.starts_with("YMM") || varName.starts_with("ZMM") ||
+        varName.starts_with("xmm") || varName.starts_with("ymm") || varName.starts_with("zmm"))
+        return false;
+
+    // Use the pre-built map if available, otherwise walk.
+    llvm::SmallVector<helix::high::VarRefOp, 8> refs;
+    if (refMap) {
+        auto it = refMap->find(varId);
+        if (it != refMap->end())
+            refs.assign(it->second.begin(), it->second.end());
+    } else {
+        funcBody.walk([&](helix::high::VarRefOp refOp) {
+            if (refOp.getVarId() == varId)
+                refs.push_back(refOp);
+        });
+    }
+
+    // If no references at all, the variable is dead.
+    if (refs.empty())
+        return true;
+
+    // Check if any reference is consumed by a live operation.
+    //
+    // A reference used as the RHS *value* of a surviving assignment keeps the
+    // variable alive: the assignment will be emitted to C and reads this
+    // variable.  Without this, the operand decl of a name-preserved
+    // assignment (e.g. AArch64 `result = sp`, where the "result" assign is
+    // kept by name but has no SSA consumer) is wrongly deleted, leaving a
+    // dangling var.ref that crashes the C-AST emitter.
+    //
+    // NOTE: iterate `refs` once and inspect each ref's *recorded* uses
+    // through the live walk; the RHS-of-assign check below uses the refMap
+    // entry's own users (never a raw getUses() on a possibly-stale handle).
+    for (auto refOp : refs) {
+        llvm::SmallPtrSet<Operation*, 16> visited;
+        if (isValueLive(refOp.getResult(), visited, refMap))
+            return false;  // at least one live use — variable is alive
+
+        // AArch64-only: keep a variable alive when it feeds the RHS *value* of
+        // a surviving assignment (e.g. `result = sp`).  This protects the
+        // operand decls of name-preserved AAPCS64 return assignments from
+        // being deleted, which would otherwise leave a dangling var.ref that
+        // crashes the C-AST emitter.  Gated to AAPCS64 so x86 liveness/DCE is
+        // byte-for-byte unchanged.
+        if (isAapcs64) {
+            for (Operation* user : refOp.getResult().getUsers()) {
+                if (auto assign = dyn_cast<helix::high::AssignOp>(user)) {
+                    if (assign.getTarget().getDefiningOp() !=
+                        refOp.getOperation())
+                        return false;
+                }
+            }
+        }
+    }
+
+    return true;  // no live uses found
+}
+
+/// Check whether an __undef assignment is dead.
+///
+/// An assignment is dead if:
+///   1. The RHS is an __undef reference (var name starts with "__undef")
+///   2. The LHS (target variable) is never read by a live operation
+///
+/// @param assignOp  The assign operation to check.
+/// @param funcBody  The function's region.
+/// @param refMap    Pre-built map from var_id to all VarRefOps.
+/// @return          True if this is a dead __undef assignment.
+static bool isDeadUndefAssign(helix::high::AssignOp assignOp,
+                              Region& funcBody,
+                              const VarRefMap* refMap = nullptr) {
+    // Check if the RHS is a var.ref to __undef.
+    auto* rhsDef = assignOp.getValue().getDefiningOp();
+    if (!rhsDef)
+        return false;
+
+    if (auto refOp = dyn_cast<helix::high::VarRefOp>(rhsDef)) {
+        auto name = refOp.getVarName();
+        if (!name.starts_with("__undef"))
+            return false;
+    } else {
+        return false;
+    }
+
+    // Check if the target variable is dead.
+    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+    if (!lhsDef)
+        return false;
+
+    if (auto targetRef = dyn_cast<helix::high::VarRefOp>(lhsDef)) {
+        auto targetId = targetRef.getVarId();
+
+        // Gather refs for this variable (use map if available).
+        llvm::SmallVector<helix::high::VarRefOp, 8> otherRefs;
+        if (refMap) {
+            auto it = refMap->find(targetId);
+            if (it != refMap->end()) {
+                for (auto ref : it->second) {
+                    if (ref.getOperation() != targetRef.getOperation())
+                        otherRefs.push_back(ref);
+                }
+            }
+        } else {
+            funcBody.walk([&](helix::high::VarRefOp otherRef) {
+                if (otherRef == targetRef) return;
+                if (otherRef.getVarId() != targetId) return;
+                otherRefs.push_back(otherRef);
+            });
+        }
+
+        // Check if any OTHER reference to this variable is live.
+        bool anyLive = false;
+        for (auto otherRef : otherRefs) {
+            llvm::SmallPtrSet<Operation*, 16> visited;
+            if (isValueLive(otherRef.getResult(), visited, refMap))
+                anyLive = true;
+        }
+
+        return !anyLive;
+    }
+
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dead Register Write Detection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Determine whether a register write is dead (the written value is never
+/// read before the register is overwritten).
+///
+/// A RegWriteOp is considered dead if:
+///   1. The register is not live-out from the block (using MLIR Liveness).
+///   2. The register is overwritten by a subsequent RegWriteOp before any
+///      RegReadOp of the same register.
+///   3. The register is not one of the ABI-required live-out registers
+///      (RAX at function return, argument registers at call sites).
+///
+/// @param writeOp  The register write operation to check.
+/// @param liveness Precomputed liveness information for the function.
+/// @return         True if the write is dead and can be removed.
+static bool isDeadRegisterWrite(helix::low::RegWriteOp writeOp) {
+    auto regName = writeOp.getRegName();
+    auto canonicalReg = helix::analysis::getCanonicalX86Register(regName);
+    auto normalizedReg = canonicalReg.empty() ? regName : canonicalReg;
+
+    // Never remove writes to RSP or RBP — they're handled by the
+    // stack pointer bookkeeping and frame pointer passes respectively.
+    // Also, never remove writes to SIMD vector registers because RemillToHelixLow
+    // erases their semantic reads, leading to false dead stores and missing offsets.
+    if (normalizedReg == "RSP" || normalizedReg == "RBP" ||
+        helix::analysis::isX86VectorRegister(regName))
+        return false;
+
+    // ── Safety net: SSA value-awareness (Option A from academic analysis) ──
+    //
+    // In Remill-lifted IR, State struct loads may become MemReadOps instead
+    // of RegReadOps when GEP chain resolution fails.  This causes the
+    // register-level forward scan to see no reads between consecutive
+    // RegWrites, falsely killing the computation.
+    //
+    // Fix: if the VALUE being written has OTHER SSA users (beyond this
+    // RegWriteOp), the computation that produces it is live and must be
+    // preserved.  The value flows through SSA even if the register-file
+    // model doesn't see the read.
+    //
+    // Also: if the value is produced by a BinOp whose FLAG results have
+    // users (e.g., flags feed into comparisons), the computation is live.
+    {
+        Value writtenValue = writeOp.getValue();
+        if (!writtenValue.hasOneUse()) {
+            // Value has consumers beyond this RegWrite → computation is live
+            return false;
+        }
+        if (auto* defOp = writtenValue.getDefiningOp()) {
+            // Check if any OTHER result of the producing op has users
+            // (e.g., BinOp flag results: carry, zero, sign, overflow)
+            for (auto result : defOp->getResults()) {
+                if (result == writtenValue) continue;
+                if (!result.use_empty()) return false;
+            }
+        }
+    }
+
+    // Forward scan: check if the register is read or overwritten within
+    // the same basic block.
+
+    Block* block = writeOp->getBlock();
+    if (!block)
+        return false;
+
+    // Scan forward from the write operation.
+    bool foundRead = false;
+    bool foundOverwrite = false;
+
+    for (auto it = std::next(writeOp->getIterator());
+         it != block->end(); ++it) {
+        Operation& op = *it;
+
+        // Check for a read that observes bits written by our write.
+        // Uses range-overlap: read AX (0:16) overlaps write AL (0:8),
+        // but read AH (8:16) does NOT overlap write AL (0:8).
+        if (auto readOp = dyn_cast<helix::low::RegReadOp>(&op)) {
+            if (helix::analysis::doesReadOverlap(readOp.getRegName(),
+                                                 regName)) {
+                foundRead = true;
+                break;
+            }
+        }
+
+        // Check for an overwrite that fully covers our write's bit range.
+        // Write AH (8:16) does NOT overwrite AL (0:8) — they are
+        // non-overlapping byte lanes within RAX.
+        // Write EAX (0:32) DOES overwrite AL (0:8) — it subsumes AL.
+        if (auto nextWrite = dyn_cast<helix::low::RegWriteOp>(&op)) {
+            if (helix::analysis::doesWriteFullyCover(nextWrite.getRegName(),
+                                                     regName)) {
+                foundOverwrite = true;
+                break;
+            }
+        }
+
+        // A call clobbers volatile registers.  If the register is volatile
+        // (RAX, RCX, RDX, R8, R9, R10, R11 on Win64), a call acts as an
+        // overwrite.  If the register is non-volatile, the call preserves it.
+        // Both regular and variadic calls follow the same ABI clobber rules.
+        if (isa<helix::low::CallOp, helix::low::VariadicCallOp>(&op)) {
+            if (helix::analysis::isWin64VolatileX86Register(normalizedReg)) {
+                foundOverwrite = true;
+                break;
+            }
+        }
+
+        // A return uses RAX (return value).  If we're writing to RAX and
+        // there's a return ahead, the write is NOT dead.
+        // AArch64 AAPCS64 returns in X0 (integer) / V0 (FP/SIMD); treat those
+        // as implicitly read by RET so the return-value write survives DCE.
+        if (isa<helix::low::RetOp>(&op)) {
+            auto upperReg = regName.upper();
+            if (helix::analysis::isX86GeneralPurposeReturnRegister(normalizedReg) ||
+                helix::analysis::isX86VectorRegister(regName) ||
+                upperReg == "X0" || upperReg == "V0") {
+                foundRead = true;  // Return-value register implicitly read by RET.
+                break;
+            }
+            // For other registers at return, the write is dead (callee-saved
+            // restores are handled by the prologue/epilogue pass).
+            foundOverwrite = true;
+            break;
+        }
+    }
+
+    // The write is dead if it's overwritten before being read.
+    if (foundOverwrite && !foundRead) {
+        LLVM_DEBUG(llvm::dbgs() << "  Dead write: " << regName << "\n");
+        return true;
+    }
+
+    // If we reached the end of the block without finding a read or overwrite,
+    // check the block's live-out set.  If the register is not live-out, the
+    // write is dead.
+    if (!foundRead && !foundOverwrite) {
+        // Use MLIR's liveness analysis.  The written value is an operand to
+        // the RegWriteOp.  If that value is not live at the end of the block,
+        // and there were no reads of the register within the block, we can
+        // consider the write dead.
+        //
+        // Note: Liveness in MLIR tracks SSA values, not abstract register
+        // names.  Since register writes are side effects without SSA results,
+        // we conservatively keep writes that reach the end of the block
+        // unless we're sure the register is dead.
+        //
+        // For now, we only remove writes that are provably overwritten
+        // within the same block (the foundOverwrite case above).
+        return false;
+    }
+
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass Implementation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dead code elimination pass for decompilation artifacts.
+///
+/// Operates on a ModuleOp, processing each HelixLow function within it.
+/// Removes operations that are specific to compiled code structure and
+/// have no meaning in decompiled output.
+struct EliminateDeadCodePass
+    : public PassWrapper<EliminateDeadCodePass, OperationPass<ModuleOp>> {
+
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EliminateDeadCodePass)
+
+    StringRef getArgument() const final { return "eliminate-dead-code"; }
+    StringRef getDescription() const final {
+        return "Remove decompilation artifacts: NOPs, INT3, prologue/epilogue "
+               "push/pop, dead register writes, RSP bookkeeping";
+    }
+
+    void getDependentDialects(DialectRegistry& registry) const override {
+        registry.insert<helix::low::HelixLowDialect>();
+        registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<helix::mid::HelixMidDialect>();
+    }
+
+    void runOnOperation() override {
+        auto module = getOperation();
+
+        // Process each HelixLow function in the module.
+        auto result = module.walk([&](helix::low::FuncOp func) -> WalkResult {
+            if (failed(eliminateDeadCode(func)))
+                return WalkResult::interrupt();
+            return WalkResult::advance();
+        });
+
+        if (result.wasInterrupted()) {
+            signalPassFailure();
+            return;
+        }
+
+        // ── Enhanced DCE (P2.10): Escape-aware dead store elimination ────
+        //
+        // After the standard HelixLow-level DCE phases, process HelixMid
+        // functions for escape-aware optimizations.  Variables annotated
+        // with "helix.escapes" = false by the EscapeAnalysis pass can be
+        // treated as pure SSA values — stores and assignments to
+        // non-escaping variables that are never read are provably dead.
+        module.walk([&](helix::mid::FuncOp midFunc) {
+            eliminateDeadMidOps(midFunc);
+        });
+    }
+
+private:
+    /// Run all dead code elimination phases on a single function.
+    ///
+    /// The phases are ordered from simplest/safest to most aggressive:
+    ///   1. Remove NOPs and INT3 markers
+    ///   2. Remove prologue/epilogue push/pop pairs
+    ///   3. Remove frame pointer setup/teardown
+    ///   4. Remove RSP bookkeeping (stack adjustments)
+    ///   5. Remove dead register writes
+    ///   6. Remove trivially dead operations
+    ///
+    /// @param func  The HelixLow function to clean up.
+    /// @return      success() or failure().
+    LogicalResult eliminateDeadCode(helix::low::FuncOp func) {
+        auto& funcBody = func.getBody();
+        if (funcBody.empty())
+            return success();
+
+        // [P0-DEBUG] Count CallOps entering DCE
+        {
+            unsigned callCount = 0;
+            funcBody.walk([&](helix::low::CallOp) { ++callCount; });
+            if (callCount > 0) {
+                llvm::errs() << "[P0-DEBUG] DCE entry '" << func.getSymName()
+                             << "': " << callCount << " low.call ops\n";
+            }
+        }
+
+        LLVM_DEBUG(llvm::dbgs() << "EliminateDeadCode: processing '"
+                                << func.getSymName() << "'\n");
+
+        // ── Phase 0: Remove infrastructure ops ──────────────────────────
+        //
+        // PropagateTypes marks PC/NEXT_PC/RETURN_PC tracking, flag-only
+        // computations, and transitive infrastructure chains with the
+        // "helix.infrastructure" attribute.  Remove these ops bottom-up:
+        // first ops whose ALL result users are also infrastructure, then
+        // iterate until no more can be removed.  RegWriteOps to infra
+        // registers are always removable.
+
+        unsigned infraRemoved = removeInfrastructureOps(funcBody);
+        NumInfraOpsRemoved += infraRemoved;
+
+        LLVM_DEBUG(if (infraRemoved > 0)
+            llvm::dbgs() << "  Phase 0: removed " << infraRemoved
+                         << " infrastructure ops\n");
+
+        // ── Phase 1: Remove NOP and INT3 markers ────────────────────────
+
+        unsigned nopsRemoved  = removeNopsAndInt3(funcBody);
+        NumNopsRemoved  += nopsRemoved;
+
+        LLVM_DEBUG(if (nopsRemoved > 0)
+            llvm::dbgs() << "  Phase 1: removed " << nopsRemoved
+                         << " NOP/INT3 ops\n");
+
+        // ── Phase 2: Remove prologue/epilogue push/pop pairs ────────────
+
+        unsigned prologueRemoved = removePrologueEpilogue(func);
+        NumPrologueOpsRemoved += prologueRemoved;
+
+        LLVM_DEBUG(if (prologueRemoved > 0)
+            llvm::dbgs() << "  Phase 2: removed " << prologueRemoved
+                         << " prologue/epilogue ops\n");
+
+        // ── Phase 3: Remove frame pointer setup/teardown ────────────────
+
+        unsigned frameOpsRemoved = removeFramePointerOps(funcBody);
+        NumPrologueOpsRemoved += frameOpsRemoved;
+
+        LLVM_DEBUG(if (frameOpsRemoved > 0)
+            llvm::dbgs() << "  Phase 3: removed " << frameOpsRemoved
+                         << " frame pointer ops\n");
+
+        // ── Phase 4: Remove RSP bookkeeping ─────────────────────────────
+
+        unsigned stackAdjRemoved = removeStackAdjustments(funcBody);
+        NumStackAdjustsRemoved += stackAdjRemoved;
+
+        LLVM_DEBUG(if (stackAdjRemoved > 0)
+            llvm::dbgs() << "  Phase 4: removed " << stackAdjRemoved
+                         << " stack adjustment ops\n");
+
+        // ── Phase 5: Remove dead register writes ────────────────────────
+
+        unsigned deadWritesRemoved = removeDeadRegisterWrites(func);
+        NumDeadWritesRemoved += deadWritesRemoved;
+
+        LLVM_DEBUG(if (deadWritesRemoved > 0)
+            llvm::dbgs() << "  Phase 5: removed " << deadWritesRemoved
+                         << " dead register writes\n");
+
+        // ── Phase 5b: Remove dead flag computations ─────────────────────
+        //
+        // Analyze flag-producing operations (binop, cmp, test) and remove
+        // individual dead flag computations.  If ALL flags of a CMP/TEST
+        // are dead, remove the entire operation.  Flags with uncertain
+        // consumption are preserved with a warning.
+
+        unsigned deadFlagsRemoved  = 0;
+        unsigned deadCmpTestRemoved = 0;
+
+        auto flagResult = removeDeadFlags(funcBody);
+        deadFlagsRemoved   = std::get<0>(flagResult);
+        deadCmpTestRemoved = std::get<1>(flagResult);
+
+        NumDeadFlagsRemoved   += deadFlagsRemoved;
+        NumDeadCmpTestRemoved += deadCmpTestRemoved;
+
+        LLVM_DEBUG(if (deadFlagsRemoved + deadCmpTestRemoved > 0)
+            llvm::dbgs() << "  Phase 5b: removed " << deadFlagsRemoved
+                         << " dead flag computations, "
+                         << deadCmpTestRemoved
+                         << " dead CMP/TEST ops\n");
+
+        // ── Phase 6: Trivially dead operation cleanup ───────────────────
+
+        unsigned trivDeadRemoved = removeTriviallyDeadOps(funcBody);
+        NumTriviallyDeadRemoved += trivDeadRemoved;
+
+        LLVM_DEBUG(if (trivDeadRemoved > 0)
+            llvm::dbgs() << "  Phase 6: removed " << trivDeadRemoved
+                         << " trivially dead ops\n");
+
+        // ── Phase 7: Dead variable elimination (HelixHigh) ─────────────
+        //
+        // Remove helix_high.var.decl whose value is never consumed by a
+        // live operation, dead __undef assignments, and dead assignment
+        // chains.  Iterates to fixed point.
+
+        unsigned deadVarsRemoved = 0;
+        unsigned deadAssignsRemoved = 0;
+        unsigned deadUndefRemoved = 0;
+
+        auto deadVarResult = removeDeadVariables(funcBody);
+        deadVarsRemoved    += std::get<0>(deadVarResult);
+        deadAssignsRemoved += std::get<1>(deadVarResult);
+        deadUndefRemoved   += std::get<2>(deadVarResult);
+
+        NumDeadVarsRemoved    += deadVarsRemoved;
+        NumDeadAssignsRemoved += deadAssignsRemoved;
+        NumDeadUndefRemoved   += deadUndefRemoved;
+
+        LLVM_DEBUG(if (deadVarsRemoved + deadAssignsRemoved + deadUndefRemoved > 0)
+            llvm::dbgs() << "  Phase 7: removed " << deadVarsRemoved
+                         << " dead vars, " << deadAssignsRemoved
+                         << " dead assigns, " << deadUndefRemoved
+                         << " dead __undef assigns\n");
+
+        LLVM_DEBUG(llvm::dbgs() << "  Total removed: "
+                                << (infraRemoved +
+                                    nopsRemoved + prologueRemoved +
+                                    frameOpsRemoved + stackAdjRemoved +
+                                    deadWritesRemoved +
+                                    deadFlagsRemoved + deadCmpTestRemoved +
+                                    trivDeadRemoved +
+                                    deadVarsRemoved + deadAssignsRemoved +
+                                    deadUndefRemoved)
+                                << "\n");
+
+        // [P0-DEBUG] Count CallOps surviving DCE
+        {
+            unsigned callCount = 0;
+            funcBody.walk([&](helix::low::CallOp) { ++callCount; });
+            llvm::errs() << "[P0-DEBUG] DCE exit '" << func.getSymName()
+                         << "': " << callCount << " low.call ops survive\n";
+        }
+
+        return success();
+    }
+
+    // ─── Phase 0: Infrastructure Removal ────────────────────────────────────
+    //
+    // Removes operations tagged with "helix.infrastructure" by PropagateTypes.
+    // These are PC/NEXT_PC tracking chains, flag-only computations, and their
+    // transitive dependents that serve no purpose in decompiled output.
+    //
+    // Strategy: iterate until fixed point.  On each pass, remove an infra op
+    // if ALL of its result's users are also infra-marked (or the op has no
+    // results, like a RegWriteOp).  Removing downstream consumers first
+    // naturally frees upstream producers for removal.
+
+    unsigned removeInfrastructureOps(Region& funcBody) {
+        unsigned totalRemoved = 0;
+        bool changed = true;
+
+        while (changed) {
+            changed = false;
+            llvm::SmallVector<Operation*, 16> toErase;
+
+            funcBody.walk([&](Operation* op) {
+                if (!op->hasAttr("helix.infrastructure"))
+                    return;
+
+                // RegWriteOps with infra marker: always safe to remove.
+                // The register write is bookkeeping, not meaningful output.
+                if (isa<helix::low::RegWriteOp>(op)) {
+                    toErase.push_back(op);
+                    return;
+                }
+
+                // For value-producing ops: only remove if ALL users of
+                // ALL results are also infrastructure-marked.
+                bool canRemove = true;
+                for (Value result : op->getResults()) {
+                    for (auto* user : result.getUsers()) {
+                        if (!user->hasAttr("helix.infrastructure")) {
+                            canRemove = false;
+                            break;
+                        }
+                    }
+                    if (!canRemove)
+                        break;
+                }
+
+                if (canRemove)
+                    toErase.push_back(op);
+            });
+
+            for (Operation* op : toErase) {
+                // [P0-DEBUG] Catch any call-like op being erased by infra removal
+                if (isa<helix::low::CallOp, helix::low::VariadicCallOp>(op)) {
+                    llvm::errs() << "[P0-DEBUG] WARNING: Phase 0 erasing a CallOp! "
+                                 << *op << "\n";
+                }
+                // Drop all uses before erasing to avoid dangling references.
+                for (Value result : op->getResults())
+                    result.dropAllUses();
+                op->erase();
+                ++totalRemoved;
+                changed = true;
+            }
+        }
+
+        return totalRemoved;
+    }
+
+    // ─── Phase 1: NOP / INT3 Removal ─────────────────────────────────────
+
+    /// Remove all `helix_low.nop` and `helix_low.int3` operations.
+    ///
+    /// These are padding/debug markers emitted by the compiler or debugger
+    /// and carry no semantic information in the decompiled output.
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          The number of operations removed.
+    unsigned removeNopsAndInt3(Region& funcBody) {
+        unsigned removed = 0;
+
+        llvm::SmallVector<Operation*, 16> toErase;
+
+        funcBody.walk([&](Operation* op) {
+            if (isa<helix::low::NopOp>(op) || isa<helix::low::Int3Op>(op)) {
+                toErase.push_back(op);
+            }
+        });
+
+        for (auto* op : toErase) {
+            // NopOp and Int3Op have no results and no users, so they can
+            // be erased unconditionally.
+            op->erase();
+            ++removed;
+        }
+
+        return removed;
+    }
+
+    // ─── Phase 2: Prologue/Epilogue Push/Pop Removal ─────────────────────
+
+    /// Remove matched push/pop pairs for non-volatile register saves.
+    ///
+    /// @param func  The function to scan.
+    /// @return      The number of operations removed (2 per pair).
+    unsigned removePrologueEpilogue(helix::low::FuncOp func) {
+        auto pairs = findPrologueEpiloguePairs(func);
+        unsigned removed = 0;
+
+        for (auto& pair : pairs) {
+            // Before erasing, check that the push result has no remaining
+            // users (other than the pop's reg.write).  If the pushed value
+            // is used elsewhere, we can't remove the pair.
+            if (pair.pushOp && pair.popOp) {
+                // Erase the pop first (it may reference the push result).
+                //
+                // For a pop that feeds a reg.write, we also need to erase the
+                // reg.write.  Collect the pop's users.
+                llvm::SmallVector<Operation*, 2> popUsers;
+                if (auto popOp = dyn_cast<helix::low::PopOp>(pair.popOp)) {
+                    for (auto* user : popOp.getResult().getUsers()) {
+                        popUsers.push_back(user);
+                    }
+                }
+
+                // Erase pop's user chain (reg.write of the restored value).
+                for (auto* user : popUsers) {
+                    if (auto writeOp = dyn_cast<helix::low::RegWriteOp>(user))
+                        writeOp.erase();
+                }
+
+                pair.popOp->erase();
+                ++removed;
+
+                // Erase the push.  If the push consumed a reg.read, that
+                // reg.read may now be trivially dead (handled in Phase 6).
+                pair.pushOp->erase();
+                ++removed;
+
+                LLVM_DEBUG(llvm::dbgs() << "  Removed push/pop pair for "
+                                        << pair.reg << "\n");
+            }
+        }
+
+        return removed;
+    }
+
+    // ─── Phase 3: Frame Pointer Setup/Teardown Removal ───────────────────
+
+    /// Remove the standard frame pointer prologue and epilogue operations.
+    ///
+    /// Patterns:
+    ///   Prologue: push rbp; mov rbp, rsp
+    ///   Epilogue: mov rsp, rbp; pop rbp
+    ///
+    /// These are removed because the frame pointer is a compiler artifact
+    /// used for stack frame addressing.  The stack layout pass has already
+    /// recovered the actual variable locations.
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          The number of operations removed.
+    unsigned removeFramePointerOps(Region& funcBody) {
+        unsigned removed = 0;
+
+        llvm::SmallVector<Operation*, 8> toErase;
+
+        funcBody.walk([&](Operation* op) {
+            if (isFramePointerPush(op) || isFramePointerMov(op) ||
+                isFramePointerTeardown(op) || isFramePointerPop(op)) {
+                toErase.push_back(op);
+            }
+        });
+
+        // Erase in reverse order to avoid iterator invalidation when
+        // operations reference each other.
+        for (auto it = toErase.rbegin(); it != toErase.rend(); ++it) {
+            Operation* op = *it;
+
+            // For PopOp, check for and erase downstream reg.write users.
+            if (auto popOp = dyn_cast<helix::low::PopOp>(op)) {
+                llvm::SmallVector<Operation*, 2> users;
+                for (auto* user : popOp.getResult().getUsers())
+                    users.push_back(user);
+                for (auto* user : users) {
+                    user->erase();
+                    ++removed;
+                }
+            }
+
+            // For RegReadOp that feeds a frame pointer mov, if the read
+            // result now has no users, it will be cleaned up in Phase 6.
+            // We just erase the direct op here.
+            op->erase();
+            ++removed;
+        }
+
+        return removed;
+    }
+
+    // ─── Phase 4: RSP Bookkeeping Removal ────────────────────────────────
+
+    /// Remove stack pointer adjustment operations.
+    ///
+    /// Patterns:
+    ///   sub rsp, N   (stack allocation in prologue)
+    ///   add rsp, N   (stack deallocation in epilogue)
+    ///   lea rsp, [rsp + N]  (alternative stack adjustment)
+    ///
+    /// These are compiler-generated stack frame management that has no
+    /// meaning in decompiled code.
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          The number of operations removed.
+    unsigned removeStackAdjustments(Region& funcBody) {
+        unsigned removed = 0;
+
+        // Iterate until fixed point because removing one RSP write may
+        // expose the BinOp that produced its value as trivially dead.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            llvm::SmallVector<Operation*, 8> toErase;
+
+            funcBody.walk([&](Operation* op) {
+                if (isStackPointerBookkeeping(op)) {
+                    toErase.push_back(op);
+                }
+            });
+
+            for (auto* op : toErase) {
+                // Before erasing a RegWriteOp to RSP, check if its source
+                // BinOp will become dead.
+                if (auto writeOp = dyn_cast<helix::low::RegWriteOp>(op)) {
+                    auto* defOp = writeOp.getValue().getDefiningOp();
+                    writeOp.erase();
+                    ++removed;
+                    changed = true;
+
+                    // If the defining BinOp now has no users, erase it too.
+                    if (defOp && defOp->use_empty()) {
+                        // Also check if the BinOp's RSP-read operand is dead.
+                        llvm::SmallVector<Operation*, 2> operandDefs;
+                        for (auto operand : defOp->getOperands()) {
+                            if (auto* opDef = operand.getDefiningOp()) {
+                                operandDefs.push_back(opDef);
+                            }
+                        }
+
+                        defOp->erase();
+                        ++removed;
+
+                        // Clean up now-dead operand definitions (e.g., RSP read).
+                        for (auto* opDef : operandDefs) {
+                            if (opDef->use_empty() &&
+                                isa<helix::low::RegReadOp>(opDef)) {
+                                opDef->erase();
+                                ++removed;
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                // For standalone BinOp that was identified as RSP bookkeeping.
+                if (op->use_empty()) {
+                    op->erase();
+                    ++removed;
+                    changed = true;
+                }
+            }
+        }
+
+        return removed;
+    }
+
+    // ─── Phase 5: Dead Register Write Removal ────────────────────────────
+
+    /// Remove register writes whose values are never read.
+    ///
+    /// Uses MLIR's Liveness analysis as the backbone, supplemented with
+    /// HelixLow-specific knowledge about register semantics (ABI-required
+    /// live registers, call clobbers, implicit uses at return).
+    ///
+    /// @param func  The function to analyze.
+    /// @return      The number of dead writes removed.
+    unsigned removeDeadRegisterWrites(helix::low::FuncOp func) {
+        auto& funcBody = func.getBody();
+        unsigned removed = 0;
+
+        // Previously this bailed out entirely for >2 blocks, causing NO
+        // register DCE on most real-world kernel functions (GAP #3 fix).
+        // isDeadRegisterWrite() uses intra-block forward scanning with
+        // range-overlap semantics — no cross-block Liveness needed.
+
+        // Iterate until fixed point: removing a dead write may expose
+        // another write as dead.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            llvm::SmallVector<helix::low::RegWriteOp, 16> deadWrites;
+
+            funcBody.walk([&](helix::low::RegWriteOp writeOp) {
+                if (isDeadRegisterWrite(writeOp)) {
+                    deadWrites.push_back(writeOp);
+                }
+            });
+
+            for (auto writeOp : deadWrites) {
+                // Before erasing, check if the value operand's defining op
+                // will become dead.
+                auto* defOp = writeOp.getValue().getDefiningOp();
+
+                writeOp.erase();
+                ++removed;
+                changed = true;
+
+                // If the defining op now has no users, it may be trivially dead.
+                // We let Phase 6 handle that, but mark that we changed the IR
+                // so we re-iterate the dead write scan.
+            }
+        }
+
+        return removed;
+    }
+
+    // ─── Phase 5b: Dead Flag Computation Removal ────────────────────────
+
+    /// Remove dead flag computations from flag-producing operations.
+    ///
+    /// For each flag-producing operation (BinOp, CmpOp, TestOp):
+    ///   1. Compute which flags are actually consumed by jcc/cmov ops
+    ///   2. If a flag has uncertain consumption (non-jcc/cmov user),
+    ///      preserve it and emit a warning
+    ///   3. For CmpOp/TestOp: if ALL flags are dead, remove the entire op
+    ///   4. For BinOp: only flag results can be dead (main result may be live);
+    ///      dead flag results are replaced with a constant false value
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          Tuple of (dead flags removed, dead CMP/TEST ops removed).
+    std::tuple<unsigned, unsigned> removeDeadFlags(Region& funcBody) {
+        unsigned totalFlagsRemoved   = 0;
+        unsigned totalCmpTestRemoved = 0;
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // ── Step 1: Handle CmpOp — remove entire op if all flags dead ──
+            {
+                llvm::SmallVector<helix::low::CmpOp, 8> deadCmps;
+
+                funcBody.walk([&](helix::low::CmpOp cmpOp) {
+                    // Check for uncertain consumption first.
+                    if (hasAnyUncertainFlags(cmpOp)) {
+                        cmpOp.emitWarning()
+                            << "flag liveness uncertain, preserving";
+                        return;
+                    }
+
+                    auto liveness = computeFlagLiveness(cmpOp);
+                    if (!liveness.any_live()) {
+                        deadCmps.push_back(cmpOp);
+                    }
+                });
+
+                for (auto cmpOp : deadCmps) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead CMP (all flags unused): "
+                        << *cmpOp.getOperation() << "\n");
+
+                    // Before erasing, clean up operand definitions that may
+                    // become dead (e.g., RegReadOps feeding the CMP).
+                    llvm::SmallVector<Operation*, 4> operandDefs;
+                    for (auto operand : cmpOp->getOperands()) {
+                        if (auto* defOp = operand.getDefiningOp())
+                            operandDefs.push_back(defOp);
+                    }
+
+                    cmpOp.erase();
+                    ++totalCmpTestRemoved;
+                    changed = true;
+
+                    // Clean up now-dead operand definitions.
+                    for (auto* defOp : operandDefs) {
+                        if (defOp->use_empty() &&
+                            isa<helix::low::RegReadOp>(defOp)) {
+                            defOp->erase();
+                            ++totalFlagsRemoved;
+                        }
+                    }
+                }
+            }
+
+            // ── Step 2: Handle TestOp — remove entire op if all flags dead ─
+            {
+                llvm::SmallVector<helix::low::TestOp, 8> deadTests;
+
+                funcBody.walk([&](helix::low::TestOp testOp) {
+                    if (hasAnyUncertainFlags(testOp)) {
+                        testOp.emitWarning()
+                            << "flag liveness uncertain, preserving";
+                        return;
+                    }
+
+                    auto liveness = computeFlagLiveness(testOp);
+                    if (!liveness.any_live()) {
+                        deadTests.push_back(testOp);
+                    }
+                });
+
+                for (auto testOp : deadTests) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead TEST (all flags unused): "
+                        << *testOp.getOperation() << "\n");
+
+                    llvm::SmallVector<Operation*, 4> operandDefs;
+                    for (auto operand : testOp->getOperands()) {
+                        if (auto* defOp = operand.getDefiningOp())
+                            operandDefs.push_back(defOp);
+                    }
+
+                    testOp.erase();
+                    ++totalCmpTestRemoved;
+                    changed = true;
+
+                    for (auto* defOp : operandDefs) {
+                        if (defOp->use_empty() &&
+                            isa<helix::low::RegReadOp>(defOp)) {
+                            defOp->erase();
+                            ++totalFlagsRemoved;
+                        }
+                    }
+                }
+            }
+
+            // ── Step 3: Handle BinOp — replace dead flag results ───────────
+            //
+            // BinOp produces both a value result and flag results.  The value
+            // result may still be live even if all flags are dead.  For dead
+            // flag results, we replace their uses (if any remain after DCE)
+            // with a constant false, then count them as removed.
+            //
+            // Note: We do NOT remove the BinOp itself — only its dead flag
+            // outputs.  The BinOp is kept if its value result is live.
+            {
+                funcBody.walk([&](helix::low::BinOp binOp) {
+                    if (hasAnyUncertainFlags(binOp)) {
+                        binOp.emitWarning()
+                            << "flag liveness uncertain, preserving";
+                        return;
+                    }
+
+                    auto liveness = computeFlagLiveness(binOp);
+
+                    // Count dead flags (unused flag results).
+                    unsigned deadCount = 0;
+                    if (!liveness.carry_live &&
+                        binOp.getCarryFlag().use_empty())
+                        ++deadCount;
+                    if (!liveness.zero_live &&
+                        binOp.getZeroFlag().use_empty())
+                        ++deadCount;
+                    if (!liveness.sign_live &&
+                        binOp.getSignFlag().use_empty())
+                        ++deadCount;
+                    if (!liveness.overflow_live &&
+                        binOp.getOverflowFlag().use_empty())
+                        ++deadCount;
+
+                    if (deadCount > 0) {
+                        LLVM_DEBUG(llvm::dbgs()
+                            << "  BinOp with " << deadCount
+                            << " dead flag(s): "
+                            << *binOp.getOperation() << "\n");
+                        totalFlagsRemoved += deadCount;
+                        // The dead flag results are already unused (use_empty),
+                        // so no replacement is needed.  They will be cleaned
+                        // up when the BinOp is eventually removed (if the
+                        // value result also becomes dead) or ignored by the
+                        // emitter.
+                    }
+                });
+            }
+        }
+
+        return {totalFlagsRemoved, totalCmpTestRemoved};
+    }
+
+    // ─── Phase 6: Trivially Dead Operation Cleanup ───────────────────────
+
+    /// Remove operations that are trivially dead (no side effects, no users).
+    ///
+    /// After the targeted removal phases above, many intermediate operations
+    /// (RegRead, constants, etc.) may have lost all their users.  MLIR's
+    /// `isOpTriviallyDead()` check handles this generically.
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          The number of operations removed.
+    unsigned removeTriviallyDeadOps(Region& funcBody) {
+        unsigned removed = 0;
+
+        // Iterate to fixed point since removing one op may make others dead.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            llvm::SmallVector<Operation*, 16> toErase;
+
+            funcBody.walk([&](Operation* op) {
+                // Skip terminators — they're never trivially dead.
+                if (op->hasTrait<OpTrait::IsTerminator>())
+                    return;
+
+                // Skip ops with side effects that we don't want to remove.
+                // Uses the MemoryEffectOpInterface so any current or future
+                // op with declared MemEffects (Write/Allocate/Free) is
+                // automatically preserved — no type-enum allowlist to keep
+                // in sync.
+                if (hasObservableSideEffects(op))
+                    return;
+
+                // Check if all results are unused.
+                bool allResultsUnused = true;
+                for (auto result : op->getResults()) {
+                    if (!result.use_empty()) {
+                        allResultsUnused = false;
+                        break;
+                    }
+                }
+
+                // RegWriteOp has no results (side-effect-only), so
+                // allResultsUnused would be trivially true.  But we
+                // shouldn't remove it here — that's Phase 5's job.
+                if (isa<helix::low::RegWriteOp>(op))
+                    return;
+
+                // PushOp and PopOp are side-effecting.
+                if (isa<helix::low::PushOp>(op) || isa<helix::low::PopOp>(op))
+                    return;
+
+                // BinOp represents a source-level computation (ADD, SUB, etc.)
+                // from a Remill semantic conversion.  Even if all SSA users have
+                // been removed (cascading from RegWrite elimination), these are
+                // real computations that should survive until the C emitter can
+                // decide whether they're observable.  Prevents the cascade:
+                //   RegWrite killed → BinOp killed → entire computation lost.
+                if (isa<helix::low::BinOp>(op))
+                    return;
+
+                if (allResultsUnused && op->getNumResults() > 0) {
+                    toErase.push_back(op);
+                }
+            });
+
+            for (auto* op : toErase) {
+                op->erase();
+                ++removed;
+                changed = true;
+            }
+        }
+
+        return removed;
+    }
+
+    // ─── Phase 7: Dead Variable Elimination (HelixHigh) ──────────────────
+
+    /// Remove dead variable declarations, dead assignment chains, and dead
+    /// __undef assignments.
+    ///
+    /// A variable is dead if none of its var.ref operations are consumed by
+    /// a live operation (branch, call, return, memory write).  Dead
+    /// assignments are removed in reverse dependency order: first the
+    /// assignments that feed the dead variable, then the declaration itself.
+    ///
+    /// Iterates to fixed point because removing one dead variable may
+    /// expose other variables as dead (transitive dependency chains).
+    ///
+    /// @param funcBody  The function's region.
+    /// @return          Tuple of (dead vars, dead assigns, dead __undef) removed.
+    std::tuple<unsigned, unsigned, unsigned>
+    removeDeadVariables(Region& funcBody) {
+        unsigned totalVars    = 0;
+        unsigned totalAssigns = 0;
+        unsigned totalUndef   = 0;
+
+        // Preserve the return-value variable: when the enclosing function
+        // declares `has_return_value`, the chain that feeds RAX at return
+        // is named "result" by RecoverVariables. For hash-loop functions
+        // (FNV, CRC, etc.) the chain lives entirely inside a loop region
+        // and has no out-of-region reader — the only "consumer" is the
+        // implicit `return result;` synthesised by CAstBuilder, which the
+        // dialect can't express on helix_low.ret. Skipping dead-assign and
+        // dead-decl elimination for "result" keeps the chain alive without
+        // changing the dialect or adding a fake live consumer op.
+        bool preserveResultVar = false;
+        bool isAapcs64 = false;
+        if (Operation* parentOp = funcBody.getParentOp()) {
+            preserveResultVar = parentOp->hasAttr("has_return_value");
+            if (auto cc = parentOp->getAttrOfType<StringAttr>(
+                    "calling_convention"))
+                isAapcs64 = (cc.getValue() == "aapcs64");
+        }
+
+        bool changed = true;
+        unsigned iteration = 0;
+        // Budget: large functions (anti-cheat VMs, >5000 ops) get
+        // limited iterations to avoid O(n^2 × k) runaway.
+        unsigned totalOps = 0;
+        funcBody.walk([&](Operation*) { totalOps++; });
+        unsigned maxIterations = (totalOps > 5000) ? 3 : 16;
+
+        while (changed && iteration < maxIterations) {
+            changed = false;
+            ++iteration;
+
+            // Build the VarRefMap once per iteration for SSA-aware
+            // liveness analysis.  This is rebuilt after each iteration
+            // because erasing ops invalidates the map.
+            VarRefMap refMap = buildVarRefMap(funcBody);
+
+            // ── Step 0: Remove infrastructure-marked assignments ────────
+            //
+            // AssignOps tagged with "helix.infrastructure" by
+            // RecoverVariables (propagated from PropagateTypes) represent
+            // PC tracking, flag bookkeeping, etc.  Safe to remove.
+            {
+                llvm::SmallVector<helix::high::AssignOp, 16> infraAssigns;
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    if (assignOp->hasAttr("helix.infrastructure"))
+                        infraAssigns.push_back(assignOp);
+                });
+
+                for (auto assignOp : infraAssigns) {
+                    auto* rhsDef = assignOp.getValue().getDefiningOp();
+                    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+
+                    assignOp.erase();
+                    ++totalAssigns;
+                    changed = true;
+
+                    if (rhsDef && rhsDef->use_empty() &&
+                        !isSideEffectingRhs(rhsDef))
+                        rhsDef->erase();
+                    if (lhsDef && lhsDef->use_empty())
+                        lhsDef->erase();
+                }
+            }
+
+            // ── Step 1: Remove dead __undef assignments ─────────────────
+            {
+                llvm::SmallVector<helix::high::AssignOp, 16> deadUndefs;
+
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    if (isDeadUndefAssign(assignOp, funcBody, &refMap))
+                        deadUndefs.push_back(assignOp);
+                });
+
+                for (auto assignOp : deadUndefs) {
+                    // Erase the RHS var.ref if it becomes unused.
+                    auto* rhsDef = assignOp.getValue().getDefiningOp();
+                    // Erase the LHS var.ref if it becomes unused.
+                    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+
+                    assignOp.erase();
+                    ++totalUndef;
+                    changed = true;
+
+                    if (rhsDef && rhsDef->use_empty() &&
+                        !isSideEffectingRhs(rhsDef))
+                        rhsDef->erase();
+                    if (lhsDef && lhsDef->use_empty())
+                        lhsDef->erase();
+                }
+            }
+
+            // ── Step 2: Remove dead assignment chains ───────────────────
+            //
+            // An assignment is dead if its target variable has no live
+            // consumers.  We remove assignments in reverse order so that
+            // removing a later assignment may expose an earlier one as dead.
+            {
+                llvm::SmallVector<helix::high::AssignOp, 16> allAssigns;
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    allAssigns.push_back(assignOp);
+                });
+
+                // Process in reverse order (reverse dependency).
+                for (auto it = allAssigns.rbegin(); it != allAssigns.rend();
+                     ++it) {
+                    auto assignOp = *it;
+
+                    // Get the target variable ID.
+                    auto* lhsDef = assignOp.getTarget().getDefiningOp();
+                    if (!lhsDef)
+                        continue;
+
+                    auto targetRef =
+                        dyn_cast<helix::high::VarRefOp>(lhsDef);
+                    if (!targetRef)
+                        continue;
+
+                    auto targetId = targetRef.getVarId();
+
+                    // Never remove assignments to SIMD vector variables —
+                    // their reads aren't modeled but they contain critical offsets.
+                    auto targetName = targetRef.getVarName();
+                    if (targetName.starts_with("xmm") || targetName.starts_with("ymm") ||
+                        targetName.starts_with("zmm") || targetName.starts_with("XMM") ||
+                        targetName.starts_with("YMM") || targetName.starts_with("ZMM"))
+                        continue;
+
+                    // Never remove the return-value chain in a value-returning
+                    // function — `result` is read by the synthesised
+                    // `return result;` statement which exists only in the C
+                    // emitter, not as an SSA use the liveness walk can see.
+                    if (preserveResultVar && targetName == "result")
+                        continue;
+
+                    // Check if the target variable has any live consumers
+                    // (excluding this assignment's own LHS reference).
+                    // Use the refMap to avoid re-walking the function body.
+                    bool anyLive = false;
+                    {
+                        auto mapIt = refMap.find(targetId);
+                        if (mapIt != refMap.end()) {
+                            for (auto refOp : mapIt->second) {
+                                if (anyLive) break;
+                                if (refOp.getOperation() ==
+                                    targetRef.getOperation())
+                                    continue;
+
+                                llvm::SmallPtrSet<Operation*, 32> visited;
+                                if (isValueLive(refOp.getResult(), visited,
+                                                &refMap, 0))
+                                    anyLive = true;
+                            }
+                        }
+                    }
+
+                    if (!anyLive) {
+                        auto* rhsDef = assignOp.getValue().getDefiningOp();
+                        auto* lhsOp  = assignOp.getTarget().getDefiningOp();
+
+                        assignOp.erase();
+                        ++totalAssigns;
+                        changed = true;
+
+                        // Clean up orphaned operand definitions — but never
+                        // erase side-effecting ops (calls, memory writes)
+                        // just because their result became unused.  A call
+                        // like `sub_foo()` whose return value is ignored
+                        // still needs to emit for its side effects.
+                        if (rhsDef && rhsDef->use_empty() &&
+                            !isSideEffectingRhs(rhsDef))
+                            rhsDef->erase();
+                        if (lhsOp && lhsOp->use_empty())
+                            lhsOp->erase();
+                    }
+                }
+            }
+
+            // ── Step 3: Remove dead variable declarations ───────────────
+            {
+                llvm::SmallVector<helix::high::VarDeclOp, 16> deadDecls;
+
+                funcBody.walk([&](helix::high::VarDeclOp declOp) {
+                    // Mirror Step 2: keep "result" alive when the function
+                    // returns a value — the consumer is the CAstBuilder-
+                    // synthesised `return result;` and never an SSA use.
+                    if (preserveResultVar &&
+                        declOp.getVarName() == "result")
+                        return;
+                    if (isDeadVarDecl(declOp, funcBody, &refMap, isAapcs64))
+                        deadDecls.push_back(declOp);
+                });
+
+                for (auto declOp : deadDecls) {
+                    // If the decl has an initializer, check if it's dead too.
+                    if (declOp.getInit()) {
+                        auto* initDef =
+                            declOp.getInit().getDefiningOp();
+                        declOp.erase();
+                        ++totalVars;
+                        changed = true;
+
+                        if (initDef && initDef->use_empty() &&
+                            !isSideEffectingRhs(initDef))
+                            initDef->erase();
+                    } else {
+                        declOp.erase();
+                        ++totalVars;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        return {totalVars, totalAssigns, totalUndef};
+    }
+
+    // ─── Enhanced DCE (P2.10): Escape-Aware Dead Store Elimination ────
+    //
+    // This phase operates on HelixMid functions and leverages the
+    // "helix.escapes" attribute set by the EscapeAnalysis pass (P2.8).
+    //
+    // For non-escaping variables:
+    //   - No external code can observe their value through a pointer.
+    //   - Assignments/stores that are overwritten before being read are dead.
+    //   - If a variable is assigned but never read at all, the assign is dead.
+    //
+    // This is more aggressive than the HelixHigh-level Phase 7 because
+    // we can prove the absence of aliasing for non-escaping variables.
+
+    /// Build the set of non-escaping variable slot IDs from var.decl attrs.
+    llvm::DenseSet<uint32_t>
+    collectNonEscapingSlots(Region& body) {
+        llvm::DenseSet<uint32_t> nonEscaping;
+
+        body.walk([&](helix::mid::VarDeclOp declOp) {
+            auto escAttr = declOp->getAttrOfType<BoolAttr>("helix.escapes");
+            if (escAttr && !escAttr.getValue())
+                nonEscaping.insert(declOp.getSlotId());
+        });
+
+        return nonEscaping;
+    }
+
+    /// Check whether a HelixMid slot has any live reads (var.ref ops whose
+    /// results feed into a side-effecting consumer).
+    bool hasMidLiveReads(uint32_t slotId, Region& body) {
+        bool hasLive = false;
+
+        body.walk([&](helix::mid::VarRefOp refOp) {
+            if (hasLive)
+                return;
+            if (refOp.getSlotId() != slotId)
+                return;
+
+            // Check if this var.ref's result is used by anything.
+            for (auto* user : refOp.getResult().getUsers()) {
+                // If used by an assign as the VALUE (RHS), the read is consumed.
+                // If used only as the assign's target-identifying slot_id match,
+                // that's an internal bookkeeping use, not a real read.
+                //
+                // At the mid level, AssignOp takes a slot_id + value, so
+                // var.ref results flowing into calls, binexpr, store, return,
+                // or if-conditions are live reads.
+                if (isa<helix::mid::CallOp>(user) ||
+                    isa<helix::mid::ReturnOp>(user) ||
+                    isa<helix::mid::StoreOp>(user) ||
+                    isa<helix::mid::BinExprOp>(user) ||
+                    isa<helix::mid::UnExprOp>(user) ||
+                    isa<helix::mid::CastOp>(user) ||
+                    isa<helix::mid::SelectOp>(user) ||
+                    isa<helix::mid::IfOp>(user) ||
+                    isa<helix::mid::WhileOp>(user) ||
+                    isa<helix::mid::LoadOp>(user) ||
+                    isa<helix::mid::FieldPtrOp>(user) ||
+                    isa<helix::mid::IndexPtrOp>(user)) {
+                    hasLive = true;
+                    return;
+                }
+
+                // If used by an assign as the value operand, check if the
+                // assigned-to slot is itself live.
+                if (auto assignOp = dyn_cast<helix::mid::AssignOp>(user)) {
+                    // The value operand flows into the assignment RHS.
+                    if (assignOp.getValue() == refOp.getResult()) {
+                        hasLive = true;
+                        return;
+                    }
+                }
+
+                // For any other op with results, trace forward.
+                if (user->getNumResults() > 0) {
+                    for (auto result : user->getResults()) {
+                        if (!result.use_empty()) {
+                            hasLive = true;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        return hasLive;
+    }
+
+    /// Eliminate dead operations in a HelixMid function using escape info.
+    void eliminateDeadMidOps(helix::mid::FuncOp func) {
+        auto& body = func.getBody();
+        if (body.empty())
+            return;
+
+        auto nonEscaping = collectNonEscapingSlots(body);
+        if (nonEscaping.empty())
+            return;
+
+        LLVM_DEBUG(llvm::dbgs() << "Enhanced DCE (P2.10): processing mid::"
+                                << func.getSymName()
+                                << " (" << nonEscaping.size()
+                                << " non-escaping slots)\n");
+
+        unsigned deadStores = 0;
+        unsigned deadAssigns = 0;
+
+        // Iterate to fixed point.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // ── Step 1: Remove dead assigns to non-escaping variables ────
+            //
+            // An assign to a non-escaping variable is dead if:
+            //   (a) The slot has no live reads, OR
+            //   (b) The assign is overwritten by a later assign to the same
+            //       slot before any read (within the same block).
+            {
+                llvm::SmallVector<helix::mid::AssignOp, 16> deadOps;
+
+                body.walk([&](helix::mid::AssignOp assignOp) {
+                    uint32_t slotId = assignOp.getSlotId();
+
+                    // Only optimize non-escaping variables.
+                    if (!nonEscaping.contains(slotId))
+                        return;
+
+                    // Check if the slot has any live reads at all.
+                    if (!hasMidLiveReads(slotId, body)) {
+                        deadOps.push_back(assignOp);
+                        return;
+                    }
+
+                    // Check for a subsequent overwrite in the same block
+                    // before any read of this slot.
+                    Block* block = assignOp->getBlock();
+                    if (!block)
+                        return;
+
+                    bool foundRead = false;
+                    bool foundOverwrite = false;
+
+                    for (auto it = std::next(assignOp->getIterator());
+                         it != block->end(); ++it) {
+                        Operation& op = *it;
+
+                        // Check for a read of the same slot.
+                        if (auto refOp = dyn_cast<helix::mid::VarRefOp>(&op)) {
+                            if (refOp.getSlotId() == slotId) {
+                                foundRead = true;
+                                break;
+                            }
+                        }
+
+                        // Check for an overwrite.
+                        if (auto nextAssign = dyn_cast<helix::mid::AssignOp>(&op)) {
+                            if (nextAssign.getSlotId() == slotId) {
+                                foundOverwrite = true;
+                                break;
+                            }
+                        }
+
+                        // A call might read the variable through a pointer,
+                        // but since we know it's non-escaping, calls cannot
+                        // observe it.  So we do NOT break on calls here.
+                    }
+
+                    if (foundOverwrite && !foundRead)
+                        deadOps.push_back(assignOp);
+                });
+
+                for (auto assignOp : deadOps) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead mid::assign to non-escaping slot "
+                        << assignOp.getSlotId() << "\n");
+
+                    auto* valueDef = assignOp.getValue().getDefiningOp();
+                    assignOp.erase();
+                    ++deadAssigns;
+                    changed = true;
+
+                    // Clean up the now-dead value definition.
+                    if (valueDef && valueDef->use_empty() &&
+                        valueDef->getNumResults() > 0) {
+                        valueDef->erase();
+                    }
+                }
+            }
+
+            // ── Step 2: Remove dead stores through non-escaping pointers ─
+            //
+            // A store to an address derived from a non-escaping variable
+            // (e.g., store to AddrOf(non_escaping_var)) is dead if the
+            // stored value is never loaded.  This is a conservative
+            // approximation — we remove stores where the address is
+            // directly an AddrOf of a non-escaping var with no loads.
+            {
+                llvm::SmallVector<helix::mid::StoreOp, 16> deadOps;
+
+                body.walk([&](helix::mid::StoreOp storeOp) {
+                    // Check if the store address originates from AddrOf
+                    // of a non-escaping variable.
+                    auto unExpr = storeOp.getAddr()
+                                      .getDefiningOp<helix::mid::UnExprOp>();
+                    if (!unExpr ||
+                        unExpr.getKind() != helix::mid::UnExprKind::AddrOf)
+                        return;
+
+                    auto varRef = unExpr.getOperand()
+                                      .getDefiningOp<helix::mid::VarRefOp>();
+                    if (!varRef)
+                        return;
+
+                    uint32_t slotId = varRef.getSlotId();
+                    if (!nonEscaping.contains(slotId))
+                        return;
+
+                    // Check if there are any loads from this slot's address.
+                    // Since the variable is non-escaping, any load of its
+                    // value must go through a var.ref (not through a pointer
+                    // dereference).  If there are no live reads of the slot,
+                    // the store is dead.
+                    if (!hasMidLiveReads(slotId, body))
+                        deadOps.push_back(storeOp);
+                });
+
+                for (auto storeOp : deadOps) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "  Dead mid::store to non-escaping var\n");
+
+                    storeOp.erase();
+                    ++deadStores;
+                    changed = true;
+                }
+            }
+        }
+
+        NumEscapeDeadStores  += deadStores;
+        NumEscapeDeadAssigns += deadAssigns;
+
+        LLVM_DEBUG(if (deadStores + deadAssigns > 0)
+            llvm::dbgs() << "  P2.10 summary: " << deadStores
+                         << " dead stores, " << deadAssigns
+                         << " dead assigns removed\n");
+    }
+};
+
+} // anonymous namespace
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+std::unique_ptr<mlir::Pass> helix::createEliminateDeadCodePass() {
+    return std::make_unique<EliminateDeadCodePass>();
+}

@@ -1,0 +1,42 @@
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_context_mmap.ll
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_csf_queue_register.ll
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_jit_allocate.ll
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_mem_alloc.ll
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_mem_commit.ll
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_mem_free.ll
+C:/Users/Mazum/Desktop/Intigrity/hexcore-reports/fresh-helix/kbase_mem_import.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-decompile/HealthData-read-FIXED.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-decompile/HealthData-read.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-decompile/RPC-Die-caller.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-decompile/RPC-SetHitPoints-caller.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-decompile/RPC-SetInvincible-caller.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-decompile/Recoil-mulss-region.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-actorbase/PlayerAwareness-UpdatePos.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-c1-live/UpdatePosition-c1.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-validate-realfn/Recoil-mulss.ll
+C:/Users/Mazum/Desktop/HexCore-SOTR/hexcore-reports/sotr-validate-realfn/UpdatePosition.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/01-lifted-entry-CRT-init.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/02-lifted-fld-global-409610.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/03-lifted-coll-resp-4C1EE7.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/04-lifted-camera-cmd-53B51F.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/05-lifted-img-loader-5BBFB5.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/06-lifted-anim-4838C2.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/07-lifted-network-625144.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/08-lifted-conversation-43E08E.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/09-lifted-config-46B87F.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/10-lifted-large-PlayerInfo-5EC502.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/11-lifted-tiny-window-4A0B5C.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/12-lifted-medium-window-4A0B5C.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/12a-lifted-4A0B5C.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/13-lifted-autobacktrack-4A0B70.ll
+C:/Users/Mazum/Desktop/CE Testing/hexcore-reports/gta-sa/helix-stress/14-lifted-data-not-code-8A36B0.ll
+C:/Users/Mazum/Desktop/HexCore-LARA/hexcore-reports/22-ctf-helix-targets/cmpsb-compare.ll
+C:/Users/Mazum/Desktop/HexCore-LARA/hexcore-reports/22-ctf-helix-targets/overflow-check.ll
+C:/Users/Mazum/Desktop/HexCore-LARA/hexcore-reports/22-ctf-helix-targets/validation-success-fail.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x140001000_sub_140001000.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x140001090_sub_140001090.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x140001190_sub_140001190.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x140001350_sub_140001350.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x140001410_sub_140001410.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x1400015C0_sub_1400015C0.ll
+C:/Users/Mazum/Desktop/HTB Challenge/akasha_fresh_ll_table/0x140001740_start.ll

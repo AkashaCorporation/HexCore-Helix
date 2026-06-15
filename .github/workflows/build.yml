@@ -1,0 +1,148 @@
+name: CI — Build & Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  LLVM_VERSION: "18"
+  LLVM_BUILD_DIR: /usr/lib/llvm-18
+  LLVM_DIR: /usr/lib/llvm-18/lib/cmake/llvm
+  MLIR_DIR: /usr/lib/llvm-18/lib/cmake/mlir
+
+jobs:
+  # ─── Rust Check & Lint ──────────────────────────────────────────────────────
+  rust-check:
+    name: Rust Check & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install LLVM/MLIR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
+
+      - name: Build native engine for Rust workspace
+        run: |
+          cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+          cmake --build engine/build --parallel
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  # ─── C++ Engine Build ───────────────────────────────────────────────────────
+  engine-build:
+    name: C++ Engine (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/MLIR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
+
+      - name: Configure CMake
+        run: cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+
+      - name: Build
+        run: cmake --build engine/build --config Release
+
+  # ─── NAPI-RS Build (Multi-Platform) ─────────────────────────────────────────
+  napi-build:
+    name: NAPI-RS Build (x86_64-unknown-linux-gnu)
+    needs: [rust-check, engine-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install LLVM/MLIR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build C++ Engine
+        run: |
+          cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+          cmake --build engine/build --parallel
+
+      - name: Build NAPI-RS
+        run: npm run build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: "*.node"
+          if-no-files-found: error
+
+  # ─── Publish (on release) ───────────────────────────────────────────────────
+  publish:
+    name: Publish to npm
+    if: github.event_name == 'release'
+    needs: [napi-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move artifacts
+        run: npm run artifacts
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,8 @@
+# HexCore Helix signature database
+# Format:
+#   <address>,<symbol_name>,<return_type>
+#
+# Example:
+# 0x140123456,CreateFileW,HANDLE
+# 0x1401234F0,CloseHandle,BOOL
+# 0x140123980,memcpy,void*

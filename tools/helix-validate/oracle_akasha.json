@@ -1,0 +1,870 @@
+{
+  "schema_version": 1,
+  "corpus": "AkashaVsHexRays / Malware HexCore Defeat v7",
+  "ground_truth": "real_source",
+  "source_file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\Malware HexCore Defeat v7.cpp",
+  "helix_dir": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output",
+  "score_model": {
+    "components": {
+      "semantic_recovery": 0.6,
+      "signature_recovery": 0.15,
+      "flow_fidelity": 0.15,
+      "quality": 0.1
+    },
+    "note": "Semantic checks are derived from source snippets, not IDA output."
+  },
+  "functions": {
+    "0x140001000_sub_140001000": {
+      "function": "0x140001000_sub_140001000",
+      "address": "0x140001000",
+      "source_function": "rt_fnv",
+      "helix_function": "sub_140001000",
+      "source_span": {
+        "start_line": 61,
+        "end_line": 73
+      },
+      "source_snippet": "static uint64_t rt_fnv(const char* s) {\n    constexpr uint32_t M = 0xA5A5A5A5;\n    volatile uint32_t oh = 0xCBF29CE4 ^ M;\n    volatile uint32_t ol = 0x84222325 ^ M;\n    volatile uint32_t ph = 0x00000100 ^ M;\n    volatile uint32_t pl = 0x000001B3 ^ M;\n\n    uint64_t h     = (static_cast<uint64_t>(oh ^ M) << 32) | (ol ^ M);\n    uint64_t prime = (static_cast<uint64_t>(ph ^ M) << 32) | (pl ^ M);\n\n    while (*s) { h = (h ^ static_cast<uint8_t>(*s++)) * prime; }\n    return h;\n}",
+      "ground_truth_source": {
+        "source": "source",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\Malware HexCore Defeat v7.cpp",
+        "loc": 13,
+        "reported_confidence": null,
+        "return_type": "static uint64_t",
+        "params": [
+          [
+            "const char*",
+            "s"
+          ]
+        ],
+        "decls": [
+          [
+            "volatile uint32_t",
+            "oh"
+          ],
+          [
+            "volatile uint32_t",
+            "ol"
+          ],
+          [
+            "volatile uint32_t",
+            "ph"
+          ],
+          [
+            "volatile uint32_t",
+            "pl"
+          ],
+          [
+            "uint64_t",
+            "h"
+          ],
+          [
+            "uint64_t",
+            "prime"
+          ]
+        ],
+        "callees": [
+          "rt_fnv"
+        ],
+        "callees_raw": [
+          "rt_fnv"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 0,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 1,
+        "loop_count": 1,
+        "is_stub": false,
+        "placeholder_id_rate": 0.0
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001000_sub_140001000.helix.c",
+        "loc": 24,
+        "reported_confidence": 77.0,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "int64_t",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "v4"
+          ],
+          [
+            "int64_t",
+            "v5"
+          ],
+          [
+            "int64_t",
+            "result"
+          ],
+          [
+            "int64_t",
+            "v0"
+          ],
+          [
+            "int64_t",
+            "v2"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ]
+        ],
+        "callees": [],
+        "callees_raw": [],
+        "named_field_count": 0,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 2,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 1,
+        "loop_count": 1,
+        "is_stub": false,
+        "placeholder_id_rate": 0.9047619047619048
+      },
+      "semantic_checks": [
+        {
+          "id": "fnv64_offset_basis",
+          "label": "recovers the 64-bit FNV offset basis or its XOR-split halves",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "0xCBF29CE484222325",
+            "14695981039346656037",
+            "0xCBF29CE4",
+            "0x84222325"
+          ]
+        },
+        {
+          "id": "fnv64_prime",
+          "label": "recovers the 64-bit FNV prime or its XOR-split halves",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "0x100000001B3",
+            "1099511628211",
+            "0x00000100",
+            "0x000001B3"
+          ]
+        },
+        {
+          "id": "nul_terminated_loop",
+          "label": "keeps the loop over the input bytes until NUL",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\bwhile\\s*\\([^)]*\\*[^)]*\\)",
+            "\\bfor\\s*\\([^;]*;[^;]*\\*"
+          ]
+        },
+        {
+          "id": "byte_xor_update",
+          "label": "keeps the byte-wise xor into the FNV accumulator",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\^\\s*(?:static_cast\\s*<\\s*uint8_t\\s*>|\\(?uint8_t\\)?|\\*|[A-Za-z_]\\w*\\[)",
+            "\\^=.*(?:\\*|[A-Za-z_]\\w*\\[)"
+          ]
+        },
+        {
+          "id": "hash_accumulator_return",
+          "label": "returns the computed hash accumulator, not an uninitialized result",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\breturn\\s+(?!result\\b)[A-Za-z_]\\w*\\s*;"
+          ]
+        }
+      ]
+    },
+    "0x140001090_sub_140001090": {
+      "function": "0x140001090_sub_140001090",
+      "address": "0x140001090",
+      "source_function": "sv_fnv32",
+      "helix_function": "sub_140001090",
+      "source_span": {
+        "start_line": 99,
+        "end_line": 106
+      },
+      "source_snippet": "static uint32_t sv_fnv32(const uint8_t* p, size_t n) {\n    uint32_t h = 0x811C9DC5u;\n    for (size_t i = 0; i < n; ++i) {\n        h ^= p[i];\n        h *= 0x01000193u;\n    }\n    return h;\n}",
+      "ground_truth_source": {
+        "source": "source",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\Malware HexCore Defeat v7.cpp",
+        "loc": 8,
+        "reported_confidence": null,
+        "return_type": "static uint32_t",
+        "params": [
+          [
+            "const uint8_t*",
+            "p"
+          ],
+          [
+            "size_t",
+            "n"
+          ]
+        ],
+        "decls": [
+          [
+            "uint32_t",
+            "h"
+          ]
+        ],
+        "callees": [
+          "sv_fnv32"
+        ],
+        "callees_raw": [
+          "sv_fnv32"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 0,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 1,
+        "loop_count": 1,
+        "is_stub": false,
+        "placeholder_id_rate": 0.0
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001090_sub_140001090.helix.c",
+        "loc": 8,
+        "reported_confidence": 82.0,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "int64_t",
+            "param_1"
+          ],
+          [
+            "bool",
+            "param_2"
+          ],
+          [
+            "bool",
+            "param_3"
+          ],
+          [
+            "int64_t",
+            "param_4"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ]
+        ],
+        "callees": [],
+        "callees_raw": [],
+        "named_field_count": 0,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 1,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 0,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 1,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 1.0
+      },
+      "semantic_checks": [
+        {
+          "id": "fnv32_offset_basis",
+          "label": "recovers the 32-bit FNV offset basis",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "0x811C9DC5",
+            "2166136261"
+          ]
+        },
+        {
+          "id": "fnv32_prime",
+          "label": "recovers the 32-bit FNV prime",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "0x01000193",
+            "0x1000193",
+            "16777619"
+          ]
+        },
+        {
+          "id": "bounded_byte_loop",
+          "label": "keeps the loop bounded by n",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\bfor\\s*\\([^;]*;[^;]*<[^;]*(?:\\bn\\b|param_2)\\b",
+            "\\bwhile\\s*\\([^)]*<[^)]*(?:\\bn\\b|param_2)\\b"
+          ]
+        },
+        {
+          "id": "indexed_byte_read",
+          "label": "reads p[i] / input byte from memory",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\[[^\\]]+\\]",
+            "\\*\\s*\\([^)]*\\+",
+            "\\*\\s*[A-Za-z_]\\w+"
+          ]
+        },
+        {
+          "id": "xor_then_multiply",
+          "label": "keeps the xor/multiply FNV update pair",
+          "weight": 1.0,
+          "mode": "all",
+          "patterns": [
+            "\\^",
+            "\\*"
+          ]
+        },
+        {
+          "id": "fnv32_accumulator_return",
+          "label": "returns the FNV accumulator, not the length/boolean parameter",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\breturn\\s+(?!param_2\\b)(?!result\\b)[A-Za-z_]\\w*\\s*;"
+          ]
+        }
+      ]
+    },
+    "0x140001190_sub_140001190": {
+      "function": "0x140001190_sub_140001190",
+      "address": "0x140001190",
+      "source_function": "sv1",
+      "helix_function": "sub_140001190",
+      "source_span": {
+        "start_line": 214,
+        "end_line": 236
+      },
+      "source_snippet": "static HMODULE sv1(PPEB peb, uint64_t target) {\n    if (!peb || !peb->Ldr) return nullptr;\n    PLIST_ENTRY head = &peb->Ldr->InMemoryOrderModuleList;\n    for (PLIST_ENTRY cur = head->Flink; cur != head; cur = cur->Flink) {\n        PLDR_DATA_TABLE_ENTRY e = CONTAINING_RECORD(cur, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);\n        if (!e->FullDllName.Buffer || e->FullDllName.Length < 2) continue;\n\n        char name[96]; size_t i = 0;\n        WCHAR* w = e->FullDllName.Buffer;\n        size_t wlen = e->FullDllName.Length / 2;\n        size_t start = 0;\n        for (size_t k = 0; k < wlen; ++k) if (w[k] == L'\\\\' || w[k] == L'/') start = k + 1;\n        for (size_t k = start; k < wlen && i + 1 < sizeof(name); ++k) {\n            char c = static_cast<char>(w[k]);\n            if (c >= 'A' && c <= 'Z') c += 32;\n            name[i++] = c;\n        }\n        name[i] = 0;\n\n        if (rt_fnv(name) == target) return reinterpret_cast<HMODULE>(e->DllBase);\n    }\n    return nullptr;\n}",
+      "ground_truth_source": {
+        "source": "source",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\Malware HexCore Defeat v7.cpp",
+        "loc": 23,
+        "reported_confidence": null,
+        "return_type": "static HMODULE",
+        "params": [
+          [
+            "PPEB",
+            "peb"
+          ],
+          [
+            "uint64_t",
+            "target"
+          ]
+        ],
+        "decls": [
+          [
+            "PLIST_ENTRY",
+            "head"
+          ],
+          [
+            "PLDR_DATA_TABLE_ENTRY",
+            "e"
+          ],
+          [
+            "size_t",
+            "wlen"
+          ],
+          [
+            "size_t",
+            "start"
+          ]
+        ],
+        "callees": [
+          "CONTAINING_RECORD",
+          "rt_fnv",
+          "sv1"
+        ],
+        "callees_raw": [
+          "sv1",
+          "CONTAINING_RECORD",
+          "rt_fnv"
+        ],
+        "named_field_count": 10,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 5,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 3,
+        "loop_count": 3,
+        "is_stub": false,
+        "placeholder_id_rate": 0.0
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001190_sub_140001190.helix.c",
+        "loc": 9,
+        "reported_confidence": 82.6,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "void*",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_2"
+          ],
+          [
+            "int64_t",
+            "param_3"
+          ],
+          [
+            "uint64_t",
+            "param_4"
+          ],
+          [
+            "int32_t",
+            "param_20"
+          ],
+          [
+            "int32_t",
+            "param_21"
+          ],
+          [
+            "int32_t",
+            "param_22"
+          ],
+          [
+            "int32_t",
+            "param_23"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "result"
+          ]
+        ],
+        "callees": [],
+        "callees_raw": [],
+        "named_field_count": 0,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 0,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 1,
+        "loop_count": 0,
+        "is_stub": false,
+        "placeholder_id_rate": 0.7
+      },
+      "semantic_checks": [
+        {
+          "id": "peb_ldr_guard",
+          "label": "keeps the PEB/Ldr null guard",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "!\\s*peb",
+            "!\\s*param_1",
+            "\\bLdr\\b",
+            "return\\s+(?:nullptr|0)"
+          ]
+        },
+        {
+          "id": "module_list_walk",
+          "label": "walks the InMemoryOrder module list",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "InMemoryOrderModuleList",
+            "\\bFlink\\b",
+            "\\bfor\\s*\\(",
+            "\\bwhile\\s*\\("
+          ]
+        },
+        {
+          "id": "full_dll_name_read",
+          "label": "reads FullDllName.Buffer/Length from each module entry",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "FullDllName",
+            "\\bBuffer\\b",
+            "\\bLength\\b",
+            "field_0x[0-9A-Fa-f]+"
+          ]
+        },
+        {
+          "id": "basename_slash_scan",
+          "label": "keeps the basename scan over slash/backslash",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\\\\\\\",
+            "0x5C",
+            "\\b92\\b",
+            "'/",
+            "\\b47\\b"
+          ]
+        },
+        {
+          "id": "ascii_lowercase_fold",
+          "label": "keeps the A-Z to lowercase fold",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "'A'",
+            "'Z'",
+            "\\+\\s*32",
+            "0x20"
+          ]
+        },
+        {
+          "id": "module_hash_compare",
+          "label": "hashes the normalized module name and compares to target",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\brt_fnv\\s*\\(",
+            "\\bsub_140001000\\s*\\("
+          ]
+        },
+        {
+          "id": "dllbase_return",
+          "label": "returns the matching module base",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\bDllBase\\b",
+            "field_0x30",
+            "\\breturn\\s+(?!result\\b)[^;]+;"
+          ]
+        }
+      ]
+    },
+    "0x140001350_sub_140001350": {
+      "function": "0x140001350_sub_140001350",
+      "address": "0x140001350",
+      "source_function": "sv2",
+      "helix_function": "sub_140001350",
+      "source_span": {
+        "start_line": 238,
+        "end_line": 260
+      },
+      "source_snippet": "static FARPROC sv2(HMODULE mod, uint64_t target) {\n    if (!mod) return nullptr;\n    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(mod);\n    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;\n    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<BYTE*>(mod) + dos->e_lfanew);\n    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;\n\n    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;\n    if (!rva) return nullptr;\n    auto exp = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<BYTE*>(mod) + rva);\n\n    auto names = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(mod) + exp->AddressOfNames);\n    auto ords  = reinterpret_cast<WORD*>(reinterpret_cast<BYTE*>(mod) + exp->AddressOfNameOrdinals);\n    auto funcs = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(mod) + exp->AddressOfFunctions);\n\n    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {\n        const char* n = reinterpret_cast<const char*>(reinterpret_cast<BYTE*>(mod) + names[i]);\n        if (rt_fnv(n) == target) {\n            return reinterpret_cast<FARPROC>(reinterpret_cast<BYTE*>(mod) + funcs[ords[i]]);\n        }\n    }\n    return nullptr;\n}",
+      "ground_truth_source": {
+        "source": "source",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\Malware HexCore Defeat v7.cpp",
+        "loc": 23,
+        "reported_confidence": null,
+        "return_type": "static FARPROC",
+        "params": [
+          [
+            "HMODULE",
+            "mod"
+          ],
+          [
+            "uint64_t",
+            "target"
+          ]
+        ],
+        "decls": [
+          [
+            "DWORD",
+            "rva"
+          ]
+        ],
+        "callees": [
+          "rt_fnv",
+          "sv2"
+        ],
+        "callees_raw": [
+          "sv2",
+          "rt_fnv"
+        ],
+        "named_field_count": 8,
+        "raw_field_count": 0,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 0,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 5,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 6,
+        "loop_count": 1,
+        "is_stub": false,
+        "placeholder_id_rate": 0.0
+      },
+      "helix_current": {
+        "source": "helix",
+        "file": "C:\\Users\\Mazum\\Desktop\\AkashaVsHexRays\\hexcore_output\\0x140001350_sub_140001350.helix.c",
+        "loc": 44,
+        "reported_confidence": 59.5,
+        "return_type": "int64_t",
+        "params": [
+          [
+            "int64_t",
+            "param_1"
+          ],
+          [
+            "int64_t",
+            "param_10"
+          ],
+          [
+            "int64_t",
+            "param_11"
+          ]
+        ],
+        "decls": [
+          [
+            "int64_t",
+            "v1"
+          ],
+          [
+            "int64_t",
+            "v2"
+          ],
+          [
+            "int64_t",
+            "result"
+          ],
+          [
+            "int64_t",
+            "v0"
+          ],
+          [
+            "int64_t",
+            "v3"
+          ],
+          [
+            "int64_t",
+            "v4"
+          ],
+          [
+            "int64_t",
+            "v5"
+          ],
+          [
+            "int64_t",
+            "v6"
+          ],
+          [
+            "int64_t",
+            "v7"
+          ],
+          [
+            "int64_t",
+            "v8"
+          ]
+        ],
+        "callees": [
+          "sub_140001000"
+        ],
+        "callees_raw": [
+          "sub_140001000"
+        ],
+        "named_field_count": 0,
+        "raw_field_count": 3,
+        "string_literals": [],
+        "raw_addr_derefs": 0,
+        "hexrays_macros": 0,
+        "decomp_macros": 0,
+        "double_derefs": 0,
+        "empty_if_blocks": 0,
+        "unreachable_after_return": 0,
+        "suspicious_self_ref": 5,
+        "log_calls_with_string": 0,
+        "log_calls_lost_string": 0,
+        "if_count": 7,
+        "else_count": 0,
+        "goto_count": 0,
+        "return_count": 2,
+        "loop_count": 1,
+        "is_stub": false,
+        "placeholder_id_rate": 0.9464285714285714
+      },
+      "semantic_checks": [
+        {
+          "id": "module_null_guard",
+          "label": "keeps the module null guard",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "!\\s*mod",
+            "!\\s*param_1",
+            "return\\s+(?:nullptr|0)"
+          ]
+        },
+        {
+          "id": "mz_signature_check",
+          "label": "checks IMAGE_DOS_SIGNATURE",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "IMAGE_DOS_SIGNATURE",
+            "0x5A4D",
+            "\\b23117\\b"
+          ]
+        },
+        {
+          "id": "pe_signature_check",
+          "label": "checks IMAGE_NT_SIGNATURE",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "IMAGE_NT_SIGNATURE",
+            "0x4550",
+            "\\b17744\\b"
+          ]
+        },
+        {
+          "id": "export_directory_rva",
+          "label": "reads the export directory RVA",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "IMAGE_DIRECTORY_ENTRY_EXPORT",
+            "DataDirectory",
+            "field_0x88",
+            "0x88",
+            "\\b136\\b"
+          ]
+        },
+        {
+          "id": "export_name_tables",
+          "label": "recovers AddressOfNames/Ordinals/Functions tables",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "AddressOfNames",
+            "AddressOfNameOrdinals",
+            "AddressOfFunctions",
+            "field_0x20",
+            "field_0x24",
+            "field_0x1C"
+          ]
+        },
+        {
+          "id": "export_name_loop",
+          "label": "iterates across exported names",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "NumberOfNames",
+            "field_0x18",
+            "\\bfor\\s*\\(",
+            "\\bwhile\\s*\\("
+          ]
+        },
+        {
+          "id": "export_hash_compare",
+          "label": "hashes each export name and compares to target",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "\\brt_fnv\\s*\\(",
+            "\\bsub_140001000\\s*\\("
+          ]
+        },
+        {
+          "id": "function_pointer_return",
+          "label": "returns the resolved function pointer, not a boolean/result",
+          "weight": 1.0,
+          "mode": "any",
+          "patterns": [
+            "funcs\\s*\\[.*ords\\s*\\[",
+            "AddressOfFunctions",
+            "\\breturn\\s+(?!result\\b)(?!0\\b)[^;]+\\[[^;]+;"
+          ]
+        }
+      ]
+    }
+  },
+  "problems": []
+}
