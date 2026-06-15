@@ -3,6 +3,38 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [0.1.4] - Real-corpus validation: the Phase-4 diagnosis is DISPROVEN - 2026-06-15
+
+Ran the guard against the **real Kernel Monarch rootkit corpus** (HTB CTF) - the
+lifted `.ll` in `rev_kernel_monarch/hexcore-reports/02b-lift-only/`, including
+`fh_install_hook.ll`, the `v4 = printk(0, v4)` x4 defect itself.
+
+**Scoreboard (`diff_v2.ps1`) over the 7 real functions: 7/7 identical, vN delta 0**
+- the guard changes NOTHING on the real defect. Instrumented diagnosis (since
+reverted) explains why, and **corrects the changelog's root-cause attribution**:
+
+- The 4 distinct printk call-results survive as distinct SSA versions through the
+  entire MLIR pipeline. At `RecoverVariables` they are `rax` / `rax_4` / `rax_5`
+  / `rax_7` (the `definedByCall` detection fires on all four), and **Phase 4
+  performs ZERO merges on `fh_install_hook`**.
+- So the changelog's "Phase 4 cross-register coalescing" attribution is **wrong /
+  outdated** for the current code. The option-1 guard sits in the wrong pass and
+  can never fire on this defect (0 `REFUSED` events on the whole corpus).
+- The collapse to a single `v4` happens in the **C-AST layer, upstream of
+  `CAstOptimizer::renameRemainingRegisterVars`** (called at line 227, very early
+  in `optimize()`): by that point the printk-chain body references are already
+  all `"rax"` while `rax_4` / `rax_5` linger only as dead declarations. The real
+  culprit is the MLIR-high -> C-AST construction (`CAstBuilder`) folding the
+  distinct register SSA versions' *body references* into one base-register name.
+
+**Net:** the Phase-4 guard is **SAFE** (0 regression on the fixtures AND the real
+corpus) but **INEFFECTIVE** on the target defect. The real fix must target the
+C-AST construction (`CAstBuilder`), not Phase 4. This is the single most valuable
+output of the arc: a measured, corpus-grounded correction of where the debt
+actually lives. **Next:** instrument `CAstBuilder` to confirm the exact fold, then
+preserve distinct call-result SSA versions into distinct C-AST vars.
+
+
 ## [0.1.1 - 0.1.3] - Phase-4 call-result identity experiment - 2026-06-15
 
 First experiment arc in the v2 sandbox: attack the FIX-081 / Phase-4
