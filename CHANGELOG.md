@@ -3,6 +3,45 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [0.1.5] - Root cause pinpointed in CAstBuilder input - and it is FAITHFUL - 2026-06-15
+
+Traced the `v4 = printk(0, v4)` collapse to its exact origin by dumping the
+printk chain at every optimizer stage plus the MLIR var names/ids feeding
+`CAstBuilder` (all instrumentation since reverted).
+
+**Findings:**
+- The collapse is **already present at `optimize()` ENTRY** - i.e. in the C-AST
+  that `CAstBuilder` produces, before any optimizer pass runs. The pass-by-pass
+  trace was identical at ENTRY / post-inferSemantic (`rax = printk(..., rax)`)
+  and only `renameRemainingRegisterVars` swaps `rax -> v4`. So no optimizer pass
+  causes it; it is upstream.
+- At `CAstBuilder` input the MLIR has the **same `helix.high` variable
+  `varId=15` ("rax") as the target of multiple printk assignments** (plus a
+  couple of survivors `rax_4`=27 / `rax_5`=30). Yet mid-`RecoverVariables` there
+  were four DISTINCT call-result varIds (15/27/30/36). So the SSA-version
+  distinction is lost in an MLIR pass **between `RecoverVariables` and
+  `CAstBuilder`** (a Mid/High lowering re-merging register versions onto one
+  varId) - definitively NOT Phase 4 (0 merges, confirmed in 0.1.4), and NOT any
+  C-AST optimizer pass.
+- **Crucial reframing: `v4 = printk(0, v4)` is FAITHFUL.** The binary really does
+  reuse the RAX register across the four `printk` calls; emitting one variable
+  `v4` that is reassigned is correct C with the same semantics. This is a
+  **readability / variable-versioning** shortfall, NOT a correctness defect -
+  which is very likely why the main line deferred it (`HELIX_PHILOSOPHY`:
+  fidelity over polish). A "fix" would split the reused register into distinct
+  SSA-versioned C variables (`v4=printk(*v11); v5=printk(v4); v6=printk(v5); ...`)
+  - more readable, equally faithful, but it is a real CFG-aware SSA-reconstruction
+  feature (the function has branches), not a quick patch, and it trades a little
+  fidelity for polish - a design call for the project owner.
+
+**Net of the whole arc (0.1.0 - 0.1.5):** the sandbox + scoreboard + real corpus
+turned a vague, mis-attributed changelog gap into a precise, evidence-backed root
+cause (MLIR varId reuse upstream of CAstBuilder) and a clear design decision
+(faithful-ugly vs readable-reconstructed). The Phase-4 guard is retained, proven
+SAFE (0 regression on fixtures and the 7-function rootkit corpus) but INEFFECTIVE
+on this defect. No further code change pending the design call.
+
+
 ## [0.1.4] - Real-corpus validation: the Phase-4 diagnosis is DISPROVEN - 2026-06-15
 
 Ran the guard against the **real Kernel Monarch rootkit corpus** (HTB CTF) - the
