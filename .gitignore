@@ -59,3 +59,7 @@ Thumbs.db
 
 # Internal RAG / agent context — never commit
 /rag/
+
+# Helix v2 sandbox
+*.exe
+/engine/build_v2_output.txt

@@ -2127,6 +2127,12 @@ private:
             std::vector<helix::high::VarRefOp> refs;
             std::set<Block*> liveBlocks;
             bool touchesCallBlock = false;
+            // Helix v2 experiment: the variable is assigned directly from a
+            // call result. Phase 4 must not merge such a variable away, or
+            // renameRemainingRegisterVars later collapses the distinct
+            // call-return SSA versions into one vN (the v3 = printk(0, v3)
+            // x4 defect documented under FIX-081).
+            bool definedByCall = false;
         };
 
         auto buildVarInfoMap = [&](Region& body)
@@ -2169,6 +2175,29 @@ private:
                     }
                 }
             }
+
+            // 4. (Helix v2 experiment) Mark variables whose value is assigned
+            //    directly from a call result. An AssignOp's target is operand
+            //    0 (a VarRefOp result) and its value is getValue(); this
+            //    mirrors the Phase-5 single-use guard's call detection.
+            body.walk([&](helix::high::AssignOp assign) {
+                Value assignedVal = assign.getValue();
+                Operation* valDef = assignedVal.getDefiningOp();
+                if (!valDef)
+                    return;
+                if (!isa<helix::high::CallOp>(valDef) &&
+                    !helix::isAnyCallOp(valDef))
+                    return;
+                if (assign->getNumOperands() == 0)
+                    return;
+                auto targetRef = assign->getOperand(0)
+                                     .getDefiningOp<helix::high::VarRefOp>();
+                if (!targetRef)
+                    return;
+                auto it = infoMap.find(targetRef.getVarId());
+                if (it != infoMap.end())
+                    it->second.definedByCall = true;
+            });
 
             return infoMap;
         };
@@ -2359,6 +2388,22 @@ private:
 
                     auto& canonInfo = infoMap[canonId];
                     auto& victimInfo = infoMap[victimId];
+
+                    // Phase-4-aware guard (Helix v2 experiment - FIX-081
+                    // follow-up option 1). Refuse to merge away a variable
+                    // whose value comes from a call result: keeping the
+                    // call-result victim distinct preserves call-return
+                    // identity that renameRemainingRegisterVars would
+                    // otherwise flatten to a single vN. Risk being measured:
+                    // extra vN placeholders on legitimate disjoint-liveness
+                    // merges across the corpus.
+                    if (victimInfo.definedByCall) {
+                        LLVM_DEBUG(llvm::dbgs()
+                            << "    [v2 phase4-callguard] keeping call-result "
+                               "var '" << victimInfo.decl.getVarName()
+                            << "' (id=" << victimId << ") distinct\n");
+                        continue;
+                    }
 
                     LLVM_DEBUG(llvm::dbgs()
                         << "    Merging var '"
