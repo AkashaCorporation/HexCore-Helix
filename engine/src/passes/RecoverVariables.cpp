@@ -2398,10 +2398,12 @@ private:
                     // extra vN placeholders on legitimate disjoint-liveness
                     // merges across the corpus.
                     if (victimInfo.definedByCall) {
-                        LLVM_DEBUG(llvm::dbgs()
-                            << "    [v2 phase4-callguard] keeping call-result "
-                               "var '" << victimInfo.decl.getVarName()
-                            << "' (id=" << victimId << ") distinct\n");
+                        // v2-exp instrumentation (0.1.1): prove the guard fires.
+                        llvm::errs() << "[v2-exp] phase4-callguard REFUSED merge of "
+                                        "call-result var '"
+                                     << victimInfo.decl.getVarName()
+                                     << "' (id=" << victimId << ") into '"
+                                     << canonInfo.decl.getVarName() << "'\n";
                         continue;
                     }
 
