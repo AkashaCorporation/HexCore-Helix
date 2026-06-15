@@ -63,3 +63,6 @@ Thumbs.db
 # Helix v2 sandbox
 *.exe
 /engine/build_v2_output.txt
+
+# v2 judge scratch
+/tools/helix-validate/_judge/
