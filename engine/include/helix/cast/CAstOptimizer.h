@@ -86,6 +86,16 @@ public:
     void initializeReadBeforeWriteVars(CFuncDecl& func);
     void reanalyzeConfidence(CFuncDecl& func);
 
+    /// Remove pure stores to variables that are NEVER read anywhere in the
+    /// function (globally dead).  The existing dseStmtList only eliminates
+    /// TOP-LEVEL dead stores (it treats nested if/switch scopes conservatively
+    /// as all-live), so dead stores buried in the deeply-nested structured form
+    /// the scf-structurer produces survive -- e.g. the `var_0 = 0xADDR`
+    /// PC-tracking shadow stores (var_0 is written 12x, read 0x).  A whole-
+    /// function read-set makes removal unconditionally sound: if a name is never
+    /// read, every pure (call-free) store to it is dead regardless of scope.
+    void removeGloballyDeadStores(CFuncDecl& func);
+
     /// M4 (SAILR-grounded): dissolve the RVSDG exit-dispatcher noise the v1.0
     /// scf-structurer emits.  transformCFGToSCF lowers multi-exit continuations
     /// as a synthetic i32 selector (scf_r<id>, id>=900000) set per region arm and

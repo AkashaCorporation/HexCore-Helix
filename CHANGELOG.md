@@ -132,8 +132,19 @@ dispatcher selectors -- a `goto`/inline P4 (not yet done) would close it -- and 
 the per-instruction `var_0 = 0xADDR` PC-tracking noise (a separate, non-dispatcher
 source). 12/12 no crash on the fresh corpus; x86 fixtures unchanged.
 
-NEXT = investigate the `var_0` PC-tracking noise (likely a quicker line-count win) +
-P4 (eliminate the dispatcher via goto/inline = the last ~2x). Code staged on
+**`removeGloballyDeadStores` (the `var_0` PC-noise fix).** The deeply-nested
+structured form the scf-structurer produces left dead `var_0 = 0xADDR` PC-tracking
+shadow stores (var_0 written 12x, read 0x) that the existing dseStmtList misses --
+it only eliminates TOP-LEVEL dead stores (nested if/switch scopes are treated
+conservatively as all-live). A new whole-function pass removes pure (call-free)
+stores to variables that never appear in the function's read-set anywhere -- sound
+regardless of scope. Cut **15-22% more lines** corpus-wide (mem_free 131 -> 102 vs
+IDA 82; context_mmap 1109 -> 952; mem_import 1068 -> 869); x86 fixtures byte-identical
+(they had no globally-dead stores); 0 crashes; correctness preserved (mem_free still
+matches IDA's control flow).
+
+NEXT = P4 (eliminate the dispatcher entirely via goto/inline = the last gap to IDA;
+IDA uses `goto LABEL_4` for the multi-entry continuation). Code staged on
 `scf-structurer-v1`; RAG write-up in `HexCore-Helix-Original/rag/18_*`.
 
 

@@ -282,6 +282,10 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     // erases ifs whose then AND else bodies are both empty (same predicate the
     // earlier sweeps use).
     removeEmptyIfStatements(func);
+    // Sweep nested/globally-dead pure stores (e.g. the scf-structurer's deeply-
+    // nested `var_0 = 0xADDR` PC-tracking shadow) that the top-level-only
+    // dseStmtList leaves behind; then drop the now-unreferenced declarations.
+    removeGloballyDeadStores(func);
     removeUnusedDeclarations(func);
     reanalyzeConfidence(func);
 }
@@ -6799,6 +6803,133 @@ void CAstOptimizer::eliminateConstBranchesInList(std::vector<StmtPtr>& stmts) {
 
 void CAstOptimizer::eliminateConstantBranches(CFuncDecl& func) {
     eliminateConstBranchesInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pass: removeGloballyDeadStores — drop pure stores to never-read variables
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void CAstOptimizer::removeGloballyDeadStores(CFuncDecl& func) {
+    // 1) collect every variable name READ as a VALUE anywhere (a plain assign
+    //    target is a write, not a read; a compound target or a deref/field/
+    //    subscript target IS read).
+    std::unordered_set<std::string> reads;
+    std::function<void(const std::vector<StmtPtr>&)> collectReads =
+        [&](const std::vector<StmtPtr>& stmts) {
+            for (const auto& sp : stmts) {
+                if (!sp)
+                    continue;
+                switch (sp->getKind()) {
+                case NodeKind::AssignStmt: {
+                    const auto& a = static_cast<const CAssignStmt&>(*sp);
+                    collectVarRefs(a.value.get(), reads);
+                    if (a.target &&
+                        (!a.compoundOp.empty() ||
+                         a.target->getKind() != NodeKind::VarRefExpr))
+                        collectVarRefs(a.target.get(), reads);
+                    break;
+                }
+                case NodeKind::IfStmt: {
+                    const auto& s = static_cast<const CIfStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectReads(s.thenBody);
+                    collectReads(s.elseBody);
+                    break;
+                }
+                case NodeKind::WhileStmt: {
+                    const auto& s = static_cast<const CWhileStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectReads(s.body);
+                    break;
+                }
+                case NodeKind::DoWhileStmt: {
+                    const auto& s = static_cast<const CDoWhileStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectReads(s.body);
+                    break;
+                }
+                case NodeKind::ForStmt: {
+                    const auto& s = static_cast<const CForStmt&>(*sp);
+                    collectVarRefs(s.condition.get(), reads);
+                    collectReads(s.body);
+                    break;
+                }
+                case NodeKind::SwitchStmt: {
+                    const auto& s = static_cast<const CSwitchStmt&>(*sp);
+                    collectVarRefs(s.selector.get(), reads);
+                    for (const auto& c : s.cases)
+                        collectReads(c.body);
+                    break;
+                }
+                case NodeKind::ReturnStmt:
+                    collectVarRefs(static_cast<const CReturnStmt&>(*sp).value.get(),
+                                   reads);
+                    break;
+                case NodeKind::ExprStmt:
+                    collectVarRefs(static_cast<const CExprStmt&>(*sp).expr.get(),
+                                   reads);
+                    break;
+                case NodeKind::BlockStmt:
+                    collectReads(static_cast<const CBlockStmt&>(*sp).stmts);
+                    break;
+                default:
+                    break;
+                }
+            }
+        };
+    collectReads(func.body);
+
+    // 2) recursively erase pure (call-free) stores whose target is a plain
+    //    variable that never appears in the read-set.
+    std::function<void(std::vector<StmtPtr>&)> removeDead =
+        [&](std::vector<StmtPtr>& stmts) {
+            for (auto& sp : stmts) {
+                if (!sp)
+                    continue;
+                switch (sp->getKind()) {
+                case NodeKind::IfStmt: {
+                    auto& s = static_cast<CIfStmt&>(*sp);
+                    removeDead(s.thenBody);
+                    removeDead(s.elseBody);
+                    break;
+                }
+                case NodeKind::WhileStmt:
+                    removeDead(static_cast<CWhileStmt&>(*sp).body);
+                    break;
+                case NodeKind::DoWhileStmt:
+                    removeDead(static_cast<CDoWhileStmt&>(*sp).body);
+                    break;
+                case NodeKind::ForStmt:
+                    removeDead(static_cast<CForStmt&>(*sp).body);
+                    break;
+                case NodeKind::SwitchStmt:
+                    for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                        removeDead(c.body);
+                    break;
+                case NodeKind::BlockStmt:
+                    removeDead(static_cast<CBlockStmt&>(*sp).stmts);
+                    break;
+                default:
+                    break;
+                }
+            }
+            std::erase_if(stmts, [&](const StmtPtr& sp) {
+                if (!sp || sp->getKind() != NodeKind::AssignStmt)
+                    return false;
+                const auto& a = static_cast<const CAssignStmt&>(*sp);
+                if (!a.compoundOp.empty() || !a.target ||
+                    a.target->getKind() != NodeKind::VarRefExpr)
+                    return false;
+                const std::string& nm =
+                    static_cast<const CVarRefExpr&>(*a.target).varName;
+                if (reads.count(nm))
+                    return false;  // read somewhere -> keep
+                if (exprHasCall(a.value.get()))
+                    return false;  // RHS has a side effect -> keep
+                return true;       // globally-dead pure store
+            });
+        };
+    removeDead(func.body);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
