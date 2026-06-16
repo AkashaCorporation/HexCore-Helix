@@ -3,6 +3,42 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [Unreleased] - v1.0 structurer rewrite: M0 PROVEN + M1 bridge started (branch scf-structurer-v1) - 2026-06-15
+
+WIP, behind the `HELIX_SCF_SPIKE` env gate; not landed (no version bump). This is
+the executable proof of the `STRUCTURER_V1_REWRITE_SCOPING.md` direction: reuse
+LLVM 18.1.8's `mlir::transformCFGToSCF` (the RVSDG / correct-by-construction
+structurer) instead of the hand-rolled block-moving pass that the
+`[Investigation]` entry below proved un-patchable.
+
+**M0 - PROVEN.** Added `runSCFSpike` + `HelixSCFInterface : mlir::CFGToSCFInterface`
+(mirrors the upstream cf->scf reference): remove-unreachable -> strip block-args
+(poison, spike-only) -> rewrite every branch terminator (helix_low.jmp/jcc +
+llvm.br/cond_br) to operand-less cf -> DominanceInfo -> `transformCFGToSCF`.
+Result on `kbase_mem_free` (the function the legacy pass mangles into a
+premature-`return` stub): **8 scf.if + value-routing scf.yield, single
+`helix_low.ret` at the END, body fully reachable, NO premature return, NO
+0xC0000409 crash.** Breadth: **15/15 valid inputs structured, 0 crashes** -
+all 7 kbase (incl. mem_alloc/import that crash under the old guard), the rootkit
+hooks, WWZ `bone_pos_calc` (the ESP fn), and **`after.ll`, the 980-block
+callfuscated irreducible boss the old structurer cannot do.** (The only 2 non-OK
+are pre-existing malformed `.ll` that fail at LLVM-IR parse, unrelated.)
+
+**M1 - bridge started.** `bridgeSCFIfToHelixHigh`: `scf.if -> helix_high.if`,
+de-SSA'ing region results (incl. the RVSDG exit-dispatcher i32 selectors) into a
+fresh temp var assigned in each arm (replacing `scf.yield`) and read after the op,
+so the downstream pipeline (RecoverVariables ... CAstBuilder) is unchanged. On
+mem_free: all 8 scf.if -> 8 helix_high.if, exit=0. **Remaining for M1:**
+`scf.index_switch -> helix_high.switch` + `scf.while -> helix_high.while` (same
+mechanic), proper block-arg normalization (replace the poison-strip), the
+`--use-scf-structurer` flag (legacy as fallback), then the end-to-end mem_free
+emit + scoreboard gate (expect the "unreachable-after-return" quad to vanish).
+The selector/dispatcher noise the bridge faithfully carries is what the M4
+SAILR-style deopt pass will dissolve into idiomatic if/else.
+
+Commits: fc062f9 (M0), 54887aa (M1 scf.if bridge).
+
+
 ## [0.1.8] - Self-ref false-positive: pointer walks are not suspicious - +5pp - 2026-06-15
 
 A second structurer-independent, honest-confidence win on `kbase_mem_import`:
