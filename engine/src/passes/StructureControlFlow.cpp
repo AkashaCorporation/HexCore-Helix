@@ -202,6 +202,81 @@ public:
     }
 };
 
+// [M1] Bridge scf.* -> helix_high.*, de-SSA'ing region results into variables so
+// the downstream pipeline (RecoverVariables ... CAstBuilder) sees the same shape
+// the legacy structurer produced.  Processes innermost-first.  Result values
+// (incl. the RVSDG exit-dispatcher i32 selectors) become a fresh temp var that is
+// assigned in each region (replacing scf.yield) and read after the op.
+static unsigned g_scfBridgeVarId = 900000;  // high base to avoid colliding w/ recovered vars
+
+static void bridgeSCFIfToHelixHigh(mlir::scf::IfOp ifOp) {
+    mlir::OpBuilder b(ifOp);
+    mlir::Location loc = ifOp.getLoc();
+    unsigned n = ifOp.getNumResults();
+
+    // 1) one temp var per result.
+    llvm::SmallVector<std::pair<uint32_t, std::string>> vars;
+    for (unsigned i = 0; i < n; ++i) {
+        uint32_t id = g_scfBridgeVarId++;
+        std::string name = std::format("scf_r{}", id);
+        b.setInsertionPoint(ifOp);
+        b.create<helix::high::VarDeclOp>(
+            loc, id, name, helix::high::StorageKind::Temporary,
+            mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+        vars.emplace_back(id, name);
+    }
+
+    // 2) in each region, replace scf.yield(vals) with per-result assigns + a
+    //    value-less helix_high.yield.
+    for (mlir::Region* reg : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+        if (reg->empty())
+            continue;
+        for (mlir::Block& blk : *reg) {
+            auto y = mlir::dyn_cast_or_null<mlir::scf::YieldOp>(blk.getTerminator());
+            if (!y)
+                continue;
+            mlir::OpBuilder yb(y);
+            for (unsigned i = 0; i < n; ++i) {
+                auto vref = yb.create<helix::high::VarRefOp>(
+                    loc, y.getOperand(i).getType(), vars[i].first,
+                    vars[i].second, mlir::IntegerAttr{});
+                yb.create<helix::high::AssignOp>(
+                    loc, vref.getResult(), y.getOperand(i), mlir::IntegerAttr{});
+            }
+            yb.create<helix::high::YieldOp>(loc, mlir::Value{});
+            y.erase();
+        }
+    }
+
+    // 3) build helix_high.if and move the regions in.
+    b.setInsertionPoint(ifOp);
+    auto hif = b.create<helix::high::IfOp>(loc, ifOp.getCondition(),
+                                           mlir::IntegerAttr{});
+    hif.getThenRegion().takeBody(ifOp.getThenRegion());
+    hif.getElseRegion().takeBody(ifOp.getElseRegion());
+
+    // 4) replace result uses with var reads placed after the if.
+    b.setInsertionPointAfter(hif);
+    for (unsigned i = 0; i < n; ++i) {
+        auto vref = b.create<helix::high::VarRefOp>(
+            loc, ifOp.getResult(i).getType(), vars[i].first, vars[i].second,
+            mlir::IntegerAttr{});
+        ifOp.getResult(i).replaceAllUsesWith(vref.getResult());
+    }
+    ifOp.erase();
+}
+
+static void bridgeSCFToHelixHigh(helix::low::FuncOp func) {
+    // Innermost-first so a child scf op is bridged before its parent.
+    llvm::SmallVector<mlir::scf::IfOp> ifs;
+    func.walk<mlir::WalkOrder::PostOrder>([&](mlir::scf::IfOp op) {
+        ifs.push_back(op);
+    });
+    for (auto op : ifs)
+        bridgeSCFIfToHelixHigh(op);
+    // TODO[M1]: scf.index_switch -> helix_high.switch, scf.while -> helix_high.while.
+}
+
 // Run the spike on one HelixLow function: convert jmp/jcc -> cf, then lift to scf.
 static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
     if (func.getBody().empty())
@@ -308,6 +383,12 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
     HelixSCFInterface iface;
     auto changed = mlir::transformCFGToSCF(func.getBody(), iface, domInfo);
     std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-transformCFGToSCF\n",
+                 func.getSymName().str().c_str());
+    std::fflush(stderr);
+
+    // [M1] bridge scf.if -> helix_high.if (switch/while still TODO).
+    bridgeSCFToHelixHigh(func);
+    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-bridge\n",
                  func.getSymName().str().c_str());
     std::fflush(stderr);
     if (mlir::failed(changed)) {
