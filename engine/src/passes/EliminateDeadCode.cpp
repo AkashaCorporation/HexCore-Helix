@@ -564,7 +564,7 @@ static bool hasObservableSideEffects(Operation* op) {
 ///
 /// Live operations:
 ///   - helix_low.jcc, helix_low.jmp                  (branch — affects control flow)
-///   - helix_high.if / while / do_while / for        (structured control flow)
+///   - helix_high.if / switch / while / do_while / for (structured control flow)
 ///   - helix_low.call / variadic_call, helix_high.call (function call — observable)
 ///   - helix_low.ret, helix_high.return              (return — observable output)
 ///   - helix_low.mem.write                           (memory write — observable)
@@ -572,6 +572,14 @@ static bool isLiveConsumer(Operation* op) {
     return isa<helix::low::JccOp>(op) ||
            isa<helix::low::JmpOp>(op) ||
            isa<helix::high::IfOp>(op) ||
+           // helix_high.switch consumes its SELECTOR as a control-flow input.
+           // It was missing here: the M1 scf-structurer bridge emits
+           // helix_high.switch for the RVSDG exit-dispatcher, whose synthetic
+           // selector (scf_r*) is read ONLY at the switch -- so without this the
+           // selector's reads are invisible to liveness, the selector var is DCE'd
+           // as dead, and the dispatcher ends up reading a phantom (=0) value,
+           // mis-guarding the dispatched continuation.
+           isa<helix::high::SwitchOp>(op) ||
            isa<helix::high::WhileOp>(op) ||
            isa<helix::high::DoWhileOp>(op) ||
            isa<helix::high::ForOp>(op) ||

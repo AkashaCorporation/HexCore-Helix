@@ -219,6 +219,11 @@ static bool isCommutative(BinaryOp op) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void CAstOptimizer::optimize(CFuncDecl& func) {
+    // M4: collapse the RVSDG exit-dispatcher switches FIRST, so every existing
+    // pass below (copy-prop, dead-store, empty-if, invert, polarity) then cleans
+    // up the now-ordinary if/else and the exposed scf_r selector copy chains.
+    dissolveExitDispatchers(func);   // P3: switch(selector) -> if/else
+    coalesceSelectorChains(func);    // P2: collapse the scf_r routing copy chains
     removePrologueEpilogue(func);
     eliminateInfrastructure(func);
     eliminateNullPtrStores(func);
@@ -4535,6 +4540,14 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
             const std::string& tgt =
                 static_cast<const CVarRefExpr*>(a.target.get())->varName;
 
+            // M4 (fix-A): keep scf_* selector / loop-carry stores live
+            // unconditionally; their consumer is a switch/if/loop condition that a
+            // flat backward liveness scan can under-count across structured scopes.
+            if (tgt.starts_with("scf_")) {
+                collectVarRefs(a.value.get(), live);
+                break;
+            }
+
             // Never DSE assignments with call side-effects.
             if (exprHasCall(a.value.get())) {
                 live.erase(tgt);
@@ -6786,6 +6799,260 @@ void CAstOptimizer::eliminateConstBranchesInList(std::vector<StmtPtr>& stmts) {
 
 void CAstOptimizer::eliminateConstantBranches(CFuncDecl& func) {
     eliminateConstBranchesInList(func.body);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// M4: RVSDG exit-dispatcher deopt (SAILR "Reverting Switch Lowering")
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// scf_r<digits> — the scf-structurer bridge's synthetic exit-selector temporaries
+/// (StructureControlFlow.cpp g_scfBridgeVarId, ids >= 900000, engine-reserved so
+/// they never collide with a recovered program variable).  scf_w* (loop-carry) is
+/// a different class handled by the loop passes and is deliberately NOT matched.
+bool isSelectorVarName(std::string_view n) {
+    if (n.size() < 6 || n.compare(0, 5, "scf_r") != 0)
+        return false;
+    for (size_t i = 5; i < n.size(); ++i)
+        if (n[i] < '0' || n[i] > '9')
+            return false;
+    return true;
+}
+
+const CVarRefExpr* asSelectorRef(const CExpr* e) {
+    if (e && e->getKind() == NodeKind::VarRefExpr) {
+        const auto* v = static_cast<const CVarRefExpr*>(e);
+        if (isSelectorVarName(v->varName))
+            return v;
+    }
+    return nullptr;
+}
+
+void stripTrailingBreak(std::vector<StmtPtr>& body) {
+    if (!body.empty() && body.back() &&
+        body.back()->getKind() == NodeKind::BreakStmt)
+        body.pop_back();
+}
+
+/// Collapse an RVSDG exit-dispatcher `switch(selector)` (selector = scf_r*, with at
+/// most two real cases + a default) into an `if/else` chain.  Returns the
+/// replacement statement, or nullptr when `sw` is a REAL switch (non-synthetic
+/// selector or >2 cases = a genuine jump table) that must never be rewritten.
+///
+/// `switch(sel){case c0:b0; case c1:b1; default:bd}` becomes
+/// `if (sel==c0){b0} else if (sel==c1){b1} else {bd}`; the trailing `break` that
+/// terminated each dispatcher arm is dropped.  Exhaustiveness is guaranteed by
+/// construction (an RVSDG selector picks exactly one region), and the downstream
+/// invertEmptyIfThen / removeEmptyIfStatements / simplifyConditionPolarity passes
+/// finish the cosmetic shaping (e.g. `if(sel==0){}else{B}` -> `if(sel!=0){B}`).
+StmtPtr collapseDispatcher(CSwitchStmt& sw) {
+    const CVarRefExpr* sel = asSelectorRef(sw.selector.get());
+    if (!sel)
+        return nullptr;
+
+    unsigned nonDefault = 0;
+    for (const auto& c : sw.cases)
+        if (!c.isDefault)
+            ++nonDefault;
+    if (nonDefault == 0 || nonDefault > 2)
+        return nullptr;
+
+    // Capture the selector identity before moving bodies out of `sw`.
+    uint32_t selId = sel->varId;
+    std::string selName = sel->varName;
+    CTypePtr selTy = sel->type;
+
+    std::vector<std::pair<int64_t, std::vector<StmtPtr>>> reals;
+    std::vector<StmtPtr> defaultBody;
+    for (auto& c : sw.cases) {
+        stripTrailingBreak(c.body);
+        if (c.isDefault)
+            defaultBody = std::move(c.body);
+        else
+            reals.emplace_back(c.value, std::move(c.body));
+    }
+
+    // Build the chain bottom-up: the default seeds the innermost else; iterate the
+    // real cases in reverse so the first case ends up the outermost `if`.
+    std::vector<StmtPtr> chain = std::move(defaultBody);
+    for (auto it = reals.rbegin(); it != reals.rend(); ++it) {
+        auto cond = std::make_unique<CBinaryExpr>(
+            BinaryOp::Eq,
+            std::make_unique<CVarRefExpr>(selId, selName, selTy),
+            std::make_unique<CIntLitExpr>(it->first, CType::int32()),
+            CType::boolTy());
+        auto ifs = std::make_unique<CIfStmt>(
+            std::move(cond), std::move(it->second), std::move(chain),
+            sw.getAddress());
+        chain.clear();
+        chain.push_back(std::move(ifs));
+    }
+    if (chain.size() == 1)
+        return std::move(chain.front());
+    if (chain.empty())
+        return nullptr;
+    return std::make_unique<CBlockStmt>(std::move(chain), sw.getAddress());
+}
+
+} // namespace
+
+bool CAstOptimizer::dissolveDispatchersInList(std::vector<StmtPtr>& stmts) {
+    bool changed = false;
+    // Recurse first (post-order): collapse inner dispatchers before their parent,
+    // so the parent takes already-simplified bodies.
+    for (auto& sp : stmts) {
+        if (!sp)
+            continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            changed |= dissolveDispatchersInList(s.thenBody);
+            changed |= dissolveDispatchersInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            changed |= dissolveDispatchersInList(static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            changed |= dissolveDispatchersInList(static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            changed |= dissolveDispatchersInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                changed |= dissolveDispatchersInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            changed |= dissolveDispatchersInList(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+    // Collapse dispatcher switches in this list.
+    for (auto& sp : stmts) {
+        if (sp && sp->getKind() == NodeKind::SwitchStmt) {
+            if (auto repl = collapseDispatcher(static_cast<CSwitchStmt&>(*sp))) {
+                sp = std::move(repl);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+void CAstOptimizer::dissolveExitDispatchers(CFuncDecl& func) {
+    // Fixed point: collapsing an inner dispatcher can expose an outer one
+    // (kbase_mem_free nests two levels).  Bounded to avoid any pathological loop.
+    for (int iter = 0; iter < 8; ++iter)
+        if (!dissolveDispatchersInList(func.body))
+            break;
+}
+
+namespace {
+
+// Recursively gather selector copy edges (scf_rDST = scf_rSRC) for the union-find.
+void gatherSelectorCopies(
+    const std::vector<StmtPtr>& stmts,
+    const std::function<void(const std::string&, const std::string&)>& addEdge) {
+    for (const auto& sp : stmts) {
+        if (!sp)
+            continue;
+        if (sp->getKind() == NodeKind::AssignStmt) {
+            const auto& a = static_cast<const CAssignStmt&>(*sp);
+            if (a.compoundOp.empty() && a.target && a.value &&
+                a.target->getKind() == NodeKind::VarRefExpr &&
+                a.value->getKind() == NodeKind::VarRefExpr) {
+                const auto& t = static_cast<const CVarRefExpr&>(*a.target);
+                const auto& v = static_cast<const CVarRefExpr&>(*a.value);
+                if (isSelectorVarName(t.varName) && isSelectorVarName(v.varName))
+                    addEdge(t.varName, v.varName);
+            }
+        }
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            const auto& s = static_cast<const CIfStmt&>(*sp);
+            gatherSelectorCopies(s.thenBody, addEdge);
+            gatherSelectorCopies(s.elseBody, addEdge);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            gatherSelectorCopies(static_cast<const CWhileStmt&>(*sp).body, addEdge);
+            break;
+        case NodeKind::DoWhileStmt:
+            gatherSelectorCopies(static_cast<const CDoWhileStmt&>(*sp).body, addEdge);
+            break;
+        case NodeKind::ForStmt:
+            gatherSelectorCopies(static_cast<const CForStmt&>(*sp).body, addEdge);
+            break;
+        case NodeKind::SwitchStmt:
+            for (const auto& c : static_cast<const CSwitchStmt&>(*sp).cases)
+                gatherSelectorCopies(c.body, addEdge);
+            break;
+        case NodeKind::BlockStmt:
+            gatherSelectorCopies(static_cast<const CBlockStmt&>(*sp).stmts, addEdge);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+} // namespace
+
+void CAstOptimizer::coalesceSelectorChains(CFuncDecl& func) {
+    // 1) union-find over selector names connected by pure copies.  scf_r names
+    //    are "scf_r" + a zero-padded-free decimal id, so a plain string compare
+    //    orders them by id -- pick the lexicographically-smallest as the rep
+    //    (deterministic; the consumed selector tends to be the lowest id).
+    std::unordered_map<std::string, std::string> parent;
+    std::function<std::string(std::string)> find = [&](std::string x) {
+        while (parent.count(x) && parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+    auto unite = [&](const std::string& a, const std::string& b) {
+        if (!parent.count(a)) parent[a] = a;
+        if (!parent.count(b)) parent[b] = b;
+        std::string ra = find(a), rb = find(b);
+        if (ra == rb) return;
+        if (rb < ra) std::swap(ra, rb);  // smaller name is the representative
+        parent[rb] = ra;
+    };
+    gatherSelectorCopies(func.body, unite);
+    if (parent.empty())
+        return;
+
+    // 2) rename map: every selector that isn't already its own rep.
+    std::unordered_map<std::string, std::string> renames;
+    for (const auto& [name, _] : parent) {
+        std::string rep = find(name);
+        if (rep != name)
+            renames[name] = rep;
+    }
+    if (renames.empty())
+        return;
+
+    // 3) rewrite all references, then rename + dedupe the declarations.  The
+    //    routing copies become `rep = rep` (removeSelfAssignments erases them);
+    //    the merged-away decls collapse to one (a later removeUnusedDeclarations
+    //    drops any that end up unread).
+    renameInStmtList(func.body, renames);
+    std::unordered_set<std::string> seenDecl;
+    for (auto& vd : func.localVars) {
+        auto it = renames.find(vd.varName);
+        if (it != renames.end())
+            vd.varName = it->second;
+    }
+    std::erase_if(func.localVars, [&](const CVarDecl& vd) {
+        if (isSelectorVarName(vd.varName) && !seenDecl.insert(vd.varName).second)
+            return true;  // duplicate selector decl after coalescing
+        return false;
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

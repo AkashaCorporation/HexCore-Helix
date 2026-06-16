@@ -86,6 +86,28 @@ public:
     void initializeReadBeforeWriteVars(CFuncDecl& func);
     void reanalyzeConfidence(CFuncDecl& func);
 
+    /// M4 (SAILR-grounded): dissolve the RVSDG exit-dispatcher noise the v1.0
+    /// scf-structurer emits.  transformCFGToSCF lowers multi-exit continuations
+    /// as a synthetic i32 selector (scf_r<id>, id>=900000) set per region arm and
+    /// consumed by a single-/two-case `switch(selector)`.  SAILR "Reverting Switch
+    /// Lowering" + DREAM condition-aware refinement: such a switch over a
+    /// var-vs-constant IS an if/else.  Collapse them to if/else chains; the
+    /// existing copy-prop + DCE then clear the now-exposed selector copy chains.
+    /// Gated on the scf_r* synthetic name + <=2 real cases so real jump tables are
+    /// never touched.
+    void dissolveExitDispatchers(CFuncDecl& func);
+
+    /// M4 P2 (DREAM++ congruence coalescing): collapse the scf_r* selector
+    /// ROUTING chains.  After dissolveExitDispatchers the dispatcher is an
+    /// `if (scf_rK)` but the selector value is still routed up through a tree of
+    /// pure copies (`scf_rB = scf_rA; scf_rC = scf_rB; ...`).  These form a
+    /// copy tree (no interference -- each routing selector's value flows only to
+    /// its parent), so coalescing every copy-connected scf_r* to one
+    /// representative is sound; the copies become `rep = rep` self-assigns that
+    /// the existing removeSelfAssignments + removeUnusedDeclarations then erase,
+    /// leaving each branch assigning the consumed selector directly.
+    void coalesceSelectorChains(CFuncDecl& func);
+
     /// Apply user-defined variable renames to the entire AST.
     /// Walks all CVarRefExpr nodes and VarDecl names, replacing
     /// occurrences of old_name with new_name from the rename map.
@@ -219,6 +241,9 @@ private:
 
     // ── Constant branch elimination helpers ──────────────────────────────
     static void eliminateConstBranchesInList(std::vector<StmtPtr>& stmts);
+
+    // ── M4 exit-dispatcher deopt helpers ──────────────────────────────────
+    static bool dissolveDispatchersInList(std::vector<StmtPtr>& stmts);
 
     // ── Empty if-statement removal helpers ────────────────────────────
     static void removeEmptyIfsInList(std::vector<StmtPtr>& stmts);

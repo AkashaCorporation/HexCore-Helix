@@ -1182,6 +1182,12 @@ std::vector<StmtPtr> CAstBuilder::buildRegionBody(Region& region) {
                 targetStr.find("*(") != std::string::npos)
                 continue;
 
+            // M4 (fix-A): never DSE scf_* dispatcher selectors / loop-carry vars
+            // (their consumer is a switch/if/loop selector this RHS-only scan does
+            // not see -- see the precomputeDeadStores guard for the full rationale).
+            if (targetStr.starts_with("scf_"))
+                continue;
+
             // Check RHS for side effects
             auto* valueDef = assignOp.getValue().getDefiningOp();
             bool hasSideEffects =
@@ -1349,8 +1355,13 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             lastRegValue_[targetStr] == valueStr)
             return nullptr;
 
-        // Invalidate cached entries that depend on the target
-        if (!targetIsOpaque) {
+        // Invalidate cached entries that depend on the target.  M4 (fix-A): never
+        // CACHE an scf_* selector / loop-carry copy chain either -- caching
+        // `scf_rX -> scf_rY` would let resolveTransitive (or a value-equivalence
+        // lookup) collapse the path-dependent dispatcher selector.
+        const bool targetIsSelector = targetStr.starts_with("scf_");
+        const bool valueIsSelector = valueStr.starts_with("scf_");
+        if (!targetIsOpaque && !targetIsSelector) {
             for (auto it = lastRegValue_.begin(); it != lastRegValue_.end();) {
                 if (it->first == targetStr ||
                     it->second.find(targetStr) != std::string::npos)
@@ -1361,12 +1372,13 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             // Only cache when the value is also representable; storing
             // "<targetStr> -> __expr" causes downstream substitutions to
             // emit the placeholder.
-            if (!valueIsOpaque)
+            if (!valueIsOpaque && !valueIsSelector)
                 lastRegValue_[targetStr] = valueStr;
         }
 
-        // Track value equivalence (skip when either side is opaque)
-        if (!targetIsOpaque && !valueIsOpaque) {
+        // Track value equivalence (skip when either side is opaque or a selector)
+        if (!targetIsOpaque && !valueIsOpaque && !targetIsSelector &&
+            !valueIsSelector) {
             auto existingIt = exprToBestName_.find(valueStr);
             bool shouldUpdate = (existingIt == exprToBestName_.end());
             if (!shouldUpdate) {
@@ -3683,6 +3695,14 @@ bool CAstBuilder::isPrologueArtifact(Operation* op) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 std::string CAstBuilder::resolveTransitive(const std::string& name) const {
+    // M4 (fix-A): never resolve the scf-structurer's exit-dispatcher selectors /
+    // loop-carry vars (scf_*) through the copy-tracking chain.  Their routing
+    // copies (scf_rX = scf_rY) look like ordinary register copies, but the chain
+    // root is PATH-DEPENDENT (set to a different constant per branch), so resolving
+    // a switch/if selector to the root is unsound -- it collapses the dispatcher to
+    // one path's value and mis-guards the continuation.  Keep the selector as-is.
+    if (name.starts_with("scf_"))
+        return name;
     std::string current = name;
     std::unordered_set<std::string> visited;
     constexpr unsigned kMaxHops = 5;
@@ -3836,6 +3856,15 @@ CAstBuilder::precomputeDeadStores(Block& block) {
             if (targetStr.find("->") != std::string::npos ||
                 targetStr.find("*(") != std::string::npos ||
                 targetStr.find("[") != std::string::npos)
+                continue;
+
+            // M4 (fix-A): never DSE the scf-structurer's exit-dispatcher selectors
+            // / loop-carry vars (scf_*).  Their consumer is a switch/if/loop
+            // selector, NOT an assign RHS, so this assign-RHS-only liveness scan
+            // cannot see the read and would wrongly kill the routing def -- leaving
+            // the phantom read alive and the dispatched continuation mis-guarded.
+            // Engine-reserved names (id>=900000), so the prefix test is exact.
+            if (targetStr.starts_with("scf_"))
                 continue;
 
             // Never DSE SIMD registers

@@ -3,7 +3,7 @@
 All notable changes to HexCore Helix are documented here.
 
 
-## [Unreleased] - v1.0 structurer rewrite: M0 PROVEN + M1 bridges COMPLETE (branch scf-structurer-v1) - 2026-06-15
+## [Unreleased] - v1.0 structurer rewrite: M0-M2 + the selector-survival fix + M4 deopt (branch scf-structurer-v1) - 2026-06-16
 
 WIP, behind the `HELIX_SCF_SPIKE` env gate; not landed (no version bump). This is
 the executable proof of the `STRUCTURER_V1_REWRITE_SCOPING.md` direction: reuse
@@ -61,10 +61,80 @@ this corpus - all call-sites preserved, no poison/undef leak in emitted C); prop
 normalization deferred. The opt-in is the `HELIX_SCF_SPIKE` env gate (legacy is the
 default); a `--use-scf-structurer` CLI alias is trivial M5 polish.
 
-Commits: fc062f9 (M0), 54887aa (M1 scf.if bridge); the index_switch + do_while
-bridges + parallel-copy fix are staged on `scf-structurer-v1` (uncommitted pending
-review sign-off). NEXT = M2 (rootkit + nested/multi-loop the kbase corpus lacks),
-M3 (WWZ + after.ll stress), M4 (the readability deopt that recovers confidence).
+Commits: fc062f9 (M0), 54887aa (M1 scf.if bridge), 224d080 (M1 index_switch +
+do_while bridges + parallel-copy fix, adversarial-review-cleared).
+
+**M2 - corpus stress (rootkit + boss), all no-crash.** Rootkit kernelmonarch hooks
+RESCUED: hook_read 20-unreachable/36.7% -> 0/53% (+16.3pp), hook_write +
+hook_ia32_write 13/45.2 -> 0/59 (+13.8pp) -- on the rootkit, unlike kbase, the
+confidence is NOT pinned at 50% (less dispatcher nesting), so the spike rescues AND
+raises confidence. fh_install_hook/hooks structure their loop as a `do_while`.
+`after.ll` (the 980-block callfuscated boss) runs end-to-end with the bridges,
+exit 0, no crash (output is still the flat deflattened call chain -- re-rolling that
+is the separate Stage-2 gap). Validated on FRESH `.ll`: a re-lift (Remill drifted)
+shrank the 3 dispatcher-heavy fns 17-20%, so the structurer is now validated against
+current-Remill input, regenerated via the `.hexcore_job.json` pipeline.
+
+**THE SELECTOR-SURVIVAL FIX (correctness, root-caused via M4).** Collapsing the
+RVSDG exit-dispatcher to `if` (M4 below) exposed that the dispatcher's synthetic
+selector (`scf_r*`) was being DESTROYED before it reached correct C: on kbase_mem_free
+`if (scf_r900000)` read a selector that was only ever 0 (a read-before-write `=0`
+init) -> the region-lookup continuation was DEAD, semantically WRONG (the spike's
+"full reachable body" was STRUCTURALLY complete but the DISPATCH ROUTING was broken,
+which call-site/line counts had not caught). **Root cause = ONE missing op in a
+liveness allowlist: `EliminateDeadCode.cpp isLiveConsumer()` enumerated the control-
+flow ops that count as a live use (helix_high.if/while/do_while/for + low branches/
+calls/ret/memwrite) but was MISSING `helix::high::SwitchOp`** -- the op the M1 bridge
+emits for the dispatcher. Its selector is read ONLY at the switch, so with switch
+absent from isLiveConsumer the read was invisible to liveness, the selector var was
+DCE'd as dead, and the dispatcher fell back to a phantom 0. FIX = add
+`isa<helix::high::SwitchOp>(op)` to isLiveConsumer (one line). **kbase_mem_free is now
+SEMANTICALLY CORRECT and matches IDA's control flow** (scf_r=1 survives on the
+LABEL_4 paths, the region-lookup runs on exactly the right paths). Defensive
+companions so no later pass re-destroys the now-surviving selectors: CAstBuilder
+dead-store guards (precomputeDeadStores + cross-block prescan skip scf_*, since
+their assign-RHS-only scan also can't see a switch/if selector read),
+`resolveTransitive` no-resolve + `lastRegValue_`/`exprToBestName_` no-cache for scf_*
+(stop the unsound path-dependent copy-chain collapse), and a dseStmtList keep-scf-live
+guard. LESSON: when the rewrite introduced a NEW helix_high op (switch), every
+liveness/DCE allowlist that enumerates control-flow ops had to learn it.
+
+**M4 - SAILR-grounded dispatcher deopt (readability, on now-CORRECT code).** Grounded
+in a 5-paper read (SAILR "Reverting Switch Lowering" + DREAM condition-refinement +
+Phoenix iterative structuring + dewolf/DREAM++ congruence). Two passes, run first in
+`CAstOptimizer::optimize()`, gated on the `scf_r*` synthetic name so real jump tables
+are never touched:
+- **P3 `dissolveExitDispatchers`**: a single-/two-case `switch(selector)` over a
+  synthetic selector IS an if/else -> rewrite to `if (selector == case) {..} else
+  {..}` (SAILR), fixed-point for nested dispatchers. context_mmap 19 switches -> 2.
+- **P2 `coalesceSelectorChains`**: the selector value is routed up a tree of pure
+  copies (`scf_rB = scf_rA; scf_rC = scf_rB; ...`); these form a copy tree with no
+  interference, so union-find-coalesce every copy-connected `scf_r*` to one
+  representative (DREAM++ congruence) -> the copies become `rep = rep` self-assigns
+  the existing removeSelfAssignments erases. **scf_r references down ~60%**
+  (context_mmap 963 -> 382, mem_import 934 -> 332, mem_alloc 834 -> 298).
+
+**3-way scoreboard (IDA vs 0.9.2 vs v2-now, on FRESH `.ll`; lines / unreachable):**
+
+| function      | IDA  | 0.9.2          | v2-now (this branch) |
+|---------------|------|----------------|----------------------|
+| mem_free      | 82   | **STUB (12)**  | **131 / 0** (correct) |
+| jit_allocate  | 315  | 203 / **87**   | 570 / **0** |
+| mem_alloc     | 361  | 190 / **88**   | 809 / **0** |
+| context_mmap  | 551  | 199 / **22**   | 1109 / **0** |
+| mem_commit    | 184  | 78 / **28**    | 309 / **0** |
+| mem_import    | 521  | 280 / 0        | 1068 / **0** |
+
+0.9.2 is BROKEN (a bare stub, or a body with 22-88 `unreachable` statements stranded
+after a premature return). v2-now is CORRECT everywhere (0 unreachable, dispatch
+routing matches IDA) and ~2x IDA in line count. The residual gap is (a) the remaining
+dispatcher selectors -- a `goto`/inline P4 (not yet done) would close it -- and (b)
+the per-instruction `var_0 = 0xADDR` PC-tracking noise (a separate, non-dispatcher
+source). 12/12 no crash on the fresh corpus; x86 fixtures unchanged.
+
+NEXT = investigate the `var_0` PC-tracking noise (likely a quicker line-count win) +
+P4 (eliminate the dispatcher via goto/inline = the last ~2x). Code staged on
+`scf-structurer-v1`; RAG write-up in `HexCore-Helix-Original/rag/18_*`.
 
 
 ## [0.1.8] - Self-ref false-positive: pointer walks are not suspicious - +5pp - 2026-06-15
