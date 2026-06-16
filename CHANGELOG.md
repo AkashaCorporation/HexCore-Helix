@@ -11,6 +11,28 @@ LLVM 18.1.8's `mlir::transformCFGToSCF` (the RVSDG / correct-by-construction
 structurer) instead of the hand-rolled block-moving pass that the
 `[Investigation]` entry below proved un-patchable.
 
+**LIFT-LAYER FIX (separate axis from the structurer) - memory read-modify-write
+address-vs-value confusion.** `RemillToHelixLow` rendered every `op [mem], x`
+read-modify-write using the memory operand's ADDRESS as its VALUE: e.g.
+`inc qword [rbx+0x9108]` became `*(p+0x9108) = (p+0x9108) + 1` and
+`or qword [rbp+0x20], 0x4064000` became `*(p+0x20) = (p+0x20) | 0x4064000`, instead
+of the correct `*p = *p + 1` / `*p = *p | flag`. The un-inlined Remill semantics
+function (`INC<MnW,Mn>`, `OR<MnW,Mn,In>`, ...) passes the memory operand as an
+address; the INC/DEC and the generic binary-op handlers used `getOperand(3/4)`
+directly as the value, never emitting the implicit load (the CMP/TEST/MOV handlers
+already loaded via `has_memory_src`; the arithmetic/logic ones did not). FIX: in
+the INC/DEC and binary handlers, when `RemillSemanticInfo.has_memory_dst` (RMW:
+load the lhs/dest) or `has_memory_src` (pure memory source: load the rhs), emit a
+`MemReadOp` before the op. Now `lock inc [mem]` -> `field++`, `or [mem], flag` ->
+`field |= flag`, `add [mem], 1` -> `field += 1` -- matching IDA. **This is a real
+correctness bug in the SHIPPED main line** (every memory increment/decrement and
+every `op [mem], imm` was wrong): it corrupts refcounts, counters, and flag-set
+operations -- directly relevant to kernel-driver refcount-UAF auditing. Found by a
+cross-review (another model flagged the symptom from the output; root-caused +
+fixed here). Validated: 0 residual address-as-value RMW across the kbase corpus,
+0 crashes, x86 fixtures byte-identical. (Same one-op-missing class as the
+`isLiveConsumer` switch bug -- the main line should take both.)
+
 **M0 - PROVEN.** Added `runSCFSpike` + `HelixSCFInterface : mlir::CFGToSCFInterface`
 (mirrors the upstream cf->scf reference): remove-unreachable -> strip block-args
 (poison, spike-only) -> rewrite every branch terminator (helix_low.jmp/jcc +
