@@ -3,7 +3,7 @@
 All notable changes to HexCore Helix are documented here.
 
 
-## [Unreleased] - v1.0 structurer rewrite: M0 PROVEN + M1 bridge started (branch scf-structurer-v1) - 2026-06-15
+## [Unreleased] - v1.0 structurer rewrite: M0 PROVEN + M1 bridges COMPLETE (branch scf-structurer-v1) - 2026-06-15
 
 WIP, behind the `HELIX_SCF_SPIKE` env gate; not landed (no version bump). This is
 the executable proof of the `STRUCTURER_V1_REWRITE_SCOPING.md` direction: reuse
@@ -24,19 +24,47 @@ hooks, WWZ `bone_pos_calc` (the ESP fn), and **`after.ll`, the 980-block
 callfuscated irreducible boss the old structurer cannot do.** (The only 2 non-OK
 are pre-existing malformed `.ll` that fail at LLVM-IR parse, unrelated.)
 
-**M1 - bridge started.** `bridgeSCFIfToHelixHigh`: `scf.if -> helix_high.if`,
-de-SSA'ing region results (incl. the RVSDG exit-dispatcher i32 selectors) into a
-fresh temp var assigned in each arm (replacing `scf.yield`) and read after the op,
-so the downstream pipeline (RecoverVariables ... CAstBuilder) is unchanged. On
-mem_free: all 8 scf.if -> 8 helix_high.if, exit=0. **Remaining for M1:**
-`scf.index_switch -> helix_high.switch` + `scf.while -> helix_high.while` (same
-mechanic), proper block-arg normalization (replace the poison-strip), the
-`--use-scf-structurer` flag (legacy as fallback), then the end-to-end mem_free
-emit + scoreboard gate (expect the "unreachable-after-return" quad to vanish).
-The selector/dispatcher noise the bridge faithfully carries is what the M4
-SAILR-style deopt pass will dissolve into idiomatic if/else.
+**M1 - bridges COMPLETE + validated end-to-end.** Three `scf -> helix_high`
+bridges, all de-SSA'ing region results into fresh temp vars (so the downstream
+RecoverVariables ... CAstBuilder pipeline is unchanged), dispatched innermost-first
+in one PostOrder walk:
+- `bridgeSCFIfToHelixHigh`: `scf.if -> helix_high.if` (region results -> var
+  assigns replacing `scf.yield`, read after the op).
+- `bridgeSCFIndexSwitchToHelixHigh`: `scf.index_switch -> helix_high.switch`.
+  Selector traced back through the interface's `arith.index_castui` to the
+  original integer (clean C, not `index`); regions REORDERED from scf's
+  `[default, case0, ...]` to helix's `[case0, ..., default]` (CAstBuilder treats
+  region index >= case_values.size() as `default:`); each case region terminated
+  with `helix_high.break` (the C printer does NOT auto-insert break, so without
+  it cases fall through).
+- `bridgeSCFWhileToHelixHigh`: `scf.while -> helix_high.do_while`. transformCFGToSCF
+  always emits the tail-controlled form (body in BEFORE ending `scf.condition`,
+  trivial pass-through AFTER); loop-carried values are de-SSA'd into temp vars and
+  the parallel `scf.condition` forward is lowered as a TRUE parallel copy
+  (snapshot every read - condition + next-values - into shadow temps before
+  writing any carried var; a naive sequential `var[i]=next[i]` would clobber a
+  loop-carried swap/rotation - caught by adversarial review). condRegion yields a
+  `cond_var` so `do { ... } while(cond_var)` reproduces the loop test.
 
-Commits: fc062f9 (M0), 54887aa (M1 scf.if bridge).
+**End-to-end scoreboard (clean spike-off vs spike-on, 7-fn kbase corpus): the
+premature-return / unreachable-after-return bug is ELIMINATED everywhere -
+unreachable 22/87/90/37/21 -> 0, body recovered 2.5x-7.2x, 12/12 no crash.**
+e.g. context_mmap 201 lines/22-unreachable -> 1449/0 (do-while emitted faithfully,
+19 switches), mem_free 49/21 -> 124/0. The dispatcher noise (RVSDG selector vars +
+single-case switches) pins confidence at 50%, which REGRESSES the 2 fns the legacy
+already structured clean (csf_queue_register 100->50, mem_import 60.8->50) - that
+noise is exactly what the M4 SAILR-style deopt pass dissolves. All flag-gated, so
+zero shipping impact.
+
+**M1 open items (honest):** block-arg poison-strip KEPT (validated non-lossy on
+this corpus - all call-sites preserved, no poison/undef leak in emitted C); proper
+normalization deferred. The opt-in is the `HELIX_SCF_SPIKE` env gate (legacy is the
+default); a `--use-scf-structurer` CLI alias is trivial M5 polish.
+
+Commits: fc062f9 (M0), 54887aa (M1 scf.if bridge); the index_switch + do_while
+bridges + parallel-copy fix are staged on `scf-structurer-v1` (uncommitted pending
+review sign-off). NEXT = M2 (rootkit + nested/multi-loop the kbase corpus lacks),
+M3 (WWZ + after.ll stress), M4 (the readability deopt that recovers confidence).
 
 
 ## [0.1.8] - Self-ref false-positive: pointer walks are not suspicious - +5pp - 2026-06-15

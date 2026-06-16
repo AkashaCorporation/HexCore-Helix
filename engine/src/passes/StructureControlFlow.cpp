@@ -266,15 +266,249 @@ static void bridgeSCFIfToHelixHigh(mlir::scf::IfOp ifOp) {
     ifOp.erase();
 }
 
+// [M1] Bridge scf.index_switch -> helix_high.switch.  The scf op orders its
+// regions [defaultRegion, caseRegions...]; CAstBuilder wants [caseRegions...,
+// default] (any region index >= case_values.size() is rendered as `default:`).
+// Each region's scf.yield(vals) is de-SSA'd into per-result var assigns (so the
+// dispatcher selectors flow through variables like the scf.if bridge) plus a
+// helix_high.break terminator -- the C printer does NOT auto-insert break, so
+// without it the cases would fall through.  The selector is traced back through
+// the arith.index_castui the interface inserted, so the emitted switch reads on
+// the original integer, not an `index`.
+static void bridgeSCFIndexSwitchToHelixHigh(mlir::scf::IndexSwitchOp sw) {
+    mlir::OpBuilder b(sw);
+    mlir::Location loc = sw.getLoc();
+    unsigned n = sw.getNumResults();
+
+    // 1) one temp var per result (value routing across the switch).
+    llvm::SmallVector<std::pair<uint32_t, std::string>> vars;
+    b.setInsertionPoint(sw);
+    for (unsigned i = 0; i < n; ++i) {
+        uint32_t id = g_scfBridgeVarId++;
+        std::string name = std::format("scf_r{}", id);
+        b.create<helix::high::VarDeclOp>(
+            loc, id, name, helix::high::StorageKind::Temporary,
+            mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+        vars.emplace_back(id, name);
+    }
+
+    // 2) selector: trace the index_castui back to the original integer.
+    mlir::Value selector = sw.getArg();
+    mlir::Operation* deadCast = nullptr;
+    if (auto cast = selector.getDefiningOp<mlir::arith::IndexCastUIOp>()) {
+        deadCast = cast;
+        selector = cast.getIn();
+    }
+
+    // 3) build helix_high.switch with one region per case + a trailing default.
+    llvm::SmallVector<int64_t> caseValues(sw.getCases().begin(),
+                                          sw.getCases().end());
+    unsigned numCaseRegions = caseValues.size() + 1;  // + default (last)
+    b.setInsertionPoint(sw);
+    auto hsw = b.create<helix::high::SwitchOp>(
+        loc, selector, llvm::ArrayRef<int64_t>(caseValues), mlir::IntegerAttr{},
+        numCaseRegions);
+
+    // de-SSA a region's scf.yield into assigns + break, then move it in.
+    auto moveRegion = [&](mlir::Region& src, mlir::Region& dst) {
+        for (mlir::Block& blk : src) {
+            auto y = mlir::dyn_cast_or_null<mlir::scf::YieldOp>(
+                blk.getTerminator());
+            if (!y)
+                continue;
+            mlir::OpBuilder yb(y);
+            for (unsigned i = 0; i < n; ++i) {
+                auto vref = yb.create<helix::high::VarRefOp>(
+                    loc, y.getOperand(i).getType(), vars[i].first,
+                    vars[i].second, mlir::IntegerAttr{});
+                yb.create<helix::high::AssignOp>(
+                    loc, vref.getResult(), y.getOperand(i), mlir::IntegerAttr{});
+            }
+            yb.create<helix::high::BreakOp>(loc, mlir::IntegerAttr{});
+            y.erase();
+        }
+        dst.takeBody(src);
+    };
+
+    mlir::MutableArrayRef<mlir::Region> dstRegions = hsw.getCaseRegions();
+    unsigned idx = 0;
+    for (mlir::Region& caseReg : sw.getCaseRegions())  // cases first
+        moveRegion(caseReg, dstRegions[idx++]);
+    moveRegion(sw.getDefaultRegion(), dstRegions[idx++]);  // default last
+
+    // 4) route the switch results to the temp vars (reads placed after).
+    b.setInsertionPointAfter(hsw);
+    for (unsigned i = 0; i < n; ++i) {
+        auto vref = b.create<helix::high::VarRefOp>(
+            loc, sw.getResult(i).getType(), vars[i].first, vars[i].second,
+            mlir::IntegerAttr{});
+        sw.getResult(i).replaceAllUsesWith(vref.getResult());
+    }
+    sw.erase();
+    if (deadCast && deadCast->use_empty())
+        deadCast->erase();
+}
+
+// [M1] Bridge scf.while -> helix_high.do_while.  transformCFGToSCF always emits
+// the tail-controlled form: the loop body lives in the BEFORE region ending in
+// scf.condition(%cond)(%next...), and the AFTER region is a trivial pass-through
+// (`do { before } while(cond)`).  The loop-carried values (inits == before-args
+// == condition-forwarded next-values == results) are de-SSA'd into temp vars:
+//   - before the loop:           var[i] = init[i]
+//   - body reads:                replace before-arg i with a read of var[i]
+//   - at scf.condition (body end): var[i] = next[i];  cond_var = cond
+//   - condRegion:                yields cond_var (do_while re-tests each iter)
+//   - after the loop:            result i reads var[i]
+// Only the single-block BEFORE form (what the RVSDG structurer produces) is
+// handled; a multi-block BEFORE is left untouched and logged.
+static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
+    if (!wh.getBefore().hasOneBlock()) {
+        std::fprintf(stderr,
+                     "[SCF-SPIKE] scf.while with multi-block before region "
+                     "left un-bridged (unsupported in M1)\n");
+        return;
+    }
+    mlir::OpBuilder b(wh);
+    mlir::Location loc = wh.getLoc();
+    mlir::Block& beforeBlk = wh.getBefore().front();
+    auto cond = mlir::cast<mlir::scf::ConditionOp>(beforeBlk.getTerminator());
+    mlir::Type condTy = cond.getCondition().getType();
+    unsigned n = wh.getNumOperands();  // loop-carried count
+
+    // 1) temp var per carried value + one for the loop condition.
+    llvm::SmallVector<std::pair<uint32_t, std::string>> vars;
+    b.setInsertionPoint(wh);
+    for (unsigned i = 0; i < n; ++i) {
+        uint32_t id = g_scfBridgeVarId++;
+        std::string name = std::format("scf_w{}", id);
+        b.create<helix::high::VarDeclOp>(
+            loc, id, name, helix::high::StorageKind::Temporary,
+            mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+        vars.emplace_back(id, name);
+    }
+    uint32_t condId = g_scfBridgeVarId++;
+    std::string condName = std::format("scf_w{}", condId);
+    b.create<helix::high::VarDeclOp>(
+        loc, condId, condName, helix::high::StorageKind::Temporary,
+        mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+    // shadow temps used to lower the scf.condition's PARALLEL carried-value
+    // forward as a true parallel copy (see step 4).
+    llvm::SmallVector<std::pair<uint32_t, std::string>> shadows;
+    for (unsigned i = 0; i < n; ++i) {
+        uint32_t id = g_scfBridgeVarId++;
+        std::string name = std::format("scf_w{}", id);
+        b.create<helix::high::VarDeclOp>(
+            loc, id, name, helix::high::StorageKind::Temporary,
+            mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+        shadows.emplace_back(id, name);
+    }
+
+    // 2) init the carried vars before the loop: var[i] = init[i].
+    for (unsigned i = 0; i < n; ++i) {
+        auto vref = b.create<helix::high::VarRefOp>(
+            loc, wh.getOperand(i).getType(), vars[i].first, vars[i].second,
+            mlir::IntegerAttr{});
+        b.create<helix::high::AssignOp>(loc, vref.getResult(),
+                                        wh.getOperand(i), mlir::IntegerAttr{});
+    }
+
+    // 3) replace before-block args (current-iteration values) with var reads.
+    {
+        mlir::OpBuilder rb(&beforeBlk, beforeBlk.begin());
+        for (unsigned i = 0; i < n; ++i) {
+            mlir::BlockArgument arg = beforeBlk.getArgument(i);
+            auto vref = rb.create<helix::high::VarRefOp>(
+                loc, arg.getType(), vars[i].first, vars[i].second,
+                mlir::IntegerAttr{});
+            arg.replaceAllUsesWith(vref.getResult());
+        }
+    }
+
+    // 4) terminate the body at scf.condition.  scf.condition forwards the
+    //    next-iteration carried values as a PARALLEL copy.  Because step 3 has
+    //    rewritten every pass-through forward into a by-name read of var[j], a
+    //    naive sequential `var[i] = next[i]` would clobber a swap/rotation
+    //    (`var0 = var1; var1 = var0;` loses the swap because the second assign
+    //    reads the already-updated var0).  So lower it as a real parallel copy:
+    //    snapshot every read (the loop condition + all next-values) into temps
+    //    BEFORE writing any carried var, then commit from the snapshots.
+    {
+        mlir::OpBuilder cb(cond);
+        mlir::OperandRange nextVals = cond.getArgs();
+        // snapshot the loop condition first (it may itself read a carried var).
+        auto cvref = cb.create<helix::high::VarRefOp>(
+            loc, condTy, condId, condName, mlir::IntegerAttr{});
+        cb.create<helix::high::AssignOp>(loc, cvref.getResult(),
+                                         cond.getCondition(),
+                                         mlir::IntegerAttr{});
+        // snapshot the next-iteration carried values into shadow temps.
+        for (unsigned i = 0; i < n; ++i) {
+            auto sref = cb.create<helix::high::VarRefOp>(
+                loc, nextVals[i].getType(), shadows[i].first, shadows[i].second,
+                mlir::IntegerAttr{});
+            cb.create<helix::high::AssignOp>(loc, sref.getResult(), nextVals[i],
+                                             mlir::IntegerAttr{});
+        }
+        // commit: var[i] = shadow[i] (every carried-var read already happened).
+        for (unsigned i = 0; i < n; ++i) {
+            auto vref = cb.create<helix::high::VarRefOp>(
+                loc, nextVals[i].getType(), vars[i].first, vars[i].second,
+                mlir::IntegerAttr{});
+            auto sread = cb.create<helix::high::VarRefOp>(
+                loc, nextVals[i].getType(), shadows[i].first, shadows[i].second,
+                mlir::IntegerAttr{});
+            cb.create<helix::high::AssignOp>(loc, vref.getResult(),
+                                             sread.getResult(),
+                                             mlir::IntegerAttr{});
+        }
+        cb.create<helix::high::YieldOp>(loc, mlir::Value{});
+        cond.erase();
+    }
+    beforeBlk.eraseArguments(0, n);
+
+    // 5) build do_while; body = the (now argument-less) before block.
+    auto dw = b.create<helix::high::DoWhileOp>(loc, mlir::IntegerAttr{});
+    dw.getBodyRegion().takeBody(wh.getBefore());
+
+    // condRegion: yield cond_var (do_while evaluates it after each iteration).
+    {
+        mlir::Region& condRegion = dw.getCondRegion();
+        auto* condBlock = new mlir::Block();
+        condRegion.push_back(condBlock);
+        mlir::OpBuilder cob(condBlock, condBlock->begin());
+        auto cvref = cob.create<helix::high::VarRefOp>(
+            loc, condTy, condId, condName, mlir::IntegerAttr{});
+        cob.create<helix::high::YieldOp>(loc, cvref.getResult());
+    }
+
+    // 6) route results to the carried vars (reads placed after the loop).
+    b.setInsertionPointAfter(dw);
+    for (unsigned i = 0; i < n; ++i) {
+        auto vref = b.create<helix::high::VarRefOp>(
+            loc, wh.getResult(i).getType(), vars[i].first, vars[i].second,
+            mlir::IntegerAttr{});
+        wh.getResult(i).replaceAllUsesWith(vref.getResult());
+    }
+    wh.erase();  // drops the trivial AFTER region too
+}
+
 static void bridgeSCFToHelixHigh(helix::low::FuncOp func) {
-    // Innermost-first so a child scf op is bridged before its parent.
-    llvm::SmallVector<mlir::scf::IfOp> ifs;
-    func.walk<mlir::WalkOrder::PostOrder>([&](mlir::scf::IfOp op) {
-        ifs.push_back(op);
+    // Collect innermost-first so a child scf op is bridged before its parent
+    // (the parent then just takes a region already full of helix_high ops).
+    llvm::SmallVector<mlir::Operation*> worklist;
+    func.walk<mlir::WalkOrder::PostOrder>([&](mlir::Operation* op) {
+        if (mlir::isa<mlir::scf::IfOp, mlir::scf::IndexSwitchOp,
+                      mlir::scf::WhileOp>(op))
+            worklist.push_back(op);
     });
-    for (auto op : ifs)
-        bridgeSCFIfToHelixHigh(op);
-    // TODO[M1]: scf.index_switch -> helix_high.switch, scf.while -> helix_high.while.
+    for (mlir::Operation* op : worklist) {
+        if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op))
+            bridgeSCFIfToHelixHigh(ifOp);
+        else if (auto sw = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(op))
+            bridgeSCFIndexSwitchToHelixHigh(sw);
+        else if (auto wh = mlir::dyn_cast<mlir::scf::WhileOp>(op))
+            bridgeSCFWhileToHelixHigh(wh);
+    }
 }
 
 // Run the spike on one HelixLow function: convert jmp/jcc -> cf, then lift to scf.
