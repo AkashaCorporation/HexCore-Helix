@@ -35,6 +35,9 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"        // [SCF-SPIKE] scf.if/while/index_switch
+#include "mlir/Dialect/UB/IR/UBOps.h"        // [SCF-SPIKE] ub.poison
+#include "mlir/Transforms/CFGToSCF.h"        // [SCF-SPIKE] transformCFGToSCF
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
@@ -57,6 +60,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>     // [SCF-SPIKE] fprintf
+#include <cstdlib>    // [SCF-SPIKE] getenv
 #include <format>
 #include <optional>
 #include <string>
@@ -82,6 +87,247 @@ STATISTIC(NumValuesPromoted,    "Number of escaping values promoted to variables
 STATISTIC(NumRepairPromoted,   "Number of escaping values fixed in final repair pass");
 
 namespace {
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [SCF-SPIKE] M0 spike: lift HelixLow CFG -> scf via mlir::transformCFGToSCF
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Proves the v1.0 rewrite direction (STRUCTURER_V1_REWRITE_SCOPING.md): the
+// upstream RVSDG-based, correct-by-construction structurer handles our IR with no
+// premature return and no dominator-tree assert.  Produces scf.if/scf.while/
+// scf.index_switch (which carry results + variadic yields = the value routing that
+// kills the premature-return bug).  A later milestone bridges scf -> HelixHigh.
+//
+// Interface impl mirrors mlir/lib/Conversion/ControlFlowToSCF/ControlFlowToSCF.cpp,
+// adapted so createUnreachableTerminator works on a helix_low.func.
+class HelixSCFInterface : public mlir::CFGToSCFInterface {
+public:
+    mlir::FailureOr<mlir::Operation*> createStructuredBranchRegionOp(
+        mlir::OpBuilder& builder, mlir::Operation* controlFlowCondOp,
+        mlir::TypeRange resultTypes,
+        mlir::MutableArrayRef<mlir::Region> regions) override {
+        if (auto condBr = mlir::dyn_cast<mlir::cf::CondBranchOp>(controlFlowCondOp)) {
+            assert(regions.size() == 2);
+            auto ifOp = builder.create<mlir::scf::IfOp>(
+                controlFlowCondOp->getLoc(), resultTypes, condBr.getCondition());
+            ifOp.getThenRegion().takeBody(regions[0]);
+            ifOp.getElseRegion().takeBody(regions[1]);
+            return ifOp.getOperation();
+        }
+        if (auto switchOp = mlir::dyn_cast<mlir::cf::SwitchOp>(controlFlowCondOp)) {
+            auto cast = builder.create<mlir::arith::IndexCastUIOp>(
+                controlFlowCondOp->getLoc(), builder.getIndexType(),
+                switchOp.getFlag());
+            llvm::SmallVector<int64_t> cases;
+            if (auto caseValues = switchOp.getCaseValues())
+                llvm::append_range(cases, llvm::map_range(
+                    *caseValues, [](const llvm::APInt& v) {
+                        return (int64_t)v.getZExtValue();
+                    }));
+            assert(regions.size() == cases.size() + 1);
+            auto idxSwitch = builder.create<mlir::scf::IndexSwitchOp>(
+                controlFlowCondOp->getLoc(), resultTypes, cast, cases, cases.size());
+            idxSwitch.getDefaultRegion().takeBody(regions[0]);
+            for (auto&& [tgt, src] : llvm::zip(idxSwitch.getCaseRegions(),
+                                               llvm::drop_begin(regions)))
+                tgt.takeBody(src);
+            return idxSwitch.getOperation();
+        }
+        controlFlowCondOp->emitOpError("[SCF-SPIKE] unknown CFG cond op");
+        return mlir::failure();
+    }
+
+    mlir::LogicalResult createStructuredBranchRegionTerminatorOp(
+        mlir::Location loc, mlir::OpBuilder& builder, mlir::Operation*,
+        mlir::Operation*, mlir::ValueRange results) override {
+        builder.create<mlir::scf::YieldOp>(loc, results);
+        return mlir::success();
+    }
+
+    mlir::FailureOr<mlir::Operation*> createStructuredDoWhileLoopOp(
+        mlir::OpBuilder& builder, mlir::Operation* replacedOp,
+        mlir::ValueRange loopValuesInit, mlir::Value condition,
+        mlir::ValueRange loopValuesNextIter, mlir::Region&& loopBody) override {
+        mlir::Location loc = replacedOp->getLoc();
+        auto whileOp = builder.create<mlir::scf::WhileOp>(
+            loc, loopValuesInit.getTypes(), loopValuesInit);
+        whileOp.getBefore().takeBody(loopBody);
+        builder.setInsertionPointToEnd(&whileOp.getBefore().back());
+        builder.create<mlir::scf::ConditionOp>(
+            loc, builder.create<mlir::arith::TruncIOp>(
+                     loc, builder.getI1Type(), condition),
+            loopValuesNextIter);
+        auto* afterBlock = new mlir::Block;
+        whileOp.getAfter().push_back(afterBlock);
+        afterBlock->addArguments(
+            loopValuesInit.getTypes(),
+            llvm::SmallVector<mlir::Location>(loopValuesInit.size(), loc));
+        builder.setInsertionPointToEnd(afterBlock);
+        builder.create<mlir::scf::YieldOp>(loc, afterBlock->getArguments());
+        return whileOp.getOperation();
+    }
+
+    mlir::Value getCFGSwitchValue(mlir::Location loc, mlir::OpBuilder& builder,
+                                  unsigned value) override {
+        return builder.create<mlir::arith::ConstantOp>(
+            loc, builder.getI32IntegerAttr(value));
+    }
+
+    void createCFGSwitchOp(mlir::Location loc, mlir::OpBuilder& builder,
+                           mlir::Value flag, mlir::ArrayRef<unsigned> caseValues,
+                           mlir::BlockRange caseDestinations,
+                           mlir::ArrayRef<mlir::ValueRange> caseArguments,
+                           mlir::Block* defaultDest,
+                           mlir::ValueRange defaultArgs) override {
+        builder.create<mlir::cf::SwitchOp>(
+            loc, flag, defaultDest, defaultArgs,
+            llvm::to_vector_of<int32_t>(caseValues), caseDestinations,
+            caseArguments);
+    }
+
+    mlir::Value getUndefValue(mlir::Location loc, mlir::OpBuilder& builder,
+                              mlir::Type type) override {
+        return builder.create<mlir::ub::PoisonOp>(loc, type, nullptr);
+    }
+
+    mlir::FailureOr<mlir::Operation*> createUnreachableTerminator(
+        mlir::Location loc, mlir::OpBuilder& builder,
+        mlir::Region& region) override {
+        // helix_low.ret has an implicit (RAX) return value, no operands.
+        auto* parent = region.getParentOp();
+        if (!mlir::isa<helix::low::FuncOp>(parent))
+            return mlir::emitError(loc, "[SCF-SPIKE] unreachable for non-func");
+        return builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{})
+            .getOperation();
+    }
+};
+
+// Run the spike on one HelixLow function: convert jmp/jcc -> cf, then lift to scf.
+static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
+    if (func.getBody().empty())
+        return mlir::success();
+
+    // 0) Remove unreachable blocks (Remill orphan islands / switch stubs) so the
+    //    DominanceInfo below is well-defined.  The legacy structurer does this too
+    //    (lines ~1519); the spike runs BEFORE that, so do it here.
+    {
+        llvm::SmallPtrSet<mlir::Block*, 32> reachable;
+        llvm::SmallVector<mlir::Block*, 16> wl;
+        wl.push_back(&func.getBody().front());
+        while (!wl.empty()) {
+            auto* blk = wl.pop_back_val();
+            if (!reachable.insert(blk).second)
+                continue;
+            for (auto* s : blk->getSuccessors())
+                wl.push_back(s);
+        }
+        llvm::SmallVector<mlir::Block*, 8> dead;
+        for (auto& blk : func.getBody())
+            if (!reachable.contains(&blk))
+                dead.push_back(&blk);
+        for (auto* blk : dead) {
+            blk->dropAllDefinedValueUses();
+            blk->dropAllReferences();
+            blk->erase();
+        }
+    }
+
+    // 1) Collect every non-cf block terminator with successors (helix_low.jmp/jcc
+    //    AND llvm.br/cond_br) - all get rewritten to operand-less cf below so the
+    //    whole region uses one branch flavor that implements BranchOpInterface.
+    llvm::SmallVector<mlir::Operation*> branches;
+    for (mlir::Block& blk : func.getBody()) {
+        auto* term = blk.getTerminator();
+        if (term && term->getNumSuccessors() > 0 &&
+            !mlir::isa<mlir::cf::BranchOp, mlir::cf::CondBranchOp,
+                       mlir::cf::SwitchOp>(term))
+            branches.push_back(term);
+    }
+    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-unreachable-removal blocks=%u\n",
+                 func.getSymName().str().c_str(),
+                 (unsigned)std::distance(func.getBody().begin(), func.getBody().end()));
+    std::fflush(stderr);
+
+    mlir::OpBuilder b(func.getContext());
+
+    // 0.5) Strip block arguments. HelixLow carries lift-artifact block-arg phis
+    //      that are inconsistently forwarded (an llvm.br sets them, a helix_low.jcc
+    //      edge to the same block does not), which makes successor-operand counts
+    //      mismatch and crashes transformCFGToSCF's BranchOpInterface access.
+    //      Replace each arg with poison and drop it; ALL branches are then
+    //      rewritten operand-less below. (M1 routes these properly as variables;
+    //      the spike only needs to prove control-flow structuring.)
+    unsigned strippedArgs = 0;
+    for (mlir::Block& blk : func.getBody()) {
+        if (blk.getNumArguments() == 0)
+            continue;
+        b.setInsertionPointToStart(&blk);
+        for (mlir::BlockArgument arg : blk.getArguments()) {
+            auto poison = b.create<mlir::ub::PoisonOp>(
+                arg.getLoc(), arg.getType(), nullptr);
+            arg.replaceAllUsesWith(poison);
+            ++strippedArgs;
+        }
+        blk.eraseArguments(0, blk.getNumArguments());
+    }
+
+    // Convert ALL branch terminators (helix_low.jmp/jcc + llvm.br/cond_br) to
+    // operand-less cf.br/cf.cond_br so every CFG op implements BranchOpInterface
+    // uniformly with no forwarded successor operands.
+    unsigned converted = 0;
+    for (mlir::Operation* op : branches) {
+        b.setInsertionPoint(op);
+        mlir::Location loc = op->getLoc();
+        if (op->getNumSuccessors() == 1) {
+            b.create<mlir::cf::BranchOp>(loc, op->getSuccessor(0),
+                                         mlir::ValueRange{});
+        } else if (op->getNumSuccessors() == 2) {
+            mlir::Value cond;
+            if (auto jcc = mlir::dyn_cast<helix::low::JccOp>(op))
+                cond = jcc.getFlagValue();
+            else if (op->getNumOperands() >= 1)
+                cond = op->getOperand(0);
+            if (cond)
+                b.create<mlir::cf::CondBranchOp>(
+                    loc, cond, op->getSuccessor(0), mlir::ValueRange{},
+                    op->getSuccessor(1), mlir::ValueRange{});
+        }
+        op->erase();
+        ++converted;
+    }
+    std::fprintf(stderr,
+                 "[SCF-SPIKE] %s: stage=after-cf-conversion (converted %u, stripped %u args)\n",
+                 func.getSymName().str().c_str(), converted, strippedArgs);
+    std::fflush(stderr);
+
+    // 2) lift to scf via the upstream correct-by-construction algorithm.
+    mlir::DominanceInfo domInfo(func);
+    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-DominanceInfo\n",
+                 func.getSymName().str().c_str());
+    std::fflush(stderr);
+    HelixSCFInterface iface;
+    auto changed = mlir::transformCFGToSCF(func.getBody(), iface, domInfo);
+    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-transformCFGToSCF\n",
+                 func.getSymName().str().c_str());
+    std::fflush(stderr);
+    if (mlir::failed(changed)) {
+        std::fprintf(stderr, "[SCF-SPIKE] transformCFGToSCF FAILED on %s\n",
+                     func.getSymName().str().c_str());
+        return mlir::failure();
+    }
+    std::fprintf(stderr, "[SCF-SPIKE] OK on %s (changed=%d)\n",
+                 func.getSymName().str().c_str(), (int)*changed);
+    // Dump the lifted scf IR for inspection.
+    if (const char* dir = std::getenv("HELIX_SCF_SPIKE_DUMP")) {
+        std::string fname =
+            std::string(dir) + "/scf_" + func.getSymName().str() + ".mlir";
+        std::error_code ec;
+        llvm::raw_fd_ostream os(fname, ec);
+        if (!ec)
+            func.print(os);
+    }
+    return mlir::success();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CFG Edge Representation
@@ -1498,6 +1744,12 @@ private:
 
         if (funcBody.empty())
             return success();
+
+        // [SCF-SPIKE] M0: gated behind HELIX_SCF_SPIKE, lift this function to scf
+        // via the upstream correct-by-construction algorithm instead of the
+        // legacy block-moving structurer, and skip the rest of the pass.
+        if (std::getenv("HELIX_SCF_SPIKE"))
+            return runSCFSpike(func);
 
         OpBuilder builder(func->getContext());
 
