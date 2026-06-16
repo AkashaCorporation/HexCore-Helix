@@ -3,6 +3,34 @@
 All notable changes to HexCore Helix are documented here.
 
 
+## [0.1.8] - Self-ref false-positive: pointer walks are not suspicious - +5pp - 2026-06-15
+
+A second structurer-independent, honest-confidence win on `kbase_mem_import`:
+**55.8% -> 60.8% (+5pp)**, self-ref count 4 -> 3.
+
+**Root cause (false positive):** the confidence scorer flags an assignment as a
+"suspicious self-referencing assignment" whenever the target var name appears
+anywhere in the RHS, with a heavy penalty (`min(20, count*5)`).  But `x = x->field`
+and `x = *x` are perfectly legitimate pointer walks / loads (a register reused
+after dereferencing itself) - extremely common in real code - and were being
+penalised as suspicious.
+
+**Fix (FIX-v2-CAST-002):** in `reanalyzeConfidence`, recognise a RHS that is
+purely a field-access / deref chain rooted at the target var (`isPureSelfWalk`)
+and exclude it from the suspicious count.  Honest: it only suppresses a FALSE
+positive; genuine self-refs stay flagged - on mem_import the pure walk
+`alloc = alloc->field_0x8f8` is now excluded while the three `alloc = call(alloc->field)`
+captures (which also carry a void-capture concern) remain counted.  Scorer-only:
+the emitted body is unchanged by construction (reanalyzeConfidence does not mutate
+the AST).
+
+**Validation:** scoreboard vs ORIGINAL 0.9.2, 7-function kbase corpus:
+**0 REGRESSED, 0 STUBBED, 2 IMPROVED (mem_import +15pp cumulative, mem_free +2.5pp),
+net +17.5pp in v2's favor.** Fixtures 5/5 byte-identical.  Broad: pointer walks
+appear in nearly every real function, so this lifts confidence wherever the
+structurer is not the dominant cap.  **v2 is now +17.5pp ahead of 0.9.2.**
+
+
 ## [0.1.7] - Empty-if sweep ordering fix: +10pp on kbase_mem_import - 2026-06-15
 
 A localized, structurer-INDEPENDENT C-AST win (the kind to keep chasing while the

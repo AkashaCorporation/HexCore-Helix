@@ -2550,6 +2550,32 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
         int identityNoOp           = 0;
     } cnt;
 
+    // FIX-v2-CAST-002: `x = x->field` / `x = *x` is a legitimate pointer walk /
+    // load (reusing a register after dereferencing it), NOT a suspicious
+    // self-reference.  The self-ref heuristic below (`target name appears in the
+    // RHS`) was flagging these and applying a heavy confidence penalty
+    // (min(20, count*5)).  Recognise a RHS that is purely a field-access / deref
+    // chain rooted at the target var and exclude it.  This only suppresses a
+    // FALSE-POSITIVE penalty; genuine self-refs (arithmetic, `x = f(x)` call
+    // captures, mixed exprs) stay flagged.  Honest-confidence fix, body unchanged.
+    auto isPureSelfWalk = [](const CExpr* e, const std::string& tn) -> bool {
+        const CExpr* cur = e;
+        bool sawAccess = false;
+        while (cur) {
+            if (auto* f = llvm::dyn_cast<CFieldAccessExpr>(cur)) {
+                sawAccess = true; cur = f->base.get(); continue;
+            }
+            if (auto* u = llvm::dyn_cast<CUnaryExpr>(cur)) {
+                if (u->op == UnaryOp::Deref) {
+                    sawAccess = true; cur = u->operand.get(); continue;
+                }
+            }
+            break;
+        }
+        auto* v = llvm::dyn_cast_or_null<CVarRefExpr>(cur);
+        return sawAccess && v && v->varName == tn;
+    };
+
     std::function<void(const CStmt*)> walkStmt;
     std::function<void(const std::vector<StmtPtr>&)> walkList =
         [&](const std::vector<StmtPtr>& body) {
@@ -2594,7 +2620,8 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
                     isZeroLit(a->value.get());
                 if (plainSelf || selfOrAnd || opZero) {
                     cnt.identityNoOp++;
-                } else if (rhsRefs) {
+                } else if (rhsRefs &&
+                           !isPureSelfWalk(a->value.get(), tn)) {
                     cnt.suspiciousSelfRef++;
                 }
             }
