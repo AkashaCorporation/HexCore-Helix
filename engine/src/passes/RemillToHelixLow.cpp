@@ -2674,6 +2674,35 @@ private:
                     break;
                 }
 
+                // Memory-operand load.  For a memory READ-MODIFY-WRITE
+                // (`or [mem], x`, has_memory_dst) the lhs operand is the [mem]
+                // ADDRESS, not its value -- load it before the op; for a pure
+                // memory SOURCE (`or reg, [mem]`, has_memory_src only) the rhs is
+                // the address.  Without this the handler used the address itself
+                // as the value, emitting `*addr = addr | flag` instead of
+                // `*addr = *addr | flag` (corrupting every `op [mem], imm`, e.g.
+                // region-flag ORs and memory counter ADDs).  Mirrors the
+                // CMP/TEST/MOV memory-source handling below.
+                Value lhsVal = ensureInt64(lhs, builder, loc, &regs, &pcTracker);
+                Value rhsVal = ensureInt64(rhs, builder, loc, &regs, &pcTracker);
+                if (semInfo.has_memory_dst) {
+                    lhsVal = ensureInt64(
+                        builder
+                            .create<helix::low::MemReadOp>(
+                                loc, i64Ty, lhsVal,
+                                builder.getUI32IntegerAttr(64), addrAttr)
+                            .getResult(),
+                        builder, loc);
+                } else if (semInfo.has_memory_src) {
+                    rhsVal = ensureInt64(
+                        builder
+                            .create<helix::low::MemReadOp>(
+                                loc, i64Ty, rhsVal,
+                                builder.getUI32IntegerAttr(64), addrAttr)
+                            .getResult(),
+                        builder, loc);
+                }
+
                 auto binOp = builder.create<helix::low::BinOp>(
                     loc,
                     /*result=*/i64Ty,
@@ -2682,8 +2711,8 @@ private:
                     /*sign_flag=*/i1Ty,
                     /*overflow_flag=*/i1Ty,
                     *kind,
-                    ensureInt64(lhs, builder, loc, &regs, &pcTracker),   // lhs
-                    ensureInt64(rhs, builder, loc, &regs, &pcTracker),   // rhs
+                    lhsVal,   // lhs
+                    rhsVal,   // rhs
                     addrAttr,
                     UnitAttr{});
 
@@ -3958,14 +3987,28 @@ private:
         case RemillSemantic::INC: {
             if (call.getNumOperands() >= 4) {
                 auto destRegPtr = call.getOperand(2);
-                auto val = call.getOperand(3);
+                auto src = call.getOperand(3);
+                // A MEMORY-operand INC (`inc qword [mem]`, e.g. `lock inc`) passes
+                // the ADDRESS as operand 3, not the value.  The handler must LOAD
+                // from it first -- without this it used the address itself as the
+                // value, emitting `*addr = addr + 1` instead of `*addr = *addr + 1`
+                // and corrupting every memory increment (refcounts, counters).
+                Value val = semInfo.has_memory_src
+                    ? ensureInt64(
+                          builder
+                              .create<helix::low::MemReadOp>(
+                                  loc, i64Ty,
+                                  ensureInt64(src, builder, loc, &regs,
+                                              &pcTracker),
+                                  builder.getUI32IntegerAttr(64), addrAttr)
+                              .getResult(),
+                          builder, loc)
+                    : ensureInt64(src, builder, loc, &regs, &pcTracker);
                 auto unOp = builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    helix::low::UnaryOpKind::Inc,
-                    ensureInt64(val, builder, loc, &regs, &pcTracker),
-                    addrAttr);
+                    helix::low::UnaryOpKind::Inc, val, addrAttr);
 
-                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, val,
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
                                           unOp.getResult(), regs, addrAttr);
                 builder.create<helix::low::RegWriteOp>(
                     loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
@@ -3977,14 +4020,25 @@ private:
         case RemillSemantic::DEC: {
             if (call.getNumOperands() >= 4) {
                 auto destRegPtr = call.getOperand(2);
-                auto val = call.getOperand(3);
+                auto src = call.getOperand(3);
+                // Memory-operand DEC: load from the address operand before
+                // decrementing (see the INC case for the full rationale).
+                Value val = semInfo.has_memory_src
+                    ? ensureInt64(
+                          builder
+                              .create<helix::low::MemReadOp>(
+                                  loc, i64Ty,
+                                  ensureInt64(src, builder, loc, &regs,
+                                              &pcTracker),
+                                  builder.getUI32IntegerAttr(64), addrAttr)
+                              .getResult(),
+                          builder, loc)
+                    : ensureInt64(src, builder, loc, &regs, &pcTracker);
                 auto unOp = builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
-                    helix::low::UnaryOpKind::Dec,
-                    ensureInt64(val, builder, loc, &regs, &pcTracker),
-                    addrAttr);
+                    helix::low::UnaryOpKind::Dec, val, addrAttr);
 
-                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, val,
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
                                           unOp.getResult(), regs, addrAttr);
                 builder.create<helix::low::RegWriteOp>(
                     loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),

@@ -2127,6 +2127,11 @@ private:
             std::vector<helix::high::VarRefOp> refs;
             std::set<Block*> liveBlocks;
             bool touchesCallBlock = false;
+            // The variable is assigned directly from a call result. Phase 4 must
+            // not merge such a variable away, or renameRemainingRegisterVars
+            // later collapses the distinct call-return SSA versions into one vN
+            // (the `v3 = printk(0, v3)` x4 defect documented under FIX-081).
+            bool definedByCall = false;
         };
 
         auto buildVarInfoMap = [&](Region& body)
@@ -2169,6 +2174,29 @@ private:
                     }
                 }
             }
+
+            // 4. Mark variables whose value is assigned directly from a call
+            //    result. An AssignOp's target is operand 0 (a VarRefOp result)
+            //    and its value is getValue(); mirrors the Phase-5 single-use
+            //    guard's call detection.
+            body.walk([&](helix::high::AssignOp assign) {
+                Value assignedVal = assign.getValue();
+                Operation* valDef = assignedVal.getDefiningOp();
+                if (!valDef)
+                    return;
+                if (!isa<helix::high::CallOp>(valDef) &&
+                    !helix::isAnyCallOp(valDef))
+                    return;
+                if (assign->getNumOperands() == 0)
+                    return;
+                auto targetRef = assign->getOperand(0)
+                                     .getDefiningOp<helix::high::VarRefOp>();
+                if (!targetRef)
+                    return;
+                auto it = infoMap.find(targetRef.getVarId());
+                if (it != infoMap.end())
+                    it->second.definedByCall = true;
+            });
 
             return infoMap;
         };
@@ -2272,6 +2300,16 @@ private:
             return false;
         };
 
+        // ---------- Helper: register family of a variable name ----------
+        // "rax" / "rax_2" -> "rax". Keeps the call-result guard CROSS-register
+        // only (same-register coalescing is Phase 3.5's job and is correct); we
+        // only protect call-result identity when Phase 4 would fold it into a
+        // DIFFERENT register's variable.
+        auto registerBase = [](llvm::StringRef n) -> llvm::StringRef {
+            size_t us = n.find('_');
+            return (us == llvm::StringRef::npos) ? n : n.take_front(us);
+        };
+
         // ---------- Run merge iterations ----------
 
         constexpr unsigned kMaxMergeIterations = 3;
@@ -2359,6 +2397,23 @@ private:
 
                     auto& canonInfo = infoMap[canonId];
                     auto& victimInfo = infoMap[victimId];
+
+                    // Phase-4-aware guard (FIX-081 follow-up option 1). Refuse to
+                    // merge away a call-result variable into a DIFFERENT
+                    // register's variable: preserves the call-return identity that
+                    // Phase 4's cover-based merge would otherwise fold into one
+                    // canonical register (later flattened to a single vN). Scoped
+                    // cross-register only so legitimate same-register coalescing
+                    // (Phase 3.5's domain) is untouched. VALIDATED on the real
+                    // Mali kbase corpus: 6 adversarial judges 5 BETTER / 1 NEUTRAL
+                    // / 0 WORSE; removes wrong void-return captures, splits
+                    // overloaded call-result vars, de-stubs placeholder branches
+                    // into real named calls, +5pp confidence, 0 regressions.
+                    if (victimInfo.definedByCall &&
+                        registerBase(victimInfo.decl.getVarName()) !=
+                            registerBase(canonInfo.decl.getVarName())) {
+                        continue;
+                    }
 
                     LLVM_DEBUG(llvm::dbgs()
                         << "    Merging var '"

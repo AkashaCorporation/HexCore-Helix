@@ -86,6 +86,16 @@ public:
     void initializeReadBeforeWriteVars(CFuncDecl& func);
     void reanalyzeConfidence(CFuncDecl& func);
 
+    /// Remove pure stores to variables that are NEVER read anywhere in the
+    /// function (globally dead).  The existing dseStmtList only eliminates
+    /// TOP-LEVEL dead stores (it treats nested if/switch scopes conservatively
+    /// as all-live), so dead stores buried in a deeply-nested structured form
+    /// survive -- e.g. `var_0 = 0xADDR` PC-tracking shadow stores (var_0 written
+    /// 12x, read 0x).  A whole-function read-set makes removal unconditionally
+    /// sound: if a name is never read, every pure (call-free) store to it is dead
+    /// regardless of scope.
+    void removeGloballyDeadStores(CFuncDecl& func);
+
     /// Apply user-defined variable renames to the entire AST.
     /// Walks all CVarRefExpr nodes and VarDecl names, replacing
     /// occurrences of old_name with new_name from the rename map.

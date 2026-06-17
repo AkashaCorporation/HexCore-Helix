@@ -564,7 +564,7 @@ static bool hasObservableSideEffects(Operation* op) {
 ///
 /// Live operations:
 ///   - helix_low.jcc, helix_low.jmp                  (branch — affects control flow)
-///   - helix_high.if / while / do_while / for        (structured control flow)
+///   - helix_high.if / switch / while / do_while / for (structured control flow)
 ///   - helix_low.call / variadic_call, helix_high.call (function call — observable)
 ///   - helix_low.ret, helix_high.return              (return — observable output)
 ///   - helix_low.mem.write                           (memory write — observable)
@@ -572,6 +572,12 @@ static bool isLiveConsumer(Operation* op) {
     return isa<helix::low::JccOp>(op) ||
            isa<helix::low::JmpOp>(op) ||
            isa<helix::high::IfOp>(op) ||
+           // helix_high.switch consumes its SELECTOR as a control-flow input.
+           // Was missing: a switch whose selector is read ONLY at the switch had
+           // its selector var DCE'd as dead, leaving the switch reading a phantom
+           // (0) value and mis-dispatching.  Affects RVSDG exit-dispatchers and
+           // any RecoverSwitchTables jump table with a switch-only selector.
+           isa<helix::high::SwitchOp>(op) ||
            isa<helix::high::WhileOp>(op) ||
            isa<helix::high::DoWhileOp>(op) ||
            isa<helix::high::ForOp>(op) ||
