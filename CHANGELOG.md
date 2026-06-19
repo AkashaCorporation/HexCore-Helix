@@ -3,7 +3,33 @@
 All notable changes to HexCore Helix are documented here.
 
 
-## [Unreleased] - v1.0 structurer rewrite: M0-M2 + the selector-survival fix + M4 deopt (branch scf-structurer-v1) - 2026-06-16
+## [Unreleased]
+
+**FIX-100 - 64-bit address printed truncated to 32 bits (public issue #37 Bug 3 / internal G7).** `CAstPrinter::formatIntLiteral` printed integer literals with `std::snprintf("0x%lX", static_cast<unsigned long>(value))`. On Windows (LLP64) `unsigned long` is 32-bit, so EVERY 64-bit address taking the `IntLitExpr` path was masked to its low 32 bits: `0x1410E5F80 -> 0x410E5F80`, i.e. any effective address crossing the `0x1_0000_0000` boundary (ImageBase >= 0x140000000 with a large `.text`) became an invalid VA, making the IR useless for semantic analysis. NOT a lifter bug (the `.ll` stores the PC full-width and computes the address via the LEA intrinsic; `llvm::raw_ostream::write_hex`, the `AddrLitExpr` path, already takes `unsigned long long`) - purely the printer's IntLit path. FIX = `"0x%llX"` + `static_cast<unsigned long long>`. SAFE: only values >= 0x1_0000_0000 change form; sub-4GB literals + all fixtures are byte-identical. Validated on ROTTR `UpdatePosition` (`*0x410E5F80 -> *0x1410E5F80`, `0x4237BA50 -> 0x14237BA50`); float bitmasks (0x7FC00000 etc.) untouched.
+
+**FIX-097 - relocated `.rodata` string recovery (the disasm <-> Helix connector the scaffold was missing).** Kernel-module / rootkit decompiles showed `printk(0, ...)` for every format string: the string-render path existed (`high::StringLitOp`, `cast::CStringLitExpr`, `DataSectionProvider::readCString`) but NOTHING ever created a `StringLitOp` from a constant, so a relocated `mov rdi, .rodata+OFF` (patched by the HexCore disassembler to a known data address) rendered as a bare integer. Wired the connector:
+- `Engine::parseHelixStringsMetadata` scans the input IR for the `!helix.strings` module metadata the disassembler emits for ET_REL `.rodata` relocations (a fake base VA + the raw, `\HH`-escaped section bytes) and registers each node via `addDataSection` at the top of `decompileIR` / `decompileIRText` - BEFORE the `ScopedDataSectionProvider` is installed (it early-returns when `data_sections_` is empty, so registration must precede it).
+- `CAstBuilder::buildIntegerConstant` (the single IntLit chokepoint) + the `AddrLitOp` branch resolve a constant through `getActiveDataSectionProvider()->readCString()` to a `CStringLitExpr` when it is a clean printable C-string - a leading kernel KERN_SOH `\001`+level byte is tolerated, >=2 body chars, <=512. GATED on an active provider, so every corpus decompile without `!helix.strings` (i.e. all existing inputs) is byte-identical -> **zero regression** (verified: a no-metadata `.ll` still renders `printk(0)`, 0 spurious strings).
+- `CAstPrinter` now escapes a `StringLitExpr` to a valid C literal - quotes/backslash, `\n` `\t` `\r`, and any other non-printable byte as **3-digit octal** (not `\xHH`, which would greedily merge a control byte with a following hex digit, e.g. the KERN prefix `\001`+`7`).
+
+Validated end-to-end on `malware.ko` `fh_install_hook`: `printk(0, *v11)` -> `printk("\0017DMESG: unresolved symbol: %s\n", *v5)` (all five DMESG format strings + KERN levels), through `liftToIR` -> Souper (preserves the metadata + constants, 0/399 replaced) -> this engine. The `.node` was rebuilt from this tree (`cargo build --release -p hexcore-helix`, bypassing the absent napi CLI; LNK2019 gotcha = copy the fresh `engine/build/helix_engine.lib` over `engine/deps/llvm-mlir/engine/`) and deployed into `vscode-main/extensions/hexcore-helix/`, where the IDE `hexcore.helix.decompile` now shows the strings. A worked example of ale's point: the dialect already had the ops, it lacked the semantics linking them.
+
+**Structurer rewrite promoted to DEFAULT-ON + M4 P4/P5 (dispatcher elimination).** The
+`mlir::transformCFGToSCF` rewrite (detailed below) is now the DEFAULT path in this
+sandbox: `StructureControlFlow.cpp` runs it unless `HELIX_SCF_LEGACY=1` is set (it was
+previously gated behind an opt-in `HELIX_SCF_SPIKE`). M4 deopt extended to P4/P5 to
+close the dispatcher gap the section below flagged as "NEXT = P4 ... not yet done":
+- **P4 (`CAstOptimizer::collapseDispatcher`).** Removed the `nonDefault > 2` bail for
+  `scf_r*` selectors, so the synthetic structurer dispatcher is collapsed even with
+  many arms instead of being emitted as a residual switch.
+- **P5 (`eliminateDeadSelectorStores`, new).** A recursive `scf_r*` liveness pass that
+  removes selector stores whose value is never read on any path -- the dead routing
+  state left after P4 collapses an arm.
+- **Validated independently:** context_mmap 899 -> 655, mem_alloc 599 -> 456 lines, all
+  0 unreachable; x86 fixtures byte-identical; WWZ ESP coverage 37.8% -> 80.3%. This
+  supersedes the "NEXT = P4 ... not yet done" note in the section below.
+
+### v1.0 structurer rewrite: M0-M2 + the selector-survival fix + M4 deopt (branch scf-structurer-v1) - 2026-06-16
 
 WIP, behind the `HELIX_SCF_SPIKE` env gate; not landed (no version bump). This is
 the executable proof of the `STRUCTURER_V1_REWRITE_SCOPING.md` direction: reuse

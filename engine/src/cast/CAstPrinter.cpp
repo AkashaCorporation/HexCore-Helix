@@ -158,7 +158,33 @@ void CAstPrinter::printExpr(const CExpr& expr, int parentPrec) {
     }
     case NodeKind::StringLitExpr: {
         const auto& e = static_cast<const CStringLitExpr&>(expr);
-        os << "\"" << e.value << "\"";
+        // Emit a valid C string literal: escape quotes/backslash, common
+        // whitespace, and any other non-printable byte as 3-digit octal
+        // (octal — not \xHH — so a control byte followed by a hex digit, e.g.
+        // the kernel KERN_SOH prefix "\001" + '7', is not greedily merged).
+        std::string out;
+        out.reserve(e.value.size() + 2);
+        out.push_back('"');
+        for (unsigned char b : e.value) {
+            switch (b) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\t': out += "\\t";  break;
+                case '\r': out += "\\r";  break;
+                default:
+                    if (b < 0x20 || b > 0x7e) {
+                        out.push_back('\\');
+                        out.push_back(static_cast<char>('0' + ((b >> 6) & 7)));
+                        out.push_back(static_cast<char>('0' + ((b >> 3) & 7)));
+                        out.push_back(static_cast<char>('0' + (b & 7)));
+                    } else {
+                        out.push_back(static_cast<char>(b));
+                    }
+            }
+        }
+        out.push_back('"');
+        os << out;
         break;
     }
     case NodeKind::AddrLitExpr: {
@@ -550,10 +576,15 @@ std::string CAstPrinter::formatIntLiteral(int64_t value) {
     if (value >= -256 && value <= 256)
         return std::to_string(value);
 
-    // Large values or hex-friendly: print as hex
+    // Large values or hex-friendly: print as hex.
+    // FIX-100 (issue #37 Bug 3 / G7): `unsigned long` is 32-bit on Windows
+    // (LLP64), so `static_cast<unsigned long>` TRUNCATED every 64-bit address
+    // to its low 32 bits (e.g. 0x1410E5F80 -> 0x410E5F80) for any RVA crossing
+    // the 4GB boundary (ImageBase >= 0x140000000). Use a width-stable 64-bit
+    // type + %llX.
     if (value >= 0) {
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "0x%lX", static_cast<unsigned long>(value));
+        std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(value));
         return buf;
     }
 

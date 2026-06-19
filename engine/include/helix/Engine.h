@@ -168,6 +168,15 @@ private:
     // Data sections owned by this engine instance.  Lazily wrapped into a
     // DataSectionProvider for the active thread before each pipeline run.
     std::vector<DataSection> data_sections_;
+
+    // FIX-097: scan the input IR text for `!helix.strings` named metadata
+    // emitted by the HexCore disassembler (relocated .rodata bytes for ET_REL
+    // string loads) and register each node as a data section, so a patched
+    // `mov rdi, <fakeBase+OFF>` resolves to its real string literal. Called at
+    // the top of decompileIR/decompileIRText, before the DataSectionProvider is
+    // installed. No-op when the metadata is absent (e.g. normal PE/ELF input,
+    // where the TS layer feeds sections via addDataSection instead).
+    void parseHelixStringsMetadata(const char* ir_text, size_t ir_len);
 };
 
 } // namespace helix

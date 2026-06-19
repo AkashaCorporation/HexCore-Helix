@@ -15,6 +15,7 @@
 #include "helix/dialects/HelixHighDialect.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
+#include "helix/analysis/DataSectionProvider.h"  // FIX-097: rodata string recovery
 
 #include <unordered_set>
 
@@ -562,6 +563,39 @@ std::string CAstBuilder::blockLabelForAddr(uint64_t addr) const {
 //   confirmed-referenced goto target (so it WILL be emitted) we prefer the
 //   sharper `&loc_xxxx`.  (FUTURE: once D3 guarantees label emission for every
 //   registry block start, the `&loc_xxxx` branch can widen.)
+// FIX-097: resolve a constant that points into a registered data section to
+// its C-string literal (e.g. a relocated `mov rdi, .rodata+OFF` => the real
+// format string). Returns nullptr when no provider is active — which is the
+// case for every ordinary corpus run, so this is behaviour-neutral unless the
+// disassembler fed string bytes (ET_REL via !helix.strings, or PE .rdata).
+static ExprPtr tryResolveStringLiteral(uint64_t value, uint64_t addr) {
+    if (value < 0x1000)
+        return nullptr;  // small immediates are never string pointers
+    const helix::DataSectionProvider* provider =
+        helix::getActiveDataSectionProvider();
+    if (!provider || !provider->isAvailable())
+        return nullptr;
+    auto str = provider->readCString(value);
+    if (!str || str->empty() || str->size() > 512)
+        return nullptr;
+    const std::string& s = *str;
+    // Allow a leading kernel KERN_SOH level prefix (0x01 + digit) and the usual
+    // \t \n \r whitespace; require every other byte to be printable ASCII so
+    // binary/non-string data is never mis-rendered as a string.
+    size_t start = (static_cast<uint8_t>(s[0]) >= 0x01 &&
+                    static_cast<uint8_t>(s[0]) <= 0x07) ? 1 : 0;
+    if (s.size() - start < 2)
+        return nullptr;
+    for (char c : s) {
+        uint8_t b = static_cast<uint8_t>(c);
+        bool ok = (b >= 0x20 && b <= 0x7e) || b == '\t' || b == '\n' ||
+                  b == '\r' || (b >= 0x01 && b <= 0x07);
+        if (!ok)
+            return nullptr;
+    }
+    return std::make_unique<CStringLitExpr>(s, addr);
+}
+
 ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
                                           uint64_t addr) {
     const uint64_t uval = static_cast<uint64_t>(value);
@@ -629,7 +663,14 @@ ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
     if (auto label = resolveFoldedCodeLabel(uval))
         return std::move(*label);
 
-    // (d) Not a code address → ordinary integer literal, unchanged.
+    // (d) FIX-097: a constant that resolves to a registered data section is a
+    //     string-literal pointer (a relocated `.rodata` load) — render the real
+    //     text, turning printk(0, ...) into printk("DMESG: ...", ...). Gated on
+    //     an active DataSectionProvider, so normal runs are unaffected.
+    if (auto str = tryResolveStringLiteral(uval, addr))
+        return str;
+
+    // (e) Not a code address → ordinary integer literal, unchanged.
     return std::make_unique<CIntLitExpr>(value, std::move(type), addr);
 }
 
@@ -2106,6 +2147,9 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── Address literal ────────────────────────────────────────────────
     if (auto addrLit = dyn_cast<helix::high::AddrLitOp>(defOp)) {
+        // FIX-097: a pointer-typed constant into a data section is a string.
+        if (auto str = tryResolveStringLiteral(addrLit.getAddrValue(), addr))
+            return str;
         return std::make_unique<CAddrLitExpr>(
             addrLit.getAddrValue(), convertType(val.getType()), addr);
     }

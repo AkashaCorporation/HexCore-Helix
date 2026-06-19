@@ -2060,10 +2060,12 @@ private:
         if (funcBody.empty())
             return success();
 
-        // [SCF-SPIKE] M0: gated behind HELIX_SCF_SPIKE, lift this function to scf
-        // via the upstream correct-by-construction algorithm instead of the
-        // legacy block-moving structurer, and skip the rest of the pass.
-        if (std::getenv("HELIX_SCF_SPIKE"))
+        // [SCF-SPIKE] 1.0.0-candidate: the upstream correct-by-construction
+        // (transformCFGToSCF / RVSDG) structurer is now the DEFAULT (M0-M4
+        // validated: 0 unreachable on kbase + WWZ, 1.2x IDA, no fixture/clean
+        // regressions). Set HELIX_SCF_LEGACY=1 to force the old block-moving
+        // structurer. (HELIX_SCF_SPIKE still forces it on too, for back-compat.)
+        if (std::getenv("HELIX_SCF_SPIKE") || !std::getenv("HELIX_SCF_LEGACY"))
             return runSCFSpike(func);
 
         OpBuilder builder(func->getContext());

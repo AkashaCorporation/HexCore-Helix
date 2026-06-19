@@ -118,6 +118,35 @@ public:
     /// leaving each branch assigning the consumed selector directly.
     void coalesceSelectorChains(CFuncDecl& func);
 
+    /// M4 P5 (selector DCE): after P3/P4 dissolve every `switch(scf_r)` into an
+    /// if/else-if chain, the synthetic selector survives only as `if (scf_rK==c)`
+    /// reads plus a forest of `scf_rK = const` writes.  The vast majority of those
+    /// writes are DEAD: an RVSDG arm sets the selector on the way out, but most
+    /// continuations re-test/overwrite it before any read (e.g. `scf_r = 0;
+    /// scf_r = 1;` or a value never reached by any later if-condition).  The
+    /// CAstBuilder-level guards (precomputeDeadStores / dseStmtList) refuse to DSE
+    /// ANY scf_* var unconditionally -- that guard existed to protect the selector
+    /// while it was consumed by a `switch`, and the flat backward scan there
+    /// under-counts liveness across structured scopes.  This pass replaces that
+    /// blunt guard with a PROPER recursive backward liveness restricted to scf_r*
+    /// selectors (sound because they are pointerless, non-aliased, never
+    /// address-taken, and never read by a call): a `scf_rK = const` is erased when
+    /// scf_rK is not live on the join after it.  This is the line-count lever --
+    /// the dead selector writes are ~36% of the dispatcher-heavy functions.  Runs
+    /// AFTER dissolveExitDispatchers so the switch is already an if-chain (no
+    /// switch selector to keep artificially live).  Loops and goto/label scopes
+    /// are handled conservatively (every selector kept live across them).
+    void eliminateDeadSelectorStores(CFuncDecl& func);
+
+    // ── Public expression utilities (used by free-function AST helpers) ───────
+
+    /// Collect all CVarRefExpr names from an expression into the given set.
+    static void collectVarRefs(const CExpr* expr,
+                               std::unordered_set<std::string>& names);
+
+    /// Returns true if the expression contains a CCallExpr (has side effects).
+    static bool exprHasCall(const CExpr* expr);
+
     /// Apply user-defined variable renames to the entire AST.
     /// Walks all CVarRefExpr nodes and VarDecl names, replacing
     /// occurrences of old_name with new_name from the rename map.
@@ -151,13 +180,6 @@ private:
     void filterStatements(std::vector<StmtPtr>& stmts);
 
     // ── Dead store helpers ───────────────────────────────────────────────────
-
-    /// Collect all CVarRefExpr names from an expression into the given set.
-    static void collectVarRefs(const CExpr* expr,
-                               std::unordered_set<std::string>& names);
-
-    /// Returns true if the expression contains a CCallExpr (has side effects).
-    static bool exprHasCall(const CExpr* expr);
 
     /// Returns true if the assign target should never be eliminated
     /// (pointer dereference, field access).
