@@ -414,9 +414,20 @@ endif()
 
 find_package(flatbuffers QUIET)
 if(flatbuffers_FOUND)
-    message(STATUS "Found FlatBuffers — enabling real serialization")
+    message(STATUS "Found FlatBuffers (package) -- enabling real serialization")
     target_link_libraries(helix_engine PRIVATE flatbuffers::flatbuffers)
     target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include/flatbuffers/flatbuffers.h")
+    # Vendored FlatBuffers C++ headers (v25.12.19, matches the Rust crate). The
+    # FlatBufferBuilder path is header-only, so no link is required -- just the
+    # include dir + the macro. This is what gives FlatBufSerializer the real
+    # C-AST -> HAST serialization that HQL (Helix Query Language) consumes.
+    message(STATUS "Using vendored FlatBuffers headers -- enabling real serialization")
+    target_include_directories(helix_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include")
+    target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
+else()
+    message(STATUS "FlatBuffers not found -- stub HAST serialization (HQL gets module name only).")
+    message(STATUS "  To enable: run  bash engine/vendor_flatbuffers.sh  then reconfigure.")
 endif()
 
 # ─── CLI Tool ──────────────────────────────────────────────────────────────────
