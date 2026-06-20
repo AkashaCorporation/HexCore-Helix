@@ -3392,7 +3392,20 @@ private:
                 // edge and collapse the whole function to a stub).  Genuine
                 // tail-call blocks have no intra-function successor, so this
                 // only fires on wired edges.
-                if (preserveCfg_) {
+                //
+                // FIX (RC4-PRGA stub-collapse): this MUST run regardless of
+                // preserveCfg_.  An LLVM `br label %bb_X` can only ever target
+                // an intra-function block, so a single-successor branch
+                // terminator on this block proves the jmp is an intra-function
+                // branch.  GCC's top-test `for` loop emits `jmp .cond`, which
+                // Remill lifts as a @JMP intrinsic with a *constant* operand
+                // AND a `br label %bb_cond` terminator; the tail-call
+                // reclassifier below only excluded *computed* operands, so the
+                // constant intra-function target was mis-lowered to a ret-
+                // terminated external call -> the entire loop body was orphaned
+                // and deleted.  Genuine tail-calls are ret-terminated (0
+                // successors) and still fall through to the reclassifier below.
+                if (true) {
                     Block* curBlock = call->getBlock();
                     Block* dest = nullptr;
                     if (curBlock) {
