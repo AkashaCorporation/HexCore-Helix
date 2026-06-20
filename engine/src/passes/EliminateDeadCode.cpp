@@ -583,6 +583,18 @@ static bool isLiveConsumer(Operation* op) {
            isa<helix::high::WhileOp>(op) ||
            isa<helix::high::DoWhileOp>(op) ||
            isa<helix::high::ForOp>(op) ||
+           // helix_high.yield terminating a LOOP CONDITION region carries the
+           // loop-guard value (scf_w*) out of the do_while/while/for. Same class
+           // as the SwitchOp selector fix above: that value is read ONLY by this
+           // yield, so without it the guard-write is invisible to liveness -> the
+           // guard-write is DCE'd -> the loop condition collapses to a phantom 0
+           // (while(scf_w...) with scf=0). Gated to loop cond-regions so if/switch
+           // result-routing yields (handled by the selector passes) stay eligible
+           // for DCE and we don't bloat the output.
+           (isa<helix::high::YieldOp>(op) && op->getNumOperands() > 0 &&
+            (isa<helix::high::DoWhileOp>(op->getParentOp()) ||
+             isa<helix::high::WhileOp>(op->getParentOp()) ||
+             isa<helix::high::ForOp>(op->getParentOp()))) ||
            isa<helix::low::CallOp>(op) ||
            isa<helix::low::VariadicCallOp>(op) ||
            isa<helix::high::CallOp>(op) ||
