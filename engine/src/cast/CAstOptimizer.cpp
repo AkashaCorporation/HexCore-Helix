@@ -22,6 +22,7 @@
 #include "llvm/Support/Casting.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cassert>
 #include <cctype>
@@ -6818,6 +6819,10 @@ void CAstOptimizer::eliminateConstantBranches(CFuncDecl& func) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void CAstOptimizer::removeGloballyDeadStores(CFuncDecl& func) {
+    // FIX-106: aggressive dead-call-result demotion is OPT-IN via the
+    // HELIX_AGGRESSIVE_DSE env var.  Default-OFF -> output byte-identical.
+    const bool aggressive = std::getenv("HELIX_AGGRESSIVE_DSE") != nullptr;
+
     // 1) collect every variable name READ as a VALUE anywhere (a plain assign
     //    target is a write, not a read; a compound target or a deref/field/
     //    subscript target IS read).
@@ -6919,6 +6924,32 @@ void CAstOptimizer::removeGloballyDeadStores(CFuncDecl& func) {
                     break;
                 default:
                     break;
+                }
+            }
+            // FIX-106 (opt-in): a globally-dead store whose RHS is a TOP-LEVEL
+            // call has its dead lvalue dropped but the call KEPT as a bare
+            // expression statement, preserving the side effect
+            // (`v5 = foo(...);` -> `foo(...);` when v5 is never read).  Guarded
+            // to a top-level CallExpr ONLY -- never `x = g() + h()` (which would
+            // discard sibling computation) -- and only when the target is
+            // globally dead.  The call's argument var-refs were already counted
+            // in `reads` (collectReads visits a.value), so liveness is unchanged.
+            if (aggressive) {
+                for (auto& sp : stmts) {
+                    if (!sp || sp->getKind() != NodeKind::AssignStmt)
+                        continue;
+                    auto& a = static_cast<CAssignStmt&>(*sp);
+                    if (!a.compoundOp.empty() || !a.target ||
+                        a.target->getKind() != NodeKind::VarRefExpr)
+                        continue;
+                    if (!a.value || a.value->getKind() != NodeKind::CallExpr)
+                        continue;
+                    const std::string& nm =
+                        static_cast<const CVarRefExpr&>(*a.target).varName;
+                    if (reads.count(nm))
+                        continue;  // read somewhere -> keep the assignment
+                    const uint64_t addr = a.getAddress();
+                    sp = std::make_unique<CExprStmt>(std::move(a.value), addr);
                 }
             }
             std::erase_if(stmts, [&](const StmtPtr& sp) {

@@ -278,6 +278,40 @@ static std::optional<int64_t> tryExtractIntLiteral(Value value) {
     return std::nullopt;
 }
 
+/// FIX-091 (issue #15) extension: recursively fold a *fully-constant* add/sub
+/// chain into a single value, so a multi-level NEXT_PC fold
+/// (e.g. `add(add(base_const, a), b)` or `sub(add(base, c), d)`) reaches
+/// `resolveFoldedCodeLabel` the same way the single-level `add(base, off)` form
+/// already does.  Bottoms out ONLY on integer literals (via tryExtractIntLiteral);
+/// any non-literal, non-add/sub leaf -> nullopt, so a runtime base
+/// (`add(param, c)`) is NEVER folded (it stays an ordinary CBinaryExpr) and the
+/// FIX-091 "fully-constant only" soundness invariant holds.  All arithmetic is
+/// uint64 wrapping; the caller masks to low-32 and gates against the in-function
+/// address set, so a transient out-of-window intermediate can only MISS a real
+/// address, never create a false positive.  Depth-capped against pathological IR.
+static std::optional<uint64_t> tryFoldConstantOffset(Value value, int depth = 0) {
+    if (!value || depth > 16)
+        return std::nullopt;
+    if (auto lit = tryExtractIntLiteral(value))
+        return static_cast<uint64_t>(*lit);
+    auto* defOp = value.getDefiningOp();
+    if (!defOp)
+        return std::nullopt;
+    if (auto addOp = dyn_cast<LLVM::AddOp>(defOp)) {
+        if (auto l = tryFoldConstantOffset(addOp.getLhs(), depth + 1))
+            if (auto r = tryFoldConstantOffset(addOp.getRhs(), depth + 1))
+                return *l + *r;
+        return std::nullopt;
+    }
+    if (auto subOp = dyn_cast<LLVM::SubOp>(defOp)) {
+        if (auto l = tryFoldConstantOffset(subOp.getLhs(), depth + 1))
+            if (auto r = tryFoldConstantOffset(subOp.getRhs(), depth + 1))
+                return *l - *r;
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 /// Heuristic: true when an identifier likely names a struct/object base.
 static bool looksLikeStructBase(std::string_view name) {
     if (name.empty() || name == "rsp" || name == "rbp")
@@ -2679,17 +2713,15 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         // as `add(base_const, off_const)` (e.g. a NEXT_PC 0x1409B9F77 =
         // 0x1409B9F5B + 0x1C).  The cast optimizer would re-fold this and the
         // printer would truncate it to the bare data leak `0x409B9F77`.
-        // Short-circuit ONLY when both operands are integer literals AND the
-        // sum resolves to a genuine in-function code address; otherwise build
-        // the ordinary binary (the optimizer's general const-fold path stays
-        // byte-identical for all non-code-address arithmetic).
-        if (auto l = tryExtractIntLiteral(addOp.getLhs()))
-            if (auto r = tryExtractIntLiteral(addOp.getRhs())) {
-                uint64_t sum = static_cast<uint64_t>(*l) +
-                               static_cast<uint64_t>(*r);
-                if (auto label = resolveFoldedCodeLabel(sum, addr))
-                    return std::move(*label);
-            }
+        // Short-circuit when the operand chain folds to a single fully-constant
+        // value (multi-level add/sub of literals, e.g. add(add(base,a),b)) AND
+        // it resolves to a genuine in-function code address; otherwise build the
+        // ordinary binary (the optimizer's general const-fold path stays
+        // byte-identical for all non-code-address arithmetic).  A non-literal
+        // leaf (a runtime base) makes the fold bail, so it is never recovered.
+        if (auto folded = tryFoldConstantOffset(val))
+            if (auto label = resolveFoldedCodeLabel(*folded, addr))
+                return std::move(*label);
         auto lhs = buildExpression(addOp.getLhs());
         auto rhs = buildExpression(addOp.getRhs());
         return std::make_unique<CBinaryExpr>(
@@ -2700,14 +2732,10 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.sub ──────────────────────────────────────────────────────
     if (auto subOp = dyn_cast<LLVM::SubOp>(defOp)) {
         // FIX-091 (issue #15 C1): same folded-code-address recovery as add,
-        // for the `sub(base_const, off_const)` shape.
-        if (auto l = tryExtractIntLiteral(subOp.getLhs()))
-            if (auto r = tryExtractIntLiteral(subOp.getRhs())) {
-                uint64_t diff = static_cast<uint64_t>(*l) -
-                                static_cast<uint64_t>(*r);
-                if (auto label = resolveFoldedCodeLabel(diff, addr))
-                    return std::move(*label);
-            }
+        // for the `sub(...)` shape (including multi-level add/sub chains).
+        if (auto folded = tryFoldConstantOffset(val))
+            if (auto label = resolveFoldedCodeLabel(*folded, addr))
+                return std::move(*label);
         auto lhs = buildExpression(subOp.getLhs());
         auto rhs = buildExpression(subOp.getRhs());
         return std::make_unique<CBinaryExpr>(

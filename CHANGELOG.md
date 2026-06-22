@@ -5,6 +5,10 @@ All notable changes to HexCore Helix are documented here.
 
 ## [Unreleased]
 
+**FIX-106 - opt-in aggressive DSE: demote a dead call-result store to a bare call (`HELIX_AGGRESSIVE_DSE`).** `removeGloballyDeadStores` deliberately KEEPS a globally-dead store whose RHS contains a call (the `exprHasCall` guard at `CAstOptimizer.cpp:6935`), to preserve the call's side effect -- so `v5 = ftrace_set_filter_ip(...)` survives in the output even when `v5` is never read again. New OPT-IN pass (gated on the `HELIX_AGGRESSIVE_DSE` env var, read once at the top of the pass; default-OFF -> byte-identical output): inside the recursive `removeDead` walk, BEFORE the existing `erase_if`, any AssignStmt whose target is a plain globally-dead variable (not in the function read-set) AND whose RHS is a **top-level `CallExpr`** is demoted in place to a bare `CExprStmt(call)`. The dead lvalue is dropped, the call (and its side effect) is kept; `removeUnusedDeclarations` (next pass) then drops the now-unused declaration. KEY guards: (1) the test is `value->getKind() == NodeKind::CallExpr` -- NOT `exprHasCall`, which is recursive and would also match `x = g() + h()` and discard the sibling computation; only a RHS that IS a top-level call is demoted. (2) The call's argument var-refs were already counted in `reads` (collectReads visits `a.value`), so liveness is unchanged -- no desync. (3) Runs at every scope level (the rewrite is inside the recursive `removeDead`, not a top-level-only pass), so nested dead-call captures are caught too. **Validated (engine-direct, before/after):** default-OFF byte-identical across the corpus; with the flag, 6 candidates in 3 functions become bare calls, the ON-vs-OFF diff containing ONLY the intended change. e.g. rootkit `fh_install_hook`: `int64_t v5; v5 = ftrace_set_filter_ip(v2, v4, 0, 0);` -> `ftrace_set_filter_ip(v2, v4, 0, 0);` (decl + dead capture removed, call kept -- matches IDA); SOTTR `_c1_updatepos`: `0x1410ff4a8 = sub_1409b14b0(v10 + 0x35C0, 1, 1, v11 - 105);` -> `sub_1409b14b0(...)` (removes a malformed `<address> = call` lvalue). Modest volume but a genuine, IDA-matching readability win on the kernel-hook code class we audit. Backlog item closed.
+
+**FIX-105 - FIX-091 folded-code-label recovery extended to multi-level constant add/sub chains.** FIX-091 recovers a folded in-function code address that surfaces as a single-level `add(base_const, off_const)` (e.g. a NEXT_PC `0x1409B9F77 = 0x1409B9F5B + 0x1C`), but its two callsites in `CAstBuilder::buildExpression` (the `llvm.add` / `llvm.sub` short-circuits) required BOTH operands to be integer literals via `tryExtractIntLiteral`, so a NESTED chain like `add(add(base,a),b)` or `sub(add(base,c),d)` failed the inner extract, fell through to an ordinary `CBinaryExpr`, and then leaked (the cast optimizer re-folds it and the printer renders a bare data constant). FIX = a new file-static recursive helper `tryFoldConstantOffset(Value, depth)` that descends `LLVM::AddOp`/`SubOp`, bottoming out ONLY on `tryExtractIntLiteral` (a leaf integer literal); any non-literal, non-add/sub leaf -> `nullopt`, so a runtime base (`add(param, c)`) is NEVER folded (it stays an ordinary binary). All arithmetic is `uint64` wrapping; depth-capped at 16 against pathological IR. The two callsites now feed the whole chain through the helper. **`resolveFoldedCodeLabel` and its gate are UNCHANGED** - the current-function high-bit reconstruction (`(entry & ~0xFFFFFFFF) | (folded & 0xFFFFFFFF)`) + the `[min,end)` span + in-function instruction-address-set test still apply, so this stays current-function-only and false-positive-proof (NO cross-function, NO runtime-base folding). **Validation (engine-direct, `helix_tool --use-cast-layer`, before/after on a clean stash-isolated build):** ZERO regression - the representative corpus (`_c1_updatepos`, the 3 fixtures, akasha plain+table, the 7 kbase fns, the rootkit hooks) is byte-identical before/after, with the 4 apparent diffs proven to be pre-existing structuring nondeterminism (noise floor `BEFORE`-vs-`BEFORE` matches the `BEFORE`-vs-`AFTER` diff exactly, no folded-label change in any of them) and 2 pre-existing parse crashes (`fh_ftrace_thunk`/`init_module`, crash on both exes). POSITIVE proof via a synthetic nested fold routed through the real lift (`add(add(0x140001000,5),6)`): an instrumented trace confirmed `tryFoldConstantOffset` engages and folds it to the correct in-function address `0x14000100B` (the old single-level code returns `nullopt` on the nested operand). The multi-level path is dormant on the natural corpus (no on-disk `.ll` produces a multi-level constant code-address fold), which is exactly why regression is zero. Backlog item closed.
+
 **FIX-100 - 64-bit address printed truncated to 32 bits (public issue #37 Bug 3 / internal G7).** `CAstPrinter::formatIntLiteral` printed integer literals with `std::snprintf("0x%lX", static_cast<unsigned long>(value))`. On Windows (LLP64) `unsigned long` is 32-bit, so EVERY 64-bit address taking the `IntLitExpr` path was masked to its low 32 bits: `0x1410E5F80 -> 0x410E5F80`, i.e. any effective address crossing the `0x1_0000_0000` boundary (ImageBase >= 0x140000000 with a large `.text`) became an invalid VA, making the IR useless for semantic analysis. NOT a lifter bug (the `.ll` stores the PC full-width and computes the address via the LEA intrinsic; `llvm::raw_ostream::write_hex`, the `AddrLitExpr` path, already takes `unsigned long long`) - purely the printer's IntLit path. FIX = `"0x%llX"` + `static_cast<unsigned long long>`. SAFE: only values >= 0x1_0000_0000 change form; sub-4GB literals + all fixtures are byte-identical. Validated on ROTTR `UpdatePosition` (`*0x410E5F80 -> *0x1410E5F80`, `0x4237BA50 -> 0x14237BA50`); float bitmasks (0x7FC00000 etc.) untouched.
 
 **FIX-097 - relocated `.rodata` string recovery (the disasm <-> Helix connector the scaffold was missing).** Kernel-module / rootkit decompiles showed `printk(0, ...)` for every format string: the string-render path existed (`high::StringLitOp`, `cast::CStringLitExpr`, `DataSectionProvider::readCString`) but NOTHING ever created a `StringLitOp` from a constant, so a relocated `mov rdi, .rodata+OFF` (patched by the HexCore disassembler to a known data address) rendered as a bare integer. Wired the connector:
@@ -29,7 +33,98 @@ close the dispatcher gap the section below flagged as "NEXT = P4 ... not yet don
   0 unreachable; x86 fixtures byte-identical; WWZ ESP coverage 37.8% -> 80.3%. This
   supersedes the "NEXT = P4 ... not yet done" note in the section below.
 
+### Invariants & conventions (engine -- keep these true)
+
+Non-obvious engine invariants, recorded so a future edit does not silently break them
+(surfaced by a 2026-06-22 code-review pass over this changelog):
+
+- **Decompile entry order (FIX-097):** `parseHelixStringsMetadata()` MUST run and
+  register data sections via `addDataSection` BEFORE the `ScopedDataSectionProvider`
+  is constructed -- the provider early-returns when `data_sections_` is empty and
+  installs nothing, so a later parse would be silently invisible (no error). Currently
+  enforced by an IDENTICAL 2-line sequence duplicated in BOTH `Engine::decompileIR`
+  (:228-229) and `decompileIRText` (:278-279); there is no shared `prepareDecompile`
+  helper yet, so the order is drift-prone. TODO: centralize.
+- **D4 damning cap has TWO defect SOURCES, not two passes (FIX-093/096):** the cap is
+  `detectDamningDefects(func).any() || func.hasDamningHonestyDefect`, and that OR is
+  evaluated at BOTH scorers -- `analyzeConfidence` (build-time, defensive) AND
+  `reanalyzeConfidence` (post-opt, the score the user sees). The split is by SOURCE,
+  not by translation unit: `hasDamningHonestyDefect_` is a sticky build-time bool that
+  latches the single D2 out-of-table-call category (stays set even if DSE erases the
+  call); `detectDamningDefects` is a pure function that RE-DERIVES three other
+  categories (surviving code-address leak / uninitialized return / irreducible
+  no-return) from the FINAL AST. It is NOT "one check in CAstBuilder, one in
+  CAstOptimizer."
+- **`resolveFoldedCodeLabel` is current-function-only (FIX-091):** it reconstructs a
+  candidate as `(currentFunctionEntryAddr_ & ~0xFFFFFFFF) | (rawValue & 0xFFFFFFFF)`
+  and hard-gates on the candidate lying in `[currentFunctionMinAddr_,
+  currentFunctionEndAddr_)` AND being a recorded instruction/block address of THIS
+  function. That `high|low32` reconstruction is WRONG for a sibling in a different
+  4GiB window, so cross-function label resolution CANNOT reuse this helper without a
+  real base/relocation model (it would reintroduce the false-positive class the span
+  gate exists to exclude). Arithmetic folding is single-level (base+offset, both
+  operands literal); nested add/sub chains are not folded yet.
+- **DSE is two complementary passes (do not merge):** `dseStmtList` is flow-sensitive
+  but level-by-level (the `eliminateDeadStores` wrapper descends ONE level into each
+  nested body); `removeGloballyDeadStores` is flow-insensitive but scope-complete --
+  it erases a pure (call-free) store to a variable that is never read ANYWHERE. No
+  double-removal hazard (each erases from a vector; the global pass re-derives its own
+  read-set), and the global pass deletes a strict subset (never-read + call-free).
+- **Address/integer literals: use `std::format("{:x}", static_cast<uint64_t>(v))`,
+  never printf `%lX`/`(unsigned long)` (FIX-100).** `unsigned long` is 32-bit on
+  Windows (LLP64) and silently truncates any address above `0x1_0000_0000`. The lone
+  surviving printf literal site is `CAstPrinter::formatIntLiteral` (now `%llX`).
+
+### Backlog -- verified opportunities (2026-06-22 review)
+
+Confirmed not-yet-done against the source; recorded so they are not lost. None is a
+correctness bug (all are additive / opt-in).
+
+- **RTTI Tier-2 type-name recovery.** Class naming today is Tier-1 only (a prefix
+  guess over resolved method names, `DevirtualizeIndirectCalls.cpp:320`). The binary
+  data path the old code comment (:328) said Tier-2 needed now exists
+  (`DataSectionProvider::readWord/readCString`, already used by FIX-097): follow
+  `vtable[-1] -> COL -> TypeDescriptor` (MSVC) or `type_info -> __type_name`
+  (Itanium). Needs a real MSVC/Itanium name decoder (`RemillDemangler` does not
+  suffice) + RVA-relative reads for PIE; opportunistic (RTTI is stripped under
+  `/GR-` / `-fno-rtti`).
+- **`--preserve-cfg` broader corpus.** ON-path validated on n=1 (`crackme.deflat2`).
+  Since the RC4-PRGA fix ungated Stage-1 (`RemillToHelixLow.cpp:3408` is now `if
+  (true)`), the flag only gates the multi-latch loop-structuring skip
+  (`StructureControlFlow.cpp:2183`), so "more corpora" means more
+  flattened/obfuscated DISPATCHERS (Callfuscated, poly, OLLVM/Tigress-FLA), not
+  generic binaries. The 4-corpus quad is the OFF tripwire (byte-identical), it does
+  not exercise ON.
+- **Aggressive DSE for dead call-result stores (opt-in).** ~~Demote a globally-dead
+  `x = foo();` to a bare `foo();`.~~ **DONE -- see FIX-106** (`HELIX_AGGRESSIVE_DSE`,
+  top-level-`CallExpr` guard, recursive per-scope rewrite before the `erase_if`,
+  default-OFF byte-identical).
+- **`resolveFoldedCodeLabel` add/sub chains.** ~~Teach the `llvm.add`/`llvm.sub` fold
+  / `tryExtractIntLiteral` to recurse through nested constant add/sub.~~ **DONE -- see
+  FIX-105** (`tryFoldConstantOffset`, current-function gate reused, cross-function kept
+  OUT per the invariants).
+- **Variadic SIGNATURE marking has no producer.** The printer/serializer already emit
+  `, ...` from the FuncOp `is_variadic` attr, but no production pass SETS it, so
+  `func.isVariadic` is always false today and the `CAstPrinter` `, ...` branch is
+  dead. Wire it from `SignatureDb`/calling-convention recognition of known variadics
+  (printf/printk family), NOT from LLVM `isVarArg` (Remill funcs are fixed-arg
+  `(State*, pc, Memory*)`). See the Wave 22 note (that work was variadic CALL-SITES,
+  a different concern).
+- **CI lint over a `HELIX_FORMAT_U64` macro (FIX-100 follow-up).** Prefer a grep-based
+  lint forbidding printf `%lX`/`%lx`/`(unsigned long)` in the emit/cast print paths; a
+  `static_assert` cannot catch a printf format/argument width mismatch anyway.
+
 ### v1.0 structurer rewrite: M0-M2 + the selector-survival fix + M4 deopt (branch scf-structurer-v1) - 2026-06-16
+
+> **HISTORICAL / SUPERSEDED -- see the top `[Unreleased]` "Structurer rewrite promoted
+> to DEFAULT-ON" entry.** This section describes the rewrite WHILE it was still an
+> opt-in spike, and is kept verbatim for history. It has since LANDED as the default
+> path: `StructureControlFlow.cpp:2068` now runs the rewrite UNLESS `HELIX_SCF_LEGACY=1`
+> (opt-OUT); `HELIX_SCF_SPIKE` is now only a vestigial force-on alias (nothing else
+> gates on it). The "WIP / behind SPIKE / not landed" and "NEXT = P4 (not yet done)"
+> notes below are STALE -- P4 (`collapseDispatcher`, the `>2`-case cap removed,
+> `CAstOptimizer.cpp:7000`) and P5 (`eliminateDeadSelectorStores`, :7538) are both
+> landed.
 
 WIP, behind the `HELIX_SCF_SPIKE` env gate; not landed (no version bump). This is
 the executable proof of the `STRUCTURER_V1_REWRITE_SCOPING.md` direction: reuse
@@ -106,7 +201,9 @@ zero shipping impact.
 
 **M1 open items (honest):** block-arg poison-strip KEPT (validated non-lossy on
 this corpus - all call-sites preserved, no poison/undef leak in emitted C); proper
-normalization deferred. The opt-in is the `HELIX_SCF_SPIKE` env gate (legacy is the
+normalization deferred. **[STALE -- now default-ON; the gate is `HELIX_SCF_LEGACY=1`
+opt-OUT, NOT a `HELIX_SCF_SPIKE` opt-IN; see the SUPERSEDED banner at the top of this
+section.]** The opt-in is the `HELIX_SCF_SPIKE` env gate (legacy is the
 default); a `--use-scf-structurer` CLI alias is trivial M5 polish.
 
 Commits: fc062f9 (M0), 54887aa (M1 scf.if bridge), 224d080 (M1 index_switch +
@@ -182,16 +279,18 @@ source). 12/12 no crash on the fresh corpus; x86 fixtures unchanged.
 
 **`removeGloballyDeadStores` (the `var_0` PC-noise fix).** The deeply-nested
 structured form the scf-structurer produces left dead `var_0 = 0xADDR` PC-tracking
-shadow stores (var_0 written 12x, read 0x) that the existing dseStmtList misses --
-it only eliminates TOP-LEVEL dead stores (nested if/switch scopes are treated
-conservatively as all-live). A new whole-function pass removes pure (call-free)
+shadow stores (var_0 written 12x, read 0x) that the existing dseStmtList misses.
+`dseStmtList` eliminates dead stores LEVEL-BY-LEVEL: the `eliminateDeadStores` wrapper
+descends ONE level into each nested body, but each invocation still treats ITS OWN
+children conservatively, so a DEEPLY-nested (>1 level) dead store survives, as does
+any never-read-anywhere store. A new whole-function pass removes pure (call-free)
 stores to variables that never appear in the function's read-set anywhere -- sound
 regardless of scope. Cut **15-22% more lines** corpus-wide (mem_free 131 -> 102 vs
 IDA 82; context_mmap 1109 -> 952; mem_import 1068 -> 869); x86 fixtures byte-identical
 (they had no globally-dead stores); 0 crashes; correctness preserved (mem_free still
 matches IDA's control flow).
 
-NEXT = P4 (eliminate the dispatcher entirely via goto/inline = the last gap to IDA;
+**[STALE -- P4 AND P5 are landed (see the SUPERSEDED banner above).]** NEXT = P4 (eliminate the dispatcher entirely via goto/inline = the last gap to IDA;
 IDA uses `goto LABEL_4` for the multi-entry continuation). Code staged on
 `scf-structurer-v1`; RAG write-up in `HexCore-Helix-Original/rag/18_*`.
 
@@ -610,6 +709,7 @@ before Phase 4).
 - **Problem**: a stub-shaped function whose address did not really lift was emitted as a silent 50–90% stub. Wave 26's `knownFunctionStarts_` always contains the lone self-entry of a single-function lift, so it cannot tell a "real self-entry" from "an address the authoritative Pathfinder table never listed".
 - **Fix**: a new narrower set `authoritativeFunctionStarts_` (and query `isAuthoritativeFunctionStart`) populated ALWAYS from the `helix.function_starts` side-table, plus FuncOp entries ONLY when more than one function is present — it deliberately EXCLUDES the lone self-entry. In `analyzeConfidence`'s stub branch, an authoritative table + a non-zero entry NOT in that set raises a sticky `CFuncDecl::registryMissHonestFailure`; `reanalyzeConfidence` forces the surviving score to 0 with a `registry miss` issue. The mandatory `entryAddr != 0` guard keeps a whole-module FuncOp whose entry is structurally 0 from being false-flagged.
 - **Impact**: inert (byte-identical) on the non-authoritative corpus; on real authoritative-table fixtures (akasha-with-table) every in-table entry is correctly NOT flagged (0 false registry-misses, scores unchanged). The #30 contract is proven by the bundled `RegistryMissTest` (GoogleTest, **3/3**): omitted-self-under-authoritative → score 0; in-table self → normal stub score; entry==0 → never forced to 0.
+- **Example** (values per `test/RegistryMissTest.cpp`): a stub-shaped FuncOp `sub_140001000` (entry `0x140001000`) under an authoritative `helix.function_starts` table that lists `0x140002000` but NOT `0x140001000`. BEFORE: emitted as a silent ~60% stub (`stub function (< 5 ops)`). AFTER: `registry miss: function entry not in the authoritative function table (no honest lift)`, confidence forced to **0** (`CAstOptimizer.cpp:2110-2113`). Contrast: the SAME stub WITH `0x140001000` in the table keeps its normal ~60% stub score (NOT flagged); a FuncOp whose entry is `0x0` is never flagged (the mandatory `entryAddr != 0` guard).
 
 | File | Symbol(s) |
 |---|---|
@@ -729,6 +829,7 @@ before Phase 4).
 - **Problem**: Wave 22 Step 2 (`RemillToHelixLow`) emits a first-class `helix_low.variadic_call` + `bundle.create<state>` for zeroed printk-family calls (`printk(0)`, `dev_err(0)`, …), but the "Step 2.5 stopgap" in `HelixLowToMid` collapsed each to a plain `mid::call` and **dropped the bundle**, so the upstream-zeroed recovery state never reached HelixHigh and a downstream opacity marker had nothing to key off.
 - **Fix**: instead of dropping the bundle, carry its recovery state forward as discardable attributes on the resulting `mid::call` — `helix.variadic_state` (`zeroed`/`opaque`/`partially_recovered`/`recovered`), `helix.variadic_fixed_args_count`, `helix.variadic_provenance`. `HelixMidToHigh` already forwards `helix.*` attributes onto the `high::call` (both the conversion pattern and the manual `low::FuncOp` walk), so the state reaches CAstBuilder for free. This is the attribute-based carriage trade-off catalogued as Divergence 1 of the Step-1 design; the fully first-class `variadic_call` op carried through every tier is deferred as an architectural follow-up.
 - **Result**: no C-output change (the marker emission itself, Step 4, is deferred); carriage verified on rootkit `fh_install_hook` — 6 zeroed-fmt variadic calls detected at lift == 6 `high::call` ops carrying `helix.variadic_state="zeroed"` in the post-pipeline IR. All baselines hold.
+- **Scope note (variadic SIGNATURE marking is a SEPARATE, currently-unwired concern):** this wave is about variadic CALL-SITES (the `helix.variadic_*` attrs on `high::call`). It does NOT mark a decompiled function's OWN signature as variadic. The FuncOp `is_variadic` attr + the `CAstPrinter` `, ...` emission (`CAstPrinter.cpp:72-75`) exist and round-trip through FlatBuffers, but NO production pass SETS that attr, so `func.isVariadic` is always false today and that printer branch is dead. See the Backlog entry "Variadic SIGNATURE marking has no producer."
 
 ### Wave 20 — C-AST dataflow fidelity: FNV accumulator chain + compound assignment (`cast/`, commits `d67b37d`, `6d30a55`, `22fbba1`)
 
