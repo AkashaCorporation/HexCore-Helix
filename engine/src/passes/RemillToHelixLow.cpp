@@ -3522,19 +3522,24 @@ private:
         case RemillSemantic::JP:
         case RemillSemantic::JNP:
         case RemillSemantic::CBZ:
-        case RemillSemantic::CBNZ: {
+        case RemillSemantic::CBNZ:
+        case RemillSemantic::TBZ:
+        case RemillSemantic::TBNZ: {
             auto condStr = getJccCondition(semantic);
-            const bool isCbz = (semantic == RemillSemantic::CBZ ||
-                                semantic == RemillSemantic::CBNZ);
-            if ((!condStr && !isCbz) || call.getNumOperands() < 5)
+            const bool isAarch64CondBranch =
+                (semantic == RemillSemantic::CBZ || semantic == RemillSemantic::CBNZ ||
+                 semantic == RemillSemantic::TBZ || semantic == RemillSemantic::TBNZ);
+            if ((!condStr && !isAarch64CondBranch) || call.getNumOperands() < 5)
                 break;
-            // CBZ/CBNZ carry no x86 condition-code string, but the JccOp built at
-            // the end of this block dereferences `*condStr` -- a null optional is
-            // UB (an access violation). Give it a sensible label; the REAL taken
-            // condition is carried by condValue (computed below), so this is only
-            // a hint for the emitter.
-            if (isCbz && !condStr)
-                condStr = std::string(semantic == RemillSemantic::CBZ ? "z" : "nz");
+            // CBZ/CBNZ/TBZ/TBNZ carry no x86 condition-code string, but the JccOp
+            // built at the end of this block dereferences `*condStr` -- a null
+            // optional is UB (an access violation). Give it a sensible label; the
+            // REAL taken condition is carried by condValue (computed below), so
+            // this is only a hint for the emitter.
+            if (isAarch64CondBranch && !condStr)
+                condStr = std::string(
+                    (semantic == RemillSemantic::CBZ || semantic == RemillSemantic::TBZ)
+                        ? "z" : "nz");
 
             // ── Synthesize real condition from preceding CMP/TEST flags ──
             //
@@ -3815,6 +3820,39 @@ private:
                 // A malformed CBZ lift (too few operands) must not fall through to
                 // the shared fallback, which dereferences the (null-for-CBZ)
                 // condStr; fail safe to "always taken" instead.
+                if (!condValue) {
+                    condValue = builder.create<LLVM::ConstantOp>(
+                        loc, i1Ty, builder.getBoolAttr(true)).getResult();
+                }
+                break;
+            }
+            case RemillSemantic::TBZ:
+            case RemillSemantic::TBNZ: {
+                // AArch64 TBZ/TBNZ: taken iff bit #imm of Rt is 0 (TBZ) / 1 (TBNZ).
+                // Operand layout (resolved empirically):
+                //   0=mem 1=state 2=bit_pos(imm) 3=BRANCH_TAKEN 4=taken_pc
+                //   5=not_taken_pc 6=Rt (the RnI register-read) 7=NEXT_PC
+                // condValue = ((Rt >> bit_pos) & 1) == 0 (TBZ) / != 0 (TBNZ).
+                if (call.getNumOperands() >= 7) {
+                    auto i64Type = builder.getIntegerType(64);
+                    auto bitPos = ensureInt64(
+                        safeGetOperand(call, 2, builder, loc),
+                        builder, loc, &regs, &pcTracker);
+                    auto rt = ensureInt64(
+                        safeGetOperand(call, 6, builder, loc),
+                        builder, loc, &regs, &pcTracker);
+                    auto shifted = builder.create<arith::ShRUIOp>(loc, rt, bitPos);
+                    auto one = builder.create<arith::ConstantOp>(
+                        loc, i64Type, builder.getI64IntegerAttr(1));
+                    auto bit = builder.create<arith::AndIOp>(loc, shifted, one);
+                    auto zero = builder.create<arith::ConstantOp>(
+                        loc, i64Type, builder.getI64IntegerAttr(0));
+                    auto pred = (semantic == RemillSemantic::TBZ)
+                        ? arith::CmpIPredicate::eq
+                        : arith::CmpIPredicate::ne;
+                    condValue = builder.create<arith::CmpIOp>(
+                        loc, pred, bit, zero).getResult();
+                }
                 if (!condValue) {
                     condValue = builder.create<LLVM::ConstantOp>(
                         loc, i1Ty, builder.getBoolAttr(true)).getResult();
