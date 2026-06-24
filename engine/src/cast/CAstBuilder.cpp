@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstring>
 #include <format>
 #include <string>
@@ -349,6 +350,38 @@ static std::string exprToString(const CExpr* expr) {
     default:
         return "__expr";
     }
+}
+
+// FIX-107: is `s` a PURE integer literal (optionally signed, decimal or 0x-hex --
+// the exact forms exprToString emits above)? Exception-free (the engine may be
+// built with -fno-exceptions), so it uses std::from_chars, not std::stoull. Used
+// to detect a copy-propagated constant that resolveTransitive folded into a name
+// string, so it can be rebuilt as a real CIntLitExpr instead of a CVarRefExpr
+// whose name is a numeric literal (an invalid lvalue).
+static bool parseIntLiteralName(const std::string& s, int64_t& out) {
+    if (s.empty())
+        return false;
+    size_t i = 0;
+    bool neg = false;
+    if (s[i] == '-' || s[i] == '+') {
+        neg = (s[i] == '-');
+        ++i;
+    }
+    if (i >= s.size())
+        return false;
+    int base = 10;
+    if (i + 2 < s.size() && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        base = 16;
+        i += 2;
+    }
+    if (i >= s.size())
+        return false;
+    unsigned long long mag = 0;
+    auto res = std::from_chars(s.data() + i, s.data() + s.size(), mag, base);
+    if (res.ec != std::errc() || res.ptr != s.data() + s.size())
+        return false;  // parse error or trailing junk -> not a pure literal
+    out = neg ? -static_cast<int64_t>(mag) : static_cast<int64_t>(mag);
+    return true;
 }
 
 } // anonymous namespace
@@ -2200,6 +2233,17 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             if (resolved != name && resolved.find(name) == std::string::npos)
                 name = resolved;
         }
+
+        // FIX-107: if copy-propagation resolved this temporary to a CONSTANT
+        // (e.g. "1", "0x200"), it is NOT a variable. A CVarRefExpr whose name is a
+        // numeric literal is an invalid lvalue: in an assignment-target / store-
+        // address position it prints the malformed `1 = <call>` / `*0 = <rhs>`
+        // (the IntLitExpr lvalue guards from FIX-047 miss it because the node is a
+        // VarRef, not a literal). Rebuild it as a real integer literal -- constant
+        // uses still print the value, and the existing target/address guards now
+        // fire and drop the malformed store.
+        if (int64_t litVal; parseIntLiteralName(name, litVal))
+            return std::make_unique<CIntLitExpr>(litVal, type, addr);
 
         return std::make_unique<CVarRefExpr>(varId, name, type, addr);
     }
