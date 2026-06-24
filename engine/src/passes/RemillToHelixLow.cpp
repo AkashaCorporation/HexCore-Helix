@@ -3520,10 +3520,21 @@ private:
         case RemillSemantic::JO:
         case RemillSemantic::JNO:
         case RemillSemantic::JP:
-        case RemillSemantic::JNP: {
+        case RemillSemantic::JNP:
+        case RemillSemantic::CBZ:
+        case RemillSemantic::CBNZ: {
             auto condStr = getJccCondition(semantic);
-            if (!condStr || call.getNumOperands() < 5)
+            const bool isCbz = (semantic == RemillSemantic::CBZ ||
+                                semantic == RemillSemantic::CBNZ);
+            if ((!condStr && !isCbz) || call.getNumOperands() < 5)
                 break;
+            // CBZ/CBNZ carry no x86 condition-code string, but the JccOp built at
+            // the end of this block dereferences `*condStr` -- a null optional is
+            // UB (an access violation). Give it a sensible label; the REAL taken
+            // condition is carried by condValue (computed below), so this is only
+            // a hint for the emitter.
+            if (isCbz && !condStr)
+                condStr = std::string(semantic == RemillSemantic::CBZ ? "z" : "nz");
 
             // ── Synthesize real condition from preceding CMP/TEST flags ──
             //
@@ -3775,6 +3786,38 @@ private:
                         condValue = builder.create<arith::CmpIOp>(
                             loc, arith::CmpIPredicate::ne, lsb, zero8).getResult();
                     }
+                }
+                break;
+            }
+            case RemillSemantic::CBZ:
+            case RemillSemantic::CBNZ: {
+                // AArch64 CBZ/CBNZ: taken iff Rn == 0 (CBZ) / Rn != 0 (CBNZ).
+                // Operand layout (resolved empirically from a real lift):
+                //   0=mem 1=state 2=BRANCH_TAKEN 3=taken_pc 4=not_taken_pc
+                //   5=Rn (the RnI register-read) 6=NEXT_PC
+                // condValue is the TAKEN condition; the shared branch-formation
+                // tail below pairs it with the real taken successor (the br
+                // terminator has the same canonical `icmp eq branch_taken,0` shape
+                // as the x86 Jcc path, so no special handling is required here).
+                if (call.getNumOperands() >= 6) {
+                    auto rn = ensureInt64(
+                        safeGetOperand(call, 5, builder, loc),
+                        builder, loc, &regs, &pcTracker);
+                    auto zero = builder.create<arith::ConstantOp>(
+                        loc, builder.getIntegerType(64),
+                        builder.getI64IntegerAttr(0));
+                    auto pred = (semantic == RemillSemantic::CBZ)
+                        ? arith::CmpIPredicate::eq
+                        : arith::CmpIPredicate::ne;
+                    condValue = builder.create<arith::CmpIOp>(
+                        loc, pred, rn, zero).getResult();
+                }
+                // A malformed CBZ lift (too few operands) must not fall through to
+                // the shared fallback, which dereferences the (null-for-CBZ)
+                // condStr; fail safe to "always taken" instead.
+                if (!condValue) {
+                    condValue = builder.create<LLVM::ConstantOp>(
+                        loc, i1Ty, builder.getBoolAttr(true)).getResult();
                 }
                 break;
             }
