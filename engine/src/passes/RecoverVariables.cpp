@@ -234,6 +234,19 @@ struct VariableTracker {
             argRegPositions["X" + std::to_string(i)] = i + 1;
     }
 
+    /// x86-32 register-argument positions (FIX-CC-THISCALL).  cdecl/stdcall pass
+    /// all integer args on the stack, but __thiscall passes `this` in ECX(=RCX)
+    /// and __fastcall passes the first two args in ECX,EDX(=RCX,RDX).  We map
+    /// both; SSA versioning gates naturally — a pure-cdecl function that WRITES
+    /// ECX before reading it (scratch / `push ecx` local slot) leaves param_1
+    /// (version 0) unused, so it is DCE'd and never reaches the signature.  Only
+    /// a genuine read-before-write of ECX/EDX (the thiscall/fastcall live-in)
+    /// keeps the param — matching RecoverCallingConvention's Phase-1 liveness.
+    void initArgRegPositionsCdecl32() {
+        argRegPositions.clear();
+        argRegPositions["RCX"] = 1;   // __thiscall `this` only; EDX/fastcall over-binds (deferred)
+    }
+
     /// Check if an operation is in a return context — i.e., the register
     /// value flows into a helix_low.ret or helix_high.return operation.
     ///
@@ -742,7 +755,15 @@ private:
         }
         tracker.isAapcs64 = isAapcs64;
         if (isCdecl32) {
-            tracker.argRegPositions.clear();
+            // FIX-CC-THISCALL round 2: only bind ECX as `this` (param_1) when
+            // RecoverCallingConvention's flows-to-deref gate approved it and set
+            // the "x86_thiscall_this" marker.  A pure-cdecl function whose ECX is
+            // merely scratch leaves argRegPositions EMPTY, so it gets NO phantom
+            // param_1 — stack args are recovered by RecoverStackLayout instead.
+            // (This kills the 0x83d050-class regression where a live-in-but-
+            // scratch ECX was mis-named param_1 and collapsed a real compare.)
+            if (func->hasAttr("x86_thiscall_this"))
+                tracker.initArgRegPositionsCdecl32();
         } else if (isAapcs64) {
             tracker.initArgRegPositionsAapcs64();
         } else {
