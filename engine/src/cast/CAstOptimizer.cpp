@@ -2178,6 +2178,17 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
             std::format("{} native opcode(s) not decomposed", nativeOps));
     }
 
+    // ── Out-of-table indirect calls (FIX-112 / L1) ───────────────────
+    // The honest `(*(code*)0xADDR)()` form (callee not in the authoritative
+    // table) is FAITHFUL, so it is a graded readability penalty, NOT the 50%
+    // damning cap it used to trip.  Capped low so a cleanly-structured function
+    // full of unresolved sibling calls is no longer pinned at 50%.
+    if (func.outOfTableCalls > 0) {
+        deduction += std::min(15.0, (double)func.outOfTableCalls * 3.0);
+        func.confidenceIssues.push_back(std::format(
+            "{} out-of-table indirect call(s)", func.outOfTableCalls));
+    }
+
     // ── Register-named variables ─────────────────────────────────────
     static const char* kRegs[] = {
         "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
@@ -4539,7 +4550,15 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
 
             // Never eliminate unsafe targets (deref/field/subscript).
             if (isUnsafeTarget(a.target.get())) {
-                // Still add value reads to live set.
+                // A store through a computed address -- *(p+off), a[i], p->f --
+                // READS the pointer/index variables to evaluate the destination;
+                // only the final memory cell is written.  Record BOTH the
+                // address-expression reads and the value reads.  Without the
+                // target reads, a base-pointer definition feeding the store
+                // (`p = real; *(p+off) = x;`) is wrongly judged dead and DSE'd,
+                // leaving `p` at its zero-init -- the Win64 sret / frame-base
+                // NULL-base cascade (`*((void*)0 + off) = x`).
+                collectVarRefs(a.target.get(), live);
                 collectVarRefs(a.value.get(), live);
                 break;
             }
@@ -6552,63 +6571,45 @@ ExprPtr CAstOptimizer::canonicalizeXorExpr(ExprPtr expr) {
     if (expr->getKind() == NodeKind::BinaryExpr) {
         auto& b = static_cast<CBinaryExpr&>(*expr);
         if (b.op == BinaryOp::BitXor && b.lhs && b.rhs) {
-            // x ^ -1
-            if (isIntLit(b.rhs.get(), -1) || isIntLit(b.rhs.get(), 0xFFFFFFFF) ||
-                isIntLit(b.rhs.get(), 1)) {
-                // If RHS is literal 1, this is a boolean flip: x ^ 1 → !x
-                if (isIntLit(b.rhs.get(), 1)) {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.lhs),
-                        b.type, b.getAddress());
-                }
-                // For -1: if the LHS looks like a comparison result or is i1, use !
-                // Otherwise use ~ (bitwise NOT)
-                bool isBooleanContext = false;
-                if (b.lhs->getKind() == NodeKind::BinaryExpr) {
-                    auto& inner = static_cast<CBinaryExpr&>(*b.lhs);
-                    isBooleanContext = isCmpOp(inner.op);
-                }
-                // Check type: 1-bit integer = boolean
-                if (b.lhs->type->kind == TypeKind::Bool ||
-                    (b.lhs->type->kind == TypeKind::Int && b.lhs->type->bitWidth == 1))
-                    isBooleanContext = true;
+            // Is an operand a boolean / 1-bit context (comparison result or i1)?
+            // FIX (Maya 11.1): null-safe — `->type` can be null on lowered nodes;
+            // the old code dereferenced b.lhs->type / b.rhs->type unconditionally.
+            auto isBooleanOperand = [](const CExpr* e) -> bool {
+                if (e->getKind() == NodeKind::BinaryExpr &&
+                    isCmpOp(static_cast<const CBinaryExpr&>(*e).op))
+                    return true;
+                return e->type &&
+                       (e->type->kind == TypeKind::Bool ||
+                        (e->type->kind == TypeKind::Int && e->type->bitWidth == 1));
+            };
 
-                if (isBooleanContext) {
+            // ── x ^ <literal> ──
+            if (isIntLit(b.rhs.get(), 1)) {
+                // FIX (Maya 11.2): x ^ 1 → !x ONLY when x is boolean/1-bit. For a
+                // wider integer this toggles bit 0 (neither !x nor ~x), so it must
+                // stay `x ^ 1`; the old code rewrote it to !x unconditionally.
+                if (isBooleanOperand(b.lhs.get()))
                     return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.lhs),
-                        b.type, b.getAddress());
-                } else {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::BitNot, std::move(b.lhs),
-                        b.type, b.getAddress());
-                }
+                        UnaryOp::LogNot, std::move(b.lhs), b.type, b.getAddress());
+            } else if (isIntLit(b.rhs.get(), -1) ||
+                       isIntLit(b.rhs.get(), 0xFFFFFFFF)) {
+                // x ^ -1 → !x (boolean) / ~x (bitwise NOT for wider integers).
+                return std::make_unique<CUnaryExpr>(
+                    isBooleanOperand(b.lhs.get()) ? UnaryOp::LogNot
+                                                  : UnaryOp::BitNot,
+                    std::move(b.lhs), b.type, b.getAddress());
             }
-            // -1 ^ x (commutative)
-            if (isIntLit(b.lhs.get(), -1) || isIntLit(b.lhs.get(), 0xFFFFFFFF) ||
-                isIntLit(b.lhs.get(), 1)) {
-                if (isIntLit(b.lhs.get(), 1)) {
+            // ── <literal> ^ x (commutative) ──
+            else if (isIntLit(b.lhs.get(), 1)) {
+                if (isBooleanOperand(b.rhs.get()))
                     return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.rhs),
-                        b.type, b.getAddress());
-                }
-                bool isBooleanContext = false;
-                if (b.rhs->getKind() == NodeKind::BinaryExpr) {
-                    auto& inner = static_cast<CBinaryExpr&>(*b.rhs);
-                    isBooleanContext = isCmpOp(inner.op);
-                }
-                if (b.rhs->type->kind == TypeKind::Bool ||
-                    (b.rhs->type->kind == TypeKind::Int && b.rhs->type->bitWidth == 1))
-                    isBooleanContext = true;
-
-                if (isBooleanContext) {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.rhs),
-                        b.type, b.getAddress());
-                } else {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::BitNot, std::move(b.rhs),
-                        b.type, b.getAddress());
-                }
+                        UnaryOp::LogNot, std::move(b.rhs), b.type, b.getAddress());
+            } else if (isIntLit(b.lhs.get(), -1) ||
+                       isIntLit(b.lhs.get(), 0xFFFFFFFF)) {
+                return std::make_unique<CUnaryExpr>(
+                    isBooleanOperand(b.rhs.get()) ? UnaryOp::LogNot
+                                                  : UnaryOp::BitNot,
+                    std::move(b.rhs), b.type, b.getAddress());
             }
         }
 

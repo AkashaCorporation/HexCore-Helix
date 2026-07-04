@@ -208,6 +208,12 @@ public:
 // (incl. the RVSDG exit-dispatcher i32 selectors) become a fresh temp var that is
 // assigned in each region (replacing scf.yield) and read after the op.
 static unsigned g_scfBridgeVarId = 900000;  // high base to avoid colliding w/ recovered vars
+// FIX (non-determinism): irreducible-CFG fallback label counters. Like
+// g_scfBridgeVarId these are per-function id spaces but were file-local statics
+// that accumulated across every decompile in the process -> loc_irr_N label
+// drift by decompile order. Reset per function (below) so labels are stable.
+static unsigned g_irrLabelCounter = 100;
+static unsigned g_gotoLabelCounter = 0;
 
 static void bridgeSCFIfToHelixHigh(mlir::scf::IfOp ifOp) {
     mlir::OpBuilder b(ifOp);
@@ -1950,6 +1956,16 @@ struct StructureControlFlowPass
 
         // Process each HelixLow function in the module.
         auto result = module.walk([&](helix::low::FuncOp func) -> WalkResult {
+            // FIX (non-determinism): g_scfBridgeVarId is a file-static counter
+            // that otherwise ACCUMULATES across every function/decompile in the
+            // process, so a function's scf_ selector ids depend on how many
+            // functions were decompiled before it (batch-position-dependent,
+            // non-reproducible output). scf bridge var_ids live in the
+            // per-function >=900000 namespace, so resetting per function is safe
+            // and makes each function's ids stable regardless of decompile order.
+            g_scfBridgeVarId = 900000;
+            g_irrLabelCounter = 100;
+            g_gotoLabelCounter = 0;
             if (failed(structureFunction(func)))
                 return WalkResult::interrupt();
             return WalkResult::advance();
@@ -2435,8 +2451,7 @@ private:
                         baseName = std::format("loc_{:x}", addr);
                 }
                 if (baseName.empty()) {
-                    static unsigned globalLabelCounter = 100;
-                    baseName = std::format("loc_irr_{}", globalLabelCounter++);
+                    baseName = std::format("loc_irr_{}", g_irrLabelCounter++);
                 }
                 // Deduplicate: multiple blocks at the same address get
                 // distinct label names (loc_X, loc_X_2, loc_X_3, ...).
@@ -3374,8 +3389,7 @@ private:
             }
         }
         if (baseName.empty()) {
-            static unsigned gotoCounter = 0;
-            baseName = std::format("loc_irr_{}", gotoCounter++);
+            baseName = std::format("loc_irr_{}", g_gotoLabelCounter++);
         }
 
         // Check if the target block already has ANY label — if so, reuse

@@ -838,7 +838,10 @@ bool CAstBuilder::gateCalleeName(const std::string& calleeName,
         hasDamningHonestyDefect_ = true; // D4 (D2 out-of-table call) -- KEPT
                                          // build-time-latched: a side-effecting
                                          // call erased by DSE is still a defect.
-        outName = std::format("(*(code *)0x{:x})", targetAddr);
+        // FIX (Maya 13.3): `code` is not a valid C type; emit a generic
+        // function-pointer cast so the indirect call is at least compilable C
+        // (unspecified args, K&R style — accepts the appended call args).
+        outName = std::format("(*(void (*)())0x{:x})", targetAddr);
         return false;
     }
 
@@ -846,9 +849,18 @@ bool CAstBuilder::gateCalleeName(const std::string& calleeName,
     // authoritative table — otherwise an isolated single-function lift would
     // wrongly rewrite every legitimate cross-function call.
     if (functionTableIsAuthoritative_) {
-        hasDamningHonestyDefect_ = true; // D4 (D2 out-of-table call) -- KEPT
-                                         // build-time-latched (see above).
-        outName = std::format("(*(code *)0x{:x})", targetAddr);
+        // FIX-112 (L1): the honest `(*(code*)0xADDR)()` indirect form is
+        // FAITHFUL -- we simply could not name a sibling callee under the
+        // authoritative table.  It must NOT trip the 50% damning cap (which
+        // pinned cleanly-structured functions at exactly 50% near-universally,
+        // since an isolated lift's siblings are never in its table).  Count it
+        // for a small graded readability penalty instead.  (The own-block
+        // tail-jump case above stays damning -- that is a genuine mis-lowering.)
+        outOfTableCalls_++;
+        // FIX (Maya 13.3): `code` is not a valid C type; emit a generic
+        // function-pointer cast so the indirect call is at least compilable C
+        // (unspecified args, K&R style — accepts the appended call args).
+        outName = std::format("(*(void (*)())0x{:x})", targetAddr);
         return false;
     }
 
@@ -1211,6 +1223,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     // CAstOptimizer::reanalyzeConfidence reads this decl flag to apply the 50%
     // cap on the score that actually survives to the user.
     funcDecl->hasDamningHonestyDefect = hasDamningHonestyDefect_;
+    funcDecl->outOfTableCalls = outOfTableCalls_; // FIX-112 (L1): graded, not capped
 
     analyzeConfidence(*funcDecl, op);
 
@@ -1248,6 +1261,7 @@ void CAstBuilder::clearFunctionState() {
     // and intentionally NOT cleared here — it survives across functions.
     blockStartToLabel_.clear();
     hasDamningHonestyDefect_ = false;
+    outOfTableCalls_ = 0; // FIX-112 (L1)
     // FIX-091 (issue #15 C1): per-function in-function code-address registry.
     inFunctionCodeAddrs_.clear();
     currentFunctionMinAddr_ = 0;
@@ -4558,6 +4572,15 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
         deduction += std::min(30.0, (double)nativeOps * 3.0);
         issues.push_back(
             std::format("{} native opcode(s) not decomposed", nativeOps));
+    }
+
+    // ── Out-of-table indirect calls (FIX-112 / L1) ───────────────────
+    // Graded penalty for the honest `(*(code*)0xADDR)()` form (no longer the
+    // 50% damning cap); kept in lockstep with reanalyzeConfidence.
+    if (func.outOfTableCalls > 0) {
+        deduction += std::min(15.0, (double)func.outOfTableCalls * 3.0);
+        issues.push_back(std::format(
+            "{} out-of-table indirect call(s)", func.outOfTableCalls));
     }
 
     // ── Register names as local variables ────────────────────────────

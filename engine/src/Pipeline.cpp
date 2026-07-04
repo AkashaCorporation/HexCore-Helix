@@ -28,6 +28,8 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/BuiltinAttributes.h" // FIX-089: ArrayAttr / IntegerAttr
+
+#include <cstdlib> // std::getenv — HELIX_PIPELINE_DEBUG gate (Maya 8.1/8.2)
 #include "mlir/IR/BuiltinTypes.h"      // FIX-089: IntegerType
 #include "mlir/Pass/PassInstrumentation.h"
 
@@ -562,9 +564,13 @@ void Pipeline::ensurePipelineBuilt() {
     // Disable multithreading for deterministic pass execution.
     mlir_ctx_->disableMultithreading();
 
-    // [P0-DEBUG] Register CallOp counting instrumentation
-    pass_manager_->addInstrumentation(
-        std::make_unique<CallOpCountInstrumentation>());
+    // [P0-DEBUG] Register CallOp counting instrumentation.
+    // FIX (Maya 8.1): gate behind HELIX_PIPELINE_DEBUG — it walked the whole
+    // module before AND after every pass (O(N*P)) and spammed stderr on every
+    // run; off by default now.
+    if (std::getenv("HELIX_PIPELINE_DEBUG"))
+        pass_manager_->addInstrumentation(
+            std::make_unique<CallOpCountInstrumentation>());
 
     buildPassPipeline(*pass_manager_);
     pipeline_built_ = true;
@@ -581,7 +587,11 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
     DiagnosticCapture capture(mlir_ctx_);
 
     // ── Pre-pipeline IR dump: LLVM dialect before any passes ─────────────
-    {
+    // FIX (Maya 8.2): the 3 dumps below wrote fixed-name .mlir files to the CWD
+    // on every run (CWD pollution + serialization cost + parallel-run filename
+    // collisions). Gate them behind HELIX_PIPELINE_DEBUG.
+    const bool pipelineDebug = std::getenv("HELIX_PIPELINE_DEBUG") != nullptr;
+    if (pipelineDebug) {
         std::error_code ec;
         llvm::raw_fd_ostream pre_os("helix_dump_0_before_passes.mlir", ec);
         if (!ec) {
@@ -599,19 +609,17 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
         );
     }
     // ── Post-pipeline IR dump: HelixHigh after all passes ────────────────
-    {
+    if (pipelineDebug) {
         std::error_code ec;
         llvm::raw_fd_ostream post_os("helix_dump_1_after_passes.mlir", ec);
         if (!ec) {
             post_os << "// === HELIX PIPELINE DUMP: After all passes ===\n";
             module->print(post_os);
         }
-    }
-    // Legacy dump
-    {
-        std::error_code ec;
-        llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec);
-        if (!ec) {
+        // Legacy dump
+        std::error_code ec2;
+        llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec2);
+        if (!ec2) {
             module->print(debug_os);
         }
     }

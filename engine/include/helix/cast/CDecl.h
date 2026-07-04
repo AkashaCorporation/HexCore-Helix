@@ -106,6 +106,13 @@ public:
     /// target is not allowed to self-report as plausible.
     bool hasDamningHonestyDefect = false;
 
+    /// FIX-112 (L1): count of out-of-table indirect calls (the honest
+    /// `(*(code*)0xADDR)()` form).  This is FAITHFUL output, so it no longer
+    /// trips the 50% damning cap (it used to, pinning cleanly-structured
+    /// functions whose only "defect" was an unresolved sibling call); instead
+    /// it drives a small graded readability penalty in the confidence scorers.
+    int outOfTableCalls = 0;
+
     /// #30 (registry-miss honest failure): set by CAstBuilder::analyzeConfidence
     /// when an AUTHORITATIVE function table exists and this stub-shaped
     /// function's (non-zero) entry address is NOT an authoritative function

@@ -237,6 +237,28 @@ void CAstPrinter::printExpr(const CExpr& expr, int parentPrec) {
     }
     case NodeKind::UnaryExpr: {
         const auto& e = static_cast<const CUnaryExpr&>(expr);
+        // FIX-107: a dereference of a CONSTANT absolute data address is the
+        // named global `g_<addr>` (Hex-Rays/Ghidra convention), not a raw
+        // `*0xADDR` pointer-literal deref. Peek through one cast wrapper
+        // (`*(T*)0xADDR`). Code addresses never reach here as a CIntLitExpr
+        // (those are CAddrLitExpr), so a literal operand >= 0x1000 is a data
+        // global. Rendering it as a primary name is precedence-safe (no parens
+        // needed) and works for reads (`x = g_ADDR`) and stores (`g_ADDR = y`).
+        if (e.op == UnaryOp::Deref) {
+            const CExpr* inner = e.operand.get();
+            if (inner && inner->getKind() == NodeKind::CastExpr)
+                inner = static_cast<const CCastExpr&>(*inner).operand.get();
+            if (inner && inner->getKind() == NodeKind::IntLitExpr) {
+                int64_t v = static_cast<const CIntLitExpr&>(*inner).value;
+                if (v >= 0x1000) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "g_%llX",
+                                  static_cast<unsigned long long>(v));
+                    os << buf;
+                    break;
+                }
+            }
+        }
         switch (e.op) {
         case UnaryOp::Neg:       os << "-"; break;
         case UnaryOp::LogNot:    os << "!"; break;

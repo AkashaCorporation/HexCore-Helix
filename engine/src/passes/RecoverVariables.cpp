@@ -768,6 +768,35 @@ private:
             tracker.initArgRegPositionsAapcs64();
         } else {
             tracker.initArgRegPositions(isWin64);
+            // FIX-CC-SRET round 3: intersect the ABI argument-register set with
+            // the parameter positions RecoverCallingConvention actually certified
+            // (its Phase-1 read-before-write verdict, published as
+            // "reg_param_indices").  This drops a scratch/copy arg register that
+            // merely HOLDS a recovered pointer -- classically the Win64/SysV sret
+            // hidden pointer parked via `mov r8, rcx` -- so RecoverVariables does
+            // NOT re-name it param_N with a phantom NULL base.  It then becomes an
+            // ordinary local, the reg-copy propagates, and the struct-field writes
+            // root at the real return pointer (param_1).  Mirrors the
+            // x86_thiscall_this gate for the multi-register x86-64 ABIs.  When the
+            // attribute is absent (older IR / inference skipped) no filtering is
+            // applied and the previous behaviour is preserved byte for byte.
+            if (auto idxAttr = func->getAttrOfType<DenseI32ArrayAttr>(
+                    "reg_param_indices")) {
+                auto certified = idxAttr.asArrayRef();
+                llvm::SmallVector<std::string, 4> toDrop;
+                for (auto& kv : tracker.argRegPositions) {
+                    bool keep = false;
+                    for (int32_t idx : certified)
+                        if (static_cast<unsigned>(idx) == kv.second) {
+                            keep = true;
+                            break;
+                        }
+                    if (!keep)
+                        toDrop.push_back(kv.first().str());
+                }
+                for (auto& reg : toDrop)
+                    tracker.argRegPositions.erase(reg);
+            }
         }
         // Win64 entry points: incoming RCX/RDX/R8/R9 are OS-set values, not
         // named parameters.  RecoverCallingConvention sets "no_reg_params" to
@@ -1325,10 +1354,20 @@ private:
                 }
             }
 
-            // ── Snapshot block exit state for idom seeding ──────────
-            if (useRPO) {
-                blockExitState[blockPtr] = ssaTracker.snapshot();
-            }
+            // ── Snapshot block exit state ──────────────────────────
+            // In RPO this seeds the idom restore (above). FIX-113 (mini-engine
+            // #1): ALSO populate it in the region-order fallback. The v2 SCF
+            // structurer (transformCFGToSCF, default) collapses funcBody to a
+            // SINGLE top-level block (the real code nests in scf regions), so
+            // useRPO's `>1 block` gate fails and this used to stay empty -- which
+            // disabled the Phase-2.5 sweep below (its `!blockExitState.empty()`
+            // guard), so every reg.read nested in an scf region fell through to a
+            // hash-slot `vN = 0` and was deref'd as null. Snapshotting the single
+            // top-level block's exit (where the pre-region pointer-setup writes
+            // are already versioned) lets Phase-2.5 bind those nested reads to the
+            // real reaching version. Harmless in RPO mode (same value); only adds
+            // entries in the fallback the sweep then consumes.
+            blockExitState[blockPtr] = ssaTracker.snapshot();
         }
 
         // ── Phase 2.5: Sweep reg ops surviving inside structured regions ──
@@ -1365,7 +1404,12 @@ private:
         // Strategy A (proper region-aware SSA tracking with snapshot/
         // restore at every region boundary) would recover per-iteration
         // versions but is left as a follow-up.
+        if (std::getenv("HELIX_DEFREC_TRACE"))
+            llvm::errs() << "[STRATB] blockExitState.size()="
+                         << blockExitState.size() << "\n";
         if (!blockExitState.empty()) {
+            const bool stratBTrace =
+                std::getenv("HELIX_DEFREC_TRACE") != nullptr; // M0b
             auto findTopLevelAncestor = [&](Operation* op) -> Operation* {
                 Operation* current = op;
                 while (current) {
@@ -1504,14 +1548,25 @@ private:
                 } else {
                     const SSAVersionTracker::Snapshot* snap =
                         snapshotForOp(readOp);
-                    if (!snap)
+                    if (!snap) {
+                        if (stratBTrace)
+                            llvm::errs() << "[STRATB] read reg=" << subReg.parent
+                                         << " -> NOSNAP (fallthrough->hash-slot)\n";
                         continue;
+                    }
                     auto vit = snap->find(subReg.parent);
-                    if (vit == snap->end())
+                    if (vit == snap->end()) {
+                        if (stratBTrace)
+                            llvm::errs() << "[STRATB] read reg=" << subReg.parent
+                                         << " -> NOREG-in-snap (fallthrough)\n";
                         continue;
+                    }
                     verPtr = &vit->second;
                 }
                 const SSAVersionTracker::Version& ver = *verPtr;
+                if (stratBTrace)
+                    llvm::errs() << "[STRATB] read reg=" << subReg.parent
+                                 << " -> bound:" << ver.varName << "\n";
 
                 OpBuilder b(readOp);
                 auto i64Ty = b.getIntegerType(64);
@@ -1639,6 +1694,33 @@ private:
             return typeStr.starts_with("float") || typeStr.starts_with("double");
         };
 
+        // M0 (def-recovery scoping): env-gated trace of every lost-def
+        // replacement, classified ptr/float/int, to measure the zero-init-ptr
+        // source distribution on the pointer-heavy corpus before any redesign.
+        const bool defRecTrace = std::getenv("HELIX_DEFREC_TRACE") != nullptr;
+        auto defTypeClass = [&](Value v) -> const char* {
+            if (auto* dop = v.getDefiningOp())
+                if (auto a = dop->getAttrOfType<StringAttr>("inferred_type")) {
+                    StringRef s = a.getValue();
+                    if (isPointerTypeStr(s)) return "ptr";
+                    if (isFloatTypeStr(s)) return "float";
+                }
+            Type t = v.getType();
+            if (isa<LLVM::LLVMPointerType>(t)) return "ptr";
+            if (isa<Float32Type>(t) || isa<Float64Type>(t)) return "float";
+            return "int";
+        };
+        auto usedInDeref = [&](Value v) -> bool {
+            for (auto& use : v.getUses()) {
+                StringRef n = use.getOwner()->getName().getStringRef();
+                if (n.contains("load") || n.contains("Load") ||
+                    n.contains("field") || n.contains("Field") ||
+                    n.contains("gep") || n.contains("Gep"))
+                    return true;
+            }
+            return false;
+        };
+
         // Helper lambda: create a typed default value for a given MLIR type
         // and optional inferred_type string.
         auto createDefaultValue = [&](Type mlirType, Operation* defOp,
@@ -1746,6 +1828,11 @@ private:
 
             checkCallArgument(undefVal);
 
+            if (defRecTrace)
+                llvm::errs() << "[DEFREC] src=undef type="
+                             << defTypeClass(undefVal)
+                             << " deref=" << (usedInDeref(undefVal) ? 1 : 0)
+                             << "\n";
             Value replacement = createDefaultValue(
                 undefVal.getType(), undefOp, undefOp.getLoc());
             undefVal.replaceAllUsesWith(replacement);
@@ -1763,6 +1850,11 @@ private:
 
             checkCallArgument(poisonVal);
 
+            if (defRecTrace)
+                llvm::errs() << "[DEFREC] src=poison type="
+                             << defTypeClass(poisonVal)
+                             << " deref=" << (usedInDeref(poisonVal) ? 1 : 0)
+                             << "\n";
             Value replacement = createDefaultValue(
                 poisonVal.getType(), poisonOp, poisonOp.getLoc());
             poisonVal.replaceAllUsesWith(replacement);

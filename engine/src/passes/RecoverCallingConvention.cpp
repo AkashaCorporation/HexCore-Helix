@@ -32,6 +32,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <string>
 #include <string_view>
@@ -773,6 +774,24 @@ private:
             /* Cdecl32 */                  "cdecl";
         func->setAttr("calling_convention",
             StringAttr::get(func->getContext(), ccStr));
+        // FIX-CC-SRET round 3 (the Win64/SysV cousin of x86_thiscall_this below):
+        // publish the exact argument-register parameter positions that Phase 1
+        // certified as genuine read-before-write live-ins.  A struct-return-by-
+        // value function parks its hidden sret pointer in a scratch arg register
+        // (Win64 `mov r8, rcx`); Phase 1 correctly EXCLUDES that written-before-
+        // read register from paramIndices, but RecoverVariables re-seeds all four
+        // ABI arg registers by identity and re-invents the phantom (R8 -> param_3
+        // with a NULL base).  Emitting the certified set lets RecoverVariables
+        // intersect its argRegPositions with Phase 1's verdict -- the single-
+        // source-of-truth mechanism of x86_thiscall_this, generalized to the
+        // multi-register x86-64 ABIs.  Additive: when every arg register is a
+        // genuine param the set is full and nothing changes.
+        if (cc == CallingConv::Win64 || cc == CallingConv::SysV) {
+            llvm::SmallVector<int32_t, 6> certifiedIdx(paramIndices.begin(),
+                                                       paramIndices.end());
+            func->setAttr("reg_param_indices",
+                DenseI32ArrayAttr::get(func->getContext(), certifiedIdx));
+        }
         // FIX-CC-THISCALL round 2: mark that the flows-to-deref gate actually
         // bound ECX as `this` (param_1) for this x86-32 function.
         // RecoverVariables keys its cdecl argRegPositions on this attribute, so

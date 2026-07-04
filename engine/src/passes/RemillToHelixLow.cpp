@@ -16,6 +16,8 @@
 #include "helix/analysis/X86RegisterInfo.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"   // LLVMFixedVectorType (FIX-CRASH-VEC)
+#include "mlir/IR/BuiltinTypes.h"            // builtin VectorType (FIX-CRASH-VEC)
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -33,6 +35,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <cstdlib>
 
 using namespace mlir;
 using namespace helix;
@@ -42,6 +45,55 @@ using namespace helix;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace {
+
+// FIX-CRASH-VEC helper (root-caused by Maya R.): MLIR imports an LLVM
+// `<N x float>` / `<N x iM>` as the *builtin* VectorType (printed
+// `vector<Nxf32>`); only vectors of LLVM-specific element types (e.g.
+// `<N x ptr>`) use LLVM::LLVMFixedVectorType.  Return the total bit width of a
+// 1-D int/float vector, or 0 if `t` is not such a vector.  Used to read an
+// XMM/SROA'd struct-return vector at its own bit-width and bitcast back, so
+// extractelement/fadd consumers keep a well-typed vector operand instead of a
+// raw i128 (a blind RegReadOp swap otherwise asserts downstream in a
+// `cast<Ty>()`, non-deterministic under ASLR).
+static unsigned vectorTotalBits(Type t) {
+    if (auto v = dyn_cast<VectorType>(t)) {
+        if (v.getRank() == 1 && !v.isScalable() &&
+            v.getElementType().isIntOrFloat())
+            return v.getNumElements() *
+                   v.getElementType().getIntOrFloatBitWidth();
+        return 0;
+    }
+    if (auto v = dyn_cast<LLVM::LLVMFixedVectorType>(t)) {
+        if (v.getElementType().isIntOrFloat())
+            return v.getNumElements() *
+                   v.getElementType().getIntOrFloatBitWidth();
+    }
+    return 0;
+}
+
+// FIX-CRASH-VEC (root-caused by Maya R.): helix_low.reg.write constrains its
+// $value operand to AnyInteger and its typed getValue() accessor does
+// `cast<TypedValue<IntegerType>>` -- so a store of an SSE scalar/vector
+// (f32 from `mulss`, f64, vector<Nxf32>) to an XMM register creates an
+// UNVERIFIED, invalid reg.write whose getValue() asserts later in
+// RecoverVariables ("cast<Ty>() argument of incompatible type").  Coerce any
+// non-integer register value to an integer of the same bit width via bitcast
+// so the register model stays integer-typed (the reg holds the value's bits).
+// No-op for values already integer.
+static Value coerceRegValueToInt(Value v, OpBuilder& builder, Location loc) {
+    Type t = v.getType();
+    if (isa<IntegerType>(t))
+        return v;
+    unsigned bits = 0;
+    if (auto ft = dyn_cast<FloatType>(t))
+        bits = ft.getWidth();
+    else
+        bits = vectorTotalBits(t);
+    if (bits == 0)
+        return v;  // pointer/other -- leave as-is (not a float/vector reg value)
+    return builder.create<LLVM::BitcastOp>(
+        loc, builder.getIntegerType(bits), v).getResult();
+}
 
 // ─── Wave 22 Step 2 — variadic call detection (printk-family with zeroed fmt) ──
 //
@@ -1602,6 +1654,33 @@ private:
                     }
                 }
 
+                // FIX-CRASH-VEC (root-caused by Maya R.): a load of an XMM/vector
+                // register yields a FixedVectorType (e.g. `<2 x float>` from a
+                // Win64 by-value struct-return SROA'd into XMM).  Replacing it
+                // with the full-register i128 RegReadOp leaves consumers such as
+                // llvm.extractelement holding an i128 operand where they require
+                // a vector -- a downstream `cast<FixedVectorType>` then asserts
+                // ("cast<Ty>() argument of incompatible type", non-deterministic
+                // under ASLR because replaceAllUsesWith is a blind Value swap).
+                // Read the register at the vector's own bit-width (its low lanes)
+                // and bitcast back to the vector type so extract/insert consumers
+                // keep a well-typed vector operand.
+                if (unsigned vecBits =
+                        vectorTotalBits(load.getResult().getType())) {
+                    auto vecReadOp = builder.create<helix::low::RegReadOp>(
+                        loc,
+                        builder.getIntegerType(vecBits),
+                        builder.getStringAttr(*regName),
+                        builder.getUI32IntegerAttr(vecBits),
+                        addrAttr);
+                    load.getResult().replaceAllUsesWith(
+                        builder.create<LLVM::BitcastOp>(
+                            loc, load.getResult().getType(),
+                            vecReadOp.getResult()).getResult());
+                    opsToErase.push_back(op);
+                    return;
+                }
+
                 unsigned width = RegisterTracker::inferRegWidth(*regName);
                 auto intTy = builder.getIntegerType(width);
 
@@ -1621,6 +1700,24 @@ private:
             {
                 auto addrVal = load.getAddr();
                 auto resultTy = load.getResult().getType();
+                // FIX-CRASH-VEC (memory variant): a `load <N x float>` from a
+                // stack/SROA slot corrupts the same way as the register path
+                // above -- the default i64 mem.read replaces a vector-typed value
+                // and orphans extractelement consumers.  Read at the vector's
+                // bit-width and bitcast back so the vector type is preserved.
+                if (unsigned vecBits = vectorTotalBits(resultTy)) {
+                    auto memReadV = builder.create<helix::low::MemReadOp>(
+                        loc,
+                        builder.getIntegerType(vecBits),
+                        ensureInt64(addrVal, builder, loc, &regs, &pcTracker),
+                        builder.getUI32IntegerAttr(vecBits),
+                        addrAttr);
+                    load.getResult().replaceAllUsesWith(
+                        builder.create<LLVM::BitcastOp>(
+                            loc, resultTy, memReadV.getResult()).getResult());
+                    opsToErase.push_back(op);
+                    return;
+                }
                 unsigned width = 64;
                 if (auto intTy = dyn_cast<IntegerType>(resultTy))
                     width = intTy.getWidth();
@@ -1684,7 +1781,7 @@ private:
 
                 builder.create<helix::low::RegWriteOp>(
                     loc,
-                    store.getValue(),
+                    coerceRegValueToInt(store.getValue(), builder, loc),
                     builder.getStringAttr(*regName),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);
@@ -1696,15 +1793,21 @@ private:
             // stack variables or memory accesses.
             {
                 auto addrVal = store.getAddr();
-                auto valTy = store.getValue().getType();
+                // helix_low.mem.write also constrains $value to AnyInteger
+                // (getValue() -> cast<TypedValue<IntegerType>>). ensureInt64
+                // only handles pointer/PC values, so a `store float`/`store
+                // <N x f32>` to a stack slot would otherwise create an invalid
+                // mem.write that asserts downstream. Coerce SSE values to an
+                // integer of matching width first (FIX-CRASH-VEC).
+                Value storeVal = coerceRegValueToInt(store.getValue(), builder, loc);
                 unsigned width = 64;
-                if (auto intTy = dyn_cast<IntegerType>(valTy))
+                if (auto intTy = dyn_cast<IntegerType>(storeVal.getType()))
                     width = intTy.getWidth();
 
                 builder.create<helix::low::MemWriteOp>(
                     loc,
                     ensureInt64(addrVal, builder, loc, &regs, &pcTracker),
-                    ensureInt64(store.getValue(), builder, loc, &regs, &pcTracker),
+                    ensureInt64(storeVal, builder, loc, &regs, &pcTracker),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);
                 opsToErase.push_back(op);

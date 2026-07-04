@@ -1969,9 +1969,19 @@ private:
         }
 
         // Store the resolved types as attributes on the operations.
+        // FIX (non-determinism): typeEnv is a DenseMap<Value,...>, iterated in
+        // POINTER-ADDRESS order, which varies per decompile (each call allocates
+        // ops at fresh addresses). Multiple results of one op (a helix.low.BinOp's
+        // value + its carry/zero/sign flags) share ONE defining op, so writing
+        // inferred_type per Value made the last-write "winner" non-deterministic
+        // (the observed inferred_type=bool vs int64 flip). Choose a deterministic
+        // winner per op -- the resolved result with the LOWEST result number (the
+        // op's primary value) -- and write once per op. Inter-op write order is
+        // irrelevant since each entry targets a distinct op.
         unsigned numTypesSet = 0;
         unsigned numBlockArgs = 0;
         unsigned numPtrTypes = 0;
+        llvm::DenseMap<Operation*, std::pair<unsigned, CTypeInfo>> chosenType;
         for (auto& [val, typeInfo] : typeEnv) {
             if (!typeInfo.isResolved())
                 continue;
@@ -1982,15 +1992,23 @@ private:
                 continue;
             }
 
-            // Encode the type as a string attribute
-            std::string typeStr = typeInfo.toCTypeString();
+            unsigned rn = 0;
+            if (auto res = mlir::dyn_cast<mlir::OpResult>(val))
+                rn = res.getResultNumber();
+            auto it = chosenType.find(defOp);
+            if (it == chosenType.end())
+                chosenType.insert({defOp, {rn, typeInfo}});
+            else if (rn < it->second.first)
+                it->second = {rn, typeInfo};
+        }
+        for (auto& [defOp, rt] : chosenType) {
+            std::string typeStr = rt.second.toCTypeString();
             if (typeStr.empty())
                 continue;
-
             defOp->setAttr("inferred_type",
                 StringAttr::get(defOp->getContext(), typeStr));
             ++numTypesSet;
-            if (typeInfo.kind == CTypeInfo::Pointer)
+            if (rt.second.kind == CTypeInfo::Pointer)
                 ++numPtrTypes;
         }
         LLVM_DEBUG(llvm::dbgs()
@@ -2986,6 +3004,10 @@ private:
         }
 
         // Store resolved types on SSA value defining ops.
+        // FIX (non-determinism): same DenseMap<Value,...> pointer-order hazard as
+        // the low path -- a deterministic winner (lowest result number) per
+        // defining op, written once.
+        llvm::DenseMap<Operation*, std::pair<unsigned, std::string>> chosenHigh;
         for (auto& [val, typeInfo] : typeEnv) {
             if (!typeInfo.isResolved())
                 continue;
@@ -2998,9 +3020,18 @@ private:
             if (typeStr.empty())
                 continue;
 
-            defOp->setAttr("inferred_type",
-                StringAttr::get(defOp->getContext(), typeStr));
+            unsigned rn = 0;
+            if (auto res = mlir::dyn_cast<mlir::OpResult>(val))
+                rn = res.getResultNumber();
+            auto it = chosenHigh.find(defOp);
+            if (it == chosenHigh.end())
+                chosenHigh.insert({defOp, {rn, typeStr}});
+            else if (rn < it->second.first)
+                it->second = {rn, typeStr};
         }
+        for (auto& [defOp, rt] : chosenHigh)
+            defOp->setAttr("inferred_type",
+                StringAttr::get(defOp->getContext(), rt.second));
     }
 };
 

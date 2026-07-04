@@ -58,9 +58,13 @@ struct DamningDefectInfo {
     bool uninitReturn = false;       // (2) return of a never-assigned local
     std::string uninitVarName;       //     that local's name (for the reason)
     bool irreducibleNoReturn = false; // (3) goto loc_irr_* with no return path
+    bool droppedControlFlow = false; // (4) FIX-110: __helix_unhandled_cf_* survived
+    std::string droppedOp;           //     the un-lowered op name (for the reason)
+    bool floatSubscript = false;     // (5) FIX-111: scalar `float v[0]` / `[0.0f]`
 
     bool any() const {
-        return codeAddrLeak || uninitReturn || irreducibleNoReturn;
+        return codeAddrLeak || uninitReturn || irreducibleNoReturn ||
+               droppedControlFlow || floatSubscript;
     }
 
     /// One-line, ASCII, located reason naming the ACTUAL surviving defect(s).
@@ -81,6 +85,10 @@ struct DamningDefectInfo {
             add("uninitialized return value '" + uninitVarName + "'");
         if (irreducibleNoReturn)
             add("irreducible CFG; no return path recovered");
+        if (droppedControlFlow)
+            add("unrecovered control flow (" + droppedOp + ")");
+        if (floatSubscript)
+            add("non-compilable scalar-float subscript (v[0] on a float)");
         return r;
     }
 };
@@ -128,6 +136,219 @@ inline std::string plainVarName(const CExpr* e) {
     if (auto* v = llvm::dyn_cast<CVarRefExpr>(e))
         return v->varName;
     return {};
+}
+
+// ── FIX-108: reachability awareness for the uninitialized-return check ───────
+// A returned local is genuinely uninitialized if its ONLY assignments sit on
+// provably-dead branches (e.g. `if (!!v1) { v2 = ...; }` where v1 is a const-0
+// local).  We fold a condition against the set of locals that are provably the
+// constant 0 (initialised to 0 and never reassigned), peeling casts and `!`.
+inline bool isProvablyNonzero(const CExpr* e,
+                              const std::unordered_set<std::string>& zeroLocals);
+
+inline bool isProvablyZero(const CExpr* e,
+                           const std::unordered_set<std::string>& zeroLocals) {
+    if (!e) return false;
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return isProvablyZero(c->operand.get(), zeroLocals);
+    if (auto* lit = llvm::dyn_cast<CIntLitExpr>(e))
+        return lit->value == 0;
+    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e))
+        return zeroLocals.count(v->varName) != 0;
+    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
+        if (u->op == UnaryOp::LogNot)            // !x is zero iff x is nonzero
+            return isProvablyNonzero(u->operand.get(), zeroLocals);
+    return false;
+}
+
+inline bool isProvablyNonzero(const CExpr* e,
+                              const std::unordered_set<std::string>& zeroLocals) {
+    if (!e) return false;
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return isProvablyNonzero(c->operand.get(), zeroLocals);
+    if (auto* lit = llvm::dyn_cast<CIntLitExpr>(e))
+        return lit->value != 0;
+    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
+        if (u->op == UnaryOp::LogNot)            // !x is nonzero iff x is zero
+            return isProvablyZero(u->operand.get(), zeroLocals);
+    return false;
+}
+
+/// Collect whole-variable assignment targets that sit on a REACHABLE path.
+/// The then-body of an `if` whose condition is provably FALSE is dead; the
+/// else-body of a provably-TRUE condition is dead; once dead, stays dead.
+inline void collectLiveAssigned(
+        const std::vector<StmtPtr>& body, bool inDead,
+        const std::unordered_set<std::string>& zeroLocals,
+        std::unordered_set<std::string>& liveAssigned) {
+    for (auto& sp : body) {
+        const CStmt* s = sp.get();
+        if (!s) continue;
+        if (auto* as = llvm::dyn_cast<CAssignStmt>(s)) {
+            if (!inDead)
+                if (auto vn = plainVarName(as->target.get()); !vn.empty())
+                    liveAssigned.insert(vn);
+        } else if (auto* ifS = llvm::dyn_cast<CIfStmt>(s)) {
+            bool thenDead = inDead || isProvablyZero(ifS->condition.get(), zeroLocals);
+            bool elseDead = inDead || isProvablyNonzero(ifS->condition.get(), zeroLocals);
+            collectLiveAssigned(ifS->thenBody, thenDead, zeroLocals, liveAssigned);
+            collectLiveAssigned(ifS->elseBody, elseDead, zeroLocals, liveAssigned);
+        } else if (auto* wh = llvm::dyn_cast<CWhileStmt>(s)) {
+            collectLiveAssigned(wh->body, inDead, zeroLocals, liveAssigned);
+        } else if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(s)) {
+            collectLiveAssigned(dw->body, inDead, zeroLocals, liveAssigned);
+        } else if (auto* fr = llvm::dyn_cast<CForStmt>(s)) {
+            collectLiveAssigned(fr->body, inDead, zeroLocals, liveAssigned);
+        } else if (auto* sw = llvm::dyn_cast<CSwitchStmt>(s)) {
+            for (auto& c : sw->cases)
+                collectLiveAssigned(c.body, inDead, zeroLocals, liveAssigned);
+        } else if (auto* blk = llvm::dyn_cast<CBlockStmt>(s)) {
+            collectLiveAssigned(blk->stmts, inDead, zeroLocals, liveAssigned);
+        }
+    }
+}
+
+// ── FIX-110: surviving un-lowered control-flow op (__helix_unhandled_cf_*) ───
+// The structurer renders a switch / conditional branch it could not recover as
+// a `__helix_unhandled_cf_switch(...)` / `__helix_unhandled_cf_cond_br(...)`
+// call.  Such a call means real control flow is MISSING from the body, so a
+// function carrying it is non-faithful and must not read High.
+inline bool exprHasUnhandledCall(const CExpr* e, std::string& outOp) {
+    if (!e) return false;
+    if (auto* call = llvm::dyn_cast<CCallExpr>(e)) {
+        if (call->targetName.rfind("__helix_unhandled_", 0) == 0) {
+            outOp = call->targetName;
+            return true;
+        }
+        for (auto& a : call->args)
+            if (exprHasUnhandledCall(a.get(), outOp)) return true;
+        return false;
+    }
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return exprHasUnhandledCall(c->operand.get(), outOp);
+    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
+        return exprHasUnhandledCall(u->operand.get(), outOp);
+    if (auto* b = llvm::dyn_cast<CBinaryExpr>(e))
+        return exprHasUnhandledCall(b->lhs.get(), outOp) ||
+               exprHasUnhandledCall(b->rhs.get(), outOp);
+    return false;
+}
+
+inline bool scanForUnhandledCF(const std::vector<StmtPtr>& body,
+                               std::string& outOp) {
+    for (auto& sp : body) {
+        const CStmt* s = sp.get();
+        if (!s) continue;
+        if (auto* es = llvm::dyn_cast<CExprStmt>(s)) {
+            if (exprHasUnhandledCall(es->expr.get(), outOp)) return true;
+        } else if (auto* as = llvm::dyn_cast<CAssignStmt>(s)) {
+            if (exprHasUnhandledCall(as->value.get(), outOp)) return true;
+            if (exprHasUnhandledCall(as->target.get(), outOp)) return true;
+        } else if (auto* rs = llvm::dyn_cast<CReturnStmt>(s)) {
+            if (rs->value && exprHasUnhandledCall(rs->value.get(), outOp))
+                return true;
+        } else if (auto* ifS = llvm::dyn_cast<CIfStmt>(s)) {
+            if (exprHasUnhandledCall(ifS->condition.get(), outOp)) return true;
+            if (scanForUnhandledCF(ifS->thenBody, outOp)) return true;
+            if (scanForUnhandledCF(ifS->elseBody, outOp)) return true;
+        } else if (auto* wh = llvm::dyn_cast<CWhileStmt>(s)) {
+            if (scanForUnhandledCF(wh->body, outOp)) return true;
+        } else if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(s)) {
+            if (scanForUnhandledCF(dw->body, outOp)) return true;
+        } else if (auto* fr = llvm::dyn_cast<CForStmt>(s)) {
+            if (scanForUnhandledCF(fr->body, outOp)) return true;
+        } else if (auto* sw = llvm::dyn_cast<CSwitchStmt>(s)) {
+            for (auto& c : sw->cases)
+                if (scanForUnhandledCF(c.body, outOp)) return true;
+        } else if (auto* blk = llvm::dyn_cast<CBlockStmt>(s)) {
+            if (scanForUnhandledCF(blk->stmts, outOp)) return true;
+        }
+    }
+    return false;
+}
+
+// ── FIX-111: non-compilable scalar-float subscript ──────────────────────────
+// The SSE scalar-compare lowering models an xmm lane-0 extract as a subscript
+// `v[0]`, but emits it on a value declared as a SCALAR `float` (or with a
+// float-literal index `[0.0f]`).  You cannot subscript a scalar float in C, so
+// the body does not compile -- a faithfulness defect that must not read High.
+// (A genuine pointer/array base has kind Pointer/Array, never Float, so this is
+// precise: it fires only on the broken scalar-subscript, not on `ptr[i]`.)
+inline bool isScalarFloatBase(const CExpr* e,
+                              const std::unordered_set<std::string>& floatVars) {
+    if (!e) return false;
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return isScalarFloatBase(c->operand.get(), floatVars);
+    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e))
+        if (floatVars.count(v->varName)) return true;   // declared `float` (decl is authoritative; the use-site var-ref type can drift)
+    return e->type && e->type->kind == TypeKind::Float;  // or the ref is itself typed float
+}
+
+inline bool exprHasFloatSubscript(
+        const CExpr* e, const std::unordered_set<std::string>& floatVars) {
+    if (!e) return false;
+    if (auto* s = llvm::dyn_cast<CSubscriptExpr>(e)) {
+        if (isScalarFloatBase(s->base.get(), floatVars)) return true;   // float v[0]
+        if (s->index && llvm::isa<CFloatLitExpr>(s->index.get()))       // v[0.0f]
+            return true;
+        return exprHasFloatSubscript(s->base.get(), floatVars) ||
+               exprHasFloatSubscript(s->index.get(), floatVars);
+    }
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return exprHasFloatSubscript(c->operand.get(), floatVars);
+    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
+        return exprHasFloatSubscript(u->operand.get(), floatVars);
+    if (auto* b = llvm::dyn_cast<CBinaryExpr>(e))
+        return exprHasFloatSubscript(b->lhs.get(), floatVars) ||
+               exprHasFloatSubscript(b->rhs.get(), floatVars);
+    if (auto* t = llvm::dyn_cast<CTernaryExpr>(e))
+        return exprHasFloatSubscript(t->cond.get(), floatVars) ||
+               exprHasFloatSubscript(t->trueVal.get(), floatVars) ||
+               exprHasFloatSubscript(t->falseVal.get(), floatVars);
+    if (auto* fa = llvm::dyn_cast<CFieldAccessExpr>(e))
+        return exprHasFloatSubscript(fa->base.get(), floatVars);
+    if (auto* call = llvm::dyn_cast<CCallExpr>(e)) {
+        for (auto& a : call->args)
+            if (exprHasFloatSubscript(a.get(), floatVars)) return true;
+        return false;
+    }
+    return false;
+}
+
+inline bool scanForFloatSubscript(
+        const std::vector<StmtPtr>& body,
+        const std::unordered_set<std::string>& floatVars) {
+    for (auto& sp : body) {
+        const CStmt* s = sp.get();
+        if (!s) continue;
+        if (auto* es = llvm::dyn_cast<CExprStmt>(s)) {
+            if (exprHasFloatSubscript(es->expr.get(), floatVars)) return true;
+        } else if (auto* as = llvm::dyn_cast<CAssignStmt>(s)) {
+            if (exprHasFloatSubscript(as->value.get(), floatVars)) return true;
+            if (exprHasFloatSubscript(as->target.get(), floatVars)) return true;
+        } else if (auto* rs = llvm::dyn_cast<CReturnStmt>(s)) {
+            if (rs->value && exprHasFloatSubscript(rs->value.get(), floatVars)) return true;
+        } else if (auto* ifS = llvm::dyn_cast<CIfStmt>(s)) {
+            if (exprHasFloatSubscript(ifS->condition.get(), floatVars)) return true;
+            if (scanForFloatSubscript(ifS->thenBody, floatVars)) return true;
+            if (scanForFloatSubscript(ifS->elseBody, floatVars)) return true;
+        } else if (auto* wh = llvm::dyn_cast<CWhileStmt>(s)) {
+            if (exprHasFloatSubscript(wh->condition.get(), floatVars)) return true;
+            if (scanForFloatSubscript(wh->body, floatVars)) return true;
+        } else if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(s)) {
+            if (exprHasFloatSubscript(dw->condition.get(), floatVars)) return true;
+            if (scanForFloatSubscript(dw->body, floatVars)) return true;
+        } else if (auto* fr = llvm::dyn_cast<CForStmt>(s)) {
+            if (scanForFloatSubscript(fr->body, floatVars)) return true;
+        } else if (auto* sw = llvm::dyn_cast<CSwitchStmt>(s)) {
+            if (exprHasFloatSubscript(sw->selector.get(), floatVars)) return true;
+            for (auto& c : sw->cases)
+                if (scanForFloatSubscript(c.body, floatVars)) return true;
+        } else if (auto* blk = llvm::dyn_cast<CBlockStmt>(s)) {
+            if (scanForFloatSubscript(blk->stmts, floatVars)) return true;
+        }
+    }
+    return false;
 }
 
 // Forward decl for mutual recursion through control-flow stmts.
@@ -255,13 +476,32 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
     // (1) Surviving code-address leak.
     if (sawLeak) { info.codeAddrLeak = true; info.leakAddr = leakAddr; }
 
-    // (2) Uninitialized return: a returned LOCAL with no initializer that is
-    //     never an assignment target anywhere in the body.  Params are never
+    // (2) Uninitialized return: a returned LOCAL with no initializer whose only
+    //     assignments sit on provably-dead branches.  Params are never
     //     "uninitialized" (they carry an incoming value), so only locals count.
+    //
+    //     FIX-108: the plain `assignedVars` set counts an assignment even when
+    //     it is inside a provably-dead branch (`if (!!v1) { v2 = ...; }` with v1
+    //     a const-0 local), which let `return v2;` read High at 87% on SOTTR
+    //     sub_140001000.  Re-derive the set of assignments that sit on a
+    //     REACHABLE path (folding `if` conditions against the const-0 locals)
+    //     and test against THAT.  `zeroLocals` = locals initialised to 0 and
+    //     never reassigned anywhere (a conservative const-0 set: a var that IS
+    //     reassigned is excluded, so a branch is only ever marked dead when its
+    //     guard is genuinely always-false -- no false-positive uninit).
+    std::unordered_set<std::string> zeroLocals;
+    for (const auto& lv : func.localVars)
+        if (lv.initExpr && !assignedVars.count(lv.varName) &&
+            detail::isProvablyZero(lv.initExpr.get(), {}))
+            zeroLocals.insert(lv.varName);
+    std::unordered_set<std::string> liveAssignedVars;
+    detail::collectLiveAssigned(func.body, /*inDead=*/false, zeroLocals,
+                                liveAssignedVars);
+
     for (const auto& lv : func.localVars) {
         if (lv.initExpr) continue;                        // has an initializer
         if (!returnedVars.count(lv.varName)) continue;    // not returned
-        if (assignedVars.count(lv.varName)) continue;     // assigned somewhere
+        if (liveAssignedVars.count(lv.varName)) continue; // assigned on a live path
         info.uninitReturn = true;
         info.uninitVarName = lv.varName;
         break;
@@ -271,6 +511,35 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
     //     body escapes via a loc_irr_* goto (structurer lost the live exit).
     if (!sawReturn && sawIrrGoto)
         info.irreducibleNoReturn = true;
+
+    // (4) FIX-110: a surviving __helix_unhandled_cf_* call -- the structurer
+    //     could not recover a switch / conditional branch, so real control flow
+    //     is missing.  A function that reads 100% with its whole dispatch
+    //     dropped to `__helix_unhandled_cf_switch(...)` is provably non-faithful.
+    {
+        std::string droppedOp;
+        if (detail::scanForUnhandledCF(func.body, droppedOp)) {
+            info.droppedControlFlow = true;
+            info.droppedOp = droppedOp;
+        }
+    }
+
+    // (5) FIX-111: a non-compilable scalar-float subscript (`float v; ... v[0]`
+    //     or a `[0.0f]` index) -- the SSE scalar-compare lowering emitted an xmm
+    //     lane extract on a scalar.  The body does not compile, so it must not
+    //     read High.  The DECLARED type is authoritative (the use-site var-ref
+    //     type can drift away from `float`), so feed the declared-float names.
+    {
+        std::unordered_set<std::string> floatVars;
+        for (const auto& lv : func.localVars)
+            if (lv.type && lv.type->kind == TypeKind::Float)
+                floatVars.insert(lv.varName);
+        for (const auto& p : func.params)
+            if (p.type && p.type->kind == TypeKind::Float)
+                floatVars.insert(p.name);
+        if (detail::scanForFloatSubscript(func.body, floatVars))
+            info.floatSubscript = true;
+    }
 
     return info;
 }

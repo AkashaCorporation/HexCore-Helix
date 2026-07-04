@@ -182,6 +182,10 @@ ValueRange ValueRange::forUnsignedBits(unsigned bits) {
 
 ValueRange ValueRange::forSignedBits(unsigned bits) {
     if (bits >= 64) return top();
+    // FIX (Maya 7.3): bits==0 (e.g. a 0-bit trunc) makes `bits - 1` underflow to
+    // UINT_MAX, so `1LL << (bits-1)` is a shift-count-out-of-range UB. A 0-bit
+    // signed value has only the single value 0.
+    if (bits == 0) return ValueRange{0, 0};
     return ValueRange{-(1LL << (bits - 1)), (1LL << (bits - 1)) - 1};
 }
 
