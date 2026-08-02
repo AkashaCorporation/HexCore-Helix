@@ -12,8 +12,6 @@ if(NOT GTest_FOUND)
     FetchContent_MakeAvailable(googletest)
 endif()
 
-enable_testing()
-
 # ─── Test Data Directory (for integration tests) ────────────────────────────────
 
 set(HELIX_TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
