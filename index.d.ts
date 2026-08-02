@@ -140,20 +140,6 @@ export interface DecompileResult {
   pipeline: string
 }
 
-/** Pipeline metrics exposed to JavaScript. */
-export interface PipelineMetricsResult {
-  /** Total pipeline duration in milliseconds. */
-  totalMs: number
-  /** Instructions decoded. */
-  instructionsDecoded: number
-  /** Functions recovered. */
-  functionsRecovered: number
-  /** Throughput in instructions per millisecond. */
-  throughput: number
-  /** Number of warnings. */
-  warningCount: number
-}
-
 /**
  * Read the function name from a CFG FlatBuffer without full deserialization.
  *
