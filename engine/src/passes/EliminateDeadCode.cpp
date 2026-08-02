@@ -1859,11 +1859,6 @@ private:
             changed = false;
             ++iteration;
 
-            // Build the VarRefMap once per iteration for SSA-aware
-            // liveness analysis.  This is rebuilt after each iteration
-            // because erasing ops invalidates the map.
-            VarRefMap refMap = buildVarRefMap(funcBody);
-
             // ── Step 0: Remove infrastructure-marked assignments ────────
             //
             // AssignOps tagged with "helix.infrastructure" by
@@ -1894,6 +1889,9 @@ private:
 
             // ── Step 1: Remove dead __undef assignments ─────────────────
             {
+                // Step 0 may erase VarRefOps, so build the map only after
+                // its cleanup has finished.
+                VarRefMap refMap = buildVarRefMap(funcBody);
                 llvm::SmallVector<helix::high::AssignOp, 16> deadUndefs;
 
                 funcBody.walk([&](helix::high::AssignOp assignOp) {
@@ -1925,10 +1923,19 @@ private:
             // consumers.  We remove assignments in reverse order so that
             // removing a later assignment may expose an earlier one as dead.
             {
+                // Step 1 erases operand definitions. Never reuse its map.
+                VarRefMap refMap = buildVarRefMap(funcBody);
                 llvm::SmallVector<helix::high::AssignOp, 16> allAssigns;
+                llvm::SmallVector<Operation*, 32> orphanDefs;
+                llvm::SmallPtrSet<Operation*, 32> seenOrphanDefs;
                 funcBody.walk([&](helix::high::AssignOp assignOp) {
                     allAssigns.push_back(assignOp);
                 });
+
+                auto rememberOrphanDef = [&](Operation* op) {
+                    if (op && seenOrphanDefs.insert(op).second)
+                        orphanDefs.push_back(op);
+                };
 
                 // Process in reverse order (reverse dependency).
                 for (auto it = allAssigns.rbegin(); it != allAssigns.rend();
@@ -1991,22 +1998,29 @@ private:
                         ++totalAssigns;
                         changed = true;
 
-                        // Clean up orphaned operand definitions — but never
-                        // erase side-effecting ops (calls, memory writes)
-                        // just because their result became unused.  A call
-                        // like `sub_foo()` whose return value is ignored
-                        // still needs to emit for its side effects.
-                        if (rhsDef && rhsDef->use_empty() &&
-                            !isSideEffectingRhs(rhsDef))
-                            rhsDef->erase();
-                        if (lhsOp && lhsOp->use_empty())
-                            lhsOp->erase();
+                        // Keep operand definitions alive until the reverse
+                        // sweep finishes. The liveness map owns VarRefOp
+                        // handles; erasing one here would leave dangling
+                        // entries for the next assignment in the sweep.
+                        rememberOrphanDef(rhsDef);
+                        rememberOrphanDef(lhsOp);
                     }
+                }
+
+                // The map is no longer consulted, so orphaned definitions can
+                // now be removed safely. Side-effecting RHS operations remain
+                // observable even when their result assignment is dead.
+                for (Operation* op : orphanDefs) {
+                    if (op->use_empty() && !isSideEffectingRhs(op))
+                        op->erase();
                 }
             }
 
             // ── Step 3: Remove dead variable declarations ───────────────
             {
+                // Step 2 changes both assignments and VarRefOps. Its liveness
+                // map is invalid after orphan cleanup.
+                VarRefMap refMap = buildVarRefMap(funcBody);
                 llvm::SmallVector<helix::high::VarDeclOp, 16> deadDecls;
 
                 funcBody.walk([&](helix::high::VarDeclOp declOp) {
