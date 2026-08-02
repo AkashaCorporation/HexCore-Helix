@@ -100,6 +100,10 @@ HelixTypeInfo HelixTypeInfo::makeFloat(unsigned bits) {
     return t;
 }
 
+HelixTypeInfo HelixTypeInfo::makePointer() {
+    return makePointer(HelixTypeInfo{});
+}
+
 HelixTypeInfo HelixTypeInfo::makePointer(HelixTypeInfo pointee) {
     HelixTypeInfo t;
     t.meta_ = MetaType::Pointer;

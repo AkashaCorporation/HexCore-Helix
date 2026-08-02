@@ -264,7 +264,14 @@ struct CTypeInfo {
         return t;
     }
 
-    static CTypeInfo makePointer(CTypeInfo pointeeType = {}) {
+    static CTypeInfo makePointer() {
+        CTypeInfo t;
+        t.kind = Pointer;
+        t.bit_width = 64;
+        return t;
+    }
+
+    static CTypeInfo makePointer(CTypeInfo pointeeType) {
         CTypeInfo t;
         t.kind = Pointer;
         t.bit_width = 64;
