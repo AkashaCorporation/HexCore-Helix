@@ -22,6 +22,8 @@
 #include "llvm/Support/Casting.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <cassert>
 #include <cctype>
@@ -140,19 +142,6 @@ static bool isRegisterName(std::string_view n) {
     return false;
 }
 
-/// True if n is one of the callee-saved registers (rbx, rbp, rsi, rdi, r12-r15).
-static bool isCalleeSaved(std::string_view n) {
-    static constexpr std::string_view cs[] = {
-        "rbx", "rbp", "rsi", "rdi",
-        "r12", "r13", "r14", "r15",
-        "RBX", "RBP", "RSI", "RDI",
-        "R12", "R13", "R14", "R15",
-    };
-    for (auto& r : cs)
-        if (n == r) return true;
-    return false;
-}
-
 /// True if n names a stack-pointer register.
 static bool isStackPointer(std::string_view n) {
     return n == "rsp" || n == "RSP" || n == "esp" || n == "ESP";
@@ -219,6 +208,23 @@ static bool isCommutative(BinaryOp op) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void CAstOptimizer::optimize(CFuncDecl& func) {
+    // M4: collapse the RVSDG exit-dispatcher switches FIRST, so every existing
+    // pass below (copy-prop, dead-store, empty-if, invert, polarity) then cleans
+    // up the now-ordinary if/else and the exposed scf_r selector copy chains.
+    dissolveExitDispatchers(func);   // P3/P4: switch(selector) -> if/else-if chain
+    // Structuring can leave orphaned gotos whose labels were already absorbed.
+    // Remove those before liveness-based copy coalescing; a real surviving goto
+    // still makes the coalescer bail out conservatively.
+    removeDanglingGotos(func);
+    coalesceSelectorChains(func);    // P2: collapse the scf_r routing copy chains
+    // P5: with every `switch(scf_r)` now an if-chain, the synthetic selector is
+    // read only by `if (scf_r==c)` conditions; the overwhelming majority of the
+    // per-arm `scf_r = const` writes are dead (overwritten or never reached by
+    // any read).  A proper recursive backward liveness restricted to scf_r* sweeps
+    // them — this is the verbosity lever (dead selector writes are ~36% of the
+    // dispatcher-heavy functions).  Must run AFTER dissolveExitDispatchers so the
+    // selector is no longer kept artificially live by a surviving switch.
+    eliminateDeadSelectorStores(func);
     removePrologueEpilogue(func);
     eliminateInfrastructure(func);
     eliminateNullPtrStores(func);
@@ -239,6 +245,7 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     eliminateRedundantCasts(func);
     synthesizeCompoundAssign(func);
     eliminateConstantBranches(func);
+    foldIdenticalNestedSCFArms(func);
     removeEmptyIfStatements(func);
     cleanupFloatZeros(func);
     collapseMinMaxPatterns(func);
@@ -267,21 +274,168 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     // a real lvalue if `v` was a simple alias of a real pointer).
     removeNullDerefPlaceholderStores(func);
     removeUnreachableAfterFirstReturn(func);
-    // FIX-CAST-001: the late DCE passes above (removeDeadStoresBeforeReturn,
-    // removeNullDerefPlaceholderStores, removeUnreachableAfterFirstReturn) can
-    // empty an if-body that was non-empty when removeEmptyIfStatements last ran,
-    // leaving an `if (cond) { }` shell that the scorer then penalises as an
-    // "empty if/else block".  Re-run the empty-if sweep here, after all
-    // body-emptying passes and before reanalyzeConfidence, so those late-created
-    // dead shells are stripped instead of counted.  Safe: only erases ifs whose
-    // then AND else bodies are both empty (same predicate the earlier sweeps use).
-    removeEmptyIfStatements(func);
-    // Sweep nested/globally-dead pure stores (e.g. a deeply-nested
-    // `var_0 = 0xADDR` PC-tracking shadow) that the top-level-only dseStmtList
-    // leaves behind; then drop the now-unreferenced declarations.
+    // Sweep nested/globally-dead pure stores (e.g. the scf-structurer's deeply-
+    // nested `var_0 = 0xADDR` PC-tracking shadow) that the top-level-only
+    // dseStmtList leaves behind.
     removeGloballyDeadStores(func);
+    // Early dispatcher cleanup can leave a source independently live until a
+    // later DSE pass removes that last consumer. Re-run the same guarded
+    // coalescer on the simplified AST; its no-interference test is recomputed
+    // from current reads, so this recovers routing-only chains without merging
+    // tuple components that remain independently observable.
+    coalesceSelectorChains(func);
+    removeSelfAssignments(func);
+    removeGloballyDeadStores(func);
+    // Global DSE can make two SCF yield arms identical only at this late
+    // point. Re-run the narrow tuple fold so those newly exposed cases are
+    // combined before declarations and confidence are finalized.
+    foldIdenticalNestedSCFArms(func);
+    // FIX-133: every body-emptying pass must precede the final empty-if sweep.
+    // In particular, removeGloballyDeadStores can erase the last selector store
+    // from a deeply nested RVSDG arm and expose an empty if/else chain. Running
+    // this post-order cleanup afterwards removes the whole shell in one pass.
+    removeEmptyIfStatements(func);
+    // The tuple fold above can remove the last read of one of its routing
+    // selectors. Close that cleanup cycle once more, then repeat the narrow
+    // fold/empty-shell cleanup on anything the DSE exposes.
+    removeGloballyDeadStores(func);
+    foldIdenticalNestedSCFArms(func);
+    removeEmptyIfStatements(func);
+    invertEmptyIfThen(func);
+    simplifyConditionPolarity(func);
+    removeEmptyIfStatements(func);
+    // Drop declarations made unused by the final DCE/empty-branch cleanup.
     removeUnusedDeclarations(func);
     reanalyzeConfidence(func);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCF identical-yield arm folding
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+bool isSyntheticSCFName(std::string_view name) {
+    if (!name.starts_with("scf_") || name.size() <= 5)
+        return false;
+    const char kind = name[4];
+    if (kind != 'r' && kind != 'w')
+        return false;
+    for (size_t i = 5; i < name.size(); ++i)
+        if (!std::isdigit(static_cast<unsigned char>(name[i])))
+            return false;
+    return true;
+}
+
+/// Compare the narrow tuple-yield shape emitted by StructureControlFlow.
+///
+/// Keeping this restricted to plain assignments to the same synthetic
+/// variables avoids treating arbitrary source statements as interchangeable.
+bool sameSyntheticTupleAssignments(const std::vector<StmtPtr>& lhs,
+                                   const std::vector<StmtPtr>& rhs) {
+    if (lhs.empty() || lhs.size() != rhs.size())
+        return false;
+
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (!lhs[i] || !rhs[i] ||
+            lhs[i]->getKind() != NodeKind::AssignStmt ||
+            rhs[i]->getKind() != NodeKind::AssignStmt)
+            return false;
+
+        const auto& a = static_cast<const CAssignStmt&>(*lhs[i]);
+        const auto& b = static_cast<const CAssignStmt&>(*rhs[i]);
+        if (!a.compoundOp.empty() || !b.compoundOp.empty() ||
+            !a.target || !b.target || !a.value || !b.value ||
+            a.target->getKind() != NodeKind::VarRefExpr ||
+            b.target->getKind() != NodeKind::VarRefExpr)
+            return false;
+
+        const auto& at = static_cast<const CVarRefExpr&>(*a.target);
+        const auto& bt = static_cast<const CVarRefExpr&>(*b.target);
+        const bool sameTargetType =
+            (!a.target->type && !b.target->type) ||
+            (a.target->type && b.target->type &&
+             *a.target->type == *b.target->type);
+        const bool sameValueType =
+            (!a.value->type && !b.value->type) ||
+            (a.value->type && b.value->type &&
+             *a.value->type == *b.value->type);
+        if (at.varName != bt.varName || !isSyntheticSCFName(at.varName) ||
+            !sameTargetType || !sameValueType ||
+            !isSameExpr(a.value.get(), b.value.get()))
+            return false;
+    }
+    return true;
+}
+
+bool foldIdenticalNestedSCFArmsInList(std::vector<StmtPtr>& stmts) {
+    bool changed = false;
+
+    for (auto& stmt : stmts) {
+        if (!stmt)
+            continue;
+
+        switch (stmt->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& outer = static_cast<CIfStmt&>(*stmt);
+            changed |= foldIdenticalNestedSCFArmsInList(outer.thenBody);
+            changed |= foldIdenticalNestedSCFArmsInList(outer.elseBody);
+
+            // Repeatedly consume an else-if chain while its successful arm
+            // yields the same SCF tuple as the outer successful arm.
+            while (outer.elseBody.size() == 1 && outer.elseBody.front() &&
+                   outer.elseBody.front()->getKind() == NodeKind::IfStmt) {
+                auto& nested =
+                    static_cast<CIfStmt&>(*outer.elseBody.front());
+                if (!sameSyntheticTupleAssignments(
+                        outer.thenBody, nested.thenBody))
+                    break;
+
+                ExprPtr nestedCondition = std::move(nested.condition);
+                std::vector<StmtPtr> replacementElse =
+                    std::move(nested.elseBody);
+                outer.condition = std::make_unique<CBinaryExpr>(
+                    BinaryOp::LogOr, std::move(outer.condition),
+                    std::move(nestedCondition), CType::boolTy(),
+                    outer.getAddress());
+                outer.elseBody = std::move(replacementElse);
+                changed = true;
+            }
+            break;
+        }
+        case NodeKind::WhileStmt:
+            changed |= foldIdenticalNestedSCFArmsInList(
+                static_cast<CWhileStmt&>(*stmt).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            changed |= foldIdenticalNestedSCFArmsInList(
+                static_cast<CDoWhileStmt&>(*stmt).body);
+            break;
+        case NodeKind::ForStmt:
+            changed |= foldIdenticalNestedSCFArmsInList(
+                static_cast<CForStmt&>(*stmt).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& switchCase : static_cast<CSwitchStmt&>(*stmt).cases)
+                changed |=
+                    foldIdenticalNestedSCFArmsInList(switchCase.body);
+            break;
+        case NodeKind::BlockStmt:
+            changed |= foldIdenticalNestedSCFArmsInList(
+                static_cast<CBlockStmt&>(*stmt).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+
+    return changed;
+}
+
+} // namespace
+
+void CAstOptimizer::foldIdenticalNestedSCFArms(CFuncDecl& func) {
+    (void)foldIdenticalNestedSCFArmsInList(func.body);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1340,6 +1494,7 @@ static const llvm::StringMap<std::string>& getSemanticMap() {
         {"OUTS",     "io_write_string"},
         // Interrupts / system
         {"INT",      "software_interrupt"},
+        {"INT_IMMb", "software_interrupt"},
         {"INT3",     "debug_break"},
         {"IRET",     "interrupt_return"},
         {"SYSCALL",  "syscall"},
@@ -1641,6 +1796,25 @@ static std::string tryStripRepPrefix(const std::string& name) {
     return {};
 }
 
+/// Recognize Remill's generic `Do<MNEMONIC>` semantic wrappers.  The `Do`
+/// prefix is not a function from the binary.  Keep the conservative opcode
+/// classifier on the suffix so ordinary application names remain untouched.
+static std::string tryStripDoPrefix(const std::string& name) {
+    static constexpr std::string_view kPrefix = "Do";
+    if (name.size() <= kPrefix.size() ||
+        name.compare(0, kPrefix.size(), kPrefix.data(), kPrefix.size()) != 0)
+        return {};
+
+    std::string innerName(name.substr(kPrefix.size()));
+    if (!isNativeOpcodeName(innerName))
+        return {};
+
+    auto mapped = mapNativeOpcode(innerName);
+    if (!mapped.empty())
+        return mapped;
+    return "__native_" + innerName;
+}
+
 static void decomposeNativeInExpr(CExpr* expr) {
     if (!expr) return;
     switch (expr->getKind()) {
@@ -1650,6 +1824,9 @@ static void decomposeNativeInExpr(CExpr* expr) {
         auto repWrapper = tryStripRepPrefix(call.targetName);
         if (!repWrapper.empty()) {
             call.targetName = std::move(repWrapper);
+        } else if (auto doWrapper = tryStripDoPrefix(call.targetName);
+                   !doWrapper.empty()) {
+            call.targetName = std::move(doWrapper);
         } else if (isNativeOpcodeName(call.targetName)) {
             auto mapped = mapNativeOpcode(call.targetName);
             if (!mapped.empty()) {
@@ -1788,8 +1965,7 @@ static bool isCanaryFailFunction(std::string_view name) {
            name == "__stack_chk_fail_local" ||
            name == "__security_check_cookie" ||
            name == "__chk_fail" ||
-           name == "__report_gsfailure" ||
-           name == "abort";  // some toolchains use abort directly
+           name == "__report_gsfailure";
 }
 
 /// Returns true if the expression matches a known stack canary read pattern.
@@ -1867,14 +2043,109 @@ static std::string getCanarySaveVar(const CStmt* stmt) {
 /// (__security_check_cookie) toolchain conventions.
 static bool isStackChkFail(const CStmt* stmt) {
     if (!stmt) return false;
-    if (stmt->getKind() == NodeKind::ExprStmt) {
-        auto& expr = static_cast<const CExprStmt&>(*stmt);
-        if (expr.expr && expr.expr->getKind() == NodeKind::CallExpr) {
-            auto& call = static_cast<const CCallExpr&>(*expr.expr);
-            return isCanaryFailFunction(call.targetName);
-        }
+    const CExpr* expr = nullptr;
+    if (stmt->getKind() == NodeKind::ExprStmt)
+        expr = static_cast<const CExprStmt&>(*stmt).expr.get();
+    else if (stmt->getKind() == NodeKind::AssignStmt)
+        expr = static_cast<const CAssignStmt&>(*stmt).value.get();
+
+    if (auto* call = llvm::dyn_cast_or_null<CCallExpr>(expr))
+        return isCanaryFailFunction(call->targetName);
+    return false;
+}
+
+/// Returns true when a statement list directly contains a canary-failure call.
+///
+/// The failure call is often followed by SCF tuple assignments, so checking
+/// only the first or last statement in an arm is insufficient. Deliberately do
+/// not recurse: an outer SCF wrapper may contain the whole cleanup dispatcher,
+/// including a nested canary check, without itself being the failure arm.
+static bool containsStackChkFail(const std::vector<StmtPtr>& stmts) {
+    for (const auto& stmt : stmts) {
+        if (!stmt)
+            continue;
+        if (isStackChkFail(stmt.get()))
+            return true;
     }
     return false;
+}
+
+/// Replace a proven canary-check if with its non-failure arm.
+///
+/// Returns false when neither or both arms contain a failure call. In that
+/// ambiguous case preserving the branch is safer than guessing its polarity.
+static bool spliceNormalCanaryArm(std::vector<StmtPtr>& stmts, size_t index) {
+    if (index >= stmts.size())
+        return false;
+    auto* branch = llvm::dyn_cast_or_null<CIfStmt>(stmts[index].get());
+    if (!branch)
+        return false;
+
+    const bool thenFails = containsStackChkFail(branch->thenBody);
+    const bool elseFails = containsStackChkFail(branch->elseBody);
+    if (thenFails == elseFails)
+        return false;
+
+    auto normalBody = thenFails ? std::move(branch->elseBody)
+                                : std::move(branch->thenBody);
+    stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(index));
+    stmts.insert(stmts.begin() + static_cast<ptrdiff_t>(index),
+                 std::make_move_iterator(normalBody.begin()),
+                 std::make_move_iterator(normalBody.end()));
+    return true;
+}
+
+/// Recursively elide structured canary-failure branches.
+///
+/// This does not depend on recognizing the compiler-specific canary read. SCF
+/// may route the check through loop-carried tuple values, while the failure
+/// callee remains authoritative and identifies the exceptional arm directly.
+static void removeStructuredCanaryChecks(std::vector<StmtPtr>& stmts) {
+    for (size_t i = 0; i < stmts.size();) {
+        if (!stmts[i]) {
+            ++i;
+            continue;
+        }
+
+        if (stmts[i]->getKind() == NodeKind::IfStmt &&
+            spliceNormalCanaryArm(stmts, i)) {
+            // Revisit this position: the selected normal arm may itself begin
+            // with another structured canary check.
+            continue;
+        }
+
+        switch (stmts[i]->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& branch = static_cast<CIfStmt&>(*stmts[i]);
+            removeStructuredCanaryChecks(branch.thenBody);
+            removeStructuredCanaryChecks(branch.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            removeStructuredCanaryChecks(
+                static_cast<CWhileStmt&>(*stmts[i]).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            removeStructuredCanaryChecks(
+                static_cast<CDoWhileStmt&>(*stmts[i]).body);
+            break;
+        case NodeKind::ForStmt:
+            removeStructuredCanaryChecks(
+                static_cast<CForStmt&>(*stmts[i]).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& arm : static_cast<CSwitchStmt&>(*stmts[i]).cases)
+                removeStructuredCanaryChecks(arm.body);
+            break;
+        case NodeKind::BlockStmt:
+            removeStructuredCanaryChecks(
+                static_cast<CBlockStmt&>(*stmts[i]).stmts);
+            break;
+        default:
+            break;
+        }
+        ++i;
+    }
 }
 
 /// Returns true if expr references varName.
@@ -1946,19 +2217,13 @@ static void removeCanaryInStmts(std::vector<StmtPtr>& stmts,
 
         // Remove canary check if-statements
         if (isCanaryCheck(s, canaryVar)) {
-            // Keep the "normal" path (usually the then-body) and drop the check
-            auto& ifStmt = static_cast<CIfStmt&>(*s);
-            // The then-body is typically the normal return path
-            if (!ifStmt.thenBody.empty()) {
-                auto thenBody = std::move(ifStmt.thenBody);
-                stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
-                stmts.insert(stmts.begin() + static_cast<ptrdiff_t>(i),
-                             std::make_move_iterator(thenBody.begin()),
-                             std::make_move_iterator(thenBody.end()));
-            } else {
-                stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
-            }
-            continue;
+            // FIX-134: determine polarity from the arm that actually calls the
+            // failure routine. RVSDG/SCF cleanup dispatchers place the failure
+            // path in the then-arm and the loop-termination tuple in the else-
+            // arm. The old unconditional "keep then" rule converted a finite
+            // cleanup chain into an infinite loop ending in stack_chk_fail.
+            if (spliceNormalCanaryArm(stmts, i))
+                continue;
         }
 
         // Recurse into nested scopes
@@ -2010,18 +2275,94 @@ static bool containsCanaryRead(const CExpr* expr) {
 }
 
 void CAstOptimizer::recognizeStackCanary(CFuncDecl& func) {
+    // FIX-134: explicit failure callees are a stronger signal than the exact
+    // lifted shape of the canary read. Handle nested SCF/RVSDG checks before
+    // the legacy source-variable strategies below.
+    removeStructuredCanaryChecks(func.body);
+
     // Strategy 1: Direct canary save — var = *(type)(void*)0 + 40
     std::string canaryVar;
+    std::string canaryStorage;
+    size_t canarySaveIndex = func.body.size();
     for (size_t i = 0; i < std::min<size_t>(func.body.size(), 10); ++i) {
         auto v = getCanarySaveVar(func.body[i].get());
-        if (!v.empty()) { canaryVar = v; break; }
+        if (!v.empty()) {
+            canaryVar = v;
+            canarySaveIndex = i;
+            break;
+        }
     }
 
     if (!canaryVar.empty()) {
-        removeCanaryInStmts(func.body, canaryVar);
+        canaryStorage = canaryVar;
+
+        // A compiler may use a callee-saved register only as a short-lived
+        // transfer for the TLS canary, then immediately reuse that register
+        // for a semantic value:
+        //
+        //   rbx = __readgsqword(40);
+        //   var_30 = rbx;
+        //   rbx = param_1;
+        //
+        // The stack slot, not RBX's later live range, is the canary storage.
+        // Treating the register name as globally canary-owned deletes real
+        // pointer uses and their enclosing control flow.
+        if (isPlainRegisterName(canaryVar)) {
+            for (size_t i = canarySaveIndex + 1;
+                 i < std::min(func.body.size(), canarySaveIndex + 8); ++i) {
+                auto* assign =
+                    llvm::dyn_cast_or_null<CAssignStmt>(func.body[i].get());
+                if (!assign || !assign->target || !assign->value)
+                    continue;
+                auto* target =
+                    llvm::dyn_cast<CVarRefExpr>(assign->target.get());
+                auto* value =
+                    llvm::dyn_cast<CVarRefExpr>(assign->value.get());
+                if (!target)
+                    continue;
+                if (target->varName == canaryVar)
+                    break; // register was reused before a canary spill
+                if (value && value->varName == canaryVar) {
+                    canaryStorage = target->varName;
+                    break;
+                }
+            }
+
+            // A reused register without a proven spill is not dedicated
+            // canary storage. Fall through to the direct-check strategy.
+            if (canaryStorage == canaryVar)
+                canaryVar.clear();
+        }
+    }
+
+    if (!canaryVar.empty()) {
+        const std::string canarySource = canaryVar;
+        removeCanaryInStmts(func.body, canaryStorage);
+
+        // Remove the TLS read and its one-hop spill. Do not erase or otherwise
+        // rewrite later assignments to the transfer register.
+        std::erase_if(func.body, [&](const StmtPtr& stmt) {
+            if (!stmt)
+                return false;
+            if (getCanarySaveVar(stmt.get()) == canarySource)
+                return true;
+            auto* assign = llvm::dyn_cast<CAssignStmt>(stmt.get());
+            if (!assign || !assign->target || !assign->value)
+                return false;
+            auto* target =
+                llvm::dyn_cast<CVarRefExpr>(assign->target.get());
+            auto* value =
+                llvm::dyn_cast<CVarRefExpr>(assign->value.get());
+            return target && value &&
+                   target->varName == canaryStorage &&
+                   value->varName == canarySource;
+        });
+
         func.localVars.erase(
             std::remove_if(func.localVars.begin(), func.localVars.end(),
-                [&](const CVarDecl& d) { return d.varName == canaryVar; }),
+                [&](const CVarDecl& d) {
+                    return d.varName == canaryStorage;
+                }),
             func.localVars.end());
         return;
     }
@@ -2041,23 +2382,16 @@ void CAstOptimizer::recognizeStackCanary(CFuncDecl& func) {
             continue;
         }
 
-        // Match if-statements whose condition contains *(type)(void*)0 + 40
+        // Match if-statements whose condition contains *(type)(void*)0 + 40.
+        // Select the normal arm by locating the failure call, never by assuming
+        // a fixed condition polarity.
         if (func.body[i]->getKind() == NodeKind::IfStmt) {
             auto& ifStmt = static_cast<CIfStmt&>(*func.body[i]);
             if (containsCanaryRead(ifStmt.condition.get())) {
-                // The then-body is the normal return path — inline it
-                if (!ifStmt.thenBody.empty()) {
-                    auto thenBody = std::move(ifStmt.thenBody);
-                    func.body.erase(func.body.begin() + static_cast<ptrdiff_t>(i));
-                    func.body.insert(
-                        func.body.begin() + static_cast<ptrdiff_t>(i),
-                        std::make_move_iterator(thenBody.begin()),
-                        std::make_move_iterator(thenBody.end()));
-                } else {
-                    func.body.erase(func.body.begin() + static_cast<ptrdiff_t>(i));
+                if (spliceNormalCanaryArm(func.body, i)) {
+                    foundCanaryCheck = true;
+                    continue;
                 }
-                foundCanaryCheck = true;
-                continue;
             }
         }
     }
@@ -2161,6 +2495,17 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
         deduction += std::min(30.0, (double)nativeOps * 3.0);
         func.confidenceIssues.push_back(
             std::format("{} native opcode(s) not decomposed", nativeOps));
+    }
+
+    // ── Out-of-table indirect calls (FIX-112 / L1) ───────────────────
+    // The honest `(*(code*)0xADDR)()` form (callee not in the authoritative
+    // table) is FAITHFUL, so it is a graded readability penalty, NOT the 50%
+    // damning cap it used to trip.  Capped low so a cleanly-structured function
+    // full of unresolved sibling calls is no longer pinned at 50%.
+    if (func.outOfTableCalls > 0) {
+        deduction += std::min(15.0, (double)func.outOfTableCalls * 3.0);
+        func.confidenceIssues.push_back(std::format(
+            "{} out-of-table indirect call(s)", func.outOfTableCalls));
     }
 
     // ── Register-named variables ─────────────────────────────────────
@@ -2553,12 +2898,12 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
         int identityNoOp           = 0;
     } cnt;
 
-    // FIX-CAST-002: `x = x->field` / `x = *x` is a legitimate pointer walk /
+    // FIX-v2-CAST-002: `x = x->field` / `x = *x` is a legitimate pointer walk /
     // load (reusing a register after dereferencing it), NOT a suspicious
     // self-reference.  The self-ref heuristic below (`target name appears in the
     // RHS`) was flagging these and applying a heavy confidence penalty
     // (min(20, count*5)).  Recognise a RHS that is purely a field-access / deref
-    // chain rooted at the target var and exclude it.  Only suppresses a
+    // chain rooted at the target var and exclude it.  This only suppresses a
     // FALSE-POSITIVE penalty; genuine self-refs (arithmetic, `x = f(x)` call
     // captures, mixed exprs) stay flagged.  Honest-confidence fix, body unchanged.
     auto isPureSelfWalk = [](const CExpr* e, const std::string& tn) -> bool {
@@ -4156,7 +4501,7 @@ void CAstOptimizer::removePrologueEpilogue(CFuncDecl& func) {
     if (body.empty()) return;
 
     /// Returns true for statements that are frame/prologue/epilogue artifacts.
-    auto isPrologue = [](const StmtPtr& sptr, bool nearBoundary) -> bool {
+    auto isPrologue = [](const StmtPtr& sptr) -> bool {
         if (!sptr) return false;
         const CStmt* s = sptr.get();
         if (s->getKind() != NodeKind::AssignStmt)
@@ -4194,17 +4539,6 @@ void CAstOptimizer::removePrologueEpilogue(CFuncDecl& func) {
                 return true;
         }
 
-        // Near the function boundary: callee-saved register saves/restores.
-        // Pattern: callee_saved = anything  OR  anything = callee_saved
-        if (nearBoundary) {
-            if (isCalleeSaved(tgt))
-                return true;
-            if (a.value->getKind() == NodeKind::VarRefExpr &&
-                isCalleeSaved(
-                    static_cast<const CVarRefExpr*>(a.value.get())->varName))
-                return true;
-        }
-
         return false;
     };
 
@@ -4213,7 +4547,7 @@ void CAstOptimizer::removePrologueEpilogue(CFuncDecl& func) {
         size_t limit = std::min<size_t>(5, body.size());
         size_t i = 0;
         while (i < limit) {
-            if (isPrologue(body[i], /*nearBoundary=*/true)) {
+            if (isPrologue(body[i])) {
                 body.erase(body.begin() + static_cast<ptrdiff_t>(i));
                 --limit;
             } else {
@@ -4227,7 +4561,7 @@ void CAstOptimizer::removePrologueEpilogue(CFuncDecl& func) {
         size_t limit = std::min<size_t>(5, body.size());
         for (size_t removed = 0; removed < limit && !body.empty(); ) {
             size_t last = body.size() - 1;
-            if (isPrologue(body[last], /*nearBoundary=*/true)) {
+            if (isPrologue(body[last])) {
                 body.erase(body.begin() + static_cast<ptrdiff_t>(last));
                 ++removed;
             } else {
@@ -4513,6 +4847,139 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
     // Mark all statements to be removed.
     std::unordered_set<size_t> toRemove;
 
+    // Compute structured live-in sets without mutating nested bodies. Unlike a
+    // union of every nested read, this transfer respects intervening
+    // definitions: `x = old; if (...) { x = new; use(x); }` does not keep the
+    // first store alive, while a value used several scopes below with no
+    // redefinition still propagates to the enclosing list.
+    using LiveSet = std::unordered_set<std::string>;
+    std::function<LiveSet(const std::vector<StmtPtr>&, LiveSet)>
+        computeListLiveIn;
+    std::function<void(const CStmt*, LiveSet&)> transferStmtLiveIn;
+
+    computeListLiveIn =
+        [&](const std::vector<StmtPtr>& body, LiveSet liveOut) {
+            for (size_t j = body.size(); j-- > 0;)
+                transferStmtLiveIn(body[j].get(), liveOut);
+            return liveOut;
+        };
+
+    transferStmtLiveIn = [&](const CStmt* stmt, LiveSet& liveIn) {
+        if (!stmt)
+            return;
+
+        switch (stmt->getKind()) {
+        case NodeKind::AssignStmt: {
+            const auto& assign = static_cast<const CAssignStmt&>(*stmt);
+            if (!assign.target)
+                return;
+
+            if (isUnsafeTarget(assign.target.get()) ||
+                assign.target->getKind() != NodeKind::VarRefExpr) {
+                collectVarRefs(assign.target.get(), liveIn);
+                collectVarRefs(assign.value.get(), liveIn);
+                return;
+            }
+
+            const auto& target =
+                static_cast<const CVarRefExpr&>(*assign.target).varName;
+            if (!assign.compoundOp.empty()) {
+                collectVarRefs(assign.value.get(), liveIn);
+                liveIn.insert(target);
+                return;
+            }
+
+            if (exprHasCall(assign.value.get()) || liveIn.contains(target)) {
+                liveIn.erase(target);
+                collectVarRefs(assign.value.get(), liveIn);
+            }
+            return;
+        }
+        case NodeKind::ExprStmt:
+            collectVarRefs(
+                static_cast<const CExprStmt&>(*stmt).expr.get(), liveIn);
+            return;
+        case NodeKind::ReturnStmt:
+            collectVarRefs(
+                static_cast<const CReturnStmt&>(*stmt).value.get(), liveIn);
+            return;
+        case NodeKind::IfStmt: {
+            const auto& branch = static_cast<const CIfStmt&>(*stmt);
+            LiveSet thenLive = computeListLiveIn(branch.thenBody, liveIn);
+            LiveSet elseLive = branch.elseBody.empty()
+                                   ? liveIn
+                                   : computeListLiveIn(branch.elseBody, liveIn);
+            thenLive.insert(elseLive.begin(), elseLive.end());
+            collectVarRefs(branch.condition.get(), thenLive);
+            liveIn = std::move(thenLive);
+            return;
+        }
+        case NodeKind::WhileStmt:
+        case NodeKind::DoWhileStmt: {
+            const CExpr* condition = nullptr;
+            const std::vector<StmtPtr>* body = nullptr;
+            if (stmt->getKind() == NodeKind::WhileStmt) {
+                const auto& loop = static_cast<const CWhileStmt&>(*stmt);
+                condition = loop.condition.get();
+                body = &loop.body;
+            } else {
+                const auto& loop = static_cast<const CDoWhileStmt&>(*stmt);
+                condition = loop.condition.get();
+                body = &loop.body;
+            }
+
+            LiveSet base = liveIn;
+            collectVarRefs(condition, base);
+            LiveSet loopLive = base;
+            for (;;) {
+                LiveSet next = computeListLiveIn(*body, loopLive);
+                next.insert(base.begin(), base.end());
+                if (next == loopLive)
+                    break;
+                loopLive = std::move(next);
+            }
+            liveIn = std::move(loopLive);
+            return;
+        }
+        case NodeKind::ForStmt: {
+            const auto& loop = static_cast<const CForStmt&>(*stmt);
+            LiveSet base = liveIn;
+            collectVarRefs(loop.condition.get(), base);
+            LiveSet loopLive = base;
+            for (;;) {
+                LiveSet iterationLive = loopLive;
+                transferStmtLiveIn(loop.step.get(), iterationLive);
+                LiveSet next = computeListLiveIn(loop.body, iterationLive);
+                next.insert(base.begin(), base.end());
+                if (next == loopLive)
+                    break;
+                loopLive = std::move(next);
+            }
+            transferStmtLiveIn(loop.init.get(), loopLive);
+            liveIn = std::move(loopLive);
+            return;
+        }
+        case NodeKind::SwitchStmt: {
+            const auto& sw = static_cast<const CSwitchStmt&>(*stmt);
+            LiveSet joined = liveIn;
+            for (const auto& c : sw.cases) {
+                LiveSet caseLive = computeListLiveIn(c.body, liveIn);
+                joined.insert(caseLive.begin(), caseLive.end());
+            }
+            collectVarRefs(sw.selector.get(), joined);
+            liveIn = std::move(joined);
+            return;
+        }
+        case NodeKind::BlockStmt:
+            liveIn = computeListLiveIn(
+                static_cast<const CBlockStmt&>(*stmt).stmts,
+                std::move(liveIn));
+            return;
+        default:
+            return;
+        }
+    };
+
     for (size_t i = stmts.size(); i-- > 0;) {
         if (!stmts[i]) continue;
         const CStmt& s = *stmts[i];
@@ -4524,7 +4991,15 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
 
             // Never eliminate unsafe targets (deref/field/subscript).
             if (isUnsafeTarget(a.target.get())) {
-                // Still add value reads to live set.
+                // A store through a computed address -- *(p+off), a[i], p->f --
+                // READS the pointer/index variables to evaluate the destination;
+                // only the final memory cell is written.  Record BOTH the
+                // address-expression reads and the value reads.  Without the
+                // target reads, a base-pointer definition feeding the store
+                // (`p = real; *(p+off) = x;`) is wrongly judged dead and DSE'd,
+                // leaving `p` at its zero-init -- the Win64 sret / frame-base
+                // NULL-base cascade (`*((void*)0 + off) = x`).
+                collectVarRefs(a.target.get(), live);
                 collectVarRefs(a.value.get(), live);
                 break;
             }
@@ -4537,6 +5012,14 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
 
             const std::string& tgt =
                 static_cast<const CVarRefExpr*>(a.target.get())->varName;
+
+            // M4 (fix-A): keep scf_* selector / loop-carry stores live
+            // unconditionally; their consumer is a switch/if/loop condition that a
+            // flat backward liveness scan can under-count across structured scopes.
+            if (tgt.starts_with("scf_")) {
+                collectVarRefs(a.value.get(), live);
+                break;
+            }
 
             // Never DSE assignments with call side-effects.
             if (exprHasCall(a.value.get())) {
@@ -4580,61 +5063,23 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
             break;
         }
 
-        // For control-flow statements: conservatively mark all referenced
-        // variables as live (don't analyze nested scopes deeply).
+        // Structured transfer propagates only values that can reach a use
+        // without being overwritten inside the nested scope.
         case NodeKind::IfStmt: {
-            const auto& ifs = static_cast<const CIfStmt&>(s);
-            collectVarRefs(ifs.condition.get(), live);
-            // Collect from nested bodies conservatively.
-            std::unordered_set<std::string> nested;
-            auto gatherFromStmts = [&](const std::vector<StmtPtr>& body) {
-                for (const auto& sp : body) {
-                    if (!sp) continue;
-                    if (sp->getKind() == NodeKind::AssignStmt) {
-                        const auto& na =
-                            static_cast<const CAssignStmt&>(*sp);
-                        collectVarRefs(na.value.get(), nested);
-                        // Target is a definition, not a use — only collect
-                        // it when compound (target is also read).
-                        if (!na.compoundOp.empty())
-                            collectVarRefs(na.target.get(), nested);
-                    } else if (sp->getKind() == NodeKind::ReturnStmt) {
-                        collectVarRefs(
-                            static_cast<const CReturnStmt&>(*sp).value.get(),
-                            nested);
-                    } else if (sp->getKind() == NodeKind::ExprStmt) {
-                        collectVarRefs(
-                            static_cast<const CExprStmt&>(*sp).expr.get(),
-                            nested);
-                    }
-                }
-            };
-            gatherFromStmts(ifs.thenBody);
-            gatherFromStmts(ifs.elseBody);
-            live.merge(nested);
+            transferStmtLiveIn(&s, live);
             break;
         }
 
         case NodeKind::WhileStmt: {
-            const auto& ws = static_cast<const CWhileStmt&>(s);
-            collectVarRefs(ws.condition.get(), live);
-            for (const auto& sp : ws.body) {
-                if (!sp) continue;
-                if (sp->getKind() == NodeKind::AssignStmt) {
-                    const auto& na = static_cast<const CAssignStmt&>(*sp);
-                    collectVarRefs(na.value.get(), live);
-                    if (!na.compoundOp.empty())
-                        collectVarRefs(na.target.get(), live);
-                } else if (sp->getKind() == NodeKind::ReturnStmt) {
-                    collectVarRefs(
-                        static_cast<const CReturnStmt&>(*sp).value.get(),
-                        live);
-                } else if (sp->getKind() == NodeKind::ExprStmt) {
-                    collectVarRefs(
-                        static_cast<const CExprStmt&>(*sp).expr.get(),
-                        live);
-                }
-            }
+            transferStmtLiveIn(&s, live);
+            break;
+        }
+
+        case NodeKind::DoWhileStmt:
+        case NodeKind::ForStmt:
+        case NodeKind::SwitchStmt:
+        case NodeKind::BlockStmt: {
+            transferStmtLiveIn(&s, live);
             break;
         }
 
@@ -4723,13 +5168,39 @@ void CAstOptimizer::eliminateDeadStores(CFuncDecl& func) {
         };
 
     // Recurse into nested scopes.
-    for (auto& sp : func.body) {
+    for (size_t i = 0; i < func.body.size(); ++i) {
+        auto& sp = func.body[i];
         if (!sp) continue;
         switch (sp->getKind()) {
         case NodeKind::IfStmt: {
             auto& s = static_cast<CIfStmt&>(*sp);
-            dseStmtList(s.thenBody);
-            dseStmtList(s.elseBody);
+            // FIX (if-branch DSE cross-boundary liveness): dseStmtList(thenBody)
+            // / dseStmtList(elseBody) each scan their OWN statement list in
+            // isolation, starting from an EMPTY live-set. A variable that's
+            // written in a branch but only read AFTER the whole if/else (the
+            // common early-return-guard-clause shape: both branches set
+            // `result`, a shared `return result;` follows the if/else) looks
+            // locally dead from inside the branch alone -- nothing AFTER the
+            // write, within that branch's own list, reads it. The loop cases
+            // right below already avoid the equivalent mistake (FIX-095d,
+            // collectLoopReads seeds the loop body's DSE with every read
+            // inside the loop, since a back-edge means a later iteration's
+            // read can consume an earlier iteration's write); if/else needs
+            // the same treatment for reads that happen AFTER the branch,
+            // not inside a back-edge. Seed with everything read anywhere in
+            // the enclosing function (deliberately whole-function rather
+            // than just "after this if" -- avoids a copy-construction
+            // issue building a subrange of the move-only StmtPtr vector,
+            // and errs in the safe direction: at worst this keeps a store
+            // slightly too conservatively, it can never cause an
+            // under-liveness bug that drops something still needed).
+            // Mirrors the coarse whole-function liveness
+            // removeGloballyDeadStores already uses for the same class of
+            // problem.
+            std::unordered_set<std::string> seed;
+            collectLoopReads(func.body, seed);
+            dseStmtList(s.thenBody, &seed);
+            dseStmtList(s.elseBody, &seed);
             break;
         }
         case NodeKind::WhileStmt: {
@@ -5249,6 +5720,17 @@ void CAstOptimizer::propagateCopies(CFuncDecl& func) {
     std::unordered_map<std::string, unsigned> refCounts;
     countVarRefs(func.body, refCounts);
 
+    // Stack locals remain addressable even when the current AST has not yet
+    // recovered their `&var_X` use. resolveFramePointerLeaks runs later and
+    // can turn `frame + offset` into that address. Inlining a stack local
+    // before then may incorrectly propagate its initializer across an
+    // escaping call and turn a real cleanup such as `kfree(var_X)` into
+    // `kfree(0)`.
+    std::unordered_set<std::string> stackLocals;
+    for (const auto& local : func.localVars)
+        if (local.stackOffset.has_value())
+            stackLocals.insert(local.varName);
+
     // Pass B: build def map from plain CAssignStmt `x = expr` where target
     // is a synthetic single-definition variable.
     std::unordered_map<std::string, const CExpr*> defs;
@@ -5264,7 +5746,8 @@ void CAstOptimizer::propagateCopies(CFuncDecl& func) {
             static_cast<const CVarRefExpr*>(a.target.get())->varName;
         defCounts[name]++;
         // Only single-definition synthetic variables are candidates.
-        if (defCounts[name] == 1 && isSyntheticName(name) &&
+        if (defCounts[name] == 1 && !stackLocals.contains(name) &&
+            isSyntheticName(name) &&
             isSimpleExpr(a.value.get())) {
             defs[name] = a.value.get();
         } else {
@@ -6301,6 +6784,17 @@ void CAstOptimizer::removeDeadCodeAfterReturn(CFuncDecl& func) {
 //   *(ptr + 0)         →  *ptr                  (offset 0 = plain deref)
 //   *(base + N) = val  →  base->field_0xN = val (in assignments)
 
+static bool isDirectFieldBase(const CExpr* expr) {
+    if (!expr) return false;
+    if (llvm::isa<CVarRefExpr>(expr) ||
+        llvm::isa<CFieldAccessExpr>(expr) ||
+        llvm::isa<CSubscriptExpr>(expr))
+        return true;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isDirectFieldBase(cast->operand.get());
+    return false;
+}
+
 ExprPtr CAstOptimizer::recoverFieldAccess(ExprPtr expr) {
     if (!expr) return nullptr;
 
@@ -6358,7 +6852,8 @@ ExprPtr CAstOptimizer::recoverFieldAccess(ExprPtr expr) {
             auto& bin = static_cast<CBinaryExpr&>(*u.operand);
             if (bin.op == BinaryOp::Add && bin.lhs && bin.rhs) {
                 auto offsetVal = getIntLit(bin.rhs.get());
-                if (offsetVal && *offsetVal > 0) {
+                if (offsetVal && *offsetVal > 0 &&
+                    isDirectFieldBase(bin.lhs.get())) {
                     // Build field name: field_0x<lowercase-hex> (canonical,
                     // shared with HelixMidToHigh + CAstBuilder).
                     char fieldName[32];
@@ -6373,7 +6868,8 @@ ExprPtr CAstOptimizer::recoverFieldAccess(ExprPtr expr) {
                 }
                 // Also check LHS as the offset (commutative)
                 auto offsetValL = getIntLit(bin.lhs.get());
-                if (offsetValL && *offsetValL > 0) {
+                if (offsetValL && *offsetValL > 0 &&
+                    isDirectFieldBase(bin.rhs.get())) {
                     char fieldName[32];
                     std::snprintf(fieldName, sizeof(fieldName),
                                   "field_0x%x",
@@ -6529,63 +7025,45 @@ ExprPtr CAstOptimizer::canonicalizeXorExpr(ExprPtr expr) {
     if (expr->getKind() == NodeKind::BinaryExpr) {
         auto& b = static_cast<CBinaryExpr&>(*expr);
         if (b.op == BinaryOp::BitXor && b.lhs && b.rhs) {
-            // x ^ -1
-            if (isIntLit(b.rhs.get(), -1) || isIntLit(b.rhs.get(), 0xFFFFFFFF) ||
-                isIntLit(b.rhs.get(), 1)) {
-                // If RHS is literal 1, this is a boolean flip: x ^ 1 → !x
-                if (isIntLit(b.rhs.get(), 1)) {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.lhs),
-                        b.type, b.getAddress());
-                }
-                // For -1: if the LHS looks like a comparison result or is i1, use !
-                // Otherwise use ~ (bitwise NOT)
-                bool isBooleanContext = false;
-                if (b.lhs->getKind() == NodeKind::BinaryExpr) {
-                    auto& inner = static_cast<CBinaryExpr&>(*b.lhs);
-                    isBooleanContext = isCmpOp(inner.op);
-                }
-                // Check type: 1-bit integer = boolean
-                if (b.lhs->type->kind == TypeKind::Bool ||
-                    (b.lhs->type->kind == TypeKind::Int && b.lhs->type->bitWidth == 1))
-                    isBooleanContext = true;
+            // Is an operand a boolean / 1-bit context (comparison result or i1)?
+            // FIX (Maya 11.1): null-safe — `->type` can be null on lowered nodes;
+            // the old code dereferenced b.lhs->type / b.rhs->type unconditionally.
+            auto isBooleanOperand = [](const CExpr* e) -> bool {
+                if (e->getKind() == NodeKind::BinaryExpr &&
+                    isCmpOp(static_cast<const CBinaryExpr&>(*e).op))
+                    return true;
+                return e->type &&
+                       (e->type->kind == TypeKind::Bool ||
+                        (e->type->kind == TypeKind::Int && e->type->bitWidth == 1));
+            };
 
-                if (isBooleanContext) {
+            // ── x ^ <literal> ──
+            if (isIntLit(b.rhs.get(), 1)) {
+                // FIX (Maya 11.2): x ^ 1 → !x ONLY when x is boolean/1-bit. For a
+                // wider integer this toggles bit 0 (neither !x nor ~x), so it must
+                // stay `x ^ 1`; the old code rewrote it to !x unconditionally.
+                if (isBooleanOperand(b.lhs.get()))
                     return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.lhs),
-                        b.type, b.getAddress());
-                } else {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::BitNot, std::move(b.lhs),
-                        b.type, b.getAddress());
-                }
+                        UnaryOp::LogNot, std::move(b.lhs), b.type, b.getAddress());
+            } else if (isIntLit(b.rhs.get(), -1) ||
+                       isIntLit(b.rhs.get(), 0xFFFFFFFF)) {
+                // x ^ -1 → !x (boolean) / ~x (bitwise NOT for wider integers).
+                return std::make_unique<CUnaryExpr>(
+                    isBooleanOperand(b.lhs.get()) ? UnaryOp::LogNot
+                                                  : UnaryOp::BitNot,
+                    std::move(b.lhs), b.type, b.getAddress());
             }
-            // -1 ^ x (commutative)
-            if (isIntLit(b.lhs.get(), -1) || isIntLit(b.lhs.get(), 0xFFFFFFFF) ||
-                isIntLit(b.lhs.get(), 1)) {
-                if (isIntLit(b.lhs.get(), 1)) {
+            // ── <literal> ^ x (commutative) ──
+            else if (isIntLit(b.lhs.get(), 1)) {
+                if (isBooleanOperand(b.rhs.get()))
                     return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.rhs),
-                        b.type, b.getAddress());
-                }
-                bool isBooleanContext = false;
-                if (b.rhs->getKind() == NodeKind::BinaryExpr) {
-                    auto& inner = static_cast<CBinaryExpr&>(*b.rhs);
-                    isBooleanContext = isCmpOp(inner.op);
-                }
-                if (b.rhs->type->kind == TypeKind::Bool ||
-                    (b.rhs->type->kind == TypeKind::Int && b.rhs->type->bitWidth == 1))
-                    isBooleanContext = true;
-
-                if (isBooleanContext) {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::LogNot, std::move(b.rhs),
-                        b.type, b.getAddress());
-                } else {
-                    return std::make_unique<CUnaryExpr>(
-                        UnaryOp::BitNot, std::move(b.rhs),
-                        b.type, b.getAddress());
-                }
+                        UnaryOp::LogNot, std::move(b.rhs), b.type, b.getAddress());
+            } else if (isIntLit(b.lhs.get(), -1) ||
+                       isIntLit(b.lhs.get(), 0xFFFFFFFF)) {
+                return std::make_unique<CUnaryExpr>(
+                    isBooleanOperand(b.rhs.get()) ? UnaryOp::LogNot
+                                                  : UnaryOp::BitNot,
+                    std::move(b.rhs), b.type, b.getAddress());
             }
         }
 
@@ -6796,79 +7274,85 @@ void CAstOptimizer::eliminateConstantBranches(CFuncDecl& func) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void CAstOptimizer::removeGloballyDeadStores(CFuncDecl& func) {
-    // 1) collect every variable name READ as a VALUE anywhere (a plain assign
-    //    target is a write, not a read; a compound target or a deref/field/
-    //    subscript target IS read).
-    std::unordered_set<std::string> reads;
-    std::function<void(const std::vector<StmtPtr>&)> collectReads =
-        [&](const std::vector<StmtPtr>& stmts) {
-            for (const auto& sp : stmts) {
-                if (!sp)
-                    continue;
-                switch (sp->getKind()) {
-                case NodeKind::AssignStmt: {
-                    const auto& a = static_cast<const CAssignStmt&>(*sp);
-                    collectVarRefs(a.value.get(), reads);
-                    if (a.target &&
-                        (!a.compoundOp.empty() ||
-                         a.target->getKind() != NodeKind::VarRefExpr))
-                        collectVarRefs(a.target.get(), reads);
-                    break;
-                }
-                case NodeKind::IfStmt: {
-                    const auto& s = static_cast<const CIfStmt&>(*sp);
-                    collectVarRefs(s.condition.get(), reads);
-                    collectReads(s.thenBody);
-                    collectReads(s.elseBody);
-                    break;
-                }
-                case NodeKind::WhileStmt: {
-                    const auto& s = static_cast<const CWhileStmt&>(*sp);
-                    collectVarRefs(s.condition.get(), reads);
-                    collectReads(s.body);
-                    break;
-                }
-                case NodeKind::DoWhileStmt: {
-                    const auto& s = static_cast<const CDoWhileStmt&>(*sp);
-                    collectVarRefs(s.condition.get(), reads);
-                    collectReads(s.body);
-                    break;
-                }
-                case NodeKind::ForStmt: {
-                    const auto& s = static_cast<const CForStmt&>(*sp);
-                    collectVarRefs(s.condition.get(), reads);
-                    collectReads(s.body);
-                    break;
-                }
-                case NodeKind::SwitchStmt: {
-                    const auto& s = static_cast<const CSwitchStmt&>(*sp);
-                    collectVarRefs(s.selector.get(), reads);
-                    for (const auto& c : s.cases)
-                        collectReads(c.body);
-                    break;
-                }
-                case NodeKind::ReturnStmt:
-                    collectVarRefs(static_cast<const CReturnStmt&>(*sp).value.get(),
-                                   reads);
-                    break;
-                case NodeKind::ExprStmt:
-                    collectVarRefs(static_cast<const CExprStmt&>(*sp).expr.get(),
-                                   reads);
-                    break;
-                case NodeKind::BlockStmt:
-                    collectReads(static_cast<const CBlockStmt&>(*sp).stmts);
-                    break;
-                default:
-                    break;
-                }
-            }
-        };
-    collectReads(func.body);
+    // FIX-106: aggressive dead-call-result demotion is OPT-IN via the
+    // HELIX_AGGRESSIVE_DSE env var.  Default-OFF -> output byte-identical.
+    const bool aggressive = std::getenv("HELIX_AGGRESSIVE_DSE") != nullptr;
 
-    // 2) recursively erase pure (call-free) stores whose target is a plain
-    //    variable that never appears in the read-set.
-    std::function<void(std::vector<StmtPtr>&)> removeDead =
-        [&](std::vector<StmtPtr>& stmts) {
+    // A dead copy target can be the only apparent read of its source. Iterate
+    // to a bounded fixed point so removing the target exposes the source store
+    // on the next round.
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        bool removedAny = false;
+
+        // 1) collect every variable name READ as a VALUE anywhere (a plain assign
+        //    target is a write, not a read; a compound target or a deref/field/
+        //    subscript target IS read).
+        std::unordered_set<std::string> reads;
+        std::function<void(const std::vector<StmtPtr>&)> collectReads =
+            [&](const std::vector<StmtPtr>& stmts) {
+                for (const auto& sp : stmts) {
+                    if (!sp)
+                        continue;
+                    switch (sp->getKind()) {
+                    case NodeKind::AssignStmt: {
+                        const auto& a = static_cast<const CAssignStmt&>(*sp);
+                        collectVarRefs(a.value.get(), reads);
+                        if (a.target &&
+                            (!a.compoundOp.empty() || a.target->getKind() != NodeKind::VarRefExpr))
+                            collectVarRefs(a.target.get(), reads);
+                        break;
+                    }
+                    case NodeKind::IfStmt: {
+                        const auto& s = static_cast<const CIfStmt&>(*sp);
+                        collectVarRefs(s.condition.get(), reads);
+                        collectReads(s.thenBody);
+                        collectReads(s.elseBody);
+                        break;
+                    }
+                    case NodeKind::WhileStmt: {
+                        const auto& s = static_cast<const CWhileStmt&>(*sp);
+                        collectVarRefs(s.condition.get(), reads);
+                        collectReads(s.body);
+                        break;
+                    }
+                    case NodeKind::DoWhileStmt: {
+                        const auto& s = static_cast<const CDoWhileStmt&>(*sp);
+                        collectVarRefs(s.condition.get(), reads);
+                        collectReads(s.body);
+                        break;
+                    }
+                    case NodeKind::ForStmt: {
+                        const auto& s = static_cast<const CForStmt&>(*sp);
+                        collectVarRefs(s.condition.get(), reads);
+                        collectReads(s.body);
+                        break;
+                    }
+                    case NodeKind::SwitchStmt: {
+                        const auto& s = static_cast<const CSwitchStmt&>(*sp);
+                        collectVarRefs(s.selector.get(), reads);
+                        for (const auto& c : s.cases)
+                            collectReads(c.body);
+                        break;
+                    }
+                    case NodeKind::ReturnStmt:
+                        collectVarRefs(static_cast<const CReturnStmt&>(*sp).value.get(), reads);
+                        break;
+                    case NodeKind::ExprStmt:
+                        collectVarRefs(static_cast<const CExprStmt&>(*sp).expr.get(), reads);
+                        break;
+                    case NodeKind::BlockStmt:
+                        collectReads(static_cast<const CBlockStmt&>(*sp).stmts);
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            };
+        collectReads(func.body);
+
+        // 2) recursively erase pure (call-free) stores whose target is a plain
+        //    variable that never appears in the read-set.
+        std::function<void(std::vector<StmtPtr>&)> removeDead = [&](std::vector<StmtPtr>& stmts) {
             for (auto& sp : stmts) {
                 if (!sp)
                     continue;
@@ -6899,6 +7383,31 @@ void CAstOptimizer::removeGloballyDeadStores(CFuncDecl& func) {
                     break;
                 }
             }
+            // FIX-106 (opt-in): a globally-dead store whose RHS is a TOP-LEVEL
+            // call has its dead lvalue dropped but the call KEPT as a bare
+            // expression statement, preserving the side effect
+            // (`v5 = foo(...);` -> `foo(...);` when v5 is never read).  Guarded
+            // to a top-level CallExpr ONLY -- never `x = g() + h()` (which would
+            // discard sibling computation) -- and only when the target is
+            // globally dead.  The call's argument var-refs were already counted
+            // in `reads` (collectReads visits a.value), so liveness is unchanged.
+            if (aggressive) {
+                for (auto& sp : stmts) {
+                    if (!sp || sp->getKind() != NodeKind::AssignStmt)
+                        continue;
+                    auto& a = static_cast<CAssignStmt&>(*sp);
+                    if (!a.compoundOp.empty() || !a.target ||
+                        a.target->getKind() != NodeKind::VarRefExpr)
+                        continue;
+                    if (!a.value || a.value->getKind() != NodeKind::CallExpr)
+                        continue;
+                    const std::string& nm = static_cast<const CVarRefExpr&>(*a.target).varName;
+                    if (reads.count(nm))
+                        continue; // read somewhere -> keep the assignment
+                    const uint64_t addr = a.getAddress();
+                    sp = std::make_unique<CExprStmt>(std::move(a.value), addr);
+                }
+            }
             std::erase_if(stmts, [&](const StmtPtr& sp) {
                 if (!sp || sp->getKind() != NodeKind::AssignStmt)
                     return false;
@@ -6906,16 +7415,903 @@ void CAstOptimizer::removeGloballyDeadStores(CFuncDecl& func) {
                 if (!a.compoundOp.empty() || !a.target ||
                     a.target->getKind() != NodeKind::VarRefExpr)
                     return false;
-                const std::string& nm =
-                    static_cast<const CVarRefExpr&>(*a.target).varName;
+                const std::string& nm = static_cast<const CVarRefExpr&>(*a.target).varName;
                 if (reads.count(nm))
-                    return false;  // read somewhere -> keep
+                    return false; // read somewhere -> keep
                 if (exprHasCall(a.value.get()))
-                    return false;  // RHS has a side effect -> keep
-                return true;       // globally-dead pure store
+                    return false; // RHS has a side effect -> keep
+                removedAny = true;
+                return true; // globally-dead pure store
             });
         };
-    removeDead(func.body);
+        removeDead(func.body);
+        if (!removedAny)
+            break;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// M4: RVSDG exit-dispatcher deopt (SAILR "Reverting Switch Lowering")
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// scf_r<digits> — the scf-structurer bridge's synthetic exit-selector temporaries
+/// (StructureControlFlow.cpp g_scfBridgeVarId, ids >= 900000, engine-reserved so
+/// they never collide with a recovered program variable).  scf_w* (loop-carry) is
+/// a different class handled by the loop passes and is deliberately NOT matched.
+bool isSelectorVarName(std::string_view n) {
+    if (n.size() < 6 || n.compare(0, 5, "scf_r") != 0)
+        return false;
+    for (size_t i = 5; i < n.size(); ++i)
+        if (n[i] < '0' || n[i] > '9')
+            return false;
+    return true;
+}
+
+const CVarRefExpr* asSelectorRef(const CExpr* e) {
+    if (e && e->getKind() == NodeKind::VarRefExpr) {
+        const auto* v = static_cast<const CVarRefExpr*>(e);
+        if (isSelectorVarName(v->varName))
+            return v;
+    }
+    return nullptr;
+}
+
+void stripTrailingBreak(std::vector<StmtPtr>& body) {
+    if (!body.empty() && body.back() &&
+        body.back()->getKind() == NodeKind::BreakStmt)
+        body.pop_back();
+}
+
+/// Collapse an RVSDG exit-dispatcher `switch(selector)` over a SYNTHETIC scf_r*
+/// selector into an `if/else-if` chain.  Returns the replacement statement, or
+/// nullptr when `sw` is a REAL switch (non-synthetic selector = a genuine jump
+/// table recovered by RecoverSwitchTables) that must never be rewritten.
+///
+/// `switch(sel){case c0:b0; case c1:b1; ...; default:bd}` becomes
+/// `if (sel==c0){b0} else if (sel==c1){b1} ... else {bd}`; the trailing `break`
+/// that terminated each dispatcher arm is dropped.  Exhaustiveness is guaranteed
+/// by construction (an RVSDG selector picks exactly one region), and the
+/// downstream invertEmptyIfThen / removeEmptyIfStatements /
+/// simplifyConditionPolarity passes finish the cosmetic shaping (e.g.
+/// `if(sel==0){}else{B}` -> `if(sel!=0){B}`).
+///
+/// M4 P4: the case-count is UNBOUNDED for scf_r* selectors.  Earlier (P3) this
+/// was capped at two real cases because a `>2`-case switch *could* be a recovered
+/// jump table — but that concern only applies to PROGRAM selectors.  scf_r* names
+/// are engine-reserved (StructureControlFlow g_scfBridgeVarId, ids >= 900000) and
+/// are emitted ONLY by the M1 bridge for an RVSDG exit dispatcher; they can never
+/// be a real jump-table selector.  Allowing the full case set lets the N-way
+/// continuation dispatchers in mem_alloc / jit_allocate / mem_import collapse to
+/// the same if/else-if shape IDA emits, instead of surviving as a switch.  We do
+/// NOT tail-duplicate: each continuation body is still emitted exactly once (the
+/// RVSDG bridge never duplicates), so the if-chain is the minimal-line form.
+StmtPtr collapseDispatcher(CSwitchStmt& sw) {
+    const CVarRefExpr* sel = asSelectorRef(sw.selector.get());
+    if (!sel)
+        return nullptr;
+
+    unsigned nonDefault = 0;
+    for (const auto& c : sw.cases)
+        if (!c.isDefault)
+            ++nonDefault;
+    if (nonDefault == 0)
+        return nullptr;
+
+    // Capture the selector identity before moving bodies out of `sw`.
+    uint32_t selId = sel->varId;
+    std::string selName = sel->varName;
+    CTypePtr selTy = sel->type;
+
+    std::vector<std::pair<int64_t, std::vector<StmtPtr>>> reals;
+    std::vector<StmtPtr> defaultBody;
+    for (auto& c : sw.cases) {
+        stripTrailingBreak(c.body);
+        if (c.isDefault)
+            defaultBody = std::move(c.body);
+        else
+            reals.emplace_back(c.value, std::move(c.body));
+    }
+
+    // Build the chain bottom-up: the default seeds the innermost else; iterate the
+    // real cases in reverse so the first case ends up the outermost `if`.
+    std::vector<StmtPtr> chain = std::move(defaultBody);
+    for (auto it = reals.rbegin(); it != reals.rend(); ++it) {
+        auto cond = std::make_unique<CBinaryExpr>(
+            BinaryOp::Eq,
+            std::make_unique<CVarRefExpr>(selId, selName, selTy),
+            std::make_unique<CIntLitExpr>(it->first, CType::int32()),
+            CType::boolTy());
+        auto ifs = std::make_unique<CIfStmt>(
+            std::move(cond), std::move(it->second), std::move(chain),
+            sw.getAddress());
+        chain.clear();
+        chain.push_back(std::move(ifs));
+    }
+    if (chain.size() == 1)
+        return std::move(chain.front());
+    if (chain.empty())
+        return nullptr;
+    return std::make_unique<CBlockStmt>(std::move(chain), sw.getAddress());
+}
+
+} // namespace
+
+bool CAstOptimizer::dissolveDispatchersInList(std::vector<StmtPtr>& stmts) {
+    bool changed = false;
+    // Recurse first (post-order): collapse inner dispatchers before their parent,
+    // so the parent takes already-simplified bodies.
+    for (auto& sp : stmts) {
+        if (!sp)
+            continue;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& s = static_cast<CIfStmt&>(*sp);
+            changed |= dissolveDispatchersInList(s.thenBody);
+            changed |= dissolveDispatchersInList(s.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            changed |= dissolveDispatchersInList(static_cast<CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            changed |= dissolveDispatchersInList(static_cast<CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            changed |= dissolveDispatchersInList(static_cast<CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& c : static_cast<CSwitchStmt&>(*sp).cases)
+                changed |= dissolveDispatchersInList(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            changed |= dissolveDispatchersInList(static_cast<CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+    // Collapse dispatcher switches in this list.
+    for (auto& sp : stmts) {
+        if (sp && sp->getKind() == NodeKind::SwitchStmt) {
+            if (auto repl = collapseDispatcher(static_cast<CSwitchStmt&>(*sp))) {
+                sp = std::move(repl);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+void CAstOptimizer::dissolveExitDispatchers(CFuncDecl& func) {
+    // Fixed point: collapsing an inner dispatcher can expose an outer one
+    // (kbase_mem_free nests two levels).  Bounded to avoid any pathological loop.
+    for (int iter = 0; iter < 8; ++iter)
+        if (!dissolveDispatchersInList(func.body))
+            break;
+}
+
+namespace {
+
+struct SelectorCopyAnalysis {
+    std::vector<std::pair<std::string, std::string>> edges;
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        destinationsBySource;
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        interferences;
+    std::unordered_set<std::string> allSelectors;
+};
+
+void collectSelectorRefs(const CExpr* expr,
+                         std::unordered_set<std::string>& out) {
+    std::unordered_set<std::string> names;
+    CAstOptimizer::collectVarRefs(expr, names);
+    for (const std::string& name : names) {
+        if (isSelectorVarName(name))
+            out.insert(name);
+    }
+}
+
+void addSelectorInterferences(
+    const std::string& defined,
+    const std::unordered_set<std::string>& live,
+    const std::string* moveSource,
+    SelectorCopyAnalysis& analysis) {
+    for (const std::string& other : live) {
+        if (other == defined || (moveSource && other == *moveSource))
+            continue;
+        analysis.interferences[defined].insert(other);
+        analysis.interferences[other].insert(defined);
+    }
+}
+
+void collectSelectorMentions(const std::vector<StmtPtr>& stmts,
+                             std::unordered_set<std::string>& out);
+
+void collectSelectorMentionsStmt(const CStmt* stmt,
+                                 std::unordered_set<std::string>& out) {
+    if (!stmt)
+        return;
+    if (stmt->getKind() == NodeKind::AssignStmt) {
+        const auto& a = static_cast<const CAssignStmt&>(*stmt);
+        collectSelectorRefs(a.target.get(), out);
+        collectSelectorRefs(a.value.get(), out);
+    }
+    switch (stmt->getKind()) {
+    case NodeKind::ExprStmt:
+        collectSelectorRefs(static_cast<const CExprStmt&>(*stmt).expr.get(), out);
+        break;
+    case NodeKind::ReturnStmt:
+        collectSelectorRefs(static_cast<const CReturnStmt&>(*stmt).value.get(), out);
+        break;
+    case NodeKind::IfStmt: {
+        const auto& s = static_cast<const CIfStmt&>(*stmt);
+        collectSelectorRefs(s.condition.get(), out);
+        collectSelectorMentions(s.thenBody, out);
+        collectSelectorMentions(s.elseBody, out);
+        break;
+    }
+    case NodeKind::WhileStmt: {
+        const auto& s = static_cast<const CWhileStmt&>(*stmt);
+        collectSelectorRefs(s.condition.get(), out);
+        collectSelectorMentions(s.body, out);
+        break;
+    }
+    case NodeKind::DoWhileStmt: {
+        const auto& s = static_cast<const CDoWhileStmt&>(*stmt);
+        collectSelectorRefs(s.condition.get(), out);
+        collectSelectorMentions(s.body, out);
+        break;
+    }
+    case NodeKind::ForStmt: {
+        const auto& s = static_cast<const CForStmt&>(*stmt);
+        collectSelectorRefs(s.condition.get(), out);
+        collectSelectorMentions(s.body, out);
+        break;
+    }
+    case NodeKind::SwitchStmt: {
+        const auto& s = static_cast<const CSwitchStmt&>(*stmt);
+        collectSelectorRefs(s.selector.get(), out);
+        for (const auto& c : s.cases)
+            collectSelectorMentions(c.body, out);
+        break;
+    }
+    case NodeKind::BlockStmt:
+        collectSelectorMentions(
+            static_cast<const CBlockStmt&>(*stmt).stmts, out);
+        break;
+    default:
+        break;
+    }
+}
+
+void collectSelectorMentions(const std::vector<StmtPtr>& stmts,
+                             std::unordered_set<std::string>& out) {
+    for (const auto& stmt : stmts)
+        collectSelectorMentionsStmt(stmt.get(), out);
+}
+
+// Build the selector interference graph with structured backward liveness.
+// A routing copy is treated as a register-allocation move: its source is
+// excluded only at that copy. Any later source definition or earlier live
+// destination therefore creates an interference edge and blocks coalescing.
+std::unordered_set<std::string> analyzeSelectorLiveness(
+    const std::vector<StmtPtr>& stmts,
+    std::unordered_set<std::string> liveAfter,
+    SelectorCopyAnalysis& analysis) {
+    auto live = std::move(liveAfter);
+    for (size_t i = stmts.size(); i-- > 0;) {
+        const CStmt* stmt = stmts[i].get();
+        if (!stmt)
+            continue;
+        switch (stmt->getKind()) {
+        case NodeKind::AssignStmt: {
+            const auto& a = static_cast<const CAssignStmt&>(*stmt);
+            const CVarRefExpr* target =
+                a.compoundOp.empty() && a.target &&
+                        a.target->getKind() == NodeKind::VarRefExpr
+                    ? static_cast<const CVarRefExpr*>(a.target.get())
+                    : nullptr;
+            if (target && isSelectorVarName(target->varName)) {
+                const CVarRefExpr* source =
+                    a.value && a.value->getKind() == NodeKind::VarRefExpr &&
+                            isSelectorVarName(
+                                static_cast<const CVarRefExpr&>(*a.value).varName)
+                        ? static_cast<const CVarRefExpr*>(a.value.get())
+                        : nullptr;
+                addSelectorInterferences(
+                    target->varName, live,
+                    source ? &source->varName : nullptr, analysis);
+                live.erase(target->varName);
+                collectSelectorRefs(a.value.get(), live);
+            } else {
+                collectSelectorRefs(a.value.get(), live);
+                collectSelectorRefs(a.target.get(), live);
+            }
+            break;
+        }
+        case NodeKind::ExprStmt:
+            collectSelectorRefs(
+                static_cast<const CExprStmt&>(*stmt).expr.get(), live);
+            break;
+        case NodeKind::ReturnStmt:
+            collectSelectorRefs(
+                static_cast<const CReturnStmt&>(*stmt).value.get(), live);
+            break;
+        case NodeKind::IfStmt: {
+            const auto& s = static_cast<const CIfStmt&>(*stmt);
+            auto thenLive = analyzeSelectorLiveness(s.thenBody, live, analysis);
+            auto elseLive = analyzeSelectorLiveness(s.elseBody, live, analysis);
+            thenLive.merge(elseLive);
+            collectSelectorRefs(s.condition.get(), thenLive);
+            live = std::move(thenLive);
+            break;
+        }
+        case NodeKind::SwitchStmt: {
+            const auto& s = static_cast<const CSwitchStmt&>(*stmt);
+            std::unordered_set<std::string> merged = live;
+            for (const auto& c : s.cases) {
+                auto caseLive = analyzeSelectorLiveness(c.body, live, analysis);
+                merged.merge(caseLive);
+            }
+            collectSelectorRefs(s.selector.get(), merged);
+            live = std::move(merged);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            const auto& s = static_cast<const CWhileStmt&>(*stmt);
+            auto exitLive = live;
+            collectSelectorRefs(s.condition.get(), exitLive);
+            auto loopLive = exitLive;
+            for (int iteration = 0; iteration < 8; ++iteration) {
+                auto bodyLive =
+                    analyzeSelectorLiveness(s.body, loopLive, analysis);
+                auto next = exitLive;
+                next.merge(bodyLive);
+                if (next == loopLive)
+                    break;
+                loopLive = std::move(next);
+            }
+            live = std::move(loopLive);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            const auto& s = static_cast<const CDoWhileStmt&>(*stmt);
+            auto exitLive = live;
+            collectSelectorRefs(s.condition.get(), exitLive);
+            auto loopLive = exitLive;
+            for (int iteration = 0; iteration < 8; ++iteration) {
+                auto bodyLive =
+                    analyzeSelectorLiveness(s.body, loopLive, analysis);
+                auto next = exitLive;
+                next.merge(bodyLive);
+                if (next == loopLive)
+                    break;
+                loopLive = std::move(next);
+            }
+            live = analyzeSelectorLiveness(s.body, loopLive, analysis);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            const auto& s = static_cast<const CForStmt&>(*stmt);
+            auto exitLive = live;
+            collectSelectorRefs(s.condition.get(), exitLive);
+            auto loopLive = exitLive;
+            for (int iteration = 0; iteration < 8; ++iteration) {
+                auto bodyLive =
+                    analyzeSelectorLiveness(s.body, loopLive, analysis);
+                auto next = exitLive;
+                next.merge(bodyLive);
+                if (next == loopLive)
+                    break;
+                loopLive = std::move(next);
+            }
+            live = std::move(loopLive);
+            break;
+        }
+        case NodeKind::BlockStmt:
+            live = analyzeSelectorLiveness(
+                static_cast<const CBlockStmt&>(*stmt).stmts,
+                std::move(live), analysis);
+            break;
+        case NodeKind::GotoStmt:
+            // We do not build a full CFG at the C-AST layer. Treat every
+            // selector as live at an unstructured transfer source. Reads after
+            // the target label already flow backwards through the lexical walk;
+            // seeding at the goto restores them across any skipped range while
+            // still allowing disjoint copies in other structured regions.
+            live.insert(analysis.allSelectors.begin(),
+                        analysis.allSelectors.end());
+            break;
+        default:
+            break;
+        }
+    }
+    return live;
+}
+
+// Recursively gather pure scf_r routing copies. Liveness below decides which
+// edges are safe to coalesce; this walk only records their direction/fan-out.
+void analyzeSelectorCopies(const std::vector<StmtPtr>& stmts,
+                           SelectorCopyAnalysis& analysis) {
+    for (const auto& sp : stmts) {
+        if (!sp)
+            continue;
+        if (sp->getKind() == NodeKind::AssignStmt) {
+            const auto& a = static_cast<const CAssignStmt&>(*sp);
+            if (a.compoundOp.empty() && a.target && a.value &&
+                a.target->getKind() == NodeKind::VarRefExpr &&
+                a.value->getKind() == NodeKind::VarRefExpr) {
+                const auto& t = static_cast<const CVarRefExpr&>(*a.target);
+                const auto& v = static_cast<const CVarRefExpr&>(*a.value);
+                if (isSelectorVarName(t.varName) &&
+                    isSelectorVarName(v.varName)) {
+                    analysis.edges.emplace_back(t.varName, v.varName);
+                    analysis.destinationsBySource[v.varName].insert(t.varName);
+                }
+            }
+        }
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            const auto& s = static_cast<const CIfStmt&>(*sp);
+            analyzeSelectorCopies(s.thenBody, analysis);
+            analyzeSelectorCopies(s.elseBody, analysis);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            const auto& s = static_cast<const CWhileStmt&>(*sp);
+            analyzeSelectorCopies(s.body, analysis);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            const auto& s = static_cast<const CDoWhileStmt&>(*sp);
+            analyzeSelectorCopies(s.body, analysis);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            const auto& s = static_cast<const CForStmt&>(*sp);
+            analyzeSelectorCopies(s.body, analysis);
+            break;
+        }
+        case NodeKind::SwitchStmt: {
+            const auto& s = static_cast<const CSwitchStmt&>(*sp);
+            for (const auto& c : s.cases)
+                analyzeSelectorCopies(c.body, analysis);
+            break;
+        }
+        case NodeKind::BlockStmt:
+            analyzeSelectorCopies(
+                static_cast<const CBlockStmt&>(*sp).stmts, analysis);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+} // namespace
+
+void CAstOptimizer::coalesceSelectorChains(CFuncDecl& func) {
+    SelectorCopyAnalysis analysis;
+    analyzeSelectorCopies(func.body, analysis);
+    collectSelectorMentions(func.body, analysis.allSelectors);
+    (void)analyzeSelectorLiveness(func.body, {}, analysis);
+
+    // 1) union-find over proven routing names connected by pure copies. scf_r names
+    //    are "scf_r" + a zero-padded-free decimal id, so a plain string compare
+    //    orders them by id -- pick the lexicographically-smallest as the rep
+    //    (deterministic; the consumed selector tends to be the lowest id).
+    std::unordered_map<std::string, std::string> parent;
+    std::function<std::string(std::string)> find = [&](std::string x) {
+        while (parent.count(x) && parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+    auto unite = [&](const std::string& a, const std::string& b) {
+        if (!parent.count(a)) parent[a] = a;
+        if (!parent.count(b)) parent[b] = b;
+        std::string ra = find(a), rb = find(b);
+        if (ra == rb) return;
+        // Pairwise-safe moves can still form an unsafe transitive class
+        // (A<->B and B<->C while A interferes with C). Check the complete
+        // current classes before joining them.
+        for (const auto& [name, _] : parent) {
+            if (find(name) != ra)
+                continue;
+            auto conflicts = analysis.interferences.find(name);
+            if (conflicts == analysis.interferences.end())
+                continue;
+            for (const std::string& other : conflicts->second) {
+                if (parent.contains(other) && find(other) == rb)
+                    return;
+            }
+        }
+        if (rb < ra) std::swap(ra, rb);  // smaller name is the representative
+        parent[rb] = ra;
+    };
+    for (const auto& [destination, source] : analysis.edges) {
+        auto destinations = analysis.destinationsBySource.find(source);
+        auto interferences = analysis.interferences.find(source);
+        if (destinations == analysis.destinationsBySource.end() ||
+            destinations->second.size() != 1)
+            continue;
+        if (interferences != analysis.interferences.end() &&
+            interferences->second.contains(destination))
+            continue;
+        unite(destination, source);
+    }
+    if (parent.empty())
+        return;
+
+    // 2) rename map: every selector that isn't already its own rep.
+    std::unordered_map<std::string, std::string> renames;
+    for (const auto& [name, _] : parent) {
+        std::string rep = find(name);
+        if (rep != name)
+            renames[name] = rep;
+    }
+    if (renames.empty())
+        return;
+
+    // 3) rewrite all references, then rename + dedupe the declarations.  The
+    //    routing copies become `rep = rep` (removeSelfAssignments erases them);
+    //    the merged-away decls collapse to one (a later removeUnusedDeclarations
+    //    drops any that end up unread).
+    renameInStmtList(func.body, renames);
+    std::unordered_set<std::string> seenDecl;
+    for (auto& vd : func.localVars) {
+        auto it = renames.find(vd.varName);
+        if (it != renames.end())
+            vd.varName = it->second;
+    }
+    std::erase_if(func.localVars, [&](const CVarDecl& vd) {
+        if (isSelectorVarName(vd.varName) && !seenDecl.insert(vd.varName).second)
+            return true;  // duplicate selector decl after coalescing
+        return false;
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// M4 P5: dead-selector-store elimination (backward liveness over scf_r* only)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Collect every scf_r* selector NAME read as a value inside `e` (a switch/if
+// condition, an assignment RHS, a return value, ...).
+void collectSelectorReads(const CExpr* e, std::unordered_set<std::string>& out) {
+    if (!e)
+        return;
+    std::unordered_set<std::string> all;
+    CAstOptimizer::collectVarRefs(e, all);
+    for (const auto& n : all)
+        if (isSelectorVarName(n))
+            out.insert(n);
+}
+
+// True if `s` (anywhere, recursively) contains a goto/label.  When a list holds
+// a goto/label we cannot reason about selector liveness with a simple
+// structured backward scan (control can jump in/out of the lexical order), so we
+// bail to "keep every selector live" for that scope.
+bool stmtHasGotoOrLabel(const CStmt* s);
+bool listHasGotoOrLabel(const std::vector<StmtPtr>& stmts) {
+    for (const auto& sp : stmts)
+        if (sp && stmtHasGotoOrLabel(sp.get()))
+            return true;
+    return false;
+}
+bool stmtHasGotoOrLabel(const CStmt* s) {
+    if (!s)
+        return false;
+    switch (s->getKind()) {
+    case NodeKind::GotoStmt:
+    case NodeKind::LabelStmt:
+        return true;
+    case NodeKind::IfStmt: {
+        const auto& i = static_cast<const CIfStmt&>(*s);
+        return listHasGotoOrLabel(i.thenBody) || listHasGotoOrLabel(i.elseBody);
+    }
+    case NodeKind::WhileStmt:
+        return listHasGotoOrLabel(static_cast<const CWhileStmt&>(*s).body);
+    case NodeKind::DoWhileStmt:
+        return listHasGotoOrLabel(static_cast<const CDoWhileStmt&>(*s).body);
+    case NodeKind::ForStmt:
+        return listHasGotoOrLabel(static_cast<const CForStmt&>(*s).body);
+    case NodeKind::SwitchStmt:
+        for (const auto& c : static_cast<const CSwitchStmt&>(*s).cases)
+            if (listHasGotoOrLabel(c.body))
+                return true;
+        return false;
+    case NodeKind::BlockStmt:
+        return listHasGotoOrLabel(static_cast<const CBlockStmt&>(*s).stmts);
+    default:
+        return false;
+    }
+}
+
+// Collect every selector read anywhere inside a statement list (used to seed the
+// conservative "keep live" sets for loops / goto scopes).
+void collectAllSelectorReads(const std::vector<StmtPtr>& stmts,
+                             std::unordered_set<std::string>& out);
+void collectAllSelectorReadsStmt(const CStmt* s,
+                                  std::unordered_set<std::string>& out) {
+    if (!s)
+        return;
+    switch (s->getKind()) {
+    case NodeKind::AssignStmt: {
+        const auto& a = static_cast<const CAssignStmt&>(*s);
+        collectSelectorReads(a.value.get(), out);
+        // A compound or deref/field/subscript target is itself a read.
+        if (a.target &&
+            (!a.compoundOp.empty() ||
+             a.target->getKind() != NodeKind::VarRefExpr))
+            collectSelectorReads(a.target.get(), out);
+        break;
+    }
+    case NodeKind::ExprStmt:
+        collectSelectorReads(static_cast<const CExprStmt&>(*s).expr.get(), out);
+        break;
+    case NodeKind::ReturnStmt:
+        collectSelectorReads(static_cast<const CReturnStmt&>(*s).value.get(), out);
+        break;
+    case NodeKind::IfStmt: {
+        const auto& i = static_cast<const CIfStmt&>(*s);
+        collectSelectorReads(i.condition.get(), out);
+        collectAllSelectorReads(i.thenBody, out);
+        collectAllSelectorReads(i.elseBody, out);
+        break;
+    }
+    case NodeKind::WhileStmt: {
+        const auto& w = static_cast<const CWhileStmt&>(*s);
+        collectSelectorReads(w.condition.get(), out);
+        collectAllSelectorReads(w.body, out);
+        break;
+    }
+    case NodeKind::DoWhileStmt: {
+        const auto& d = static_cast<const CDoWhileStmt&>(*s);
+        collectSelectorReads(d.condition.get(), out);
+        collectAllSelectorReads(d.body, out);
+        break;
+    }
+    case NodeKind::ForStmt: {
+        const auto& f = static_cast<const CForStmt&>(*s);
+        collectSelectorReads(f.condition.get(), out);
+        collectAllSelectorReads(f.body, out);
+        break;
+    }
+    case NodeKind::SwitchStmt: {
+        const auto& sw = static_cast<const CSwitchStmt&>(*s);
+        collectSelectorReads(sw.selector.get(), out);
+        for (const auto& c : sw.cases)
+            collectAllSelectorReads(c.body, out);
+        break;
+    }
+    case NodeKind::BlockStmt:
+        collectAllSelectorReads(static_cast<const CBlockStmt&>(*s).stmts, out);
+        break;
+    default:
+        break;
+    }
+}
+void collectAllSelectorReads(const std::vector<StmtPtr>& stmts,
+                             std::unordered_set<std::string>& out) {
+    for (const auto& sp : stmts)
+        collectAllSelectorReadsStmt(sp.get(), out);
+}
+
+// Backward liveness over scf_r* selectors only.  `liveAfter` = selectors live on
+// the join immediately after this list; returns the live set BEFORE the list.
+// Mutates `stmts`, erasing every dead `scf_rK = <const/copy>` store.
+//
+// Soundness: scf_r* values are engine-reserved region-result storage. They may
+// carry pointer values, but the synthetic storage itself is never address-taken,
+// aliased, or read implicitly through a call. Their reads are explicit AST
+// references. So a `scf_rK = e` write is dead iff scf_rK is not live on the join
+// after it, computed precisely across if/switch by unioning the per-branch
+// live-before sets.  Loops and goto/label scopes are handled conservatively
+// (every selector read inside them is forced live throughout, nothing erased).
+std::unordered_set<std::string>
+deadSelectorDSE(std::vector<StmtPtr>& stmts,
+                std::unordered_set<std::string> liveAfter) {
+    // Conservative bail: a goto/label in THIS list breaks lexical-order liveness.
+    if (listHasGotoOrLabel(stmts)) {
+        std::unordered_set<std::string> live = std::move(liveAfter);
+        collectAllSelectorReads(stmts, live);
+        return live;
+    }
+
+    std::vector<size_t> toErase;
+    std::unordered_set<std::string> live = std::move(liveAfter);
+
+    for (size_t i = stmts.size(); i-- > 0;) {
+        CStmt* s = stmts[i].get();
+        if (!s)
+            continue;
+        switch (s->getKind()) {
+        case NodeKind::AssignStmt: {
+            auto& a = static_cast<CAssignStmt&>(*s);
+            // Only plain (non-compound) assignments to a bare scf_r* variable are
+            // candidates for elimination.
+            const bool plainSelectorTarget =
+                a.compoundOp.empty() && a.target &&
+                a.target->getKind() == NodeKind::VarRefExpr &&
+                isSelectorVarName(
+                    static_cast<const CVarRefExpr&>(*a.target).varName);
+            if (plainSelectorTarget) {
+                const std::string& tgt =
+                    static_cast<const CVarRefExpr&>(*a.target).varName;
+                // The RHS must be side-effect-free to drop the whole statement.
+                const bool pureRhs = !CAstOptimizer::exprHasCall(a.value.get());
+                if (pureRhs && live.find(tgt) == live.end()) {
+                    toErase.push_back(i);  // dead selector store
+                    break;                 // its RHS reads are dead too
+                }
+                // Live (or impure): kill the def, then add RHS selector reads.
+                live.erase(tgt);
+                collectSelectorReads(a.value.get(), live);
+                break;
+            }
+            // Non-selector / compound / unsafe target: never erased here, but its
+            // RHS (and a compound/unsafe target lvalue) may READ a selector.
+            collectSelectorReads(a.value.get(), live);
+            if (a.target &&
+                (!a.compoundOp.empty() ||
+                 a.target->getKind() != NodeKind::VarRefExpr))
+                collectSelectorReads(a.target.get(), live);
+            break;
+        }
+        case NodeKind::ExprStmt:
+            collectSelectorReads(static_cast<const CExprStmt&>(*s).expr.get(),
+                                 live);
+            break;
+        case NodeKind::ReturnStmt:
+            collectSelectorReads(static_cast<const CReturnStmt&>(*s).value.get(),
+                                 live);
+            break;
+        case NodeKind::IfStmt: {
+            auto& i = static_cast<CIfStmt&>(*s);
+            // Both arms see the SAME join (the live set after the if).  Recurse
+            // into each with a copy, then the live-before of the if is the union
+            // of the two arms' live-before sets plus the condition's reads.
+            auto thenLive = deadSelectorDSE(i.thenBody, live);
+            auto elseLive = deadSelectorDSE(i.elseBody, live);
+            std::unordered_set<std::string> merged = std::move(thenLive);
+            merged.merge(elseLive);
+            collectSelectorReads(i.condition.get(), merged);
+            live = std::move(merged);
+            break;
+        }
+        case NodeKind::SwitchStmt: {
+            // After P4 a scf_r switch is already an if-chain, so a surviving
+            // switch is a REAL jump table — never touch its bodies for selector
+            // DSE, but its cases may still read selectors (rare) and its selector
+            // expr may BE a selector (the pre-P4 guard); union all of them.
+            auto& sw = static_cast<CSwitchStmt&>(*s);
+            std::unordered_set<std::string> merged;
+            for (auto& c : sw.cases) {
+                auto caseLive = deadSelectorDSE(c.body, live);
+                merged.merge(caseLive);
+            }
+            merged.merge(live);  // fall-through / default reaches the join
+            collectSelectorReads(sw.selector.get(), merged);
+            live = std::move(merged);
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            // Conservative: a back-edge means a read at the top consumes a write
+            // from a prior iteration.  Force every selector read in the body+cond
+            // live throughout; do not erase inside.
+            auto& w = static_cast<CWhileStmt&>(*s);
+            std::unordered_set<std::string> bodyReads;
+            collectAllSelectorReads(w.body, bodyReads);
+            collectSelectorReads(w.condition.get(), bodyReads);
+            (void)deadSelectorDSE(
+                w.body, [&] {
+                    auto seed = live;
+                    seed.merge(std::unordered_set<std::string>(bodyReads));
+                    return seed;
+                }());  // recurse for nested non-loop dead stores, seeded live
+            live.merge(bodyReads);
+            break;
+        }
+        case NodeKind::DoWhileStmt: {
+            auto& d = static_cast<CDoWhileStmt&>(*s);
+            std::unordered_set<std::string> bodyReads;
+            collectAllSelectorReads(d.body, bodyReads);
+            collectSelectorReads(d.condition.get(), bodyReads);
+            (void)deadSelectorDSE(d.body, [&] {
+                auto seed = live;
+                seed.merge(std::unordered_set<std::string>(bodyReads));
+                return seed;
+            }());
+            live.merge(bodyReads);
+            break;
+        }
+        case NodeKind::ForStmt: {
+            auto& f = static_cast<CForStmt&>(*s);
+            std::unordered_set<std::string> bodyReads;
+            collectAllSelectorReads(f.body, bodyReads);
+            collectSelectorReads(f.condition.get(), bodyReads);
+            (void)deadSelectorDSE(f.body, [&] {
+                auto seed = live;
+                seed.merge(std::unordered_set<std::string>(bodyReads));
+                return seed;
+            }());
+            live.merge(bodyReads);
+            break;
+        }
+        case NodeKind::BlockStmt: {
+            auto& b = static_cast<CBlockStmt&>(*s);
+            live = deadSelectorDSE(b.stmts, std::move(live));
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // Erase the dead stores (indices were pushed in descending order).
+    for (size_t idx : toErase)
+        stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(idx));
+
+    return live;
+}
+
+} // namespace
+
+namespace {
+// Count every AssignStmt in the (recursively nested) body — used to detect the
+// dead-selector-store fixed point.
+size_t countAssignStmts(const std::vector<StmtPtr>& stmts) {
+    size_t n = 0;
+    for (const auto& sp : stmts) {
+        if (!sp)
+            continue;
+        if (sp->getKind() == NodeKind::AssignStmt)
+            ++n;
+        switch (sp->getKind()) {
+        case NodeKind::IfStmt: {
+            const auto& i = static_cast<const CIfStmt&>(*sp);
+            n += countAssignStmts(i.thenBody);
+            n += countAssignStmts(i.elseBody);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            n += countAssignStmts(static_cast<const CWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::DoWhileStmt:
+            n += countAssignStmts(static_cast<const CDoWhileStmt&>(*sp).body);
+            break;
+        case NodeKind::ForStmt:
+            n += countAssignStmts(static_cast<const CForStmt&>(*sp).body);
+            break;
+        case NodeKind::SwitchStmt:
+            for (const auto& c : static_cast<const CSwitchStmt&>(*sp).cases)
+                n += countAssignStmts(c.body);
+            break;
+        case NodeKind::BlockStmt:
+            n += countAssignStmts(static_cast<const CBlockStmt&>(*sp).stmts);
+            break;
+        default:
+            break;
+        }
+    }
+    return n;
+}
+} // namespace
+
+void CAstOptimizer::eliminateDeadSelectorStores(CFuncDecl& func) {
+    // Fixed point: erasing a dead store can expose another (e.g. `scf_r = 0;
+    // scf_r = 0; scf_r = 1;` collapses one write per pass).  Cheap + bounded.
+    for (int iter = 0; iter < 8; ++iter) {
+        size_t before = countAssignStmts(func.body);
+        deadSelectorDSE(func.body, {});
+        if (countAssignStmts(func.body) == before)
+            break;  // nothing erased this pass -> done
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

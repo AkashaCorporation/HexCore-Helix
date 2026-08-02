@@ -21,13 +21,20 @@
 // MLIR includes
 #include "mlir/Target/LLVMIR/Import.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/BuiltinAttributes.h" // FIX-089: ArrayAttr / IntegerAttr
+
+#include <cstdlib> // std::getenv — HELIX_PIPELINE_DEBUG gate (Maya 8.1/8.2)
 #include "mlir/IR/BuiltinTypes.h"      // FIX-089: IntegerType
 #include "mlir/Pass/PassInstrumentation.h"
 
@@ -46,6 +53,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Metadata.h"   // FIX-089: NamedMDNode / MDNode / ConstantAsMetadata
 #include "llvm/IR/Constants.h"  // FIX-089: ConstantInt
+#include "llvm/ADT/StringMap.h"
 
 #include <cassert>
 #include <format>
@@ -163,7 +171,13 @@ Pipeline::Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch,
     {
         mlir::DialectRegistry registry;
         mlir::registerAllFromLLVMIRTranslations(registry);
-        registry.insert<mlir::DLTIDialect>();
+        registry.insert<
+            mlir::DLTIDialect,
+            mlir::arith::ArithDialect,
+            mlir::cf::ControlFlowDialect,
+            mlir::func::FuncDialect,
+            mlir::scf::SCFDialect,
+            mlir::ub::UBDialect>();
         mlir_ctx_->appendDialectRegistry(registry);
     }
 
@@ -259,6 +273,24 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
     // Capture the target triple before the LLVM module is moved.
     std::string targetTriple = llvm_module->getTargetTriple();
 
+    // The LLVM importer preserves block order but drops textual block names.
+    // Remill names lifted blocks `bb_<decimal-address>`; retain that evidence
+    // so RIP-relative bookkeeping can be seeded per block after translation.
+    llvm::StringMap<llvm::SmallVector<int64_t>> blockAddresses;
+    for (const llvm::Function& func : *llvm_module) {
+        if (func.isDeclaration())
+            continue;
+        auto& addresses = blockAddresses[func.getName()];
+        addresses.reserve(func.size());
+        for (const llvm::BasicBlock& block : func) {
+            uint64_t address = 0;
+            llvm::StringRef name = block.getName();
+            if (name.consume_front("bb_"))
+                (void)name.getAsInteger(10, address);
+            addresses.push_back(static_cast<int64_t>(address));
+        }
+    }
+
     // FIX-089: capture the Pathfinder function-start table BEFORE the LLVM
     // module is moved.  The MLIR LLVM-IR importer drops named metadata, so —
     // exactly like the target triple below — we lift it out by hand and
@@ -337,6 +369,25 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
         (*mlir_module)->setAttr(
             "helix.function_starts",
             mlir::ArrayAttr::get(mlir_ctx_, starts));
+    }
+
+    for (mlir::LLVM::LLVMFuncOp func :
+         (*mlir_module).getOps<mlir::LLVM::LLVMFuncOp>()) {
+        auto it = blockAddresses.find(func.getName());
+        if (it == blockAddresses.end() || it->second.empty())
+            continue;
+        func->setAttr(
+            "helix.block_addresses",
+            mlir::DenseI64ArrayAttr::get(mlir_ctx_, it->second));
+    }
+
+    // FIX-121: nominal debug types are supplied by the IDE after DWARF/BTF/PDB
+    // parsing. The LLVM importer cannot carry this external database, so keep
+    // the versioned JSON as a module attribute for ApplyDebugTypes.
+    if (!debug_type_info_json_.empty()) {
+        (*mlir_module)->setAttr(
+            "helix.debug_type_info_json",
+            mlir::StringAttr::get(mlir_ctx_, debug_type_info_json_));
     }
 
     // Run the MLIR verifier to catch structural problems early (invalid
@@ -464,6 +515,14 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    machine-level HelixLow operations (registers, flags, raw memory).
     pm.addPass(createRemillToHelixLowPass(preserve_cfg_));
 
+    // FIX-138: seed authoritative debug function signatures before ABI
+    // inference. The full nominal-type pass still runs in Tier 3.5, after
+    // variables and fields exist, but return types must be visible before
+    // RecoverCallingConvention decides whether an RAX write means that the
+    // source function returns a value. This matters for large void functions
+    // that use RAX heavily as scratch storage.
+    pm.addPass(createApplyDebugTypesPass());
+
     // ── Tier 1 Analysis: HelixLow-level passes ──────────────────────────
     //    These passes operate on machine-level IR to recover high-level
     //    information while register/flag semantics are still explicit.
@@ -508,6 +567,11 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     pm.addPass(createStructureControlFlowPass(preserve_cfg_));
 
     pm.addPass(createRecoverVariablesPass());
+    // FIX-144: make the recovered return identity a real SSA use before DCE.
+    // This replaces an implicit low-level RET only when RecoverVariables has
+    // produced exactly one canonical `result` identity for a non-void
+    // function. Ambiguous functions retain the existing implicit fallback.
+    pm.addPass(createBindReturnValuesPass());
     pm.addPass(createEliminateDeadCodePass());          // [Nightly: +liveness-driven DCE]
 
     // ── FIX-087 (2026-05-20): per-function SSA renaming of register reads/
@@ -546,6 +610,17 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    abstract slots to named C variables.
     pm.addPass(createHelixMidToHighPass());
 
+    // ── Tier 3.5: Nominal debug types (FIX-121) ─────────────────────────
+    // DWARF/BTF/PDB lives outside the lifted LLVM IR, so the IDE supplies a
+    // scoped JSON database through `helix.debug_type_info_json`. Seed params,
+    // call results and fields only after every op is in High, then run the
+    // existing lattice to propagate those authoritative seeds through aliases.
+    // A second seed resolves fields whose base type became known in that first
+    // propagation; the final propagation carries recovered field types onward.
+    pm.addPass(createApplyDebugTypesPass());
+    pm.addPass(createPropagateTypesHighPass());
+    pm.addPass(createApplyDebugTypesPass());
+
 }
 
 void Pipeline::ensurePipelineBuilt() {
@@ -562,9 +637,21 @@ void Pipeline::ensurePipelineBuilt() {
     // Disable multithreading for deterministic pass execution.
     mlir_ctx_->disableMultithreading();
 
-    // [P0-DEBUG] Register CallOp counting instrumentation
-    pass_manager_->addInstrumentation(
-        std::make_unique<CallOpCountInstrumentation>());
+    // [P0-DEBUG] Register CallOp counting instrumentation.
+    // FIX (Maya 8.1): gate behind HELIX_PIPELINE_DEBUG — it walked the whole
+    // module before AND after every pass (O(N*P)) and spammed stderr on every
+    // run; off by default now.
+    if (std::getenv("HELIX_PIPELINE_DEBUG"))
+        pass_manager_->addInstrumentation(
+            std::make_unique<CallOpCountInstrumentation>());
+
+    // Per-pass IR dump (only passes that actually change the IR) -- a
+    // standard MLIR PassManager utility, kept as a permanent debug switch
+    // alongside HELIX_PIPELINE_DEBUG above rather than stripped, since it's
+    // proven broadly useful for bisecting which pass introduces/loses a
+    // given IR shape.
+    if (std::getenv("HELIX_IR_PRINT"))
+        pass_manager_->enableIRPrinting();
 
     buildPassPipeline(*pass_manager_);
     pipeline_built_ = true;
@@ -581,7 +668,11 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
     DiagnosticCapture capture(mlir_ctx_);
 
     // ── Pre-pipeline IR dump: LLVM dialect before any passes ─────────────
-    {
+    // FIX (Maya 8.2): the 3 dumps below wrote fixed-name .mlir files to the CWD
+    // on every run (CWD pollution + serialization cost + parallel-run filename
+    // collisions). Gate them behind HELIX_PIPELINE_DEBUG.
+    const bool pipelineDebug = std::getenv("HELIX_PIPELINE_DEBUG") != nullptr;
+    if (pipelineDebug) {
         std::error_code ec;
         llvm::raw_fd_ostream pre_os("helix_dump_0_before_passes.mlir", ec);
         if (!ec) {
@@ -599,19 +690,17 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
         );
     }
     // ── Post-pipeline IR dump: HelixHigh after all passes ────────────────
-    {
+    if (pipelineDebug) {
         std::error_code ec;
         llvm::raw_fd_ostream post_os("helix_dump_1_after_passes.mlir", ec);
         if (!ec) {
             post_os << "// === HELIX PIPELINE DUMP: After all passes ===\n";
             module->print(post_os);
         }
-    }
-    // Legacy dump
-    {
-        std::error_code ec;
-        llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec);
-        if (!ec) {
+        // Legacy dump
+        std::error_code ec2;
+        llvm::raw_fd_ostream debug_os("mlir_debug_dump.txt", ec2);
+        if (!ec2) {
             module->print(debug_os);
         }
     }

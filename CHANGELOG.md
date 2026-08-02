@@ -2,6 +2,59 @@
 
 All notable changes to HexCore Helix are documented here.
 
+## [v0.9.3] - Unreleased
+
+This release promotes the validated v2 sandbox into the canonical Helix line.
+It is not a parallel product or a permanent fork: v2 existed to rebuild the
+0.9.2 foundation under corpus, determinism, and full-IDE gates before these
+changes entered the public engine.
+
+### Engine and IR
+
+- The production pipeline remains an ordered 19-pass Low/Mid/High MLIR
+  lowering. Pass dispatch now follows the actual operation shape at each
+  stage, including explicit High-IR propagation inside the retained Low
+  function container.
+- Debug signatures and nominal DWARF/BTF/PDB layouts cross the N-API/C API
+  boundary and are applied at the correct late type-recovery stage.
+- Native SCF lowering preserves branch operands, PHI transport, tuple
+  components, loop-carried values, return identity, and parameter identity.
+- Remill lowering preserves floating call operands/results, block-local PC
+  evidence, signed division semantics, NEG writeback, and scalarized vector
+  lane-zero semantics.
+
+### Correctness and honesty
+
+- Variable coalescing distinguishes address-bearing storage from pure scalar
+  values and uses interference-aware structured liveness before merging SCF
+  selectors.
+- Stack-local aliasing, computed-store bases, debug-proven void calls,
+  structured return binding, and nominal aliases no longer collapse into
+  fabricated zero/null identities.
+- Confidence is derived from the final AST and explicitly caps surviving
+  stubs, uninitialized returns, dropped control flow, post-return statements,
+  invalid scalar subscripts, and code-address leaks.
+- Output determinism no longer depends on pointer-ordered `DenseMap`
+  iteration or process-global SCF counters.
+
+### Validation
+
+- Canonical Windows build reports `helix-js=0.9.3 native=0.9.3` and enables
+  vendored FlatBuffers real serialization; the package smoke produced a
+  non-empty HAST deterministically across two fresh engine instances.
+- Native suite: **216/216** with FlatBuffers enabled.
+- Fresh NUCLEO corpus: **80/80**, with flat confidence/placeholders and no
+  adverse call, memory-store, return, goto, label, or code-address delta.
+- Determinism: fixed ten-function oracle stable at **K=10**.
+- Cross-corpus direct lift: **12/12** across game, Mali, Windows-driver, and
+  controlled-obfuscation fixtures.
+- Kernel lift sweep: **30/30** across six binaries.
+- Full IDE lanes: Mali CSF **3/3** and ROTTR **2/2**.
+
+See [MIGRATION_V2_TO_0_9_3.md](MIGRATION_V2_TO_0_9_3.md) for the exact source
+boundary and excluded artifacts. Detailed per-fix evidence remains preserved
+in the v2 development handoff and release benchmark records.
+
 
 ## [v0.9.2] — 2026-06-12
 

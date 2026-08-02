@@ -142,6 +142,15 @@ RemillSemantic classifySemantic(std::string_view name) {
                                               return RemillSemantic::RET;
     if (name == "JMP"   || name == "JMPI")   return RemillSemantic::JMP;
 
+    // ---- AArch64 compare-and-branch against zero ----------------------------
+    // CBZ Rn,label / CBNZ Rn,label: branch iff Rn == 0 / Rn != 0. No flags; the
+    // tested register is a direct operand, decomposed in RemillToHelixLow.
+    if (name == "CBZ")                       return RemillSemantic::CBZ;
+    if (name == "CBNZ")                      return RemillSemantic::CBNZ;
+    // TBZ Rt,#imm,label / TBNZ: branch iff bit #imm of Rt is 0 / 1.
+    if (name == "TBZ")                       return RemillSemantic::TBZ;
+    if (name == "TBNZ")                      return RemillSemantic::TBNZ;
+
     // ---- Bit manipulation ---------------------------------------------------
     if (name == "BSF"   || name == "BSFI")   return RemillSemantic::BSF;
     if (name == "BSR"   || name == "BSRI")   return RemillSemantic::BSR;

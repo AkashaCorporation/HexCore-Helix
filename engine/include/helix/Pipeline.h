@@ -107,6 +107,13 @@ public:
     [[nodiscard]] const std::vector<uint64_t>&
     functionStarts() const { return function_starts_; }
 
+    /// Provide function signatures and nominal struct layouts extracted from
+    /// DWARF/BTF/PDB. The JSON is stamped on the ModuleOp and consumed by the
+    /// late debug-type seed pass. Empty clears the side channel.
+    void setDebugTypeInfoJson(std::string json) {
+        debug_type_info_json_ = std::move(json);
+    }
+
     // ─── Stage 1: LLVM IR Parsing ────────────────────────────────────────
 
     /// Parse LLVM IR text into an llvm::Module.
@@ -219,6 +226,10 @@ private:
     /// vector in translateToMLIR before the `helix.function_starts` attribute
     /// is stamped.  Empty by default -> behaviour identical to today.
     std::vector<uint64_t> function_starts_;
+
+    /// Versioned StructInfoJson side channel from the IDE. Kept as JSON at
+    /// this boundary so Rust/NAPI do not duplicate the C++ type schema.
+    std::string debug_type_info_json_;
 
     /// Build the pass manager if not already built.
     void ensurePipelineBuilt();

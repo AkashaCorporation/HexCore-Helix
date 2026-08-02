@@ -15,6 +15,7 @@
 #include "helix/dialects/HelixHighDialect.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
+#include "helix/analysis/DataSectionProvider.h"  // FIX-097: rodata string recovery
 
 #include <unordered_set>
 
@@ -27,6 +28,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstring>
 #include <format>
 #include <string>
@@ -58,6 +60,58 @@ static std::optional<unsigned> parseParamIndex(std::string_view name) {
     if (value == 0)
         return std::nullopt;
     return value;
+}
+
+static std::string_view trimType(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.remove_suffix(1);
+    return s;
+}
+
+/// Parse the canonical C spellings supplied by DWARF/BTF and PropagateTypes.
+/// Unknown typedefs intentionally remain int64_t rather than inventing a type.
+static CTypePtr cTypeFromString(std::string_view raw) {
+    raw = trimType(raw);
+    for (std::string_view qualifier : {"const ", "volatile ", "restrict "}) {
+        if (raw.starts_with(qualifier)) {
+            raw.remove_prefix(qualifier.size());
+            raw = trimType(raw);
+        }
+    }
+    if (raw.ends_with('*')) {
+        raw.remove_suffix(1);
+        raw = trimType(raw);
+        for (std::string_view qualifier : {"const ", "volatile ", "restrict "}) {
+            if (raw.starts_with(qualifier)) {
+                raw.remove_prefix(qualifier.size());
+                raw = trimType(raw);
+            }
+        }
+        if (raw == "void")
+            return CType::voidPtr();
+        if (raw.starts_with("struct "))
+            raw.remove_prefix(7);
+        return CType::pointerTo(CType::structTy(std::string(trimType(raw))));
+    }
+    if (raw.starts_with("struct ")) {
+        raw.remove_prefix(7);
+        return CType::structTy(std::string(trimType(raw)));
+    }
+    if (raw == "void") return CType::voidTy();
+    if (raw == "bool") return CType::boolTy();
+    if (raw == "int8_t" || raw == "int8" || raw == "char" || raw == "signed char") return CType::int8();
+    if (raw == "uint8_t" || raw == "uint8" || raw == "u8" || raw == "unsigned char") return CType::uint8();
+    if (raw == "int16_t" || raw == "int16" || raw == "short") return CType::int16();
+    if (raw == "uint16_t" || raw == "uint16" || raw == "u16" || raw == "unsigned short") return CType::uint16();
+    if (raw == "int32_t" || raw == "int32" || raw == "int") return CType::int32();
+    if (raw == "uint32_t" || raw == "uint32" || raw == "u32" || raw == "unsigned int") return CType::uint32();
+    if (raw == "int64_t" || raw == "int64" || raw == "long" || raw == "long int") return CType::int64();
+    if (raw == "uint64_t" || raw == "uint64" || raw == "u64" || raw == "unsigned long" || raw == "long unsigned int") return CType::uint64();
+    if (raw == "float" || raw == "float32") return CType::floatTy();
+    if (raw == "double" || raw == "float64") return CType::doubleTy();
+    return CType::int64();
 }
 
 /// True for synthetic variable names (var_N, spill_N).
@@ -277,6 +331,72 @@ static std::optional<int64_t> tryExtractIntLiteral(Value value) {
     return std::nullopt;
 }
 
+/// Read an integer from the synthetic ET_REL .rodata address range.
+///
+/// The IDE maps immutable sections at 0x7F000000..0x7FFEFFFF and reserves
+/// 0x7FFF0000+ for external call targets. Restricting the fold to that range
+/// avoids treating ordinary reads from mutable PE/ELF data as compile-time
+/// constants merely because their initial bytes are available.
+static std::optional<uint64_t>
+tryReadRelocatedDataWord(Value address, Type resultType) {
+    auto literal = tryExtractIntLiteral(address);
+    if (!literal)
+        return std::nullopt;
+
+    const uint64_t rawAddress = static_cast<uint64_t>(*literal);
+    if (rawAddress < 0x7F000000ULL || rawAddress >= 0x7FFF0000ULL)
+        return std::nullopt;
+
+    auto intType = dyn_cast<IntegerType>(resultType);
+    if (!intType || intType.getWidth() == 0 ||
+        intType.getWidth() % 8 != 0)
+        return std::nullopt;
+    const unsigned byteWidth = intType.getWidth() / 8;
+    if (byteWidth != 1 && byteWidth != 2 &&
+        byteWidth != 4 && byteWidth != 8)
+        return std::nullopt;
+
+    const helix::DataSectionProvider* provider =
+        helix::getActiveDataSectionProvider();
+    if (!provider || !provider->isAvailable())
+        return std::nullopt;
+    return provider->readWord(rawAddress, byteWidth);
+}
+
+/// FIX-091 (issue #15) extension: recursively fold a *fully-constant* add/sub
+/// chain into a single value, so a multi-level NEXT_PC fold
+/// (e.g. `add(add(base_const, a), b)` or `sub(add(base, c), d)`) reaches
+/// `resolveFoldedCodeLabel` the same way the single-level `add(base, off)` form
+/// already does.  Bottoms out ONLY on integer literals (via tryExtractIntLiteral);
+/// any non-literal, non-add/sub leaf -> nullopt, so a runtime base
+/// (`add(param, c)`) is NEVER folded (it stays an ordinary CBinaryExpr) and the
+/// FIX-091 "fully-constant only" soundness invariant holds.  All arithmetic is
+/// uint64 wrapping; the caller masks to low-32 and gates against the in-function
+/// address set, so a transient out-of-window intermediate can only MISS a real
+/// address, never create a false positive.  Depth-capped against pathological IR.
+static std::optional<uint64_t> tryFoldConstantOffset(Value value, int depth = 0) {
+    if (!value || depth > 16)
+        return std::nullopt;
+    if (auto lit = tryExtractIntLiteral(value))
+        return static_cast<uint64_t>(*lit);
+    auto* defOp = value.getDefiningOp();
+    if (!defOp)
+        return std::nullopt;
+    if (auto addOp = dyn_cast<LLVM::AddOp>(defOp)) {
+        if (auto l = tryFoldConstantOffset(addOp.getLhs(), depth + 1))
+            if (auto r = tryFoldConstantOffset(addOp.getRhs(), depth + 1))
+                return *l + *r;
+        return std::nullopt;
+    }
+    if (auto subOp = dyn_cast<LLVM::SubOp>(defOp)) {
+        if (auto l = tryFoldConstantOffset(subOp.getLhs(), depth + 1))
+            if (auto r = tryFoldConstantOffset(subOp.getRhs(), depth + 1))
+                return *l - *r;
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 /// Heuristic: true when an identifier likely names a struct/object base.
 static bool looksLikeStructBase(std::string_view name) {
     if (name.empty() || name == "rsp" || name == "rbp")
@@ -314,6 +434,38 @@ static std::string exprToString(const CExpr* expr) {
     default:
         return "__expr";
     }
+}
+
+// FIX-107: is `s` a PURE integer literal (optionally signed, decimal or 0x-hex --
+// the exact forms exprToString emits above)? Exception-free (the engine may be
+// built with -fno-exceptions), so it uses std::from_chars, not std::stoull. Used
+// to detect a copy-propagated constant that resolveTransitive folded into a name
+// string, so it can be rebuilt as a real CIntLitExpr instead of a CVarRefExpr
+// whose name is a numeric literal (an invalid lvalue).
+static bool parseIntLiteralName(const std::string& s, int64_t& out) {
+    if (s.empty())
+        return false;
+    size_t i = 0;
+    bool neg = false;
+    if (s[i] == '-' || s[i] == '+') {
+        neg = (s[i] == '-');
+        ++i;
+    }
+    if (i >= s.size())
+        return false;
+    int base = 10;
+    if (i + 2 < s.size() && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        base = 16;
+        i += 2;
+    }
+    if (i >= s.size())
+        return false;
+    unsigned long long mag = 0;
+    auto res = std::from_chars(s.data() + i, s.data() + s.size(), mag, base);
+    if (res.ec != std::errc() || res.ptr != s.data() + s.size())
+        return false;  // parse error or trailing junk -> not a pure literal
+    out = neg ? -static_cast<int64_t>(mag) : static_cast<int64_t>(mag);
+    return true;
 }
 
 } // anonymous namespace
@@ -562,6 +714,39 @@ std::string CAstBuilder::blockLabelForAddr(uint64_t addr) const {
 //   confirmed-referenced goto target (so it WILL be emitted) we prefer the
 //   sharper `&loc_xxxx`.  (FUTURE: once D3 guarantees label emission for every
 //   registry block start, the `&loc_xxxx` branch can widen.)
+// FIX-097: resolve a constant that points into a registered data section to
+// its C-string literal (e.g. a relocated `mov rdi, .rodata+OFF` => the real
+// format string). Returns nullptr when no provider is active — which is the
+// case for every ordinary corpus run, so this is behaviour-neutral unless the
+// disassembler fed string bytes (ET_REL via !helix.strings, or PE .rdata).
+static ExprPtr tryResolveStringLiteral(uint64_t value, uint64_t addr) {
+    if (value < 0x1000)
+        return nullptr;  // small immediates are never string pointers
+    const helix::DataSectionProvider* provider =
+        helix::getActiveDataSectionProvider();
+    if (!provider || !provider->isAvailable())
+        return nullptr;
+    auto str = provider->readCString(value);
+    if (!str || str->empty() || str->size() > 512)
+        return nullptr;
+    const std::string& s = *str;
+    // Allow a leading kernel KERN_SOH level prefix (0x01 + digit) and the usual
+    // \t \n \r whitespace; require every other byte to be printable ASCII so
+    // binary/non-string data is never mis-rendered as a string.
+    size_t start = (static_cast<uint8_t>(s[0]) >= 0x01 &&
+                    static_cast<uint8_t>(s[0]) <= 0x07) ? 1 : 0;
+    if (s.size() - start < 2)
+        return nullptr;
+    for (char c : s) {
+        uint8_t b = static_cast<uint8_t>(c);
+        bool ok = (b >= 0x20 && b <= 0x7e) || b == '\t' || b == '\n' ||
+                  b == '\r' || (b >= 0x01 && b <= 0x07);
+        if (!ok)
+            return nullptr;
+    }
+    return std::make_unique<CStringLitExpr>(s, addr);
+}
+
 ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
                                           uint64_t addr) {
     const uint64_t uval = static_cast<uint64_t>(value);
@@ -629,7 +814,14 @@ ExprPtr CAstBuilder::buildIntegerConstant(int64_t value, CTypePtr type,
     if (auto label = resolveFoldedCodeLabel(uval))
         return std::move(*label);
 
-    // (d) Not a code address → ordinary integer literal, unchanged.
+    // (d) FIX-097: a constant that resolves to a registered data section is a
+    //     string-literal pointer (a relocated `.rodata` load) — render the real
+    //     text, turning printk(0, ...) into printk("DMESG: ...", ...). Gated on
+    //     an active DataSectionProvider, so normal runs are unaffected.
+    if (auto str = tryResolveStringLiteral(uval, addr))
+        return str;
+
+    // (e) Not a code address → ordinary integer literal, unchanged.
     return std::make_unique<CIntLitExpr>(value, std::move(type), addr);
 }
 
@@ -730,7 +922,10 @@ bool CAstBuilder::gateCalleeName(const std::string& calleeName,
         hasDamningHonestyDefect_ = true; // D4 (D2 out-of-table call) -- KEPT
                                          // build-time-latched: a side-effecting
                                          // call erased by DSE is still a defect.
-        outName = std::format("(*(code *)0x{:x})", targetAddr);
+        // FIX (Maya 13.3): `code` is not a valid C type; emit a generic
+        // function-pointer cast so the indirect call is at least compilable C
+        // (unspecified args, K&R style — accepts the appended call args).
+        outName = std::format("(*(void (*)())0x{:x})", targetAddr);
         return false;
     }
 
@@ -738,9 +933,18 @@ bool CAstBuilder::gateCalleeName(const std::string& calleeName,
     // authoritative table — otherwise an isolated single-function lift would
     // wrongly rewrite every legitimate cross-function call.
     if (functionTableIsAuthoritative_) {
-        hasDamningHonestyDefect_ = true; // D4 (D2 out-of-table call) -- KEPT
-                                         // build-time-latched (see above).
-        outName = std::format("(*(code *)0x{:x})", targetAddr);
+        // FIX-112 (L1): the honest `(*(code*)0xADDR)()` indirect form is
+        // FAITHFUL -- we simply could not name a sibling callee under the
+        // authoritative table.  It must NOT trip the 50% damning cap (which
+        // pinned cleanly-structured functions at exactly 50% near-universally,
+        // since an isolated lift's siblings are never in its table).  Count it
+        // for a small graded readability penalty instead.  (The own-block
+        // tail-jump case above stays damning -- that is a genuine mis-lowering.)
+        outOfTableCalls_++;
+        // FIX (Maya 13.3): `code` is not a valid C type; emit a generic
+        // function-pointer cast so the indirect call is at least compilable C
+        // (unspecified args, K&R style — accepts the appended call args).
+        outName = std::format("(*(void (*)())0x{:x})", targetAddr);
         return false;
     }
 
@@ -898,40 +1102,9 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             return;
 
         CTypePtr varType = CType::int64(); // default
-        if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type")) {
-            auto typeStr = inferredType.getValue().str();
-            if (typeStr == "void*")
-                varType = CType::voidPtr();
-            else if (typeStr == "int32_t")
-                varType = CType::int32();
-            else if (typeStr == "uint32_t")
-                varType = CType::uint32();
-            else if (typeStr == "int16_t")
-                varType = CType::int16();
-            else if (typeStr == "uint16_t")
-                varType = CType::uint16();
-            else if (typeStr == "int8_t")
-                varType = CType::int8();
-            else if (typeStr == "uint8_t")
-                varType = CType::uint8();
-            else if (typeStr == "uint64_t")
-                varType = CType::uint64();
-            else if (typeStr == "float")
-                varType = CType::floatTy();
-            else if (typeStr == "double")
-                varType = CType::doubleTy();
-            else if (typeStr == "bool")
-                varType = CType::boolTy();
-            else if (typeStr.ends_with("*")) {
-                // Pointer-to-struct (e.g., "auto_struct_0*")
-                auto pointeeName = typeStr.substr(0, typeStr.size() - 1);
-                if (!pointeeName.empty() && pointeeName != "void") {
-                    varType = CType::pointerTo(CType::structTy(pointeeName));
-                } else {
-                    varType = CType::voidPtr();
-                }
-            }
-        }
+        if (auto inferredType =
+                decl->getAttrOfType<StringAttr>("inferred_type"))
+            varType = cTypeFromString(inferredType.getValue().str());
 
         // XMM/YMM registers are floating-point
         auto varName = decl.getVarName().str();
@@ -982,9 +1155,15 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type"))
             paramType = inferredType.getValue().str();
 
-        std::string rawName = decl.getVarName().str();
-        if (auto index = parseParamIndex(rawName))
-            recordParam(*index, paramType, rawName);
+        std::string identityName = decl.getVarName().str();
+        if (auto index = parseParamIndex(identityName)) {
+            std::string displayName = identityName;
+            if (auto debugName = decl->getAttrOfType<StringAttr>("helix.debug_name")) {
+                displayName = debugName.getValue().str();
+                nameAliases_[identityName] = displayName;
+            }
+            recordParam(*index, paramType, displayName);
+        }
     });
 
     // Also from VarRefOps that look like param_N
@@ -1006,7 +1185,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             }
         });
 
-        if (objectUseScore >= 3) {
+        if (objectUseScore >= 3 && !nameAliases_.contains("param_1")) {
             nameAliases_["param_1"] = "this";
             auto& selfParam = paramInfoByIndex[1];
             selfParam.rawName = "this";
@@ -1023,37 +1202,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             : info.rawName;
         paramName = applyNameAliases(paramName);
 
-        CTypePtr paramType = CType::int64(); // default
-        if (info.typeStr == "void*")
-            paramType = CType::voidPtr();
-        else if (info.typeStr == "int32_t")
-            paramType = CType::int32();
-        else if (info.typeStr == "uint32_t")
-            paramType = CType::uint32();
-        else if (info.typeStr == "int16_t")
-            paramType = CType::int16();
-        else if (info.typeStr == "uint16_t")
-            paramType = CType::uint16();
-        else if (info.typeStr == "int8_t")
-            paramType = CType::int8();
-        else if (info.typeStr == "uint8_t")
-            paramType = CType::uint8();
-        else if (info.typeStr == "uint64_t")
-            paramType = CType::uint64();
-        else if (info.typeStr == "float")
-            paramType = CType::floatTy();
-        else if (info.typeStr == "double")
-            paramType = CType::doubleTy();
-        else if (info.typeStr == "bool")
-            paramType = CType::boolTy();
-        else if (info.typeStr.ends_with("*")) {
-            auto pointeeName =
-                info.typeStr.substr(0, info.typeStr.size() - 1);
-            if (!pointeeName.empty() && pointeeName != "void")
-                paramType = CType::pointerTo(CType::structTy(pointeeName));
-            else
-                paramType = CType::voidPtr();
-        }
+        CTypePtr paramType = cTypeFromString(info.typeStr);
 
         params.emplace_back(paramName, paramType, index);
     }
@@ -1076,6 +1225,10 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     // ── Return type ─────────────────────────────────────────────────────
     CTypePtr returnType =
         currentFunctionHasReturnValue_ ? CType::int64() : CType::voidTy();
+    if (auto inferredReturn =
+            op->getAttrOfType<StringAttr>("inferred_return_type")) {
+        returnType = cTypeFromString(inferredReturn.getValue().str());
+    }
 
     // ── Build body ──────────────────────────────────────────────────────
     std::vector<StmtPtr> body;
@@ -1103,6 +1256,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     // CAstOptimizer::reanalyzeConfidence reads this decl flag to apply the 50%
     // cap on the score that actually survives to the user.
     funcDecl->hasDamningHonestyDefect = hasDamningHonestyDefect_;
+    funcDecl->outOfTableCalls = outOfTableCalls_; // FIX-112 (L1): graded, not capped
 
     analyzeConfidence(*funcDecl, op);
 
@@ -1140,6 +1294,7 @@ void CAstBuilder::clearFunctionState() {
     // and intentionally NOT cleared here — it survives across functions.
     blockStartToLabel_.clear();
     hasDamningHonestyDefect_ = false;
+    outOfTableCalls_ = 0; // FIX-112 (L1)
     // FIX-091 (issue #15 C1): per-function in-function code-address registry.
     inFunctionCodeAddrs_.clear();
     currentFunctionMinAddr_ = 0;
@@ -1180,6 +1335,12 @@ std::vector<StmtPtr> CAstBuilder::buildRegionBody(Region& region) {
             // Skip complex targets
             if (targetStr.find("->") != std::string::npos ||
                 targetStr.find("*(") != std::string::npos)
+                continue;
+
+            // M4 (fix-A): never DSE scf_* dispatcher selectors / loop-carry vars
+            // (their consumer is a switch/if/loop selector this RHS-only scan does
+            // not see -- see the precomputeDeadStores guard for the full rationale).
+            if (targetStr.starts_with("scf_"))
                 continue;
 
             // Check RHS for side effects
@@ -1301,6 +1462,16 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         if (!targetExpr || !valueExpr)
             return nullptr;
 
+        // A lifted ABI result register may still bind a call whose debug
+        // signature proves it returns void. Preserve the side effect, but do
+        // not emit invalid C such as `result = kfree(ptr)`.
+        if (auto* call = llvm::dyn_cast<CCallExpr>(valueExpr.get());
+            call && call->type && call->type->kind == TypeKind::Void) {
+            lastRegValue_.clear();
+            exprToBestName_.clear();
+            return std::make_unique<CExprStmt>(std::move(valueExpr), addr);
+        }
+
         // FIX-047, part 2): guard against malformed lvalue targets.
         //
         // `buildExpression` is context-unaware: when it encounters a
@@ -1349,8 +1520,13 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             lastRegValue_[targetStr] == valueStr)
             return nullptr;
 
-        // Invalidate cached entries that depend on the target
-        if (!targetIsOpaque) {
+        // Invalidate cached entries that depend on the target.  M4 (fix-A): never
+        // CACHE an scf_* selector / loop-carry copy chain either -- caching
+        // `scf_rX -> scf_rY` would let resolveTransitive (or a value-equivalence
+        // lookup) collapse the path-dependent dispatcher selector.
+        const bool targetIsSelector = targetStr.starts_with("scf_");
+        const bool valueIsSelector = valueStr.starts_with("scf_");
+        if (!targetIsOpaque && !targetIsSelector) {
             for (auto it = lastRegValue_.begin(); it != lastRegValue_.end();) {
                 if (it->first == targetStr ||
                     it->second.find(targetStr) != std::string::npos)
@@ -1361,12 +1537,13 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             // Only cache when the value is also representable; storing
             // "<targetStr> -> __expr" causes downstream substitutions to
             // emit the placeholder.
-            if (!valueIsOpaque)
+            if (!valueIsOpaque && !valueIsSelector)
                 lastRegValue_[targetStr] = valueStr;
         }
 
-        // Track value equivalence (skip when either side is opaque)
-        if (!targetIsOpaque && !valueIsOpaque) {
+        // Track value equivalence (skip when either side is opaque or a selector)
+        if (!targetIsOpaque && !valueIsOpaque && !targetIsSelector &&
+            !valueIsSelector) {
             auto existingIt = exprToBestName_.find(valueStr);
             bool shouldUpdate = (existingIt == exprToBestName_.end());
             if (!shouldUpdate) {
@@ -2055,6 +2232,59 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 // Expression builder
 // ═══════════════════════════════════════════════════════════════════════════════
 
+ExprPtr CAstBuilder::buildDebugIndexedField(Value address) {
+    auto outer = address.getDefiningOp<LLVM::AddOp>();
+    if (!outer)
+        return nullptr;
+    auto fieldName = outer->getAttrOfType<StringAttr>(
+        "helix.debug_indexed_field_name");
+    auto elementType = outer->getAttrOfType<StringAttr>(
+        "helix.debug_indexed_element_type");
+    auto fieldOffset = outer->getAttrOfType<IntegerAttr>(
+        "helix.debug_indexed_field_offset");
+    if (!fieldName || !elementType || !fieldOffset)
+        return nullptr;
+
+    Value innerValue;
+    if (tryExtractIntLiteral(outer.getRhs()))
+        innerValue = outer.getLhs();
+    else if (tryExtractIntLiteral(outer.getLhs()))
+        innerValue = outer.getRhs();
+    else
+        return nullptr;
+    auto inner = innerValue.getDefiningOp<LLVM::AddOp>();
+    if (!inner)
+        return nullptr;
+
+    Value baseValue;
+    Value indexValue;
+    if (inner.getLhs().getDefiningOp<helix::high::VarRefOp>() &&
+        !tryExtractIntLiteral(inner.getRhs())) {
+        baseValue = inner.getLhs();
+        indexValue = inner.getRhs();
+    } else if (inner.getRhs().getDefiningOp<helix::high::VarRefOp>() &&
+               !tryExtractIntLiteral(inner.getLhs())) {
+        baseValue = inner.getRhs();
+        indexValue = inner.getLhs();
+    } else {
+        return nullptr;
+    }
+
+    auto base = buildExpression(baseValue);
+    auto index = buildExpression(indexValue);
+    if (!base || !index)
+        return nullptr;
+    auto elemType = cTypeFromString(elementType.getValue().str());
+    auto arrayType = CType::arrayOf(elemType);
+    auto field = std::make_unique<CFieldAccessExpr>(
+        std::move(base), fieldName.getValue().str(),
+        fieldOffset.getValue().getZExtValue(), /*isPointer=*/true,
+        std::move(arrayType), extractAddress(outer));
+    return std::make_unique<CSubscriptExpr>(
+        std::move(field), std::move(index), std::move(elemType),
+        extractAddress(outer));
+}
+
 ExprPtr CAstBuilder::buildExpression(Value val) {
     if (!val)
         return std::make_unique<CVarRefExpr>(0, "/* null */", CType::unknownTy());
@@ -2094,6 +2324,9 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── Address literal ────────────────────────────────────────────────
     if (auto addrLit = dyn_cast<helix::high::AddrLitOp>(defOp)) {
+        // FIX-097: a pointer-typed constant into a data section is a string.
+        if (auto str = tryResolveStringLiteral(addrLit.getAddrValue(), addr))
+            return str;
         return std::make_unique<CAddrLitExpr>(
             addrLit.getAddrValue(), convertType(val.getType()), addr);
     }
@@ -2111,6 +2344,17 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
                 name = resolved;
         }
 
+        // FIX-107: if copy-propagation resolved this temporary to a CONSTANT
+        // (e.g. "1", "0x200"), it is NOT a variable. A CVarRefExpr whose name is a
+        // numeric literal is an invalid lvalue: in an assignment-target / store-
+        // address position it prints the malformed `1 = <call>` / `*0 = <rhs>`
+        // (the IntLitExpr lvalue guards from FIX-047 miss it because the node is a
+        // VarRef, not a literal). Rebuild it as a real integer literal -- constant
+        // uses still print the value, and the existing target/address guards now
+        // fire and drop the malformed store.
+        if (int64_t litVal; parseIntLiteralName(name, litVal))
+            return std::make_unique<CIntLitExpr>(litVal, type, addr);
+
         return std::make_unique<CVarRefExpr>(varId, name, type, addr);
     }
 
@@ -2127,6 +2371,16 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── Unary expression ───────────────────────────────────────────────
     if (auto unary = dyn_cast<helix::high::UnaryOp>(defOp)) {
+        if (unary.getOp() == helix::high::UnaryOpKind::Deref) {
+            if (auto word =
+                    tryReadRelocatedDataWord(unary.getOperand(), val.getType())) {
+                return std::make_unique<CIntLitExpr>(
+                    static_cast<int64_t>(*word),
+                    convertType(val.getType()), addr);
+            }
+            if (auto indexed = buildDebugIndexedField(unary.getOperand()))
+                return indexed;
+        }
         auto operand = buildExpression(unary.getOperand());
         auto op = mapUnaryOp(unary.getOp());
         auto type = convertType(val.getType());
@@ -2180,6 +2434,10 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         auto calleeName = call.getTargetName().str();
         auto targetAddr = call.getTargetAddr();
         auto returnType = convertType(val.getType());
+        if (auto inferredType =
+                call->getAttrOfType<StringAttr>("inferred_type")) {
+            returnType = cTypeFromString(inferredType.getValue().str());
+        }
 
         std::vector<ExprPtr> callArgs;
         for (auto arg : call.getArgs()) {
@@ -2320,6 +2578,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── mid.load ──────────────────────────────────────────────────────
     if (auto midLoad = dyn_cast<helix::mid::LoadOp>(defOp)) {
+        if (auto word =
+                tryReadRelocatedDataWord(midLoad.getAddr(), val.getType())) {
+            return std::make_unique<CIntLitExpr>(
+                static_cast<int64_t>(*word),
+                convertType(val.getType()), addr);
+        }
         auto addrExpr = buildExpression(midLoad.getAddr());
         return std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
@@ -2436,6 +2700,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── helix_low.mem_read ────────────────────────────────────────────
     if (auto memRead = dyn_cast<helix::low::MemReadOp>(defOp)) {
+        if (auto word =
+                tryReadRelocatedDataWord(memRead.getAddr(), val.getType())) {
+            return std::make_unique<CIntLitExpr>(
+                static_cast<int64_t>(*word),
+                convertType(val.getType()), addr);
+        }
         auto addrExpr = buildExpression(memRead.getAddr());
         return std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
@@ -2623,17 +2893,15 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         // as `add(base_const, off_const)` (e.g. a NEXT_PC 0x1409B9F77 =
         // 0x1409B9F5B + 0x1C).  The cast optimizer would re-fold this and the
         // printer would truncate it to the bare data leak `0x409B9F77`.
-        // Short-circuit ONLY when both operands are integer literals AND the
-        // sum resolves to a genuine in-function code address; otherwise build
-        // the ordinary binary (the optimizer's general const-fold path stays
-        // byte-identical for all non-code-address arithmetic).
-        if (auto l = tryExtractIntLiteral(addOp.getLhs()))
-            if (auto r = tryExtractIntLiteral(addOp.getRhs())) {
-                uint64_t sum = static_cast<uint64_t>(*l) +
-                               static_cast<uint64_t>(*r);
-                if (auto label = resolveFoldedCodeLabel(sum, addr))
-                    return std::move(*label);
-            }
+        // Short-circuit when the operand chain folds to a single fully-constant
+        // value (multi-level add/sub of literals, e.g. add(add(base,a),b)) AND
+        // it resolves to a genuine in-function code address; otherwise build the
+        // ordinary binary (the optimizer's general const-fold path stays
+        // byte-identical for all non-code-address arithmetic).  A non-literal
+        // leaf (a runtime base) makes the fold bail, so it is never recovered.
+        if (auto folded = tryFoldConstantOffset(val))
+            if (auto label = resolveFoldedCodeLabel(*folded, addr))
+                return std::move(*label);
         auto lhs = buildExpression(addOp.getLhs());
         auto rhs = buildExpression(addOp.getRhs());
         return std::make_unique<CBinaryExpr>(
@@ -2644,14 +2912,10 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.sub ──────────────────────────────────────────────────────
     if (auto subOp = dyn_cast<LLVM::SubOp>(defOp)) {
         // FIX-091 (issue #15 C1): same folded-code-address recovery as add,
-        // for the `sub(base_const, off_const)` shape.
-        if (auto l = tryExtractIntLiteral(subOp.getLhs()))
-            if (auto r = tryExtractIntLiteral(subOp.getRhs())) {
-                uint64_t diff = static_cast<uint64_t>(*l) -
-                                static_cast<uint64_t>(*r);
-                if (auto label = resolveFoldedCodeLabel(diff, addr))
-                    return std::move(*label);
-            }
+        // for the `sub(...)` shape (including multi-level add/sub chains).
+        if (auto folded = tryFoldConstantOffset(val))
+            if (auto label = resolveFoldedCodeLabel(*folded, addr))
+                return std::move(*label);
         auto lhs = buildExpression(subOp.getLhs());
         auto rhs = buildExpression(subOp.getRhs());
         return std::make_unique<CBinaryExpr>(
@@ -2952,6 +3216,17 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.extractelement ───────────────────────────────────────────
     if (auto extract = dyn_cast<LLVM::ExtractElementOp>(defOp)) {
         auto vec = buildExpression(extract.getVector());
+
+        // convertType deliberately scalarizes vectors to their element type.
+        // Under that representation the expression denotes lane zero already;
+        // emitting `vec[0]` produces invalid C such as `float v; v[0]`.
+        // Keep non-zero lanes explicit until the C AST has a sized vector type.
+        Type vectorType = extract.getVector().getType();
+        if ((isa<VectorType>(vectorType) ||
+             isa<LLVM::LLVMFixedVectorType>(vectorType)) &&
+            tryExtractIntLiteral(extract.getPosition()).value_or(-1) == 0)
+            return vec;
+
         auto idx = buildExpression(extract.getPosition());
         return std::make_unique<CSubscriptExpr>(
             std::move(vec), std::move(idx),
@@ -2986,6 +3261,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.load ─────────────────────────────────────────────────────
     if (auto load = dyn_cast<LLVM::LoadOp>(defOp)) {
+        if (auto indexed = buildDebugIndexedField(load.getAddr()))
+            return indexed;
         auto addrExpr = buildExpression(load.getAddr());
         return std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
@@ -3683,6 +3960,14 @@ bool CAstBuilder::isPrologueArtifact(Operation* op) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 std::string CAstBuilder::resolveTransitive(const std::string& name) const {
+    // M4 (fix-A): never resolve the scf-structurer's exit-dispatcher selectors /
+    // loop-carry vars (scf_*) through the copy-tracking chain.  Their routing
+    // copies (scf_rX = scf_rY) look like ordinary register copies, but the chain
+    // root is PATH-DEPENDENT (set to a different constant per branch), so resolving
+    // a switch/if selector to the root is unsound -- it collapses the dispatcher to
+    // one path's value and mis-guards the continuation.  Keep the selector as-is.
+    if (name.starts_with("scf_"))
+        return name;
     std::string current = name;
     std::unordered_set<std::string> visited;
     constexpr unsigned kMaxHops = 5;
@@ -3836,6 +4121,15 @@ CAstBuilder::precomputeDeadStores(Block& block) {
             if (targetStr.find("->") != std::string::npos ||
                 targetStr.find("*(") != std::string::npos ||
                 targetStr.find("[") != std::string::npos)
+                continue;
+
+            // M4 (fix-A): never DSE the scf-structurer's exit-dispatcher selectors
+            // / loop-carry vars (scf_*).  Their consumer is a switch/if/loop
+            // selector, NOT an assign RHS, so this assign-RHS-only liveness scan
+            // cannot see the read and would wrongly kill the routing def -- leaving
+            // the phantom read alive and the dispatched continuation mis-guarded.
+            // Engine-reserved names (id>=900000), so the prefix test is exact.
+            if (targetStr.starts_with("scf_"))
                 continue;
 
             // Never DSE SIMD registers
@@ -4413,6 +4707,15 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
         deduction += std::min(30.0, (double)nativeOps * 3.0);
         issues.push_back(
             std::format("{} native opcode(s) not decomposed", nativeOps));
+    }
+
+    // ── Out-of-table indirect calls (FIX-112 / L1) ───────────────────
+    // Graded penalty for the honest `(*(code*)0xADDR)()` form (no longer the
+    // 50% damning cap); kept in lockstep with reanalyzeConfidence.
+    if (func.outOfTableCalls > 0) {
+        deduction += std::min(15.0, (double)func.outOfTableCalls * 3.0);
+        issues.push_back(std::format(
+            "{} out-of-table indirect call(s)", func.outOfTableCalls));
     }
 
     // ── Register names as local variables ────────────────────────────

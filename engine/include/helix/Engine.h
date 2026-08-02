@@ -128,6 +128,10 @@ public:
     /// Call before decompile.  Replaces the full set on each call.
     void setFunctionStarts(const int64_t* starts, size_t len);
 
+    /// Provide versioned DWARF/BTF/PDB type metadata as UTF-8 JSON.
+    /// The engine copies the bytes; an empty payload clears prior metadata.
+    void setDebugTypeInfoJson(const char* json, size_t len);
+
     /// Register raw bytes for a virtual-address range so passes can read from
     /// the original binary (jump tables, vtables, string literals, etc.).
     ///
@@ -168,6 +172,16 @@ private:
     // Data sections owned by this engine instance.  Lazily wrapped into a
     // DataSectionProvider for the active thread before each pipeline run.
     std::vector<DataSection> data_sections_;
+    std::string debug_type_info_json_;
+
+    // FIX-097: scan the input IR text for `!helix.strings` named metadata
+    // emitted by the HexCore disassembler (relocated .rodata bytes for ET_REL
+    // string loads) and register each node as a data section, so a patched
+    // `mov rdi, <fakeBase+OFF>` resolves to its real string literal. Called at
+    // the top of decompileIR/decompileIRText, before the DataSectionProvider is
+    // installed. No-op when the metadata is absent (e.g. normal PE/ELF input,
+    // where the TS layer feeds sections via addDataSection instead).
+    void parseHelixStringsMetadata(const char* ir_text, size_t ir_len);
 };
 
 } // namespace helix
@@ -272,6 +286,13 @@ void helix_engine_clear_variable_renames(HelixEngineHandle* engine);
 void helix_engine_set_function_starts(
     HelixEngineHandle* engine,
     const int64_t* starts,
+    size_t len
+);
+
+/// Provide versioned DWARF/BTF/PDB type metadata as UTF-8 JSON.
+void helix_engine_set_debug_type_info_json(
+    HelixEngineHandle* engine,
+    const char* json,
     size_t len
 );
 

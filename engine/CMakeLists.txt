@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(helix_engine
-    VERSION 1.0.0
+    VERSION 0.9.3
     LANGUAGES CXX C
     DESCRIPTION "HexCore Helix Decompilation Engine — C++23/MLIR 3-Tier Architecture"
 )
@@ -237,9 +237,11 @@ set(HELIX_SOURCES
     src/passes/RecoverStackLayout.cpp
     src/passes/RecoverCallingConvention.cpp
     src/passes/PropagateTypes.cpp
+    src/passes/ApplyDebugTypes.cpp
     src/passes/StructureControlFlow.cpp
     src/passes/RecoverVariables.cpp
     src/passes/RecoverVariablesFactory.cpp
+    src/passes/BindReturnValues.cpp
     src/passes/EliminateDeadCode.cpp
     src/passes/RegisterSSARename.cpp          # FIX-087: per-fn SSA versioning
 
@@ -326,6 +328,7 @@ set(HELIX_HEADERS
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})
+target_compile_definitions(helix_engine PRIVATE HELIX_ENGINE_VERSION="${PROJECT_VERSION}")
 
 target_include_directories(helix_engine
     PUBLIC
@@ -412,11 +415,25 @@ endif()
 
 # ─── FlatBuffers (optional) ──────────────────────────────────────────────────────
 
+set(HELIX_FLATBUFFERS_STATUS "disabled")
 find_package(flatbuffers QUIET)
 if(flatbuffers_FOUND)
-    message(STATUS "Found FlatBuffers — enabling real serialization")
+    message(STATUS "Found FlatBuffers (package) -- enabling real serialization")
     target_link_libraries(helix_engine PRIVATE flatbuffers::flatbuffers)
     target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
+    set(HELIX_FLATBUFFERS_STATUS "package")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include/flatbuffers/flatbuffers.h")
+    # Vendored FlatBuffers C++ headers (v25.12.19, matches the Rust crate). The
+    # FlatBufferBuilder path is header-only, so no link is required -- just the
+    # include dir + the macro. This is what gives FlatBufSerializer the real
+    # C-AST -> HAST serialization that HQL (Helix Query Language) consumes.
+    message(STATUS "Using vendored FlatBuffers headers -- enabling real serialization")
+    target_include_directories(helix_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include")
+    target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
+    set(HELIX_FLATBUFFERS_STATUS "vendored")
+else()
+    message(STATUS "FlatBuffers not found -- stub HAST serialization (HQL gets module name only).")
+    message(STATUS "  To enable: run  bash engine/vendor_flatbuffers.sh  then reconfigure.")
 endif()
 
 # ─── CLI Tool ──────────────────────────────────────────────────────────────────
@@ -465,7 +482,7 @@ message(STATUS "║  Architecture:  3-Tier (Low→Mid→High)   ║")
 message(STATUS "║  C++ Standard:  C++${CMAKE_CXX_STANDARD}                    ║")
 message(STATUS "║  LLVM/MLIR:     ${HELIX_USE_LLVM}                      ║")
 message(STATUS "║  Emitter:       PseudoC                   ║")
-message(STATUS "║  FlatBuffers:   ${flatbuffers_FOUND}")
+message(STATUS "║  FlatBuffers:   ${HELIX_FLATBUFFERS_STATUS}")
 message(STATUS "║  CLI Tool:      ${HELIX_BUILD_TOOLS}")
 message(STATUS "║  Tests:         ${HELIX_BUILD_TESTS}")
 message(STATUS "║  Build Type:    ${CMAKE_BUILD_TYPE}")

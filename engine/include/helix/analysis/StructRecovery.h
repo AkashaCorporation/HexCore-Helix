@@ -52,6 +52,9 @@ struct RecoveredStruct {
     unsigned total_size;                    ///< Total struct size in bytes
     unsigned alignment;                     ///< Inferred alignment
     bool has_overlaps;                      ///< If true, some fields overlap -> union candidate
+    uint32_t base_var_id = 0;               ///< The var_id this struct's accesses were grouped by
+                                             ///< (lets a consumer map the struct back to its
+                                             ///< declaring var.decl without re-deriving the grouping).
 };
 
 /// Analyzes memory access patterns to recover struct layouts.

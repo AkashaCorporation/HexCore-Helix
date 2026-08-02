@@ -14,11 +14,15 @@
 #include "helix/analysis/RemillDemangler.h"
 #include "helix/analysis/SignatureDb.h"
 #include "helix/analysis/X86RegisterInfo.h"
+#include "helix/utils/Debug.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"   // LLVMFixedVectorType (FIX-CRASH-VEC)
+#include "mlir/IR/BuiltinTypes.h"            // builtin VectorType (FIX-CRASH-VEC)
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -33,6 +37,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <cstdlib>
 
 using namespace mlir;
 using namespace helix;
@@ -42,6 +47,84 @@ using namespace helix;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace {
+
+// FIX-CRASH-VEC helper (root-caused by Maya R.): MLIR imports an LLVM
+// `<N x float>` / `<N x iM>` as the *builtin* VectorType (printed
+// `vector<Nxf32>`); only vectors of LLVM-specific element types (e.g.
+// `<N x ptr>`) use LLVM::LLVMFixedVectorType.  Return the total bit width of a
+// 1-D int/float vector, or 0 if `t` is not such a vector.  Used to read an
+// XMM/SROA'd struct-return vector at its own bit-width and bitcast back, so
+// extractelement/fadd consumers keep a well-typed vector operand instead of a
+// raw i128 (a blind RegReadOp swap otherwise asserts downstream in a
+// `cast<Ty>()`, non-deterministic under ASLR).
+static unsigned vectorTotalBits(Type t) {
+    if (auto v = dyn_cast<VectorType>(t)) {
+        if (v.getRank() == 1 && !v.isScalable() &&
+            v.getElementType().isIntOrFloat())
+            return v.getNumElements() *
+                   v.getElementType().getIntOrFloatBitWidth();
+        return 0;
+    }
+    if (auto v = dyn_cast<LLVM::LLVMFixedVectorType>(t)) {
+        if (v.getElementType().isIntOrFloat())
+            return v.getNumElements() *
+                   v.getElementType().getIntOrFloatBitWidth();
+    }
+    return 0;
+}
+
+static SmallVector<Value> captureForwardedOperands(Operation* terminator,
+                                                   unsigned successorIndex) {
+    SmallVector<Value> values;
+    auto branch = dyn_cast_or_null<BranchOpInterface>(terminator);
+    if (!branch || successorIndex >= terminator->getNumSuccessors())
+        return values;
+
+    SuccessorOperands operands = branch.getSuccessorOperands(successorIndex);
+    if (operands.getProducedOperandCount() != 0)
+        return values;
+    llvm::append_range(values, operands.getForwardedOperands());
+    return values;
+}
+
+// Direct LLVM calls introduced by Remill/LLVM optimization can carry
+// authoritative floating-point SSA operands and results (for example,
+// `call float @sqrtf(float %x)`). Reconstructing those arguments from the
+// integer calling-convention registers loses XMM values and can emit
+// malformed calls such as `sqrtf()`.
+static bool carriesFloatingPoint(Type t) {
+    if (isa<FloatType>(t))
+        return true;
+    if (auto v = dyn_cast<VectorType>(t))
+        return isa<FloatType>(v.getElementType());
+    if (auto v = dyn_cast<LLVM::LLVMFixedVectorType>(t))
+        return isa<FloatType>(v.getElementType());
+    return false;
+}
+
+// FIX-CRASH-VEC (root-caused by Maya R.): helix_low.reg.write constrains its
+// $value operand to AnyInteger and its typed getValue() accessor does
+// `cast<TypedValue<IntegerType>>` -- so a store of an SSE scalar/vector
+// (f32 from `mulss`, f64, vector<Nxf32>) to an XMM register creates an
+// UNVERIFIED, invalid reg.write whose getValue() asserts later in
+// RecoverVariables ("cast<Ty>() argument of incompatible type").  Coerce any
+// non-integer register value to an integer of the same bit width via bitcast
+// so the register model stays integer-typed (the reg holds the value's bits).
+// No-op for values already integer.
+static Value coerceRegValueToInt(Value v, OpBuilder& builder, Location loc) {
+    Type t = v.getType();
+    if (isa<IntegerType>(t))
+        return v;
+    unsigned bits = 0;
+    if (auto ft = dyn_cast<FloatType>(t))
+        bits = ft.getWidth();
+    else
+        bits = vectorTotalBits(t);
+    if (bits == 0)
+        return v;  // pointer/other -- leave as-is (not a float/vector reg value)
+    return builder.create<LLVM::BitcastOp>(
+        loc, builder.getIntegerType(bits), v).getResult();
+}
 
 // ─── Wave 22 Step 2 — variadic call detection (printk-family with zeroed fmt) ──
 //
@@ -1023,8 +1106,8 @@ struct RemillToHelixLowPass
         // signature database.
         helix::resolveCallTargets(module);
 
-        // [P0-DEBUG] Count surviving CallOps after full conversion + resolution
-        {
+        // Count surviving calls only when pipeline diagnostics are requested.
+        if (helix::pipelineDebugEnabled()) {
             unsigned lowCallCount = 0;
             module.walk([&](helix::low::CallOp) { ++lowCallCount; });
             llvm::errs() << "[P0-DEBUG] After RemillToHelixLow + resolveCallTargets: "
@@ -1059,6 +1142,12 @@ private:
     /// llvm.target_triple.
     bool isAArch64_ = false;
 
+    // The common signed-division sequence is CQO_RAX immediately followed by
+    // IDIVrdxrax in the same block. Track that proven pairing so we can lower
+    // quotient/remainder without approximating arbitrary 128-bit dividends.
+    Block* pendingCqoBlock_ = nullptr;
+    Operation* pendingCqoWrite_ = nullptr;
+
     /// Integer return register name for the current target ABI: X0 on AArch64
     /// (AAPCS64), RAX on x86 (SysV/Win64).
     ///
@@ -1086,6 +1175,8 @@ private:
     /// Convert a single Remill lifted function to HelixLow.
     LogicalResult convertFunction(LLVM::LLVMFuncOp llvmFunc) {
         liftStats = LiftStats{}; // reset per-function
+        pendingCqoBlock_ = nullptr;
+        pendingCqoWrite_ = nullptr;
         OpBuilder builder(llvmFunc->getContext());
         builder.setInsertionPointAfter(llvmFunc);
 
@@ -1241,6 +1332,19 @@ private:
         PCTracker pcTracker;
         Value inferredPcAlloca;   // Fallback: alloca identified as PC by address heuristic
         llvm::SmallVector<Operation*, 16> opsToErase;
+        llvm::DenseMap<Block*, uint64_t> blockAddresses;
+        if (auto addresses =
+                llvmFunc->getAttrOfType<DenseI64ArrayAttr>(
+                    "helix.block_addresses")) {
+            size_t index = 0;
+            for (Block& block : helixFunc.getBody()) {
+                if (index >= addresses.size())
+                    break;
+                auto address = static_cast<uint64_t>(addresses[index++]);
+                if (address != 0)
+                    blockAddresses[&block] = address;
+            }
+        }
 
         // Walk the function and convert operations in-place.
         // We use a pre-order walk to ensure we handle definitions before uses if needed,
@@ -1255,6 +1359,20 @@ private:
         for (auto* block : blocks) {
             // A structure to hold a deferred terminator creation.
             std::function<void(OpBuilder&, IntegerAttr)> deferredTerminator = nullptr;
+
+            // A lifted block's textual `bb_<address>` name is captured by
+            // Pipeline before LLVM->MLIR import. Seed both bookkeeping slots
+            // at the block boundary so a linear pass walk cannot reuse the
+            // NEXT_PC value from an unrelated predecessor/layout neighbour.
+            if (auto it = blockAddresses.find(block);
+                it != blockAddresses.end()) {
+                pcTracker.current_pc = it->second;
+                pcTracker.has_pc = true;
+                pcTracker.trackedValues["PC"] =
+                    static_cast<int64_t>(it->second);
+                pcTracker.trackedValues["NEXT_PC"] =
+                    static_cast<int64_t>(it->second);
+            }
 
             // Clear the SSA evaluation cache at block boundaries.
             // Within a block, the cache ensures that re-evaluating the same
@@ -1357,15 +1475,16 @@ private:
             dummyBlock->erase();
         }
 
-        // Log conversion coverage metrics.
-        llvm::errs() << "[LIFT-STATS] " << name
-                     << ": total=" << liftStats.totalCalls
-                     << " converted=" << liftStats.converted
-                     << " memOps=" << liftStats.memoryOps
-                     << " helpers=" << liftStats.helpers
-                     << " external=" << liftStats.externalCalls
-                     << " indirect=" << liftStats.indirectCalls
-                     << "\n";
+        if (helix::pipelineDebugEnabled()) {
+            llvm::errs() << "[LIFT-STATS] " << name
+                         << ": total=" << liftStats.totalCalls
+                         << " converted=" << liftStats.converted
+                         << " memOps=" << liftStats.memoryOps
+                         << " helpers=" << liftStats.helpers
+                         << " external=" << liftStats.externalCalls
+                         << " indirect=" << liftStats.indirectCalls
+                         << "\n";
+        }
 
         // We can now safely erase the original LLVM function.
         llvmFunc.erase();
@@ -1602,6 +1721,33 @@ private:
                     }
                 }
 
+                // FIX-CRASH-VEC (root-caused by Maya R.): a load of an XMM/vector
+                // register yields a FixedVectorType (e.g. `<2 x float>` from a
+                // Win64 by-value struct-return SROA'd into XMM).  Replacing it
+                // with the full-register i128 RegReadOp leaves consumers such as
+                // llvm.extractelement holding an i128 operand where they require
+                // a vector -- a downstream `cast<FixedVectorType>` then asserts
+                // ("cast<Ty>() argument of incompatible type", non-deterministic
+                // under ASLR because replaceAllUsesWith is a blind Value swap).
+                // Read the register at the vector's own bit-width (its low lanes)
+                // and bitcast back to the vector type so extract/insert consumers
+                // keep a well-typed vector operand.
+                if (unsigned vecBits =
+                        vectorTotalBits(load.getResult().getType())) {
+                    auto vecReadOp = builder.create<helix::low::RegReadOp>(
+                        loc,
+                        builder.getIntegerType(vecBits),
+                        builder.getStringAttr(*regName),
+                        builder.getUI32IntegerAttr(vecBits),
+                        addrAttr);
+                    load.getResult().replaceAllUsesWith(
+                        builder.create<LLVM::BitcastOp>(
+                            loc, load.getResult().getType(),
+                            vecReadOp.getResult()).getResult());
+                    opsToErase.push_back(op);
+                    return;
+                }
+
                 unsigned width = RegisterTracker::inferRegWidth(*regName);
                 auto intTy = builder.getIntegerType(width);
 
@@ -1621,6 +1767,24 @@ private:
             {
                 auto addrVal = load.getAddr();
                 auto resultTy = load.getResult().getType();
+                // FIX-CRASH-VEC (memory variant): a `load <N x float>` from a
+                // stack/SROA slot corrupts the same way as the register path
+                // above -- the default i64 mem.read replaces a vector-typed value
+                // and orphans extractelement consumers.  Read at the vector's
+                // bit-width and bitcast back so the vector type is preserved.
+                if (unsigned vecBits = vectorTotalBits(resultTy)) {
+                    auto memReadV = builder.create<helix::low::MemReadOp>(
+                        loc,
+                        builder.getIntegerType(vecBits),
+                        ensureInt64(addrVal, builder, loc, &regs, &pcTracker),
+                        builder.getUI32IntegerAttr(vecBits),
+                        addrAttr);
+                    load.getResult().replaceAllUsesWith(
+                        builder.create<LLVM::BitcastOp>(
+                            loc, resultTy, memReadV.getResult()).getResult());
+                    opsToErase.push_back(op);
+                    return;
+                }
                 unsigned width = 64;
                 if (auto intTy = dyn_cast<IntegerType>(resultTy))
                     width = intTy.getWidth();
@@ -1684,7 +1848,7 @@ private:
 
                 builder.create<helix::low::RegWriteOp>(
                     loc,
-                    store.getValue(),
+                    coerceRegValueToInt(store.getValue(), builder, loc),
                     builder.getStringAttr(*regName),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);
@@ -1696,15 +1860,21 @@ private:
             // stack variables or memory accesses.
             {
                 auto addrVal = store.getAddr();
-                auto valTy = store.getValue().getType();
+                // helix_low.mem.write also constrains $value to AnyInteger
+                // (getValue() -> cast<TypedValue<IntegerType>>). ensureInt64
+                // only handles pointer/PC values, so a `store float`/`store
+                // <N x f32>` to a stack slot would otherwise create an invalid
+                // mem.write that asserts downstream. Coerce SSE values to an
+                // integer of matching width first (FIX-CRASH-VEC).
+                Value storeVal = coerceRegValueToInt(store.getValue(), builder, loc);
                 unsigned width = 64;
-                if (auto intTy = dyn_cast<IntegerType>(valTy))
+                if (auto intTy = dyn_cast<IntegerType>(storeVal.getType()))
                     width = intTy.getWidth();
 
                 builder.create<helix::low::MemWriteOp>(
                     loc,
                     ensureInt64(addrVal, builder, loc, &regs, &pcTracker),
-                    ensureInt64(store.getValue(), builder, loc, &regs, &pcTracker),
+                    ensureInt64(storeVal, builder, loc, &regs, &pcTracker),
                     builder.getUI32IntegerAttr(width),
                     addrAttr);
                 opsToErase.push_back(op);
@@ -1800,10 +1970,12 @@ private:
                         builder.getUI32IntegerAttr(resultBits),
                         addrAttr);
 
-                    llvm::errs() << "[P0-DEBUG] Indirect call: created CallOp"
-                                 << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
-                                 << " nArgs=" << callArgs.size()
-                                 << "\n";
+                    if (helix::pipelineDebugEnabled()) {
+                        llvm::errs() << "[P0-DEBUG] Indirect call: created CallOp"
+                                     << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
+                                     << " nArgs=" << callArgs.size()
+                                     << "\n";
+                    }
                 }
 
                 eraseRemillCall();
@@ -1863,6 +2035,35 @@ private:
             auto semInfo = demangleRemillSemantic(calleeName);
             if (!semInfo) {
                 ++liftStats.externalCalls;
+
+                // FIX-124: Plain direct LLVM calls with floating-point data
+                // already encode their real arguments and result in SSA.
+                // Keep them intact so CAstBuilder consumes that exact call.
+                // The ABI-recovery path below only models integer registers
+                // and therefore cannot recover XMM arguments or returns.
+                bool hasExplicitFloatingPointData = false;
+                for (Value operand : call.getArgOperands()) {
+                    if (carriesFloatingPoint(operand.getType())) {
+                        hasExplicitFloatingPointData = true;
+                        break;
+                    }
+                }
+                if (!hasExplicitFloatingPointData) {
+                    for (Value result : call.getResults()) {
+                        if (carriesFloatingPoint(result.getType())) {
+                            hasExplicitFloatingPointData = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasExplicitFloatingPointData) {
+                    if (calleeName.starts_with("_Z")) {
+                        op->emitWarning("unrecognized mangled name: ")
+                            << calleeName;
+                    }
+                    return;
+                }
+
                 // Unrecognized mangled name — preserve the call and emit warning.
                 // This ensures we don't silently drop calls that might be
                 // important for the decompiled output.
@@ -1903,10 +2104,12 @@ private:
                             builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                             builder.getUI32IntegerAttr(machineIntWidth_),
                             addrAttr);
-                        llvm::errs()
-                            << "[P0-DEBUG] Variadic call (zeroed fmt): name="
-                            << calleeName << " fmtSlot=" << *fmtSlot
-                            << " nArgs=" << callArgs.size() << "\n";
+                        if (helix::pipelineDebugEnabled()) {
+                            llvm::errs()
+                                << "[P0-DEBUG] Variadic call (zeroed fmt): name="
+                                << calleeName << " fmtSlot=" << *fmtSlot
+                                << " nArgs=" << callArgs.size() << "\n";
+                        }
                         eraseRemillCall();
                         return;
                     }
@@ -1929,11 +2132,13 @@ private:
                     builder.getUI32IntegerAttr(machineIntWidth_),
                     addrAttr);
 
-                llvm::errs() << "[P0-DEBUG] External call: created CallOp"
-                             << " name=" << calleeName
-                             << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
-                             << " nArgs=" << callArgs.size()
-                             << "\n";
+                if (helix::pipelineDebugEnabled()) {
+                    llvm::errs() << "[P0-DEBUG] External call: created CallOp"
+                                 << " name=" << calleeName
+                                 << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
+                                 << " nArgs=" << callArgs.size()
+                                 << "\n";
+                }
 
                 // Break the use-def chain and mark for erasure to ensure
                 // Memory* tokens don't leak into variable recovery.
@@ -2616,6 +2821,65 @@ private:
         auto i64Ty = builder.getIntegerType(64);
         auto i1Ty = builder.getIntegerType(1);
 
+        if (semInfo.raw_name == "CQO_RAX") {
+            Value rax;
+            if (auto prior = findLatestRegWriteInBlock(
+                    call->getBlock(), call->getIterator(), "RAX")) {
+                rax = *prior;
+            } else {
+                rax = builder.create<helix::low::RegReadOp>(
+                    loc, i64Ty, builder.getStringAttr("RAX"),
+                    builder.getUI32IntegerAttr(64), addrAttr);
+            }
+            auto shift = builder.create<arith::ConstantIntOp>(loc, 63, 64);
+            auto signHigh = builder.create<arith::ShRSIOp>(
+                loc, rax, shift.getResult());
+            auto rdxWrite = builder.create<helix::low::RegWriteOp>(
+                loc, signHigh.getResult(), builder.getStringAttr("RDX"),
+                builder.getUI32IntegerAttr(64), addrAttr);
+            pendingCqoBlock_ = call->getBlock();
+            pendingCqoWrite_ = rdxWrite.getOperation();
+            return;
+        }
+
+        const bool isCqoPairedIdiv =
+            semInfo.raw_name.starts_with("IDIVrdxrax") &&
+            pendingCqoBlock_ == call->getBlock();
+        pendingCqoBlock_ = nullptr;
+        if (isCqoPairedIdiv && pendingCqoWrite_) {
+            // The divisor may itself be the incoming RDX value. Keeping the
+            // intermediate CQO write makes variable recovery alias the
+            // divisor with the sign-extension result. For the proven pair,
+            // signed RAX/divisor and RAX%divisor already encode CQO's effect.
+            pendingCqoWrite_->erase();
+        }
+        pendingCqoWrite_ = nullptr;
+
+        if (isCqoPairedIdiv && call.getNumOperands() >= 3) {
+            Value dividend;
+            if (auto prior = findLatestRegWriteInBlock(
+                    call->getBlock(), call->getIterator(), "RAX")) {
+                dividend = *prior;
+            } else {
+                dividend = builder.create<helix::low::RegReadOp>(
+                    loc, i64Ty, builder.getStringAttr("RAX"),
+                    builder.getUI32IntegerAttr(64), addrAttr);
+            }
+            Value divisor = ensureInt64(
+                call.getOperand(2), builder, loc, &regs, &pcTracker);
+            auto quotient = builder.create<arith::DivSIOp>(
+                loc, dividend, divisor);
+            auto remainder = builder.create<arith::RemSIOp>(
+                loc, dividend, divisor);
+            builder.create<helix::low::RegWriteOp>(
+                loc, quotient.getResult(), builder.getStringAttr("RAX"),
+                builder.getUI32IntegerAttr(64), addrAttr);
+            builder.create<helix::low::RegWriteOp>(
+                loc, remainder.getResult(), builder.getStringAttr("RDX"),
+                builder.getUI32IntegerAttr(64), addrAttr);
+            return;
+        }
+
         switch (semantic) {
         // ─── Arithmetic/Logic Binary Ops ─────────────────────────────────
         case RemillSemantic::ADD:
@@ -3267,8 +3531,10 @@ private:
                             !symName.starts_with("llvm.") &&
                             !symName.starts_with("_ZN")) {
                             targetName = builder.getStringAttr(symName);
-                            llvm::errs() << "[P0-DEBUG] CALL addressof resolved: "
-                                         << symName << "\n";
+                            if (helix::pipelineDebugEnabled()) {
+                                llvm::errs() << "[P0-DEBUG] CALL addressof resolved: "
+                                             << symName << "\n";
+                            }
                         }
                     }
                 }
@@ -3316,11 +3582,13 @@ private:
                                 builder.getStringAttr(returnRegName()), // X0 on AArch64, RAX on x86
                                 builder.getUI32IntegerAttr(resultBits),
                                 addrAttr);
-                            llvm::errs()
-                                << "[P0-DEBUG] Variadic call (zeroed fmt)"
-                                << " [semantic]: name=" << calleeName
-                                << " fmtSlot=" << *fmtSlot
-                                << " nArgs=" << callArgs.size() << "\n";
+                            if (helix::pipelineDebugEnabled()) {
+                                llvm::errs()
+                                    << "[P0-DEBUG] Variadic call (zeroed fmt)"
+                                    << " [semantic]: name=" << calleeName
+                                    << " fmtSlot=" << *fmtSlot
+                                    << " nArgs=" << callArgs.size() << "\n";
+                            }
                             break;  // exit the RemillSemantic::CALL case
                         }
                     }
@@ -3347,12 +3615,14 @@ private:
                     builder.getUI32IntegerAttr(resultBits),
                     addrAttr);
 
-                llvm::errs() << "[P0-DEBUG] CALL semantic: created CallOp"
-                             << " target=" << (targetName ? targetName.getValue() : "none")
-                             << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
-                             << " resolved=" << addrResolved
-                             << " nArgs=" << callArgs.size()
-                             << "\n";
+                if (helix::pipelineDebugEnabled()) {
+                    llvm::errs() << "[P0-DEBUG] CALL semantic: created CallOp"
+                                 << " target=" << (targetName ? targetName.getValue() : "none")
+                                 << " addr=" << (addrAttr ? std::to_string(addrAttr.getValue().getZExtValue()) : "null")
+                                 << " resolved=" << addrResolved
+                                 << " nArgs=" << callArgs.size()
+                                 << "\n";
+                }
             }
             break;
         }
@@ -3392,19 +3662,36 @@ private:
                 // edge and collapse the whole function to a stub).  Genuine
                 // tail-call blocks have no intra-function successor, so this
                 // only fires on wired edges.
-                if (preserveCfg_) {
+                //
+                // FIX (RC4-PRGA stub-collapse): this MUST run regardless of
+                // preserveCfg_.  An LLVM `br label %bb_X` can only ever target
+                // an intra-function block, so a single-successor branch
+                // terminator on this block proves the jmp is an intra-function
+                // branch.  GCC's top-test `for` loop emits `jmp .cond`, which
+                // Remill lifts as a @JMP intrinsic with a *constant* operand
+                // AND a `br label %bb_cond` terminator; the tail-call
+                // reclassifier below only excluded *computed* operands, so the
+                // constant intra-function target was mis-lowered to a ret-
+                // terminated external call -> the entire loop body was orphaned
+                // and deleted.  Genuine tail-calls are ret-terminated (0
+                // successors) and still fall through to the reclassifier below.
+                if (true) {
                     Block* curBlock = call->getBlock();
+                    Operation* originalTerminator =
+                        curBlock ? curBlock->getTerminator() : nullptr;
                     Block* dest = nullptr;
-                    if (curBlock) {
-                        auto* term = curBlock->getTerminator();
-                        if (term && term->getNumSuccessors() == 1)
-                            dest = term->getSuccessor(0);
-                    }
+                    if (originalTerminator &&
+                        originalTerminator->getNumSuccessors() == 1)
+                        dest = originalTerminator->getSuccessor(0);
                     if (dest) {
                         deferredTerminator =
-                            [loc, dest](OpBuilder& b, IntegerAttr addr) {
+                            [loc, dest, originalTerminator](
+                                OpBuilder& b, IntegerAttr addr) {
+                                auto destOperands = captureForwardedOperands(
+                                    originalTerminator, 0);
                                 b.create<helix::low::JmpOp>(
-                                    loc, /*target_addr=*/IntegerAttr{},
+                                    loc, mlir::ValueRange(destOperands),
+                                    /*target_addr=*/IntegerAttr{},
                                     /*address=*/addr, /*dest=*/dest);
                             };
                         break;  // edge preserved — skip tail-call reclassify
@@ -3472,9 +3759,11 @@ private:
                         b.create<helix::low::RetOp>(loc, addr);
                     };
 
-                    llvm::errs() << "[P0-DEBUG] JMP semantic: tail-call to "
-                                 << targetName.getValue()
-                                 << " nArgs=" << callArgs.size() << "\n";
+                    if (helix::pipelineDebugEnabled()) {
+                        llvm::errs() << "[P0-DEBUG] JMP semantic: tail-call to "
+                                     << targetName.getValue()
+                                     << " nArgs=" << callArgs.size() << "\n";
+                    }
                 } else {
                     // Indirect jump (jump table, computed goto, indirect tail
                     // call).  Keep as JmpOp; RecoverSwitchTables / downstream
@@ -3482,6 +3771,7 @@ private:
                     deferredTerminator = [loc, dummyBlock](OpBuilder& b, IntegerAttr addr) {
                         b.create<helix::low::JmpOp>(
                             loc,
+                            /*destOperands=*/mlir::ValueRange{},
                             /*target_addr=*/IntegerAttr{},
                             /*address=*/addr,
                             /*dest=*/dummyBlock);
@@ -3507,10 +3797,26 @@ private:
         case RemillSemantic::JO:
         case RemillSemantic::JNO:
         case RemillSemantic::JP:
-        case RemillSemantic::JNP: {
+        case RemillSemantic::JNP:
+        case RemillSemantic::CBZ:
+        case RemillSemantic::CBNZ:
+        case RemillSemantic::TBZ:
+        case RemillSemantic::TBNZ: {
             auto condStr = getJccCondition(semantic);
-            if (!condStr || call.getNumOperands() < 5)
+            const bool isAarch64CondBranch =
+                (semantic == RemillSemantic::CBZ || semantic == RemillSemantic::CBNZ ||
+                 semantic == RemillSemantic::TBZ || semantic == RemillSemantic::TBNZ);
+            if ((!condStr && !isAarch64CondBranch) || call.getNumOperands() < 5)
                 break;
+            // CBZ/CBNZ/TBZ/TBNZ carry no x86 condition-code string, but the JccOp
+            // built at the end of this block dereferences `*condStr` -- a null
+            // optional is UB (an access violation). Give it a sensible label; the
+            // REAL taken condition is carried by condValue (computed below), so
+            // this is only a hint for the emitter.
+            if (isAarch64CondBranch && !condStr)
+                condStr = std::string(
+                    (semantic == RemillSemantic::CBZ || semantic == RemillSemantic::TBZ)
+                        ? "z" : "nz");
 
             // ── Synthesize real condition from preceding CMP/TEST flags ──
             //
@@ -3765,6 +4071,71 @@ private:
                 }
                 break;
             }
+            case RemillSemantic::CBZ:
+            case RemillSemantic::CBNZ: {
+                // AArch64 CBZ/CBNZ: taken iff Rn == 0 (CBZ) / Rn != 0 (CBNZ).
+                // Operand layout (resolved empirically from a real lift):
+                //   0=mem 1=state 2=BRANCH_TAKEN 3=taken_pc 4=not_taken_pc
+                //   5=Rn (the RnI register-read) 6=NEXT_PC
+                // condValue is the TAKEN condition; the shared branch-formation
+                // tail below pairs it with the real taken successor (the br
+                // terminator has the same canonical `icmp eq branch_taken,0` shape
+                // as the x86 Jcc path, so no special handling is required here).
+                if (call.getNumOperands() >= 6) {
+                    auto rn = ensureInt64(
+                        safeGetOperand(call, 5, builder, loc),
+                        builder, loc, &regs, &pcTracker);
+                    auto zero = builder.create<arith::ConstantOp>(
+                        loc, builder.getIntegerType(64),
+                        builder.getI64IntegerAttr(0));
+                    auto pred = (semantic == RemillSemantic::CBZ)
+                        ? arith::CmpIPredicate::eq
+                        : arith::CmpIPredicate::ne;
+                    condValue = builder.create<arith::CmpIOp>(
+                        loc, pred, rn, zero).getResult();
+                }
+                // A malformed CBZ lift (too few operands) must not fall through to
+                // the shared fallback, which dereferences the (null-for-CBZ)
+                // condStr; fail safe to "always taken" instead.
+                if (!condValue) {
+                    condValue = builder.create<LLVM::ConstantOp>(
+                        loc, i1Ty, builder.getBoolAttr(true)).getResult();
+                }
+                break;
+            }
+            case RemillSemantic::TBZ:
+            case RemillSemantic::TBNZ: {
+                // AArch64 TBZ/TBNZ: taken iff bit #imm of Rt is 0 (TBZ) / 1 (TBNZ).
+                // Operand layout (resolved empirically):
+                //   0=mem 1=state 2=bit_pos(imm) 3=BRANCH_TAKEN 4=taken_pc
+                //   5=not_taken_pc 6=Rt (the RnI register-read) 7=NEXT_PC
+                // condValue = ((Rt >> bit_pos) & 1) == 0 (TBZ) / != 0 (TBNZ).
+                if (call.getNumOperands() >= 7) {
+                    auto i64Type = builder.getIntegerType(64);
+                    auto bitPos = ensureInt64(
+                        safeGetOperand(call, 2, builder, loc),
+                        builder, loc, &regs, &pcTracker);
+                    auto rt = ensureInt64(
+                        safeGetOperand(call, 6, builder, loc),
+                        builder, loc, &regs, &pcTracker);
+                    auto shifted = builder.create<arith::ShRUIOp>(loc, rt, bitPos);
+                    auto one = builder.create<arith::ConstantOp>(
+                        loc, i64Type, builder.getI64IntegerAttr(1));
+                    auto bit = builder.create<arith::AndIOp>(loc, shifted, one);
+                    auto zero = builder.create<arith::ConstantOp>(
+                        loc, i64Type, builder.getI64IntegerAttr(0));
+                    auto pred = (semantic == RemillSemantic::TBZ)
+                        ? arith::CmpIPredicate::eq
+                        : arith::CmpIPredicate::ne;
+                    condValue = builder.create<arith::CmpIOp>(
+                        loc, pred, bit, zero).getResult();
+                }
+                if (!condValue) {
+                    condValue = builder.create<LLVM::ConstantOp>(
+                        loc, i1Ty, builder.getBoolAttr(true)).getResult();
+                }
+                break;
+            }
             default:
                 break;
             }
@@ -3823,9 +4194,13 @@ private:
             // ordering so behaviour is never worse than before.
             Block* trueBlock = dummyBlock;
             Block* falseBlock = dummyBlock;
+            unsigned trueSuccessorIndex = 0;
+            unsigned falseSuccessorIndex = 1;
             Block* currentBlock = call->getBlock();
+            Operation* originalTerminator =
+                currentBlock ? currentBlock->getTerminator() : nullptr;
             if (currentBlock) {
-                auto* term = currentBlock->getTerminator();
+                auto* term = originalTerminator;
                 if (term && term->getNumSuccessors() >= 2) {
                     Block* succ0 = term->getSuccessor(0);
                     Block* succ1 = term->getSuccessor(1);
@@ -3853,6 +4228,8 @@ private:
                         // .not canonical form: successor(1) is the taken edge.
                         trueBlock = succ1;
                         falseBlock = succ0;
+                        trueSuccessorIndex = 1;
+                        falseSuccessorIndex = 0;
                     } else {
                         // Unknown branch shape: preserve historical ordering.
                         trueBlock = succ0;
@@ -3874,12 +4251,20 @@ private:
             }
 
             deferredTerminator = [loc, condStr, condValue, trueBlock, falseBlock,
+                                  originalTerminator, trueSuccessorIndex,
+                                  falseSuccessorIndex,
                                   flagSynthesisFailed](
                                      OpBuilder& b, IntegerAttr addr) {
+                auto trueDestOperands = captureForwardedOperands(
+                    originalTerminator, trueSuccessorIndex);
+                auto falseDestOperands = captureForwardedOperands(
+                    originalTerminator, falseSuccessorIndex);
                 auto jcc = b.create<helix::low::JccOp>(
                     loc,
                     *condStr,             // condition code string
                     condValue,            // real flag condition (i1)
+                    mlir::ValueRange(trueDestOperands),
+                    mlir::ValueRange(falseDestOperands),
                     addr,                 // address
                     trueBlock,            // taken destination
                     falseBlock);          // fallthrough destination
@@ -3958,12 +4343,35 @@ private:
         }
 
         case RemillSemantic::NEG: {
-            if (call.getNumOperands() >= 3) {
-                builder.create<helix::low::UnaryOp>(
+            // Remill unary read-modify-write layout:
+            // (memory, state, destination, source-value). The old handler
+            // treated the destination pointer as the value and never wrote
+            // the negated result back, silently turning `neg rdx` into a
+            // no-op in every downstream stage.
+            if (call.getNumOperands() >= 4) {
+                auto destRegPtr = call.getOperand(2);
+                auto src = call.getOperand(3);
+                Value val = semInfo.has_memory_src
+                    ? ensureInt64(
+                          builder
+                              .create<helix::low::MemReadOp>(
+                                  loc, i64Ty,
+                                  ensureInt64(src, builder, loc, &regs,
+                                              &pcTracker),
+                                  builder.getUI32IntegerAttr(64), addrAttr)
+                              .getResult(),
+                          builder, loc)
+                    : ensureInt64(src, builder, loc, &regs, &pcTracker);
+                auto unOp = builder.create<helix::low::UnaryOp>(
                     loc, i64Ty, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Neg,
-                    call.getOperand(2),
-                    addrAttr);
+                    val, addrAttr);
+
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
+                                          unOp.getResult(), regs, addrAttr);
+                builder.create<helix::low::RegWriteOp>(
+                    loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
+                    builder.getUI32IntegerAttr(1), addrAttr);
             }
             break;
         }

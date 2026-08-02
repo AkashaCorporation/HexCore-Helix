@@ -56,6 +56,7 @@ pub fn read_cfg_function_name(buffer: Buffer) -> Result<Option<String>> {
 // ── Helpers internos para construir CfgData/AstData ──────────────────
 
 /// Constrói CfgData a partir de dados do pipeline Helix.
+#[cfg(feature = "rust-pipeline")]
 pub(crate) fn build_cfg_data(
     module_name: &str,
     function_count: usize,
@@ -76,6 +77,7 @@ pub(crate) fn build_cfg_data(
 }
 
 /// Constrói AstData a partir de dados do pipeline Helix.
+#[cfg(feature = "rust-pipeline")]
 pub(crate) fn build_ast_data(module_name: &str, source: &str, function_count: usize) -> AstData {
     let functions = vec![AstFunctionData {
         name: format!("module_{}", function_count),

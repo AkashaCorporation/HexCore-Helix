@@ -42,7 +42,10 @@ pub struct DecompileOutput {
 /// **Deprecated since v0.7**: The C++ MLIR pipeline (`HelixEngine::decompile_ir`)
 /// is now the sole production path.  This function is retained for comparison
 /// testing only and will be removed in a future release.
-#[deprecated(since = "0.7.0", note = "Use the C++ MLIR pipeline via HelixEngine::decompile_ir()")]
+#[deprecated(
+    since = "0.7.0",
+    note = "Use the C++ MLIR pipeline via HelixEngine::decompile_ir()"
+)]
 pub fn decompile_ir_via_hir(ir_text: &str) -> Result<DecompileOutput, String> {
     use crate::analysis::calling_convention;
     use crate::analysis::control_flow;

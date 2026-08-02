@@ -105,8 +105,7 @@ TEST(RegistryMissTest, OmittedSelfEntryUnderAuthoritativeTableForcesZero) {
 }
 
 // (b) AUTHORITATIVE table INCLUDING the self-entry -> flag stays false AND the
-// stub keeps its normal score (analyzeConfidence: 100 - 40 stub == 60; post-opt
-// score is the normal non-zero stub score, NOT the registry-miss 0).
+// stub is capped at 50 by #56, but is NOT forced to registry-miss 0.
 TEST(RegistryMissTest, InTableSelfEntryKeepsNormalStubScore) {
     mlir::MLIRContext ctx;
     mlir::Operation* funcOp = nullptr;
@@ -122,16 +121,21 @@ TEST(RegistryMissTest, InTableSelfEntryKeepsNormalStubScore) {
     cab.analyzeConfidence(*decl, funcOp);
 
     EXPECT_FALSE(decl->registryMissHonestFailure);
-    // 100 - 40 (stub function (< 5 ops)) == 60, no damning cap (flag false).
-    EXPECT_DOUBLE_EQ(decl->confidenceScore, 60.0);
+    // #56 applies the same final-AST empty-stub cap in the initial scorer.
+    EXPECT_DOUBLE_EQ(decl->confidenceScore, 50.0);
 
     CAstOptimizer opt;
     opt.reanalyzeConfidence(*decl);
 
-    // The early-return is skipped; the normal stub score survives (well above
-    // the registry-miss 0 and the A-D4 50% cap, below a fully-recovered 100).
-    EXPECT_GT(decl->confidenceScore, 50.0);
-    EXPECT_LT(decl->confidenceScore, 100.0);
+    // #56: an empty body contains no recovered behavior and cannot report
+    // Medium/High even when its address is a valid registry entry.
+    EXPECT_DOUBLE_EQ(decl->confidenceScore, 50.0);
+    bool sawStubCap = false;
+    for (const auto& issue : decl->confidenceIssues) {
+        if (issue.find("stub/empty body") != std::string::npos)
+            sawStubCap = true;
+    }
+    EXPECT_TRUE(sawStubCap);
 }
 
 // Mandatory guard (rag/13 3.3 revision 1): a FuncOp whose entry address is 0

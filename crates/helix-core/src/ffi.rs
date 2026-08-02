@@ -108,6 +108,13 @@ extern "C" {
         len: usize,
     );
 
+    /// Provide versioned DWARF/BTF/PDB type metadata as UTF-8 JSON.
+    pub fn helix_engine_set_debug_type_info_json(
+        engine: *mut HelixEngineHandle,
+        json: *const c_char,
+        len: usize,
+    );
+
     /// Register raw bytes for a virtual-address range so passes can read
     /// from the original binary (jump tables, vtables, string literals).
     /// Bytes are copied into the engine; the caller may free immediately.
@@ -204,10 +211,17 @@ impl EngineHandle {
     /// free immediately.  An empty slice clears the side-channel.
     pub fn set_function_starts(&mut self, starts: &[i64]) {
         unsafe {
-            helix_engine_set_function_starts(
+            helix_engine_set_function_starts(self.handle, starts.as_ptr(), starts.len());
+        }
+    }
+
+    /// Replace the debug-type metadata side channel. Empty clears it.
+    pub fn set_debug_type_info_json(&mut self, json: &str) {
+        unsafe {
+            helix_engine_set_debug_type_info_json(
                 self.handle,
-                starts.as_ptr(),
-                starts.len(),
+                json.as_ptr() as *const c_char,
+                json.len(),
             );
         }
     }

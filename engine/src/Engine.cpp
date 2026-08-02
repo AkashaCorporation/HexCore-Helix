@@ -21,7 +21,10 @@
 #include "mlir/Pass/PassManager.h"
 
 #include <cstring>
+#include <cstdint>
 #include <format>
+#include <string_view>
+#include <vector>
 
 namespace helix {
 
@@ -105,6 +108,8 @@ void Engine::setSkipOptimization(bool skip) {
     // Re-apply preserve-cfg onto the fresh pipeline (rebuild loses state).
     if (preserve_cfg_)
         pipeline_->setPreserveCfg(true);
+    if (!debug_type_info_json_.empty())
+        pipeline_->setDebugTypeInfoJson(debug_type_info_json_);
 }
 
 void Engine::setPreserveCfg(bool v) {
@@ -143,6 +148,12 @@ void Engine::setFunctionStarts(const int64_t* starts, size_t len) {
     }
 }
 
+void Engine::setDebugTypeInfoJson(const char* json, size_t len) {
+    debug_type_info_json_.assign(json ? json : "", json ? len : 0);
+    if (pipeline_)
+        pipeline_->setDebugTypeInfoJson(debug_type_info_json_);
+}
+
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
@@ -150,7 +161,7 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 // ─── API ───────────────────────────────────────────────────────────────────────
 
 const char* Engine::version() noexcept {
-    return "0.9.2";
+    return HELIX_ENGINE_VERSION;
 }
 
 HelixStatus Engine::decompile(
@@ -218,6 +229,10 @@ HelixStatus Engine::decompileIR(
     //   - helix_tool.exe: /STACK:16777216 set in CMakeLists.txt
     //   - Rust FFI: caller spawns a thread with 16 MB stack via
     //     std::thread::Builder::stack_size()
+    // FIX-097: pick up relocated .rodata string bytes embedded as
+    // !helix.strings metadata (ET_REL string loads) before installing the
+    // provider — no-op when the metadata is absent.
+    parseHelixStringsMetadata(ir_text, ir_len);
     ScopedDataSectionProvider scopedProvider(&data_sections_);
     llvm::StringRef irStr(ir_text, ir_len);
     auto result = pipeline_->decompile(irStr);
@@ -265,6 +280,9 @@ HelixStatus Engine::decompileIRText(
 
     // Run the full MLIR decompilation pipeline.
     // Stack requirements documented in decompileIR().
+    // FIX-097: see decompileIR() — register !helix.strings data before the
+    // provider is installed.
+    parseHelixStringsMetadata(ir_text, ir_len);
     ScopedDataSectionProvider scopedProvider(&data_sections_);
     llvm::StringRef irStr(ir_text, ir_len);
     auto result = pipeline_->decompile(irStr);
@@ -293,6 +311,90 @@ HelixStatus Engine::decompileIRText(
     last_error_.clear();
 
     return HELIX_OK;
+}
+
+void Engine::parseHelixStringsMetadata(const char* ir_text, size_t ir_len) {
+    if (!ir_text || ir_len == 0)
+        return;
+    std::string_view ir(ir_text, ir_len);
+
+    // Named metadata emitted by the disassembler: `!helix.strings = !{!N, ...}`
+    constexpr std::string_view kTag = "!helix.strings";
+    size_t tagPos = ir.find(kTag);
+    if (tagPos == std::string_view::npos)
+        return;
+    size_t brace = ir.find('{', tagPos);
+    size_t braceEnd = (brace == std::string_view::npos)
+        ? std::string_view::npos : ir.find('}', brace);
+    if (braceEnd == std::string_view::npos)
+        return;
+    std::string_view refList = ir.substr(brace + 1, braceEnd - brace - 1);
+
+    // Collect referenced node ids (e.g. 90000) in `!{!90000, !90001}`.
+    std::vector<std::string> nodeIds;
+    for (size_t i = 0; i < refList.size();) {
+        size_t bang = refList.find('!', i);
+        if (bang == std::string_view::npos)
+            break;
+        size_t j = bang + 1;
+        std::string id;
+        while (j < refList.size() && refList[j] >= '0' && refList[j] <= '9')
+            id.push_back(refList[j++]);
+        if (!id.empty())
+            nodeIds.push_back(std::move(id));
+        i = j;
+    }
+
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
+    // Each node: `!<id> = !{i64 <addr>, !"<\HH-escaped bytes>"}`.
+    for (const auto& id : nodeIds) {
+        std::string needle = "!" + id + " = ";
+        size_t p = ir.find(needle);
+        if (p == std::string_view::npos)
+            continue;
+        size_t i64p = ir.find("i64", p);
+        if (i64p == std::string_view::npos)
+            continue;
+        i64p += 3;
+        while (i64p < ir.size() && (ir[i64p] == ' ' || ir[i64p] == '\t'))
+            ++i64p;
+        uint64_t addr = 0;
+        bool any = false;
+        while (i64p < ir.size() && ir[i64p] >= '0' && ir[i64p] <= '9') {
+            addr = addr * 10 + static_cast<uint64_t>(ir[i64p] - '0');
+            ++i64p;
+            any = true;
+        }
+        if (!any)
+            continue;
+        size_t q = ir.find("!\"", i64p);
+        if (q == std::string_view::npos)
+            continue;
+        q += 2;
+        std::vector<uint8_t> bytes;
+        while (q < ir.size() && ir[q] != '"') {
+            char c = ir[q];
+            if (c == '\\' && q + 2 < ir.size()) {
+                int hi = hexVal(ir[q + 1]);
+                int lo = hexVal(ir[q + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+                    q += 3;
+                    continue;
+                }
+            }
+            bytes.push_back(static_cast<uint8_t>(c));
+            ++q;
+        }
+        if (!bytes.empty())
+            addDataSection(addr, bytes.data(), bytes.size());
+    }
 }
 
 void Engine::addDataSection(uint64_t va_start, const uint8_t* bytes, size_t len) {

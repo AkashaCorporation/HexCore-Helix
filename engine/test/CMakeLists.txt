@@ -28,6 +28,11 @@ add_executable(helix_tests
     IntegrationPipelineTest.cpp
     EmitterTest.cpp
     RegistryMissTest.cpp
+    RecoverVariablesTest.cpp
+    BindReturnValuesTest.cpp
+    StructureControlFlowTest.cpp
+    ApplyDebugTypesTest.cpp
+    VectorLaneTest.cpp
 )
 
 target_include_directories(helix_tests PRIVATE

@@ -79,6 +79,7 @@ pub struct DecompileResult {
 }
 
 /// Pipeline metrics exposed to JavaScript.
+#[cfg(feature = "rust-pipeline")]
 #[napi(object)]
 pub struct PipelineMetricsResult {
     /// Total pipeline duration in milliseconds.
@@ -137,9 +138,10 @@ impl HelixEngine {
     /// Must be called before the first decompile call.
     #[napi]
     pub fn set_skip_optimization(&mut self, skip: bool) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_skip_optimization(skip);
         Ok(())
     }
@@ -150,9 +152,10 @@ impl HelixEngine {
     /// Must be called before the first decompile call.
     #[napi]
     pub fn set_use_cast_layer(&mut self, use_cast: bool) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_use_cast_layer(use_cast);
         Ok(())
     }
@@ -163,9 +166,10 @@ impl HelixEngine {
     /// Call before decompileIr(). Multiple renames accumulate.
     #[napi]
     pub fn add_variable_rename(&mut self, old_name: String, new_name: String) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.add_variable_rename(&old_name, &new_name);
         Ok(())
     }
@@ -174,9 +178,10 @@ impl HelixEngine {
     /// if the rename set changes.
     #[napi]
     pub fn clear_variable_renames(&mut self) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.clear_variable_renames();
         Ok(())
     }
@@ -193,10 +198,23 @@ impl HelixEngine {
     /// Replaces the full set on each call; pass the complete table.
     #[napi]
     pub fn set_function_starts(&mut self, starts: Vec<i64>) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_function_starts(&starts);
+        Ok(())
+    }
+
+    /// Provide versioned function signatures and nominal struct layouts from
+    /// DWARF/BTF/PDB. Pass an empty string to clear metadata between files.
+    #[napi]
+    pub fn set_debug_type_info_json(&mut self, json: String) -> Result<()> {
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
+        handle.set_debug_type_info_json(&json);
         Ok(())
     }
 
@@ -212,9 +230,10 @@ impl HelixEngine {
     /// section's virtual address + bytes here once per file.
     #[napi]
     pub fn add_data_section(&mut self, va_start: BigInt, bytes: Buffer) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         let (_signed, va, _lossless) = va_start.get_u64();
         handle.add_data_section(va, &bytes);
         Ok(())
@@ -223,9 +242,10 @@ impl HelixEngine {
     /// Drop every registered data section.  Call between binaries.
     #[napi]
     pub fn clear_data_sections(&mut self) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.clear_data_sections();
         Ok(())
     }
@@ -344,9 +364,7 @@ impl HelixEngine {
 
         // ── MLIR C++ pipeline (sole pipeline since v0.7) ──
         let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason(
-                "MLIR engine not initialized. Cannot decompile without C++ engine.",
-            )
+            Error::from_reason("MLIR engine not initialized. Cannot decompile without C++ engine.")
         })?;
 
         let source = handle
@@ -356,10 +374,7 @@ impl HelixEngine {
         // Retrieve the HAST FlatBuffer (runs pipeline a second time).
         // The C++ engine produces both pseudo-C and FlatBuffer in each run;
         // a future optimisation can add a combined C API to avoid the double run.
-        let ast_buffer = handle
-            .decompile_ir(&ir_text)
-            .ok()
-            .map(Buffer::from);
+        let ast_buffer = handle.decompile_ir(&ir_text).ok().map(Buffer::from);
 
         Ok(DecompileResult {
             source,

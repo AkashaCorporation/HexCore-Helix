@@ -44,6 +44,17 @@ std::unique_ptr<mlir::Pass> createRecoverCallingConventionPass();
 /// binary operation semantics, and pointer arithmetic patterns.
 std::unique_ptr<mlir::Pass> createPropagateTypesPass();
 
+/// Create the HelixHigh-only type propagation pass used after MidToHigh.
+///
+/// HelixHigh operations normally remain nested in a helix_low.func container,
+/// so this mode selects the body tier explicitly instead of using the
+/// container operation's dialect.
+std::unique_ptr<mlir::Pass> createPropagateTypesHighPass();
+
+/// Seed nominal function/parameter/call/field types from the versioned
+/// `helix.debug_type_info_json` module attribute (DWARF/BTF/PDB side channel).
+std::unique_ptr<mlir::Pass> createApplyDebugTypesPass();
+
 /// Create the control flow structuring pass.
 ///
 /// Transforms flat basic blocks with branches into structured control flow
@@ -59,6 +70,13 @@ std::unique_ptr<mlir::Pass> createStructureControlFlowPass(bool preserveCfg = fa
 /// conventions: register vars → lowercase, stack vars → var_<offset>,
 /// temporaries → v<N>.
 std::unique_ptr<mlir::Pass> createRecoverVariablesPass();
+
+/// Bind implicit machine-level returns to the unique recovered result
+/// variable when return-value recovery has produced unambiguous evidence.
+///
+/// Functions without a return value, without a canonical `result`, or with
+/// multiple result identities are left unchanged for the existing fallback.
+std::unique_ptr<mlir::Pass> createBindReturnValuesPass();
 
 /// Create the dead code elimination pass.
 ///

@@ -352,7 +352,10 @@ def HelixLow_RetOp : HelixLow_Op<"ret", [Terminator]> {
   }];
 }
 
-def HelixLow_JmpOp : HelixLow_Op<"jmp", [Terminator]> {
+def HelixLow_JmpOp : HelixLow_Op<"jmp", [
+    DeclareOpInterfaceMethods<BranchOpInterface, ["getSuccessorForOperands"]>,
+    Terminator
+  ]> {
   let summary = "Unconditional jump";
   let description = [{
     Unconditionally transfers control to the target block. Generated from
@@ -360,17 +363,23 @@ def HelixLow_JmpOp : HelixLow_Op<"jmp", [Terminator]> {
   }];
 
   let arguments = (ins
+    Variadic<AnyType>:$destOperands,
     OptionalAttr<UI64Attr>:$target_addr,
     OptionalAttr<UI64Attr>:$address
   );
   let successors = (successor AnySuccessor:$dest);
 
   let assemblyFormat = [{
-    $dest (`target` $target_addr^)? (`at` $address^)? attr-dict
+    $dest (`(` $destOperands^ `:` type($destOperands) `)`)?
+    (`target` $target_addr^)? (`at` $address^)? attr-dict
   }];
 }
 
-def HelixLow_JccOp : HelixLow_Op<"jcc", [Terminator]> {
+def HelixLow_JccOp : HelixLow_Op<"jcc", [
+    AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<BranchOpInterface, ["getSuccessorForOperands"]>,
+    Terminator
+  ]> {
   let summary = "Conditional jump based on flags";
   let description = [{
     Conditionally transfers control based on a flag condition. The `condition`
@@ -381,6 +390,8 @@ def HelixLow_JccOp : HelixLow_Op<"jcc", [Terminator]> {
   let arguments = (ins
     StrAttr:$condition,
     I1:$flag_value,
+    Variadic<AnyType>:$trueDestOperands,
+    Variadic<AnyType>:$falseDestOperands,
     OptionalAttr<UI64Attr>:$address
   );
   let successors = (successor
@@ -389,7 +400,9 @@ def HelixLow_JccOp : HelixLow_Op<"jcc", [Terminator]> {
   );
 
   let assemblyFormat = [{
-    $condition $flag_value `,` $trueDest `,` $falseDest
+    $condition $flag_value `,` $trueDest
+    (`(` $trueDestOperands^ `:` type($trueDestOperands) `)`)? `,` $falseDest
+    (`(` $falseDestOperands^ `:` type($falseDestOperands) `)`)?
     (`at` $address^)? attr-dict
   }];
 }

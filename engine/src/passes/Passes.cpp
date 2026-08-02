@@ -20,10 +20,16 @@ void registerHelixPasses() {
         return createPropagateTypesPass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createApplyDebugTypesPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createStructureControlFlowPass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createRecoverVariablesPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createBindReturnValuesPass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createEliminateDeadCodePass();

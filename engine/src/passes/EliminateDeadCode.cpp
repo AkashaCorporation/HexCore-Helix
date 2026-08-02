@@ -40,6 +40,7 @@
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
+#include "helix/utils/Debug.h"
 
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/IR/Builders.h"
@@ -573,14 +574,28 @@ static bool isLiveConsumer(Operation* op) {
            isa<helix::low::JmpOp>(op) ||
            isa<helix::high::IfOp>(op) ||
            // helix_high.switch consumes its SELECTOR as a control-flow input.
-           // Was missing: a switch whose selector is read ONLY at the switch had
-           // its selector var DCE'd as dead, leaving the switch reading a phantom
-           // (0) value and mis-dispatching.  Affects RVSDG exit-dispatchers and
-           // any RecoverSwitchTables jump table with a switch-only selector.
+           // It was missing here: the M1 scf-structurer bridge emits
+           // helix_high.switch for the RVSDG exit-dispatcher, whose synthetic
+           // selector (scf_r*) is read ONLY at the switch -- so without this the
+           // selector's reads are invisible to liveness, the selector var is DCE'd
+           // as dead, and the dispatcher ends up reading a phantom (=0) value,
+           // mis-guarding the dispatched continuation.
            isa<helix::high::SwitchOp>(op) ||
            isa<helix::high::WhileOp>(op) ||
            isa<helix::high::DoWhileOp>(op) ||
            isa<helix::high::ForOp>(op) ||
+           // helix_high.yield terminating a LOOP CONDITION region carries the
+           // loop-guard value (scf_w*) out of the do_while/while/for. Same class
+           // as the SwitchOp selector fix above: that value is read ONLY by this
+           // yield, so without it the guard-write is invisible to liveness -> the
+           // guard-write is DCE'd -> the loop condition collapses to a phantom 0
+           // (while(scf_w...) with scf=0). Gated to loop cond-regions so if/switch
+           // result-routing yields (handled by the selector passes) stay eligible
+           // for DCE and we don't bloat the output.
+           (isa<helix::high::YieldOp>(op) && op->getNumOperands() > 0 &&
+            (isa<helix::high::DoWhileOp>(op->getParentOp()) ||
+             isa<helix::high::WhileOp>(op->getParentOp()) ||
+             isa<helix::high::ForOp>(op->getParentOp()))) ||
            isa<helix::low::CallOp>(op) ||
            isa<helix::low::VariadicCallOp>(op) ||
            isa<helix::high::CallOp>(op) ||
@@ -660,6 +675,13 @@ static bool isValueLive(Value value,
                 // SSA-aware path: look up all refs for the target variable.
                 if (auto targetRef = assignOp.getTarget()
                         .getDefiningOp<helix::high::VarRefOp>()) {
+                    // `result` is consumed implicitly by CAstBuilder's
+                    // synthesized return statement. There is no SSA read
+                    // for that consumer, so every value chain reaching the
+                    // preserved result assignment is live by definition.
+                    if (targetRef.getVarName() == "result")
+                        return true;
+
                     uint32_t targetVarId = targetRef.getVarId();
                     auto it = refMap->find(targetVarId);
                     if (it != refMap->end()) {
@@ -1071,8 +1093,7 @@ private:
         if (funcBody.empty())
             return success();
 
-        // [P0-DEBUG] Count CallOps entering DCE
-        {
+        if (helix::pipelineDebugEnabled()) {
             unsigned callCount = 0;
             funcBody.walk([&](helix::low::CallOp) { ++callCount; });
             if (callCount > 0) {
@@ -1213,8 +1234,7 @@ private:
                                     deadUndefRemoved)
                                 << "\n");
 
-        // [P0-DEBUG] Count CallOps surviving DCE
-        {
+        if (helix::pipelineDebugEnabled()) {
             unsigned callCount = 0;
             funcBody.walk([&](helix::low::CallOp) { ++callCount; });
             llvm::errs() << "[P0-DEBUG] DCE exit '" << func.getSymName()
@@ -1273,8 +1293,8 @@ private:
             });
 
             for (Operation* op : toErase) {
-                // [P0-DEBUG] Catch any call-like op being erased by infra removal
-                if (isa<helix::low::CallOp, helix::low::VariadicCallOp>(op)) {
+                if (helix::pipelineDebugEnabled() &&
+                    isa<helix::low::CallOp, helix::low::VariadicCallOp>(op)) {
                     llvm::errs() << "[P0-DEBUG] WARNING: Phase 0 erasing a CallOp! "
                                  << *op << "\n";
                 }

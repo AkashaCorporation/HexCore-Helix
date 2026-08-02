@@ -17,6 +17,7 @@
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/dialects/HelixLowOps.h"
+#include "helix/utils/Debug.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -861,8 +862,10 @@ struct HelixMidToHighPass
                         highCall->setAttr(name, namedAttr.getValue());
                 }
 
-                llvm::errs() << "[P0-DEBUG] Manual MidCall→HighCall: "
-                             << callee_name << "\n";
+                if (helix::pipelineDebugEnabled()) {
+                    llvm::errs() << "[P0-DEBUG] Manual MidCall→HighCall: "
+                                 << callee_name << "\n";
+                }
 
                 // When the mid.call produced a return value (RAX), forward
                 // uses of its result onto high.call's result before erasing.
@@ -876,7 +879,7 @@ struct HelixMidToHighPass
                 ++converted;
             }
 
-            if (converted > 0) {
+            if (converted > 0 && helix::pipelineDebugEnabled()) {
                 llvm::errs() << "[P0-DEBUG] HelixMidToHigh: manually converted "
                              << converted << " mid.call → high.call\n";
             }

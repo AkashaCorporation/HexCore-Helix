@@ -131,6 +131,11 @@ private:
     /// Build an expression AST node from an MLIR Value.
     ExprPtr buildExpression(mlir::Value val);
 
+    /// Recover a debug-proven unit-stride struct array element from an
+    /// annotated address expression. Returns null when the address is not the
+    /// exact `base + index + fieldOffset` shape.
+    ExprPtr buildDebugIndexedField(mlir::Value address);
+
     // ── Filtering ───────────────────────────────────────────────────────
 
     /// Return true if this operation should be skipped during AST building.
@@ -326,6 +331,13 @@ private:
     /// honest indirect call).  Reserved for the D4 score-gate hook (next
     /// increment): a function carrying a damning honesty defect caps at 50%.
     bool hasDamningHonestyDefect_ = false;
+
+    /// FIX-112 (L1): count of out-of-table indirect calls rendered as the HONEST
+    /// `(*(code*)0xADDR)()` form because the callee was not in the authoritative
+    /// function table.  That form is FAITHFUL (we just couldn't name a sibling
+    /// callee), so it must NOT trip the 50% damning cap -- it feeds a graded
+    /// readability penalty instead.  Function-scoped; transferred to the decl.
+    int outOfTableCalls_ = 0;
 };
 
 } // namespace helix::cast

@@ -63,11 +63,14 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Debug.h"
 
 #include <format>
 #include <map>
 #include <optional>
 #include <string>
+
+#define DEBUG_TYPE "propagate-types"
 
 using namespace mlir;
 using namespace helix;
@@ -203,6 +206,21 @@ struct CTypeInfo {
                 pointee = other.pointee;
                 return true;
             }
+            // Debug-derived nominal structs are stronger evidence than the
+            // synthetic auto_struct_N names created by structural recovery.
+            // Never replace one nominal type with another: that ambiguity
+            // must remain conservative.
+            if (pointee && other.pointee &&
+                pointee->kind == Struct && other.pointee->kind == Struct) {
+                bool currentSynthetic = llvm::StringRef(pointee->struct_name)
+                    .starts_with("auto_struct_");
+                bool otherSynthetic = llvm::StringRef(other.pointee->struct_name)
+                    .starts_with("auto_struct_");
+                if (currentSynthetic && !otherSynthetic) {
+                    pointee = other.pointee;
+                    return true;
+                }
+            }
         }
 
         return changed;
@@ -252,6 +270,13 @@ struct CTypeInfo {
         t.bit_width = 64;
         if (pointeeType.isResolved())
             t.pointee = std::make_shared<CTypeInfo>(std::move(pointeeType));
+        return t;
+    }
+
+    static CTypeInfo makeStruct(llvm::StringRef name) {
+        CTypeInfo t;
+        t.kind = Struct;
+        t.struct_name = name.str();
         return t;
     }
 
@@ -589,6 +614,8 @@ struct PropagateTypesPass
         return "Iteratively propagate and infer C types from usage patterns";
     }
 
+    bool highOnly_ = false;
+
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
         registry.insert<helix::high::HelixHighDialect>();
@@ -596,25 +623,52 @@ struct PropagateTypesPass
 
     /// Convert a SignatureDb return type string to a CTypeInfo.
     static CTypeInfo typeFromSignatureStr(llvm::StringRef typeStr) {
+        typeStr = typeStr.trim();
+        for (llvm::StringRef qualifier : {"const ", "volatile ", "restrict "})
+            typeStr.consume_front(qualifier);
+        typeStr = typeStr.trim();
+
+        if (typeStr.ends_with("*")) {
+            llvm::StringRef pointee = typeStr.drop_back().rtrim();
+            for (llvm::StringRef qualifier : {"const ", "volatile ", "restrict "})
+                pointee.consume_front(qualifier);
+            pointee = pointee.trim();
+            if (pointee.consume_front("struct "))
+                return CTypeInfo::makePointer(CTypeInfo::makeStruct(pointee));
+            if (pointee == "void")
+                return CTypeInfo::makePointer();
+            CTypeInfo scalar = typeFromSignatureStr(pointee);
+            return scalar.isResolved()
+                ? CTypeInfo::makePointer(scalar)
+                : CTypeInfo::makePointer();
+        }
+        if (typeStr.consume_front("struct "))
+            return CTypeInfo::makeStruct(typeStr);
         if (typeStr == "void")
             return CTypeInfo::makeVoid();
         if (typeStr == "ptr" || typeStr == "void*")
             return CTypeInfo::makePointer();
-        if (typeStr == "int8")
+        if (typeStr == "int8" || typeStr == "int8_t" || typeStr == "char" ||
+            typeStr == "signed char")
             return CTypeInfo::makeInt(8, /*signed=*/true);
-        if (typeStr == "uint8")
+        if (typeStr == "uint8" || typeStr == "uint8_t" ||
+            typeStr == "unsigned char" || typeStr == "u8")
             return CTypeInfo::makeInt(8, /*signed=*/false);
-        if (typeStr == "int16")
+        if (typeStr == "int16" || typeStr == "int16_t" || typeStr == "short")
             return CTypeInfo::makeInt(16, /*signed=*/true);
-        if (typeStr == "uint16")
+        if (typeStr == "uint16" || typeStr == "uint16_t" ||
+            typeStr == "unsigned short" || typeStr == "u16")
             return CTypeInfo::makeInt(16, /*signed=*/false);
-        if (typeStr == "int32")
+        if (typeStr == "int32" || typeStr == "int32_t" || typeStr == "int")
             return CTypeInfo::makeInt(32, /*signed=*/true);
-        if (typeStr == "uint32")
+        if (typeStr == "uint32" || typeStr == "uint32_t" ||
+            typeStr == "unsigned int" || typeStr == "u32")
             return CTypeInfo::makeInt(32, /*signed=*/false);
-        if (typeStr == "int64")
+        if (typeStr == "int64" || typeStr == "int64_t" || typeStr == "long" ||
+            typeStr == "long int")
             return CTypeInfo::makeInt(64, /*signed=*/true);
-        if (typeStr == "uint64")
+        if (typeStr == "uint64" || typeStr == "uint64_t" || typeStr == "u64" ||
+            typeStr == "unsigned long" || typeStr == "long unsigned int")
             return CTypeInfo::makeInt(64, /*signed=*/false);
         if (typeStr == "bool")
             return CTypeInfo::makeBool();
@@ -631,11 +685,20 @@ struct PropagateTypesPass
 
     void runOnOperation() override {
         auto module = getOperation();
+        if (!highOnly_) {
+            module.walk([&](helix::low::FuncOp func) {
+                propagateTypesLow(func);
+            });
+            return;
+        }
+
+        // The pipeline retains low::FuncOp as its function container after
+        // MidToHigh. Walk High operations through that container explicitly.
         module.walk([&](helix::low::FuncOp func) {
-            propagateTypesLow(func);
+            propagateTypesHigh(func);
         });
 
-        // Propagate types in HelixHigh functions.
+        // Also support standalone High IR supplied directly by API clients.
         module.walk([&](helix::high::FuncOp func) {
             propagateTypesHigh(func);
         });
@@ -1969,9 +2032,19 @@ private:
         }
 
         // Store the resolved types as attributes on the operations.
+        // FIX (non-determinism): typeEnv is a DenseMap<Value,...>, iterated in
+        // POINTER-ADDRESS order, which varies per decompile (each call allocates
+        // ops at fresh addresses). Multiple results of one op (a helix.low.BinOp's
+        // value + its carry/zero/sign flags) share ONE defining op, so writing
+        // inferred_type per Value made the last-write "winner" non-deterministic
+        // (the observed inferred_type=bool vs int64 flip). Choose a deterministic
+        // winner per op -- the resolved result with the LOWEST result number (the
+        // op's primary value) -- and write once per op. Inter-op write order is
+        // irrelevant since each entry targets a distinct op.
         unsigned numTypesSet = 0;
         unsigned numBlockArgs = 0;
         unsigned numPtrTypes = 0;
+        llvm::DenseMap<Operation*, std::pair<unsigned, CTypeInfo>> chosenType;
         for (auto& [val, typeInfo] : typeEnv) {
             if (!typeInfo.isResolved())
                 continue;
@@ -1982,15 +2055,23 @@ private:
                 continue;
             }
 
-            // Encode the type as a string attribute
-            std::string typeStr = typeInfo.toCTypeString();
+            unsigned rn = 0;
+            if (auto res = mlir::dyn_cast<mlir::OpResult>(val))
+                rn = res.getResultNumber();
+            auto it = chosenType.find(defOp);
+            if (it == chosenType.end())
+                chosenType.insert({defOp, {rn, typeInfo}});
+            else if (rn < it->second.first)
+                it->second = {rn, typeInfo};
+        }
+        for (auto& [defOp, rt] : chosenType) {
+            std::string typeStr = rt.second.toCTypeString();
             if (typeStr.empty())
                 continue;
-
             defOp->setAttr("inferred_type",
                 StringAttr::get(defOp->getContext(), typeStr));
             ++numTypesSet;
-            if (typeInfo.kind == CTypeInfo::Pointer)
+            if (rt.second.kind == CTypeInfo::Pointer)
                 ++numPtrTypes;
         }
         LLVM_DEBUG(llvm::dbgs()
@@ -2001,11 +2082,45 @@ private:
     /// Propagate types through HelixHigh operations (var.decl, assign, call).
     /// This handles the higher-level IR after stack recovery and variable
     /// recovery have introduced typed variable declarations and assignments.
-    void propagateTypesHigh(helix::high::FuncOp func) {
+    template <typename FuncOpT>
+    void propagateTypesHigh(FuncOpT func) {
         // VarTypes: maps variable IDs to their inferred C type.
         VarTypeMap varTypes;
         // TypeEnv: maps SSA Values to their inferred C type.
         llvm::DenseMap<Value, CTypeInfo> typeEnv;
+
+        // A recovered variable can still represent several machine-register
+        // definitions. Authoritative nominal types (DWARF/BTF/PDB struct
+        // pointers) may cross a direct copy only when the destination is a
+        // single-definition local. Otherwise one debug-typed parameter can
+        // contaminate every later value held in the same physical register.
+        llvm::DenseMap<uint32_t, unsigned> assignmentCounts;
+        llvm::DenseMap<uint32_t, helix::high::StorageKind> storageKinds;
+        func.walk([&](helix::high::VarDeclOp decl) {
+            storageKinds[decl.getVarId()] = decl.getStorage();
+        });
+        func.walk([&](helix::high::AssignOp assign) {
+            auto target = assign.getTarget()
+                .template getDefiningOp<helix::high::VarRefOp>();
+            if (target)
+                ++assignmentCounts[target.getVarId()];
+        });
+        auto isAuthoritativeNominalPointer = [](const CTypeInfo& type) {
+            return type.kind == CTypeInfo::Pointer && type.pointee &&
+                   type.pointee->kind == CTypeInfo::Struct &&
+                   !llvm::StringRef(type.pointee->struct_name)
+                        .starts_with("auto_struct_");
+        };
+        auto canCarryAssignedType = [&](uint32_t varId,
+                                        const CTypeInfo& type) {
+            if (!isAuthoritativeNominalPointer(type))
+                return true;
+            auto storage = storageKinds.find(varId);
+            if (storage == storageKinds.end() ||
+                storage->second == helix::high::StorageKind::Parameter)
+                return false;
+            return assignmentCounts.lookup(varId) == 1;
+        };
 
         // ─── Type-lock pre-scan (HelixHigh) ─────────────────────────────────
         //
@@ -2131,24 +2246,34 @@ private:
 
                     auto valueType = typeEnv[value];
                     auto targetType = typeEnv[target];
+                    auto targetRef =
+                        target.getDefiningOp<helix::high::VarRefOp>();
+                    const bool targetAcceptsValue =
+                        !targetRef ||
+                        canCarryAssignedType(targetRef.getVarId(), valueType);
 
                     // Forward: value type → target
                     if (valueType.isResolved() && !targetType.isResolved() &&
+                            targetAcceptsValue &&
                             !isTypeLocked(target, lockedValues)) {
                         if (typeEnv[target].mergeFrom(valueType))
                             changed = true;
                     }
                     // Backward: target type → value
                     if (targetType.isResolved() && !valueType.isResolved() &&
+                            (!targetRef ||
+                             canCarryAssignedType(targetRef.getVarId(),
+                                                  targetType)) &&
                             !isTypeLocked(value, lockedValues)) {
                         if (typeEnv[value].mergeFrom(targetType))
                             changed = true;
                     }
 
                     // Also propagate to/from the variable type map via var.ref
-                    if (auto varRef = target.getDefiningOp<helix::high::VarRefOp>()) {
+                    if (auto varRef = targetRef) {
                         uint32_t varId = varRef.getVarId();
                         if (valueType.isResolved() &&
+                                canCarryAssignedType(varId, valueType) &&
                                 !lockedVarIds.count(varId)) {
                             if (varTypes[varId].mergeFrom(valueType))
                                 changed = true;
@@ -2156,6 +2281,7 @@ private:
                         // Backward: variable type → value
                         auto varType = varTypes[varId];
                         if (varType.isResolved() &&
+                                canCarryAssignedType(varId, varType) &&
                                 !isTypeLocked(value, lockedValues)) {
                             if (typeEnv[value].mergeFrom(varType))
                                 changed = true;
@@ -2794,6 +2920,7 @@ private:
                         uint32_t varId = varRef.getVarId();
                         auto varType = varTypes[varId];
                         if (varType.isResolved() &&
+                                canCarryAssignedType(varId, varType) &&
                                 !isTypeLocked(value, lockedValues)) {
                             if (typeEnv[value].mergeFrom(varType))
                                 changed = true;
@@ -2803,12 +2930,21 @@ private:
                     // If the assigned value type is known, propagate to target.
                     auto valueType = typeEnv[value];
                     auto targetType = typeEnv[target];
+                    auto targetRef =
+                        target.getDefiningOp<helix::high::VarRefOp>();
+                    const bool targetAcceptsValue =
+                        !targetRef ||
+                        canCarryAssignedType(targetRef.getVarId(), valueType);
                     if (valueType.isResolved() && !targetType.isResolved() &&
+                            targetAcceptsValue &&
                             !isTypeLocked(target, lockedValues)) {
                         if (typeEnv[target].mergeFrom(valueType))
                             changed = true;
                     }
                     if (targetType.isResolved() && !valueType.isResolved() &&
+                            (!targetRef ||
+                             canCarryAssignedType(targetRef.getVarId(),
+                                                  targetType)) &&
                             !isTypeLocked(value, lockedValues)) {
                         if (typeEnv[value].mergeFrom(targetType))
                             changed = true;
@@ -2986,6 +3122,10 @@ private:
         }
 
         // Store resolved types on SSA value defining ops.
+        // FIX (non-determinism): same DenseMap<Value,...> pointer-order hazard as
+        // the low path -- a deterministic winner (lowest result number) per
+        // defining op, written once.
+        llvm::DenseMap<Operation*, std::pair<unsigned, std::string>> chosenHigh;
         for (auto& [val, typeInfo] : typeEnv) {
             if (!typeInfo.isResolved())
                 continue;
@@ -2998,9 +3138,18 @@ private:
             if (typeStr.empty())
                 continue;
 
-            defOp->setAttr("inferred_type",
-                StringAttr::get(defOp->getContext(), typeStr));
+            unsigned rn = 0;
+            if (auto res = mlir::dyn_cast<mlir::OpResult>(val))
+                rn = res.getResultNumber();
+            auto it = chosenHigh.find(defOp);
+            if (it == chosenHigh.end())
+                chosenHigh.insert({defOp, {rn, typeStr}});
+            else if (rn < it->second.first)
+                it->second = {rn, typeStr};
         }
+        for (auto& [defOp, rt] : chosenHigh)
+            defOp->setAttr("inferred_type",
+                StringAttr::get(defOp->getContext(), rt.second));
     }
 };
 
@@ -3008,4 +3157,10 @@ private:
 
 std::unique_ptr<mlir::Pass> helix::createPropagateTypesPass() {
     return std::make_unique<PropagateTypesPass>();
+}
+
+std::unique_ptr<mlir::Pass> helix::createPropagateTypesHighPass() {
+    auto pass = std::make_unique<PropagateTypesPass>();
+    pass->highOnly_ = true;
+    return pass;
 }

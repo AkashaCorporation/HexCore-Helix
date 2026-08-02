@@ -34,6 +34,9 @@ enum class RemillSemantic {
     // Control flow
     CALL, RET, JMP, JZ, JNZ, JB, JNB, JBE, JNBE, JL, JNL, JLE, JNLE,
     JS, JNS, JO, JNO, JP, JNP,
+    // AArch64 compare-and-branch (CBZ/CBNZ: Rn vs 0) + test-bit-and-branch
+    // (TBZ/TBNZ: bit #imm of Rt vs 0). No flags; operands are direct.
+    CBZ, CBNZ, TBZ, TBNZ,
     // Bit manipulation
     BSF, BSR, BSWAP, BT, BTS, BTR, BTC,
     // String operations

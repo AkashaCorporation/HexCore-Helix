@@ -42,6 +42,11 @@ public:
     void recoverStructFieldAccess(CFuncDecl& func);
     void canonicalizeXorPatterns(CFuncDecl& func);
     void eliminateConstantBranches(CFuncDecl& func);
+    /// Fold nested SCF arms that yield the exact same synthetic tuple:
+    /// `if (A) { S } else if (B) { S } else { T }` becomes
+    /// `if (A || B) { S } else { T }`. The logical OR preserves the original
+    /// short-circuit evaluation of B.
+    void foldIdenticalNestedSCFArms(CFuncDecl& func);
     void removeEmptyIfStatements(CFuncDecl& func);
     void eliminateNullPtrStores(CFuncDecl& func);
     void cleanupFloatZeros(CFuncDecl& func);
@@ -89,12 +94,65 @@ public:
     /// Remove pure stores to variables that are NEVER read anywhere in the
     /// function (globally dead).  The existing dseStmtList only eliminates
     /// TOP-LEVEL dead stores (it treats nested if/switch scopes conservatively
-    /// as all-live), so dead stores buried in a deeply-nested structured form
-    /// survive -- e.g. `var_0 = 0xADDR` PC-tracking shadow stores (var_0 written
-    /// 12x, read 0x).  A whole-function read-set makes removal unconditionally
-    /// sound: if a name is never read, every pure (call-free) store to it is dead
-    /// regardless of scope.
+    /// as all-live), so dead stores buried in the deeply-nested structured form
+    /// the scf-structurer produces survive -- e.g. the `var_0 = 0xADDR`
+    /// PC-tracking shadow stores (var_0 is written 12x, read 0x).  A whole-
+    /// function read-set makes removal unconditionally sound: if a name is never
+    /// read, every pure (call-free) store to it is dead regardless of scope.
     void removeGloballyDeadStores(CFuncDecl& func);
+
+    /// M4 (SAILR-grounded): dissolve the RVSDG exit-dispatcher noise the v1.0
+    /// scf-structurer emits.  transformCFGToSCF lowers multi-exit continuations
+    /// as a synthetic i32 selector (scf_r<id>, id>=900000) set per region arm and
+    /// consumed by a single-/two-case `switch(selector)`.  SAILR "Reverting Switch
+    /// Lowering" + DREAM condition-aware refinement: such a switch over a
+    /// var-vs-constant IS an if/else.  Collapse them to if/else chains; the
+    /// existing copy-prop + DCE then clear the now-exposed selector copy chains.
+    /// Gated on the scf_r* synthetic name + <=2 real cases so real jump tables are
+    /// never touched.
+    void dissolveExitDispatchers(CFuncDecl& func);
+
+    /// M4 P2 (DREAM++ congruence coalescing): collapse the scf_r* selector
+    /// ROUTING chains.  After dissolveExitDispatchers the dispatcher is an
+    /// `if (scf_rK)` but the selector value is still routed up through a tree of
+    /// pure copies (`scf_rB = scf_rA; scf_rC = scf_rB; ...`). A copy edge is
+    /// coalesced only when the source routes to exactly one destination and
+    /// structured backward liveness proves that their live ranges do not
+    /// interfere. Loop back-edges are solved to a fixed point and gotos seed all
+    /// selectors live conservatively. The complete union-find classes are also
+    /// checked for transitive interference. Accepted copies become `rep = rep`
+    /// self-assigns that the existing cleanup then erases.
+    void coalesceSelectorChains(CFuncDecl& func);
+
+    /// M4 P5 (selector DCE): after P3/P4 dissolve every `switch(scf_r)` into an
+    /// if/else-if chain, the synthetic selector survives only as `if (scf_rK==c)`
+    /// reads plus a forest of `scf_rK = const` writes.  The vast majority of those
+    /// writes are DEAD: an RVSDG arm sets the selector on the way out, but most
+    /// continuations re-test/overwrite it before any read (e.g. `scf_r = 0;
+    /// scf_r = 1;` or a value never reached by any later if-condition).  The
+    /// CAstBuilder-level guards (precomputeDeadStores / dseStmtList) refuse to DSE
+    /// ANY scf_* var unconditionally -- that guard existed to protect the selector
+    /// while it was consumed by a `switch`, and the flat backward scan there
+    /// under-counts liveness across structured scopes.  This pass replaces that
+    /// blunt guard with a PROPER recursive backward liveness restricted to scf_r*
+    /// region-result storage. These variables may carry pointer values, but the
+    /// synthetic storage identity itself is never address-taken, aliased, or read
+    /// implicitly by a call. A `scf_rK = const` is erased when scf_rK is not live
+    /// on the join after it. This is the line-count lever --
+    /// the dead selector writes are ~36% of the dispatcher-heavy functions.  Runs
+    /// AFTER dissolveExitDispatchers so the switch is already an if-chain (no
+    /// switch selector to keep artificially live).  Loops and goto/label scopes
+    /// are handled conservatively (every selector kept live across them).
+    void eliminateDeadSelectorStores(CFuncDecl& func);
+
+    // ── Public expression utilities (used by free-function AST helpers) ───────
+
+    /// Collect all CVarRefExpr names from an expression into the given set.
+    static void collectVarRefs(const CExpr* expr,
+                               std::unordered_set<std::string>& names);
+
+    /// Returns true if the expression contains a CCallExpr (has side effects).
+    static bool exprHasCall(const CExpr* expr);
 
     /// Apply user-defined variable renames to the entire AST.
     /// Walks all CVarRefExpr nodes and VarDecl names, replacing
@@ -129,13 +187,6 @@ private:
     void filterStatements(std::vector<StmtPtr>& stmts);
 
     // ── Dead store helpers ───────────────────────────────────────────────────
-
-    /// Collect all CVarRefExpr names from an expression into the given set.
-    static void collectVarRefs(const CExpr* expr,
-                               std::unordered_set<std::string>& names);
-
-    /// Returns true if the expression contains a CCallExpr (has side effects).
-    static bool exprHasCall(const CExpr* expr);
 
     /// Returns true if the assign target should never be eliminated
     /// (pointer dereference, field access).
@@ -229,6 +280,9 @@ private:
 
     // ── Constant branch elimination helpers ──────────────────────────────
     static void eliminateConstBranchesInList(std::vector<StmtPtr>& stmts);
+
+    // ── M4 exit-dispatcher deopt helpers ──────────────────────────────────
+    static bool dissolveDispatchersInList(std::vector<StmtPtr>& stmts);
 
     // ── Empty if-statement removal helpers ────────────────────────────
     static void removeEmptyIfsInList(std::vector<StmtPtr>& stmts);

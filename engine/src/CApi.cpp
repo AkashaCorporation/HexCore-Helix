@@ -157,6 +157,14 @@ void helix_engine_set_function_starts(HelixEngineHandle* handle,
     }
 }
 
+void helix_engine_set_debug_type_info_json(HelixEngineHandle* handle,
+                                           const char* json,
+                                           size_t len) {
+    if (handle) {
+        to_engine(handle)->setDebugTypeInfoJson(json, len);
+    }
+}
+
 void helix_engine_add_data_section(HelixEngineHandle* handle,
                                     uint64_t va_start,
                                     const uint8_t* bytes,

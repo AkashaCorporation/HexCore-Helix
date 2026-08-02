@@ -222,6 +222,11 @@ using FBB = flatbuffers::FlatBufferBuilder;
 using TableOff = flatbuffers::Offset<flatbuffers::Table>;
 using StringOff = flatbuffers::Offset<flatbuffers::String>;
 
+static void appendIfPresent(std::vector<TableOff>& offsets, TableOff offset) {
+    if (!offset.IsNull())
+        offsets.push_back(offset);
+}
+
 // ── Enum mappings ──────────────────────────────────────────────────────────
 
 static uint8_t typeKindToFB(cast::TypeKind k) {
@@ -458,25 +463,25 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
         auto* bin = static_cast<const cast::CBinaryExpr*>(expr);
         // Children first (recursion happens before StartTable)
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, bin->lhs.get()));
-        ch.push_back(emitExpression(fbb, bin->rhs.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, bin->lhs.get()));
+        appendIfPresent(ch, emitExpression(fbb, bin->rhs.get()));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         opStr = fbb.CreateString(binaryOpStr(bin->op));
         break;
     }
     case cast::NodeKind::UnaryExpr: {
         auto* un = static_cast<const cast::CUnaryExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, un->operand.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, un->operand.get()));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         opStr = fbb.CreateString(unaryOpStr(un->op));
         break;
     }
     case cast::NodeKind::CastExpr: {
         auto* ce = static_cast<const cast::CCastExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, ce->operand.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, ce->operand.get()));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         castType = emitDataType(fbb, ce->targetType.get());
         break;
     }
@@ -484,7 +489,7 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
         auto* call = static_cast<const cast::CCallExpr*>(expr);
         std::vector<TableOff> ch;
         for (auto& arg : call->args)
-            ch.push_back(emitExpression(fbb, arg.get()));
+            appendIfPresent(ch, emitExpression(fbb, arg.get()));
         if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         strVal = fbb.CreateString(call->targetName);
         break;
@@ -492,25 +497,25 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
     case cast::NodeKind::TernaryExpr: {
         auto* te = static_cast<const cast::CTernaryExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, te->cond.get()));
-        ch.push_back(emitExpression(fbb, te->trueVal.get()));
-        ch.push_back(emitExpression(fbb, te->falseVal.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, te->cond.get()));
+        appendIfPresent(ch, emitExpression(fbb, te->trueVal.get()));
+        appendIfPresent(ch, emitExpression(fbb, te->falseVal.get()));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         break;
     }
     case cast::NodeKind::SubscriptExpr: {
         auto* sub = static_cast<const cast::CSubscriptExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, sub->base.get()));
-        ch.push_back(emitExpression(fbb, sub->index.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, sub->base.get()));
+        appendIfPresent(ch, emitExpression(fbb, sub->index.get()));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         break;
     }
     case cast::NodeKind::FieldAccessExpr: {
         auto* fa = static_cast<const cast::CFieldAccessExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, fa->base.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, fa->base.get()));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         strVal = fbb.CreateString(fa->fieldName);
         // Override kind: Member (9) or DerefMember (10)
         kind = fa->isPointer ? uint8_t(10) : uint8_t(9);
@@ -583,9 +588,9 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::AssignStmt: {
         auto* a = static_cast<const cast::CAssignStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, a->target.get()));
-        exprs.push_back(emitExpression(fbb, a->value.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs, emitExpression(fbb, a->target.get()));
+        appendIfPresent(exprs, emitExpression(fbb, a->value.get()));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         if (!a->compoundOp.empty())
             text = fbb.CreateString(a->compoundOp);
         break;
@@ -594,8 +599,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::ExprStmt: {
         auto* e = static_cast<const cast::CExprStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, e->expr.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs, emitExpression(fbb, e->expr.get()));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         break;
     }
 
@@ -613,8 +618,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         auto* ifs = static_cast<const cast::CIfStmt*>(stmt);
         // expressions[0] = condition
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, ifs->condition.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs, emitExpression(fbb, ifs->condition.get()));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         // children = then_body ++ else_body
         auto thenOffs = emitStmtList(fbb, ifs->thenBody);
         auto elseOffs = emitStmtList(fbb, ifs->elseBody);
@@ -630,8 +635,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::WhileStmt: {
         auto* w = static_cast<const cast::CWhileStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, w->condition.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs, emitExpression(fbb, w->condition.get()));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         auto bodyOffs = emitStmtList(fbb, w->body);
         if (!bodyOffs.empty()) childrenVec = fbb.CreateVector(bodyOffs);
         break;
@@ -640,8 +645,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::DoWhileStmt: {
         auto* dw = static_cast<const cast::CDoWhileStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, dw->condition.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs, emitExpression(fbb, dw->condition.get()));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         auto bodyOffs = emitStmtList(fbb, dw->body);
         if (!bodyOffs.empty()) childrenVec = fbb.CreateVector(bodyOffs);
         break;
@@ -659,8 +664,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         std::vector<TableOff> ch;
         bool hasInit = f->init != nullptr;
         bool hasStep = f->step != nullptr;
-        if (hasInit) ch.push_back(emitStatement(fbb, f->init.get()));
-        if (hasStep) ch.push_back(emitStatement(fbb, f->step.get()));
+        if (hasInit) appendIfPresent(ch, emitStatement(fbb, f->init.get()));
+        if (hasStep) appendIfPresent(ch, emitStatement(fbb, f->step.get()));
         auto bodyOffs = emitStmtList(fbb, f->body);
         ch.insert(ch.end(), bodyOffs.begin(), bodyOffs.end());
         if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
@@ -674,8 +679,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         auto* sw = static_cast<const cast::CSwitchStmt*>(stmt);
         // expressions = [selector]
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, sw->selector.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs, emitExpression(fbb, sw->selector.get()));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         // cases = [SwitchCase, ...]
         std::vector<TableOff> caseOffs;
         for (auto& sc : sw->cases) {

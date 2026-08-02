@@ -13,11 +13,15 @@ fn main() {
     // ─── Paths ─────────────────────────────────────────────────────────
     // Try to find pre-built engine lib in deps first (CI), then local build
     let engine_lib_search_paths = [
-        project_root.join("engine").join("deps").join("llvm-mlir").join("engine"),
+        project_root
+            .join("engine")
+            .join("deps")
+            .join("llvm-mlir")
+            .join("engine"),
         project_root.join("engine").join("build").join("Release"),
         project_root.join("engine").join("build"),
     ];
-    
+
     let engine_build_dir = engine_lib_search_paths
         .iter()
         .find(|p| {
@@ -63,7 +67,10 @@ fn main() {
         );
     }
 
-    println!("cargo:warning=Using LLVM libs from: {}", llvm_lib_dir.display());
+    println!(
+        "cargo:warning=Using LLVM libs from: {}",
+        llvm_lib_dir.display()
+    );
 
     // ─── Link the Helix engine static library ──────────────────────────
     println!(
@@ -262,7 +269,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LLVM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_BUILD_DIR");
-    
+
     let engine_lib_name = if cfg!(target_os = "windows") {
         "helix_engine.lib"
     } else {

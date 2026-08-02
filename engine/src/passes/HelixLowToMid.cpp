@@ -18,6 +18,7 @@
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
+#include "helix/utils/Debug.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -207,12 +208,12 @@ tryDecomposeAddrAsField(Value addr) {
     auto rhs = addOp.getRhs();
     if (!lhs || !rhs) return std::nullopt;
 
-    auto extractConst = [](Value v) -> std::optional<uint64_t> {
+    auto extractConst = [](Value v) -> std::optional<int64_t> {
         auto cst = v.getDefiningOp<LLVM::ConstantOp>();
         if (!cst) return std::nullopt;
         auto intAttr = dyn_cast<IntegerAttr>(cst.getValue());
         if (!intAttr) return std::nullopt;
-        return intAttr.getValue().getZExtValue();
+        return intAttr.getValue().getSExtValue();
     };
 
     auto lhsConst = extractConst(lhs);
@@ -220,14 +221,27 @@ tryDecomposeAddrAsField(Value addr) {
 
     // Refuse if both operands are constants (fully-foldable; no provenance).
     if (lhsConst && rhsConst) return std::nullopt;
-    // Refuse zero-offset — not a real field, just a pointer alias.
-    if (rhsConst && *rhsConst == 0) return std::nullopt;
-    if (lhsConst && *lhsConst == 0) return std::nullopt;
+    // Only positive displacements can be inferred as forward struct fields.
+    // Negative displacements are common for stack/container arithmetic.  The
+    // old ZExt read turned -80 into 0xffffffffffffffb0 and printed it as an
+    // enormous field offset.
+    if (rhsConst && *rhsConst <= 0) return std::nullopt;
+    if (lhsConst && *lhsConst <= 0) return std::nullopt;
+
+    // Keep this recognizer scoped to a direct base plus a constant.  An outer
+    // Add whose non-constant side is itself address arithmetic commonly means
+    // `image_base + index * stride + displacement`, not a struct field.
+    // Classifying that shape as FieldPtr fabricated forms such as
+    // `(image_base + (i << 3))->field_0x18b30`.
+    if (rhsConst && lhs.getDefiningOp<LLVM::AddOp>())
+        return std::nullopt;
+    if (lhsConst && rhs.getDefiningOp<LLVM::AddOp>())
+        return std::nullopt;
 
     if (rhsConst)
-        return AddrFieldDecomposition{lhs, *rhsConst};
+        return AddrFieldDecomposition{lhs, static_cast<uint64_t>(*rhsConst)};
     if (lhsConst)
-        return AddrFieldDecomposition{rhs, *lhsConst};
+        return AddrFieldDecomposition{rhs, static_cast<uint64_t>(*lhsConst)};
     return std::nullopt;
 }
 
@@ -497,16 +511,18 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
         low::CallOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
-        llvm::errs() << "[P0-DEBUG] CallToMidCall: attempting conversion for CallOp"
-                     << " target=" << (op.getTargetNameAttr() ? op.getTargetNameAttr().getValue() : "none")
-                     << " nArgs=" << op.getArgs().size()
-                     << " nAdaptedArgs=" << adaptor.getArgs().size()
-                     << "\n";
+        if (helix::pipelineDebugEnabled()) {
+            llvm::errs() << "[P0-DEBUG] CallToMidCall: attempting conversion for CallOp"
+                         << " target=" << (op.getTargetNameAttr() ? op.getTargetNameAttr().getValue() : "none")
+                         << " nArgs=" << op.getArgs().size()
+                         << " nAdaptedArgs=" << adaptor.getArgs().size()
+                         << "\n";
+        }
 
         // Check if adapted args are valid
         for (unsigned i = 0; i < adaptor.getArgs().size(); ++i) {
             auto arg = adaptor.getArgs()[i];
-            if (!arg) {
+            if (!arg && helix::pipelineDebugEnabled()) {
                 llvm::errs() << "[P0-DEBUG] CallToMidCall: adapted arg " << i << " is NULL!\n";
             }
         }
@@ -623,11 +639,13 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
                     rewriter.getI64IntegerAttr(vtable_offset));
         }
 
-        llvm::errs() << "[P0-DEBUG] CallToMidCall: SUCCESS → mid.call"
-                     << " name=" << (callee_name_attr ? callee_name_attr.getValue() : "none")
-                     << " addr=" << callee_addr
-                     << " hasResult=" << (op.getNumResults() > 0)
-                     << "\n";
+        if (helix::pipelineDebugEnabled()) {
+            llvm::errs() << "[P0-DEBUG] CallToMidCall: SUCCESS → mid.call"
+                         << " name=" << (callee_name_attr ? callee_name_attr.getValue() : "none")
+                         << " addr=" << callee_addr
+                         << " hasResult=" << (op.getNumResults() > 0)
+                         << "\n";
+        }
 
         // replaceOp forwards SSA uses of the old result onto the new one.
         // eraseOp would leave dangling references for callers that consume
@@ -940,8 +958,7 @@ struct HelixLowToMidPass
         auto module = getOperation();
         auto *ctx = &getContext();
 
-        // [P0-DEBUG] Count low::CallOps before conversion
-        {
+        if (helix::pipelineDebugEnabled()) {
             unsigned lowCalls = 0;
             module.walk([&](low::CallOp) { ++lowCalls; });
             llvm::errs() << "[P0-DEBUG] HelixLowToMid entry: "
@@ -1070,9 +1087,11 @@ struct HelixLowToMidPass
                             builder.getI64IntegerAttr(vtable_offset));
                 }
 
-                llvm::errs() << "[P0-DEBUG] Manual CallOp→MidCall: "
-                             << (callee_name_attr ? callee_name_attr.getValue() : "indirect")
-                             << " addr=" << callee_addr << "\n";
+                if (helix::pipelineDebugEnabled()) {
+                    llvm::errs() << "[P0-DEBUG] Manual CallOp→MidCall: "
+                                 << (callee_name_attr ? callee_name_attr.getValue() : "indirect")
+                                 << " addr=" << callee_addr << "\n";
+                }
 
                 // Transfer any SSA uses of the low.call's result (e.g. the
                 // synthetic RegWrite RAX from RemillToHelixLow) onto the new
@@ -1088,8 +1107,10 @@ struct HelixLowToMidPass
                 ++converted;
             }
 
-            llvm::errs() << "[P0-DEBUG] HelixLowToMid: manually converted "
-                         << converted << " CallOps\n";
+            if (helix::pipelineDebugEnabled()) {
+                llvm::errs() << "[P0-DEBUG] HelixLowToMid: manually converted "
+                             << converted << " CallOps\n";
+            }
         }
 
         // ── Wave 22 Step 3-lite: variadic_call + bundle.create → mid.call ──────
@@ -1166,15 +1187,14 @@ struct HelixLowToMidPass
                 if (b->use_empty()) bundlesToErase.push_back(b);
             });
             for (auto b : bundlesToErase) b->erase();
-            if (!vcallsToConvert.empty()) {
+            if (!vcallsToConvert.empty() && helix::pipelineDebugEnabled()) {
                 llvm::errs() << "[P0-DEBUG] Wave22-Step2.5 stopgap: "
                              << vcallsToConvert.size()
                              << " variadic_call->mid.call\n";
             }
         }
 
-        // [P0-DEBUG] Final count
-        {
+        if (helix::pipelineDebugEnabled()) {
             unsigned lowCalls = 0, midCalls = 0;
             module.walk([&](Operation* op) {
                 if (isa<low::CallOp>(op)) ++lowCalls;

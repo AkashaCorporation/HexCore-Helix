@@ -18,7 +18,9 @@
 ///   - van Emmerik, "Using a Decompiler for Real-World Source Recovery" (2004)
 
 #include "helix/passes/Passes.h"
+#include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
+#include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/StructRecovery.h"
 #include "helix/analysis/TypeLattice.h"
 
@@ -31,8 +33,10 @@
 #include "llvm/Support/Debug.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <optional>
+#include <string>
 
 #define DEBUG_TYPE "recover-struct-types"
 
@@ -70,6 +74,28 @@ struct BaseOffset {
 };
 
 static std::optional<BaseOffset> decomposeAddress(Value addr) {
+    // FIX (Maya R. review, type-recovery trace): FIX-082 (HelixLowToMid) lifts
+    // `llvm.add(base, const)` into a dedicated `mid::FieldPtrOp(base, offset)`
+    // BEFORE the Load/StoreOp is constructed, so on real post-FIX-082 IR the
+    // addr operand here is almost always a FieldPtrOp result, never the raw
+    // BinExprOp this function originally matched -- that staleness is why
+    // struct recovery never fired on the NUCLEO corpus (0/879 `auto_struct`
+    // occurrences) despite the analyzer/serialization being otherwise sound.
+    // FieldPtrOp carries (base, field_offset) directly, no decomposition needed.
+    if (auto fieldPtr = addr.getDefiningOp<mid::FieldPtrOp>()) {
+        // Variable recovery (RecoverVariablesPass) runs BEFORE HelixLowToMid and
+        // represents named variables/parameters as helix::high::VarRefOp
+        // regardless of which pipeline tier the surrounding ops belong to -- so
+        // a mid::FieldPtrOp's base is a HIGH-dialect VarRefOp, not a mid one.
+        if (auto varRef = fieldPtr.getBase().getDefiningOp<helix::high::VarRefOp>()) {
+            return BaseOffset{varRef.getVarId(),
+                              static_cast<int64_t>(fieldPtr.getFieldOffset())};
+        }
+        // A nested field.ptr base (chained field access, e.g. `p->pos.x`) is
+        // not yet handled -- fall through to std::nullopt rather than mis-key it.
+        return std::nullopt;
+    }
+
     auto binExpr = addr.getDefiningOp<mid::BinExprOp>();
     if (!binExpr || binExpr.getKind() != mid::BinExprKind::Add)
         return std::nullopt;
@@ -220,13 +246,21 @@ struct RecoverStructTypesPass
     void runOnOperation() override {
         auto module = getOperation();
 
-        module.walk([&](mid::FuncOp func) {
+        // FIX (Maya R. review, type-recovery trace): this pass walked for
+        // `mid::FuncOp`, but HelixLowToMid marks `low::FuncOp` as a LEGAL
+        // (unconverted) op -- the function CONTAINER never becomes mid::FuncOp,
+        // only the ops inside its body get rewritten to the Mid dialect.
+        // `mid::FuncOp` is defined in the dialect but never instantiated by
+        // this pipeline, so the old walk matched zero functions, unconditionally,
+        // on every input -- the root cause (one layer deeper than the stale
+        // decomposeAddress pattern above) of struct recovery never firing.
+        module.walk([&](helix::low::FuncOp func) {
             recoverStructsInFunction(func);
         });
     }
 
 private:
-    void recoverStructsInFunction(mid::FuncOp func) {
+    void recoverStructsInFunction(helix::low::FuncOp func) {
         auto& body = func.getBody();
         if (body.empty())
             return;
@@ -298,84 +332,35 @@ private:
         if (structs.empty())
             return;
 
-        // Build a map from base_var_id to the struct layout for annotation.
-        // We recover the base_var_id by scanning the access patterns — the
-        // analyzer groups them internally.  We re-derive the mapping by
-        // noting that each struct was built from a unique base_var_id.
-        //
-        // Since the analyzer numbers structs sequentially and we process
-        // groups in order, we re-collect the mapping here.
-        llvm::DenseMap<uint32_t, const RecoveredStruct*> varToStruct;
-
-        // Re-group to establish the mapping.
-        {
-            std::map<uint32_t, unsigned> baseVarCount;
-            // We need to re-scan the accesses, but the analyzer does not
-            // expose its internal grouping.  Instead, we use FieldPtrOps
-            // or simply annotate each struct by its index.
-            //
-            // For now, just log the recovered structs and annotate by walking
-            // var.decl ops and checking if the var ID matches any base.
-        }
-
         // ── Phase 4: Annotate var.decl ops ───────────────────────────────
         //
-        // For each recovered struct, find the var.decl with the matching
-        // slot ID and set attributes describing the struct layout.
-
-        // First, build a quick mapping from slot_id to struct pointer.
-        // We need to re-derive which base_var_id each struct corresponds to.
-        // Since analyze() returns structs in order of base_var_id iteration
-        // (std::map order), we re-scan the accesses for the mapping.
-        {
-            std::map<uint32_t, std::vector<AccessPattern>> groups;
-            // We don't have access to the analyzer's internal accesses after
-            // analyze() returns.  Instead, we re-collect from the IR.
-
-            // Re-walk loads and stores to build the mapping.
-            std::map<uint32_t, unsigned> slotAccessCount;
-            body.walk([&](mid::LoadOp loadOp) {
-                if (auto d = decomposeAddress(loadOp.getAddr()))
-                    slotAccessCount[d->base_slot]++;
-            });
-            body.walk([&](mid::StoreOp storeOp) {
-                if (auto d = decomposeAddress(storeOp.getAddr()))
-                    slotAccessCount[d->base_slot]++;
-            });
-
-            // Match structs to base slots by order (std::map iterates in
-            // key order, matching the analyzer's grouping).
-            std::vector<uint32_t> orderedSlots;
-            for (auto& [slot, count] : slotAccessCount) {
-                // Only slots with 2+ distinct offsets produced a struct.
-                // We rely on the struct list being in the same order.
-                orderedSlots.push_back(slot);
-            }
-
-            // The number of structs may be less than orderedSlots (some
-            // groups had < 2 distinct offsets).  We cannot trivially match
-            // without re-running the grouping logic.  Instead, we embed
-            // the base_var_id in a custom attribute on the struct's name.
-            //
-            // Simpler approach: annotate ALL matching var.decl ops that
-            // appear as base pointers in any struct.  We tag the first N
-            // vars that produced structs.
-
-            unsigned structIdx = 0;
-            for (auto slotId : orderedSlots) {
-                if (structIdx >= structs.size())
-                    break;
-
-                // This is a heuristic match — in production, the analyzer
-                // should return the base_var_id alongside each struct.
-                varToStruct[slotId] = &structs[structIdx];
-                ++structIdx;
-            }
-        }
+        // FIX (Maya R. review, type-recovery trace): this used to be a
+        // heuristic re-derivation (re-walk loads/stores, count accesses per
+        // slot, POSITIONALLY match the Nth struct to the Nth most-accessed
+        // slot) because the analyzer didn't expose which base_var_id each
+        // RecoveredStruct came from -- the code's own comments admitted this
+        // ("heuristic match", "cannot trivially match"), and it silently
+        // mismatched whenever a function had >1 struct or any non-struct
+        // (single-offset) pointer accesses mixed in. `RecoveredStruct` now
+        // carries `base_var_id` directly (set in StructRecoveryAnalyzer::
+        // buildStruct), so the mapping is a direct, exact O(n) build.
+        llvm::DenseMap<uint32_t, const RecoveredStruct*> varToStruct;
+        for (const auto& s : structs)
+            varToStruct[s.base_var_id] = &s;
 
         // Annotate var.decl ops with struct metadata.
-        body.walk([&](mid::VarDeclOp declOp) {
-            auto it = varToStruct.find(declOp.getSlotId());
+        //
+        // FIX (Maya R. review, type-recovery trace): variable declarations at
+        // this pipeline point are `helix::high::VarDeclOp` (RecoverVariablesPass
+        // runs before HelixLowToMid and represents named variables via the
+        // High dialect regardless of the surrounding ops' tier -- the same
+        // reason `decomposeAddress`'s FieldPtrOp base is a high::VarRefOp, see
+        // above) -- walking `mid::VarDeclOp` here matched zero declarations on
+        // every input, so struct metadata never reached the AST even once
+        // `structs` was non-empty. `getVarId()` is the high-dialect identity
+        // accessor (mid dialect calls the analogous field getSlotId()).
+        body.walk([&](helix::high::VarDeclOp declOp) {
+            auto it = varToStruct.find(declOp.getVarId());
             if (it == varToStruct.end())
                 return;
 
@@ -385,6 +370,25 @@ private:
             declOp->setAttr("helix.struct_name",
                             StringAttr::get(declOp.getContext(),
                                             recovered->name));
+
+            // FIX (Maya R. review, type-recovery trace): also set the generic
+            // `inferred_type` attribute (not just the helix.struct_name side
+            // attr) to "<name>*". PropagateTypesPass runs BEFORE this pass
+            // (Pipeline.cpp: PropagateTypes at line ~494, RecoverStructTypes at
+            // ~538) so it never sees the struct info and leaves this var typed
+            // generically (int64_t/void*). CAstBuilder already has a working,
+            // wired mechanism (var.decl ~1045 and the parameter path ~1169)
+            // that parses an `inferred_type` ending in `*` into a real
+            // `pointerTo(structTy(name))` -- it just never received a matching
+            // string before, since nothing set inferred_type to a struct-typed
+            // pointer. Every var reaching this point was matched via a
+            // FieldPtrOp base, i.e. used as a pointer by construction, so "*"
+            // is always semantically correct here. PropagateTypes' earlier,
+            // less-informed guess is intentionally overwritten -- struct
+            // recovery is strictly more specific for this variable.
+            declOp->setAttr("inferred_type",
+                            StringAttr::get(declOp.getContext(),
+                                            recovered->name + "*"));
 
             // Set the total size.
             declOp->setAttr("helix.struct_size",
@@ -403,6 +407,30 @@ private:
                             IntegerAttr::get(
                                 IntegerType::get(declOp.getContext(), 32),
                                 recovered->fields.size()));
+
+            // FIX (Maya R. review, type-recovery trace): the per-field layout
+            // (offset/size/inferred-type) is fully computed in `recovered->fields`
+            // -- until now it only reached an LLVM_DEBUG print (Phase 5 below) and
+            // was discarded at this annotation boundary, so CAstBuilder never saw
+            // anything past the aggregate struct_size/field_count and had to fall
+            // back to raw `field_0xN : int64_t` guessing. Serialize the layout as
+            // "off:size:ctype,off:size:ctype,..." (sorted by offset, matching
+            // `recovered->fields`' existing order) so a future CAstBuilder change
+            // can type struct-field accesses precisely instead of guessing. This
+            // change only ADDS an attribute nobody reads yet -- zero behavior
+            // change to the emitted C until a consumer is wired.
+            if (!recovered->fields.empty()) {
+                std::string encoded;
+                for (const auto& f : recovered->fields) {
+                    if (!encoded.empty())
+                        encoded += ',';
+                    encoded += std::to_string(f.offset) + ':' +
+                               std::to_string(f.size) + ':' +
+                               f.type.toCTypeString();
+                }
+                declOp->setAttr("helix.struct_fields",
+                                StringAttr::get(declOp.getContext(), encoded));
+            }
 
             // Mark union candidates.
             if (recovered->has_overlaps) {

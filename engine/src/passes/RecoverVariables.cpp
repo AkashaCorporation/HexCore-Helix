@@ -170,6 +170,52 @@ static uint32_t getNextAvailableVarId(helix::low::FuncOp func) {
     return nextId;
 }
 
+/// FIX (Maya R. review, Phase 3.5/4 usage-classifier gap): returns true if
+/// `addOp` is the address-forming `llvm.add(base, const)` shape that
+/// HelixLowToMid's `tryDecomposeAddrAsField` (HelixLowToMid.cpp ~L202) will
+/// later lift into a `mid.field.ptr`. Mirrors that function's own
+/// const/zero-offset checks so the two stay in lockstep, then additionally
+/// confirms the add's RESULT actually feeds a MemRead/MemWrite address
+/// operand -- narrowing to the specific shape that becomes an address, not
+/// every add with one constant operand.
+///
+/// RecoverVariables' Phase 3.5/4 usage classifier runs BEFORE HelixLowToMid
+/// (Pipeline.cpp: RecoverVariables ~L512, HelixLowToMid ~L525), so at
+/// classification time the address is still this raw LLVM::AddOp -- neither
+/// `mid::FieldPtrOp` nor `high::FieldAccessOp` exist yet in the IR. A
+/// classifier branch checking for either op (as originally proposed) is
+/// dead code at this pipeline stage; this helper checks the actual shape
+/// present here instead.
+static bool isAddressFormingAdd(LLVM::AddOp addOp) {
+    if (!addOp) return false;
+    auto lhs = addOp.getLhs();
+    auto rhs = addOp.getRhs();
+    if (!lhs || !rhs) return false;
+
+    auto extractConst = [](Value v) -> std::optional<uint64_t> {
+        auto cst = v.getDefiningOp<LLVM::ConstantOp>();
+        if (!cst) return std::nullopt;
+        auto intAttr = dyn_cast<IntegerAttr>(cst.getValue());
+        if (!intAttr) return std::nullopt;
+        return intAttr.getValue().getZExtValue();
+    };
+
+    auto lhsConst = extractConst(lhs);
+    auto rhsConst = extractConst(rhs);
+    if (lhsConst && rhsConst) return false;   // fully-foldable, no provenance
+    if (!lhsConst && !rhsConst) return false; // neither side is a constant offset
+    if (rhsConst && *rhsConst == 0) return false;
+    if (lhsConst && *lhsConst == 0) return false;
+
+    for (auto& use : addOp.getResult().getUses()) {
+        Operation* user = use.getOwner();
+        unsigned idx = use.getOperandNumber();
+        if (isa<helix::low::MemReadOp>(user) && idx == 0) return true;
+        if (isa<helix::low::MemWriteOp>(user) && idx == 0) return true;
+    }
+    return false;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Variable Tracker
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -201,11 +247,21 @@ struct VariableTracker {
     /// Whether the function has a return value (set by RecoverCallingConvention).
     bool hasReturnValue = false;
 
-    /// Whether the current function uses the AArch64 AAPCS64 ABI.  Gates the
-    /// AArch64-specific return-register (X0) and "result" naming/coalescing
-    /// behaviour so x86 (SysV/Win64/cdecl) output stays byte-for-byte
-    /// unchanged.
+    /// Whether the current function uses the AArch64 AAPCS64 ABI.  Gates
+    /// AArch64-specific X0 argument/return-register handling.
     bool isAapcs64 = false;
+
+    /// A fixed debug signature gives the source parameters stable identities.
+    /// Later writes to their physical ABI registers are scratch/local values,
+    /// not mutations of the source parameter.
+    bool preserveExactParameterIdentity = false;
+
+    /// Keep the implicit return-register definition as an exact, separate
+    /// `result` variable. On x86 this is restricted to call-free functions:
+    /// unknown calls conservatively materialize RAX and complex call-heavy
+    /// functions rely on the established coalescing policy. AAPCS64 keeps
+    /// the pre-existing exact-X0 behavior.
+    bool preserveExactReturnIdentity = false;
 
     /// Initialize the argument register position map based on calling convention.
     ///
@@ -234,23 +290,34 @@ struct VariableTracker {
             argRegPositions["X" + std::to_string(i)] = i + 1;
     }
 
-    /// Check if an operation is in a return context — i.e., the register
-    /// value flows into a helix_low.ret or helix_high.return operation.
+    /// x86-32 register-argument positions (FIX-CC-THISCALL).  cdecl/stdcall pass
+    /// all integer args on the stack, but __thiscall passes `this` in ECX(=RCX)
+    /// and __fastcall passes the first two args in ECX,EDX(=RCX,RDX).  We map
+    /// both; SSA versioning gates naturally — a pure-cdecl function that WRITES
+    /// ECX before reading it (scratch / `push ecx` local slot) leaves param_1
+    /// (version 0) unused, so it is DCE'd and never reaches the signature.  Only
+    /// a genuine read-before-write of ECX/EDX (the thiscall/fastcall live-in)
+    /// keeps the param — matching RecoverCallingConvention's Phase-1 liveness.
+    void initArgRegPositionsCdecl32() {
+        argRegPositions.clear();
+        argRegPositions["RCX"] = 1;   // __thiscall `this` only; EDX/fastcall over-binds (deferred)
+    }
+
+    /// Same-block forward scan used by isReturnContext, factored out so it
+    /// can be re-entered on the target block of an unconditional jmp chain
+    /// (see isReturnContext's comment for why that's needed).
     ///
-    /// Scans forward from the given operation within the same block to find
-    /// if a RetOp follows without an intervening write to the same register.
-    ///
-    /// @param op       The operation to check (typically a reg.write to RAX).
-    /// @param regName  The register being written (checked for intervening writes).
-    /// @return         true if this write feeds a return.
-    static bool isReturnContext(Operation* op, llvm::StringRef regName) {
-        auto* block = op->getBlock();
-        if (!block)
+    /// @param visited  Blocks already scanned in this query -- guards
+    ///                 against infinite recursion on a jmp cycle (which
+    ///                 shouldn't occur in practice for a jmp chain that's
+    ///                 actually converging on a return, but a malformed or
+    ///                 adversarial CFG must not hang the pass).
+    static bool isReturnContextScan(Block* block, Block::iterator it,
+                                    llvm::StringRef regName,
+                                    llvm::SmallPtrSetImpl<Block*>& visited) {
+        if (!visited.insert(block).second)
             return false;
 
-        // Scan forward from op to the end of the block.
-        auto it = Block::iterator(op);
-        ++it; // skip the current op
         for (auto end = block->end(); it != end; ++it) {
             // If we hit a return, this is a return context.
             if (isa<helix::low::RetOp>(&*it))
@@ -262,13 +329,64 @@ struct VariableTracker {
                     return false;
             }
 
-            // If we hit a call or branch, stop scanning.
-            if (helix::isAnyCallOp(&*it) ||
-                isa<helix::low::JmpOp, helix::low::JccOp>(&*it))
+            if (helix::isAnyCallOp(&*it))
+                return false;
+
+            // FIX (return-context-through-jmp-chain): an unconditional jmp
+            // to another block does NOT by itself disqualify return
+            // context -- follow it and keep scanning there. This is the
+            // common shape for an early-return guard clause: the compiler
+            // merges multiple `return` sites into one shared exit block,
+            // so the register write that logically IS `return 1` sits in
+            // a predecessor block that reaches the real helix_low.ret only
+            // via an intervening jmp. Before this fix, hitting that jmp
+            // unconditionally returned false, so none of the predecessor
+            // writes were ever recognized as return context -- the write
+            // got named as a plain register variable, EliminateDeadCode
+            // then correctly-per-its-own-logic removed it as unread (since
+            // the operand-less helix_low.ret doesn't reference it either),
+            // and CAstBuilder's return-statement construction fell back to
+            // an unbound placeholder ("int64_t result;" declared but never
+            // assigned). A conditional branch (JccOp) is intentionally NOT
+            // followed here -- that's a genuine fork where the write may
+            // or may not reach a return depending on which edge is taken,
+            // a materially different and harder question this narrow fix
+            // doesn't attempt to answer.
+            if (auto jmp = dyn_cast<helix::low::JmpOp>(&*it)) {
+                Block* dest = jmp.getDest();
+                if (!dest)
+                    return false;
+                return isReturnContextScan(dest, dest->begin(), regName,
+                                           visited);
+            }
+
+            if (isa<helix::low::JccOp>(&*it))
                 return false;
         }
 
         return false;
+    }
+
+    /// Check if an operation is in a return context — i.e., the register
+    /// value flows into a helix_low.ret or helix_high.return operation.
+    ///
+    /// Scans forward from the given operation, following unconditional
+    /// jmp chains into their target blocks, to find if a RetOp follows
+    /// without an intervening write to the same register or a conditional
+    /// branch (see isReturnContextScan for why Jcc stops the scan but Jmp
+    /// doesn't).
+    ///
+    /// @param op       The operation to check (typically a reg.write to RAX).
+    /// @param regName  The register being written (checked for intervening writes).
+    /// @return         true if this write feeds a return.
+    static bool isReturnContext(Operation* op, llvm::StringRef regName) {
+        auto* block = op->getBlock();
+        if (!block)
+            return false;
+        auto it = Block::iterator(op);
+        ++it; // skip the current op
+        llvm::SmallPtrSet<Block*, 8> visited;
+        return isReturnContextScan(block, it, regName, visited);
     }
 
     /// Determine the semantic variable name for a canonical register.
@@ -481,14 +599,21 @@ struct SSAVersionTracker {
         unsigned ver = versionCounters[canonReg]++;
         auto [baseName, storage] = tracker.getSemanticName(canonReg, contextOp);
 
+        if (ver > 0 &&
+            storage == helix::high::StorageKind::Parameter &&
+            tracker.preserveExactParameterIdentity) {
+            baseName = regToVarName(canonReg);
+            storage = helix::high::StorageKind::Register;
+        }
+
         std::string varName;
-        // On AArch64, X0's param-init version 0 ("param_1") is followed by a
-        // return-context write that must still be named exactly "result" (no
-        // SSA suffix) so the C emitter / DCE preservation recognise it. This
-        // is gated to AAPCS64 so x86 version naming (rax_1, etc.) is byte-for
-        // -byte unchanged.
+        // Selected return-context writes must be named exactly "result"
+        // (without an SSA suffix). DCE and CAstBuilder model the implicit
+        // consumer of the return register through this semantic name; the
+        // tracker flag keeps the x86 policy narrow for call-heavy functions.
         if (ver == 0 ||
-            (tracker.isAapcs64 && baseName == "result")) {
+            (tracker.preserveExactReturnIdentity &&
+             baseName == "result")) {
             varName = baseName;
         } else {
             varName = llvm::formatv("{0}_{1}", baseName, ver).str();
@@ -742,11 +867,43 @@ private:
         }
         tracker.isAapcs64 = isAapcs64;
         if (isCdecl32) {
-            tracker.argRegPositions.clear();
+            // FIX-CC-THISCALL round 2: only bind ECX as `this` (param_1) when
+            // RecoverCallingConvention's flows-to-deref gate approved it and set
+            // the "x86_thiscall_this" marker.  A pure-cdecl function whose ECX is
+            // merely scratch leaves argRegPositions EMPTY, so it gets NO phantom
+            // param_1 — stack args are recovered by RecoverStackLayout instead.
+            // (This kills the 0x83d050-class regression where a live-in-but-
+            // scratch ECX was mis-named param_1 and collapsed a real compare.)
+            if (func->hasAttr("x86_thiscall_this"))
+                tracker.initArgRegPositionsCdecl32();
         } else if (isAapcs64) {
             tracker.initArgRegPositionsAapcs64();
         } else {
             tracker.initArgRegPositions(isWin64);
+        }
+        // FIX-CC-SRET / FIX-139: intersect the ABI register map with the
+        // positions RecoverCallingConvention certified. On x86-64 this drops
+        // hidden/scratch register copies; on AAPCS64 the attribute is emitted
+        // only for an exact debug signature, so legacy/no-debug behavior stays
+        // byte-identical while extra live-in scratch registers become locals.
+        if (!isCdecl32) {
+            if (auto idxAttr = func->getAttrOfType<DenseI32ArrayAttr>(
+                    "reg_param_indices")) {
+                auto certified = idxAttr.asArrayRef();
+                llvm::SmallVector<std::string, 8> toDrop;
+                for (auto& kv : tracker.argRegPositions) {
+                    bool keep = false;
+                    for (int32_t idx : certified)
+                        if (static_cast<unsigned>(idx) == kv.second) {
+                            keep = true;
+                            break;
+                        }
+                    if (!keep)
+                        toDrop.push_back(kv.first().str());
+                }
+                for (auto& reg : toDrop)
+                    tracker.argRegPositions.erase(reg);
+            }
         }
         // Win64 entry points: incoming RCX/RDX/R8/R9 are OS-set values, not
         // named parameters.  RecoverCallingConvention sets "no_reg_params" to
@@ -756,6 +913,25 @@ private:
         }
         tracker.hasReturnValue =
             func->hasAttr("has_return_value");
+        tracker.preserveExactParameterIdentity =
+            func->hasAttr("helix.debug_param_count");
+        bool hasProgramCalls = false;
+        funcBody.walk([&](Operation* op) {
+            if (!helix::isAnyCallOp(op))
+                return;
+
+            // CQO_RAX is a Remill machine helper for the x86 CQO
+            // instruction, not a source-level call. Treating it as a call
+            // disabled exact return recovery in arithmetic leaf functions
+            // such as signed division and opaque-predicate helpers.
+            auto targetName = helix::getCallTargetName(op);
+            if (targetName && *targetName == "CQO_RAX")
+                return;
+
+            hasProgramCalls = true;
+        });
+        tracker.preserveExactReturnIdentity =
+            tracker.isAapcs64 || !hasProgramCalls;
 
         // Position the builder at the entry block's start for variable
         // declarations.  All var.decl ops go at the top of the function
@@ -1304,10 +1480,20 @@ private:
                 }
             }
 
-            // ── Snapshot block exit state for idom seeding ──────────
-            if (useRPO) {
-                blockExitState[blockPtr] = ssaTracker.snapshot();
-            }
+            // ── Snapshot block exit state ──────────────────────────
+            // In RPO this seeds the idom restore (above). FIX-113 (mini-engine
+            // #1): ALSO populate it in the region-order fallback. The v2 SCF
+            // structurer (transformCFGToSCF, default) collapses funcBody to a
+            // SINGLE top-level block (the real code nests in scf regions), so
+            // useRPO's `>1 block` gate fails and this used to stay empty -- which
+            // disabled the Phase-2.5 sweep below (its `!blockExitState.empty()`
+            // guard), so every reg.read nested in an scf region fell through to a
+            // hash-slot `vN = 0` and was deref'd as null. Snapshotting the single
+            // top-level block's exit (where the pre-region pointer-setup writes
+            // are already versioned) lets Phase-2.5 bind those nested reads to the
+            // real reaching version. Harmless in RPO mode (same value); only adds
+            // entries in the fallback the sweep then consumes.
+            blockExitState[blockPtr] = ssaTracker.snapshot();
         }
 
         // ── Phase 2.5: Sweep reg ops surviving inside structured regions ──
@@ -1344,7 +1530,12 @@ private:
         // Strategy A (proper region-aware SSA tracking with snapshot/
         // restore at every region boundary) would recover per-iteration
         // versions but is left as a follow-up.
+        if (std::getenv("HELIX_DEFREC_TRACE"))
+            llvm::errs() << "[STRATB] blockExitState.size()="
+                         << blockExitState.size() << "\n";
         if (!blockExitState.empty()) {
+            const bool stratBTrace =
+                std::getenv("HELIX_DEFREC_TRACE") != nullptr; // M0b
             auto findTopLevelAncestor = [&](Operation* op) -> Operation* {
                 Operation* current = op;
                 while (current) {
@@ -1390,6 +1581,95 @@ private:
                 survivingWrites.push_back(w);
             });
 
+            // Strategy B models nested regions with mutable register slots.
+            // A fixed debug parameter must not be that slot: compiled code
+            // freely reuses ABI registers after consuming their entry value.
+            // Create one initialized shadow per top-level block/register when
+            // a nested full-width write would otherwise target a parameter.
+            using RegionRegKey = std::pair<Block*, std::string>;
+            std::set<RegionRegKey> nestedWrittenRegs;
+            for (auto writeOp : survivingWrites) {
+                auto subReg = getSubRegInfo(writeOp.getRegName());
+                Operation* topOp = findTopLevelAncestor(writeOp);
+                if (!subReg || !topOp ||
+                    subReg->width != 64 || subReg->bitOffset != 0)
+                    continue;
+                nestedWrittenRegs.emplace(topOp->getBlock(),
+                                          subReg->parent);
+            }
+
+            std::map<RegionRegKey, SSAVersionTracker::Version>
+                nestedParameterShadows;
+            auto versionForNestedOp =
+                [&](Operation* op, llvm::StringRef canonicalReg)
+                    -> const SSAVersionTracker::Version* {
+                const SSAVersionTracker::Snapshot* snap = snapshotForOp(op);
+                if (!snap)
+                    return nullptr;
+                auto vit = snap->find(canonicalReg);
+                if (vit == snap->end())
+                    return nullptr;
+
+                const auto& reaching = vit->second;
+                if (!tracker.preserveExactParameterIdentity)
+                    return &reaching;
+
+                auto reachingDecl =
+                    dyn_cast_or_null<helix::high::VarDeclOp>(reaching.decl);
+                Operation* topOp = findTopLevelAncestor(op);
+                if (!reachingDecl || !topOp ||
+                    reachingDecl.getStorage() !=
+                        helix::high::StorageKind::Parameter)
+                    return &reaching;
+
+                RegionRegKey key{topOp->getBlock(),
+                                 canonicalReg.str()};
+                if (!nestedWrittenRegs.contains(key))
+                    return &reaching;
+
+                auto existing = nestedParameterShadows.find(key);
+                if (existing != nestedParameterShadows.end())
+                    return &existing->second;
+
+                std::string shadowName =
+                    llvm::formatv("{0}_region_{1}",
+                                  regToVarName(canonicalReg),
+                                  tracker.varIdCounter).str();
+                auto shadowDecl =
+                    declBuilder.create<helix::high::VarDeclOp>(
+                        funcLoc,
+                        /*var_id=*/tracker.varIdCounter++,
+                        /*var_name=*/shadowName,
+                        /*storage=*/helix::high::StorageKind::Register,
+                        /*stack_offset=*/IntegerAttr{},
+                        /*init=*/Value{},
+                        /*address=*/IntegerAttr{});
+
+                OpBuilder initBuilder(topOp);
+                auto i64Ty = initBuilder.getIntegerType(64);
+                auto sourceRef =
+                    initBuilder.create<helix::high::VarRefOp>(
+                        topOp->getLoc(), i64Ty, reaching.varId,
+                        initBuilder.getStringAttr(reaching.varName),
+                        mlir::IntegerAttr{});
+                auto shadowRef =
+                    initBuilder.create<helix::high::VarRefOp>(
+                        topOp->getLoc(), i64Ty, shadowDecl.getVarId(),
+                        shadowDecl.getVarName(), mlir::IntegerAttr{});
+                initBuilder.create<helix::high::AssignOp>(
+                    topOp->getLoc(), shadowRef.getResult(),
+                    sourceRef.getResult(), mlir::IntegerAttr{});
+
+                auto [inserted, _] = nestedParameterShadows.emplace(
+                    std::move(key),
+                    SSAVersionTracker::Version{
+                        shadowDecl, shadowDecl.getVarId(),
+                        shadowDecl.getVarName().str()});
+                ++NumRegVarsCreated;
+                ++NumSSAVersions;
+                return &inserted->second;
+            };
+
             // ── Return-context fallback for in-region RAX writes ──────────
             //
             // For hash-loop style functions (FNV, CRC, etc.) the final RAX
@@ -1406,27 +1686,42 @@ private:
             // unassigned `int64_t result;` and the loop body is empty
             // except for the byte-load.
             //
-            // Fix: when the function returns a value AND main-loop
-            // processing produced no "RAX__result" decl AND a surviving
-            // in-region RAX (full-width) write exists, synthesise a
-            // "result" VarDecl at function entry and use it as the
-            // override target for every full-width in-region RAX
-            // read/write below.  This gives the accumulator chain a
-            // user-visible consumer (the synthesised `return result`)
-            // and keeps it alive through DCE.
-            // Conservatism guard: only apply this fallback when the RAX
-            // chain lives inside a LOOP region (do_while / while / for).
-            // Hash-loop functions (FNV, CRC, …) match this shape; if-only
-            // RAX writes are conditional return paths whose pre-fix DCE
-            // behaviour is already what callers expect, and renaming them
-            // to "result" exposes raw-VA derefs that score worse without
-            // adding semantic content.
-            auto isInsideLoopRegion = [](Operation* op) {
+            // Fix: when a surviving in-region RAX (full-width) write exists,
+            // reuse the exact `result` SSA identity already created by the
+            // top-level walk. Only synthesize that identity when the nested
+            // region is the first place that writes the return register.
+            // Looking this up by var_id matters: the old string-map probe used
+            // the non-existent key "RAX__result", so it created a second
+            // VarDecl named `result` even when one already existed. The C AST
+            // then contained two declarations with the same identifier.
+            // FIX (return-context, if-region extension): originally gated
+            // to LOOP regions only (do_while/while/for) -- hash-loop
+            // functions (FNV, CRC, ...) match that shape. If-only RAX
+            // writes (an early-return guard clause: `if (cond) { ...;
+            // return 1; } else { ...; return 0; }`, both writes converging
+            // on one shared exit block via jmp) were deliberately excluded
+            // per a prior note that doing so "exposes raw-VA derefs that
+            // score worse without adding semantic content." Empirically
+            // (isolated repro: a bare `if(argc<4){printf;return 1;}
+            // return 0;` guard clause) if-only writes are NOT already
+            // handled elsewhere -- they hit exactly the failure mode this
+            // whole fallback exists to fix (uninitialized `result`,
+            // DCE'd write, damning-honesty confidence cap), so the
+            // original premise doesn't hold for this shape. Extending to
+            // `IfOp` is still additive-only: it only widens which
+            // orphaned in-region RAX writes get a real backing variable
+            // instead of being silently DCE'd; it never touches a write
+            // that was already being handled by another path. Validate
+            // corpus-wide before trusting this over the prior guard's
+            // warning -- that warning came from a real (if unspecified)
+            // regression case, not a guess.
+            auto isInsideLoopOrIfRegion = [](Operation* op) {
                 for (Operation* cur = op->getParentOp(); cur;
                      cur = cur->getParentOp()) {
                     if (isa<helix::high::DoWhileOp,
                             helix::high::WhileOp,
-                            helix::high::ForOp>(cur))
+                            helix::high::ForOp,
+                            helix::high::IfOp>(cur))
                         return true;
                 }
                 return false;
@@ -1434,33 +1729,49 @@ private:
 
             SSAVersionTracker::Version resultOverride;
             bool useResultOverrideForRAX = false;
-            if (tracker.hasReturnValue
-                && !tracker.regToDecl.count("RAX__result")) {
+            if (tracker.hasReturnValue) {
                 bool hasInRegionFullRaxWrite = false;
                 for (auto w : survivingWrites) {
                     auto sr = getSubRegInfo(w.getRegName());
                     if (sr && sr->parent == "RAX"
                         && sr->width == 64 && sr->bitOffset == 0
-                        && isInsideLoopRegion(w)) {
+                        && isInsideLoopOrIfRegion(w)) {
                         hasInRegionFullRaxWrite = true;
                         break;
                     }
                 }
                 if (hasInRegionFullRaxWrite) {
-                    auto declOp = declBuilder.create<helix::high::VarDeclOp>(
-                        funcLoc,
-                        /*var_id=*/tracker.varIdCounter++,
-                        /*var_name=*/"result",
-                        /*storage=*/helix::high::StorageKind::Register,
-                        /*stack_offset=*/IntegerAttr{},
-                        /*init=*/Value{},
-                        /*address=*/IntegerAttr{});
-                    tracker.regToDecl["RAX__result"] = declOp;
-                    resultOverride.decl = declOp;
-                    resultOverride.varId = declOp.getVarId();
-                    resultOverride.varName = "result";
-                    useResultOverrideForRAX = true;
-                    ++NumReturnVarsNamed;
+                    auto versionsIt = ssaTracker.allVersions.find("RAX");
+                    if (versionsIt != ssaTracker.allVersions.end()) {
+                        for (auto it = versionsIt->second.rbegin();
+                             it != versionsIt->second.rend(); ++it) {
+                            if (it->varName == "result") {
+                                resultOverride = *it;
+                                useResultOverrideForRAX = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!useResultOverrideForRAX) {
+                        auto declOp =
+                            declBuilder.create<helix::high::VarDeclOp>(
+                                funcLoc,
+                                /*var_id=*/tracker.varIdCounter++,
+                                /*var_name=*/"result",
+                                /*storage=*/helix::high::StorageKind::Register,
+                                /*stack_offset=*/IntegerAttr{},
+                                /*init=*/Value{},
+                                /*address=*/IntegerAttr{});
+                        tracker.regToDecl["__ret_result"] = declOp;
+                        resultOverride.decl = declOp;
+                        resultOverride.varId = declOp.getVarId();
+                        resultOverride.varName = "result";
+                        ++NumRegVarsCreated;
+                        ++NumSSAVersions;
+                        ++NumReturnVarsNamed;
+                        useResultOverrideForRAX = true;
+                    }
                 }
             }
 
@@ -1475,22 +1786,24 @@ private:
 
                 const SSAVersionTracker::Version* verPtr = nullptr;
                 if (useResultOverrideForRAX && subReg.parent == "RAX"
-                    && isInsideLoopRegion(readOp)) {
+                    && isInsideLoopOrIfRegion(readOp)) {
                     // Hash-loop-style return-context fallback: every
                     // in-loop RAX access shares the "result" identity
                     // (sub-register narrowing still applies below).
                     verPtr = &resultOverride;
                 } else {
-                    const SSAVersionTracker::Snapshot* snap =
-                        snapshotForOp(readOp);
-                    if (!snap)
+                    verPtr = versionForNestedOp(readOp, subReg.parent);
+                    if (!verPtr) {
+                        if (stratBTrace)
+                            llvm::errs() << "[STRATB] read reg=" << subReg.parent
+                                         << " -> NOSNAP (fallthrough->hash-slot)\n";
                         continue;
-                    auto vit = snap->find(subReg.parent);
-                    if (vit == snap->end())
-                        continue;
-                    verPtr = &vit->second;
+                    }
                 }
                 const SSAVersionTracker::Version& ver = *verPtr;
+                if (stratBTrace)
+                    llvm::errs() << "[STRATB] read reg=" << subReg.parent
+                                 << " -> bound:" << ver.varName << "\n";
 
                 OpBuilder b(readOp);
                 auto i64Ty = b.getIntegerType(64);
@@ -1540,17 +1853,12 @@ private:
 
                 const SSAVersionTracker::Version* verPtr = nullptr;
                 if (useResultOverrideForRAX && subReg.parent == "RAX"
-                    && isInsideLoopRegion(writeOp)) {
+                    && isInsideLoopOrIfRegion(writeOp)) {
                     verPtr = &resultOverride;
                 } else {
-                    const SSAVersionTracker::Snapshot* snap =
-                        snapshotForOp(writeOp);
-                    if (!snap)
+                    verPtr = versionForNestedOp(writeOp, subReg.parent);
+                    if (!verPtr)
                         continue;
-                    auto vit = snap->find(subReg.parent);
-                    if (vit == snap->end())
-                        continue;
-                    verPtr = &vit->second;
                 }
                 const SSAVersionTracker::Version& ver = *verPtr;
 
@@ -1616,6 +1924,33 @@ private:
         // Helper lambda: determine if a type string indicates a float type.
         auto isFloatTypeStr = [](llvm::StringRef typeStr) -> bool {
             return typeStr.starts_with("float") || typeStr.starts_with("double");
+        };
+
+        // M0 (def-recovery scoping): env-gated trace of every lost-def
+        // replacement, classified ptr/float/int, to measure the zero-init-ptr
+        // source distribution on the pointer-heavy corpus before any redesign.
+        const bool defRecTrace = std::getenv("HELIX_DEFREC_TRACE") != nullptr;
+        auto defTypeClass = [&](Value v) -> const char* {
+            if (auto* dop = v.getDefiningOp())
+                if (auto a = dop->getAttrOfType<StringAttr>("inferred_type")) {
+                    StringRef s = a.getValue();
+                    if (isPointerTypeStr(s)) return "ptr";
+                    if (isFloatTypeStr(s)) return "float";
+                }
+            Type t = v.getType();
+            if (isa<LLVM::LLVMPointerType>(t)) return "ptr";
+            if (isa<Float32Type>(t) || isa<Float64Type>(t)) return "float";
+            return "int";
+        };
+        auto usedInDeref = [&](Value v) -> bool {
+            for (auto& use : v.getUses()) {
+                StringRef n = use.getOwner()->getName().getStringRef();
+                if (n.contains("load") || n.contains("Load") ||
+                    n.contains("field") || n.contains("Field") ||
+                    n.contains("gep") || n.contains("Gep"))
+                    return true;
+            }
+            return false;
         };
 
         // Helper lambda: create a typed default value for a given MLIR type
@@ -1725,6 +2060,11 @@ private:
 
             checkCallArgument(undefVal);
 
+            if (defRecTrace)
+                llvm::errs() << "[DEFREC] src=undef type="
+                             << defTypeClass(undefVal)
+                             << " deref=" << (usedInDeref(undefVal) ? 1 : 0)
+                             << "\n";
             Value replacement = createDefaultValue(
                 undefVal.getType(), undefOp, undefOp.getLoc());
             undefVal.replaceAllUsesWith(replacement);
@@ -1742,6 +2082,11 @@ private:
 
             checkCallArgument(poisonVal);
 
+            if (defRecTrace)
+                llvm::errs() << "[DEFREC] src=poison type="
+                             << defTypeClass(poisonVal)
+                             << " deref=" << (usedInDeref(poisonVal) ? 1 : 0)
+                             << "\n";
             Value replacement = createDefaultValue(
                 poisonVal.getType(), poisonOp, poisonOp.getLoc());
             poisonVal.replaceAllUsesWith(replacement);
@@ -1802,7 +2147,6 @@ private:
         // Used for semantic compatibility in coalescing — we refuse to merge
         // an Address-only variable with a Value-only variable, even if the
         // explicit type attributes don't conflict.
-        enum class UsageKind : uint8_t { None, Address, Value, Mixed };
         llvm::DenseMap<unsigned, uint8_t> usageMap;
         funcBody.walk([&](helix::high::VarRefOp ref) {
             unsigned varId = ref.getVarId();
@@ -1819,6 +2163,23 @@ private:
                     else flags |= 0x2;            // value operand
                 } else if (isa<helix::high::FieldAccessOp>(user)) {
                     if (idx == 0) flags |= 0x1;  // base operand
+                } else if (auto addOp = dyn_cast<LLVM::AddOp>(user)) {
+                    // FIX (Maya R. review): the address-forming
+                    // `llvm.add(base, const)` shape RecoverVariables
+                    // actually sees pre-HelixLowToMid (mid::FieldPtrOp
+                    // doesn't exist yet at this pipeline stage -- see
+                    // isAddressFormingAdd's comment). Any operand of this
+                    // add is address-forming, so it counts regardless of
+                    // which side (lhs/rhs) `ref` is on.
+                    if (isAddressFormingAdd(addOp))
+                        flags |= 0x1;  // addr-forming operand
+                    else
+                        flags |= 0x2;  // plain integer add
+                } else if (isa<helix::low::LeaOp>(user)) {
+                    // LEA is pure address computation by definition
+                    // (base + index*scale + disp) -- both base (operand 0)
+                    // and index (operand 1) are address-forming.
+                    flags |= 0x1;
                 } else if (isa<arith::AddIOp>(user) ||
                            isa<arith::SubIOp>(user) ||
                            isa<arith::MulIOp>(user) ||
@@ -1839,14 +2200,23 @@ private:
             usageMap[varId] = flags;
         });
 
-        auto getUsageKind = [&](unsigned varId) -> UsageKind {
-            uint8_t flags = usageMap.lookup(varId);
-            bool addr = (flags & 0x1) != 0;
-            bool val  = (flags & 0x2) != 0;
-            if (addr && val) return UsageKind::Mixed;
-            if (addr) return UsageKind::Address;
-            if (val) return UsageKind::Value;
-            return UsageKind::None;
+        // A mixed version is not split here: it may legitimately use one
+        // pointer value in both address and scalar contexts. It must not,
+        // however, absorb a separate version that has only scalar uses.
+        // Keep this flag-level rule shared with Phase 4 below.
+        auto isAddressBearing = [](uint8_t flags) {
+            return (flags & 0x1) != 0;
+        };
+        auto isPureValue = [](uint8_t flags) {
+            return (flags & 0x2) != 0 && (flags & 0x1) == 0;
+        };
+        auto areUsageFlagsCompatible = [&](uint8_t lhs, uint8_t rhs) {
+            return !(isAddressBearing(lhs) && isPureValue(rhs)) &&
+                   !(isAddressBearing(rhs) && isPureValue(lhs));
+        };
+        auto areSemanticsCompatible = [&](uint32_t idA, uint32_t idB) {
+            return areUsageFlagsCompatible(usageMap.lookup(idA),
+                                           usageMap.lookup(idB));
         };
 
         // Helper: returns true if a type string represents a pointer.
@@ -1867,12 +2237,24 @@ private:
                 if (!base.decl)
                     continue;
 
+                // A fixed debug signature certifies version 0 as a source
+                // parameter. Reusing X0/X1 later does not mutate that source
+                // variable, so never fold subsequent register lifetimes back
+                // into it. Phase 4 may still merge the resulting locals.
+                if (tracker.preserveExactParameterIdentity) {
+                    auto baseDecl =
+                        dyn_cast<helix::high::VarDeclOp>(base.decl);
+                    if (baseDecl &&
+                        baseDecl.getStorage() ==
+                            helix::high::StorageKind::Parameter)
+                        continue;
+                }
+
                 // Type of the base version (for compatibility check).
                 auto baseTypeAttr =
                     base.decl->getAttrOfType<StringAttr>("inferred_type");
                 bool basePtr = static_cast<bool>(baseTypeAttr) &&
                                isPtrTypeStr(baseTypeAttr.getValue());
-                auto baseKind = getUsageKind(base.varId);
 
                 for (size_t vi = 1; vi < versions.size(); ++vi) {
                     auto& ver = versions[vi];
@@ -1880,15 +2262,13 @@ private:
                         continue;
 
                     // ── Preserve the "result" return-value identity ───────
-                    // On AArch64 AAPCS64, X0 is both the first argument and
-                    // the integer return register: version 0 is the param
-                    // ("param_1") and a return-context write produces a
-                    // distinct "result" version. Coalescing "result" into the
-                    // param base would erase the return-value name that the C
-                    // emitter and DCE preservation key on. Keep them separate.
-                    // Gated to AAPCS64 so x86 coalescing is unchanged.
-                    if (tracker.isAapcs64 &&
-                        ver.varName == "result" && base.varName != "result")
+                    // The return-register version is an implicit output, even
+                    // though helix_low.ret has no SSA operand. Coalescing it
+                    // into an earlier scratch/parameter version erases the
+                    // exact "result" identity used by DCE and CAstBuilder.
+                    if (tracker.preserveExactReturnIdentity &&
+                        ver.varName == "result" &&
+                        base.varName != "result")
                         continue;
 
                     // ── Type compatibility check ──────────────────────────
@@ -1910,16 +2290,12 @@ private:
                     }
 
                     // ── Semantic usage compatibility ──────────────────────
-                    // Refuse coalescing if one version is used exclusively
-                    // as an address (pointer) and the other exclusively as
-                    // a value (arithmetic operand).  This catches the case
-                    // where the Remill lift assigned the same register to
-                    // semantically distinct values that share no type info.
-                    auto verKind = getUsageKind(ver.varId);
-                    if ((baseKind == UsageKind::Address &&
-                         verKind == UsageKind::Value) ||
-                        (baseKind == UsageKind::Value &&
-                         verKind == UsageKind::Address))
+                    // Refuse coalescing when one version is address-bearing
+                    // (Address or Mixed) and the other is pure scalar value.
+                    // This catches a pointer-bearing register version trying
+                    // to absorb an unrelated counter without splitting the
+                    // Mixed version's own uses.
+                    if (!areSemanticsCompatible(base.varId, ver.varId))
                         continue;
 
                     // ── Liveness interference check ───────────────────────
@@ -2127,10 +2503,11 @@ private:
             std::vector<helix::high::VarRefOp> refs;
             std::set<Block*> liveBlocks;
             bool touchesCallBlock = false;
-            // The variable is assigned directly from a call result. Phase 4 must
-            // not merge such a variable away, or renameRemainingRegisterVars
-            // later collapses the distinct call-return SSA versions into one vN
-            // (the `v3 = printk(0, v3)` x4 defect documented under FIX-081).
+            // Helix v2 experiment: the variable is assigned directly from a
+            // call result. Phase 4 must not merge such a variable away, or
+            // renameRemainingRegisterVars later collapses the distinct
+            // call-return SSA versions into one vN (the v3 = printk(0, v3)
+            // x4 defect documented under FIX-081).
             bool definedByCall = false;
         };
 
@@ -2175,10 +2552,10 @@ private:
                 }
             }
 
-            // 4. Mark variables whose value is assigned directly from a call
-            //    result. An AssignOp's target is operand 0 (a VarRefOp result)
-            //    and its value is getValue(); mirrors the Phase-5 single-use
-            //    guard's call detection.
+            // 4. (Helix v2 experiment) Mark variables whose value is assigned
+            //    directly from a call result. An AssignOp's target is operand
+            //    0 (a VarRefOp result) and its value is getValue(); this
+            //    mirrors the Phase-5 single-use guard's call detection.
             body.walk([&](helix::high::AssignOp assign) {
                 Value assignedVal = assign.getValue();
                 Operation* valDef = assignedVal.getDefiningOp();
@@ -2234,6 +2611,16 @@ private:
                     else flags |= 0x2;
                 } else if (isa<helix::high::FieldAccessOp>(user)) {
                     if (idx == 0) flags |= 0x1;
+                } else if (auto addOp = dyn_cast<LLVM::AddOp>(user)) {
+                    // Keep this duplicate Phase 4 classifier in sync with
+                    // Phase 3.5: this pass still sees raw llvm.add before
+                    // HelixLowToMid has materialized field-pointer ops.
+                    if (isAddressFormingAdd(addOp))
+                        flags |= 0x1;
+                    else
+                        flags |= 0x2;
+                } else if (isa<helix::low::LeaOp>(user)) {
+                    flags |= 0x1;
                 } else if (isa<arith::AddIOp>(user) ||
                            isa<arith::SubIOp>(user) ||
                            isa<arith::MulIOp>(user) ||
@@ -2254,20 +2641,8 @@ private:
             usageMap[varId] = flags;
         });
 
-        // Phase 4 semantic compatibility: refuse merging an Address-only
-        // variable with a Value-only variable.
-        auto areSemanticsCompatible = [&](uint32_t idA, uint32_t idB) -> bool {
-            uint8_t a = usageMap.lookup(idA);
-            uint8_t b = usageMap.lookup(idB);
-            bool aAddr = (a & 0x1) != 0;
-            bool aVal  = (a & 0x2) != 0;
-            bool bAddr = (b & 0x1) != 0;
-            bool bVal  = (b & 0x2) != 0;
-            // Address-only and Value-only conflict
-            if (aAddr && !aVal && bVal && !bAddr) return false;
-            if (bAddr && !bVal && aVal && !aAddr) return false;
-            return true;
-        };
+        // Phase 4 reuses the Phase 3.5 rule above after rebuilding usageMap
+        // for the varIds rewritten by same-register coalescing.
 
         // ---------- Helper: check if live ranges overlap ----------
 
@@ -2301,10 +2676,10 @@ private:
         };
 
         // ---------- Helper: register family of a variable name ----------
-        // "rax" / "rax_2" -> "rax". Keeps the call-result guard CROSS-register
-        // only (same-register coalescing is Phase 3.5's job and is correct); we
-        // only protect call-result identity when Phase 4 would fold it into a
-        // DIFFERENT register's variable.
+        // "rax" / "rax_2" -> "rax". Used to keep the call-result guard
+        // CROSS-register only (same-register coalescing is Phase 3.5's job
+        // and is correct); we only protect call-result identity when Phase 4
+        // would fold it into a DIFFERENT register's variable.
         auto registerBase = [](llvm::StringRef n) -> llvm::StringRef {
             size_t us = n.find('_');
             return (us == llvm::StringRef::npos) ? n : n.take_front(us);
@@ -2354,6 +2729,39 @@ private:
                     if (!infoB.decl || isErased(infoB.decl.getOperation()))
                         continue;
 
+                    // Phase 3.5 preserves the implicit return-register
+                    // identity for same-register versions. Phase 4 must not
+                    // subsequently merge that `result` into an unrelated
+                    // register variable merely because their explicit live
+                    // ranges do not overlap.
+                    bool aIsResult =
+                        infoA.decl.getVarName() == "result";
+                    bool bIsResult =
+                        infoB.decl.getVarName() == "result";
+                    if (tracker.preserveExactReturnIdentity &&
+                        aIsResult != bIsResult)
+                        continue;
+
+                    // FIX-132: scf_r*/scf_w* are explicit storage identities
+                    // introduced by StructureControlFlow for region results,
+                    // loop-carried state, the loop condition, and parallel-copy
+                    // shadows. Their lexical live ranges may appear disjoint,
+                    // but tuple components and values carried across a loop
+                    // backedge are simultaneously live by construction.
+                    // Generic cover-based reuse can merge next_state, auxiliary
+                    // results, and continue into one slot, making the last
+                    // sequential assignment overwrite the others and turning a
+                    // finite cleanup chain into an infinite do-while. Keep every
+                    // bridge identity distinct here; the C-AST dispatcher pass
+                    // separately coalesces proven scf_r copy chains without
+                    // touching scf_w loop storage.
+                    const bool aIsSCFBridge =
+                        infoA.decl.getVarName().starts_with("scf_");
+                    const bool bIsSCFBridge =
+                        infoB.decl.getVarName().starts_with("scf_");
+                    if (aIsSCFBridge || bIsSCFBridge)
+                        continue;
+
                     // Don't merge if either touches a call block — the
                     // function call may clobber registers, making it unsafe
                     // to assume non-interference.
@@ -2364,8 +2772,8 @@ private:
                     if (!areTypesCompatible(infoA.decl, infoB.decl))
                         continue;
 
-                    // Semantic usage must be compatible (refuse merging
-                    // address-only with value-only).
+                    // Semantic usage must be compatible (refuse an
+                    // address-bearing variable with a pure-value variable).
                     if (!areSemanticsCompatible(idA, idB))
                         continue;
 
@@ -2398,17 +2806,30 @@ private:
                     auto& canonInfo = infoMap[canonId];
                     auto& victimInfo = infoMap[victimId];
 
-                    // Phase-4-aware guard (FIX-081 follow-up option 1). Refuse to
-                    // merge away a call-result variable into a DIFFERENT
-                    // register's variable: preserves the call-return identity that
-                    // Phase 4's cover-based merge would otherwise fold into one
-                    // canonical register (later flattened to a single vN). Scoped
-                    // cross-register only so legitimate same-register coalescing
-                    // (Phase 3.5's domain) is untouched. VALIDATED on the real
-                    // Mali kbase corpus: 6 adversarial judges 5 BETTER / 1 NEUTRAL
-                    // / 0 WORSE; removes wrong void-return captures, splits
-                    // overloaded call-result vars, de-stubs placeholder branches
-                    // into real named calls, +5pp confidence, 0 regressions.
+                    // Phase-4-aware guard (Helix v2 experiment - FIX-081
+                    // follow-up option 1). Refuse to merge away a variable
+                    // whose value comes from a call result: keeping the
+                    // call-result victim distinct preserves call-return
+                    // identity that renameRemainingRegisterVars would
+                    // otherwise flatten to a single vN. Risk being measured:
+                    // extra vN placeholders on legitimate disjoint-liveness
+                    // merges across the corpus.
+                    // Phase-4-aware guard (FIX-081 follow-up option 1). Refuse
+                    // to merge away a call-result variable into a DIFFERENT
+                    // register's variable: preserves the call-return identity
+                    // that Phase 4's cover-based merge would otherwise fold into
+                    // one canonical register (later flattened to a single vN).
+                    // Scoped cross-register only so legitimate same-register
+                    // coalescing (Phase 3.5's domain) is untouched.
+                    //
+                    // VALIDATED v0.1.6 on the real Mali kbase corpus: 6 skeptical
+                    // adversarial judges scored 5 BETTER / 1 NEUTRAL / 0 WORSE.
+                    // It removes factually-wrong void-return captures
+                    // (v13 = _dev_err(...)), splits overloaded call-result vars
+                    // into distinct named results, de-stubs placeholder branches
+                    // into real named kbase_* calls (incl. audit-relevant grow /
+                    // -EINVAL paths), and adds no net garbage; net +5pp
+                    // confidence, 0 regressions.
                     if (victimInfo.definedByCall &&
                         registerBase(victimInfo.decl.getVarName()) !=
                             registerBase(canonInfo.decl.getVarName())) {

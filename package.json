@@ -1,6 +1,6 @@
 {
     "name": "@hexcore/helix",
-    "version": "0.9.2",
+    "version": "0.9.3",
     "description": "HexCore Helix — Next-generation decompilation engine powered by Rust, C++23/MLIR, and FlatBuffers",
     "main": "index.js",
     "types": "index.d.ts",
@@ -20,8 +20,8 @@
     },
     "scripts": {
         "artifacts": "napi artifacts",
-        "build": "napi build --platform --release --manifest-path crates/hexcore-helix/Cargo.toml",
-        "build:debug": "napi build --platform --manifest-path crates/hexcore-helix/Cargo.toml",
+        "build": "napi build --platform --release --manifest-path crates/hexcore-helix/Cargo.toml --output-dir .",
+        "build:debug": "napi build --platform --manifest-path crates/hexcore-helix/Cargo.toml --output-dir .",
         "report:logs": "cargo run -p helix-core --example benchmark_logs -- --label latest --iterations 25 --output tests/reports/latest.md log1.txt log2.txt log3.txt",
         "prepublishOnly": "napi prepublish -t npm",
         "version": "napi version",
@@ -33,7 +33,7 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/LXrdKnowkill/HexCore-Helix"
+        "url": "https://github.com/AkashaCorporation/HexCore-Helix"
     },
     "license": "Apache-2.0",
     "engines": {

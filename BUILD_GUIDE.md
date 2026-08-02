@@ -6,7 +6,7 @@ Este guia documenta como compilar o HexCore-Helix do zero.
 
 - **Visual Studio 2022** com C++ Desktop Development
 - **LLVM/MLIR** compilado (localizado em `C:\Users\Mazum\Desktop\caps\llvm-build\build-mlir`)
-- **Node.js** (v18+)
+- **Node.js** (v22+)
 - **Rust** (stable)
 - **Ninja** (build system)
 - **CMake** (3.20+)
@@ -65,9 +65,18 @@ cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 `
 cmake --build . --config Release
 ```
 
-## Passo 2: Compilar o Módulo NAPI (Rust)
+## Passo 2: Compilar o Pacote N-API
 
-O módulo NAPI precisa saber onde estão as libs do LLVM.
+No host Windows mantido, use o script canônico. Ele configura o MSVC,
+compila o engine atual, copia exatamente essa biblioteca para o caminho que o
+Cargo liga e executa o `napi-rs` para regenerar o `.node`, o loader e os tipos.
+
+```powershell
+.\build_node.bat
+```
+
+Para executar apenas o passo N-API, a biblioteca C++ já precisa estar
+atualizada e `LLVM_LIB_DIR` precisa apontar para as bibliotecas do LLVM.
 
 ### Usando Git Bash ou terminal Unix-like
 
@@ -96,22 +105,26 @@ npm run build
 
 O arquivo `.node` será gerado em:
 ```
-crates/hexcore-helix/hexcore-helix.win32-x64-msvc.node
+hexcore-helix.win32-x64-msvc.node
 ```
+
+`index.js` e `index.d.ts` são regenerados no mesmo diretório. O build deve ser
+rejeitado se a versão JS e a versão nativa reportadas por `engine.version()`
+forem diferentes.
 
 ## Passo 3: Copiar para a Extensão VSCode
 
 **IMPORTANTE:** Feche o VSCode antes de copiar!
 
 ```bash
-cp crates/hexcore-helix/hexcore-helix.win32-x64-msvc.node \
+cp hexcore-helix.win32-x64-msvc.node \
    "C:/Users/Mazum/Desktop/vscode-main/extensions/hexcore-helix/"
 ```
 
 Ou via PowerShell:
 
 ```powershell
-Copy-Item ".\crates\hexcore-helix\hexcore-helix.win32-x64-msvc.node" `
+Copy-Item ".\hexcore-helix.win32-x64-msvc.node" `
   -Destination "C:\Users\Mazum\Desktop\vscode-main\extensions\hexcore-helix\" -Force
 ```
 
@@ -137,7 +150,7 @@ echo "=== Building NAPI Module ==="
 LLVM_LIB_DIR="$LLVM_LIB" npm run build
 
 echo "=== Copying to VSCode Extension ==="
-cp crates/hexcore-helix/hexcore-helix.win32-x64-msvc.node "$VSCODE_EXT/"
+cp hexcore-helix.win32-x64-msvc.node "$VSCODE_EXT/"
 
 echo "=== Build Complete ==="
 ```

@@ -43,6 +43,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
 
+      - name: Vendor FlatBuffers headers
+        run: bash engine/vendor_flatbuffers.sh
+
       - name: Build native engine for Rust workspace
         run: |
           cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
@@ -72,11 +75,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
 
+      - name: Vendor FlatBuffers headers
+        run: bash engine/vendor_flatbuffers.sh
+
       - name: Configure CMake
-        run: cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+        run: cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DHELIX_BUILD_TESTS=ON -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
 
       - name: Build
         run: cmake --build engine/build --config Release
+
+      - name: Run native tests
+        run: ctest --test-dir engine/build --output-on-failure
 
   # ─── NAPI-RS Build (Multi-Platform) ─────────────────────────────────────────
   napi-build:
@@ -104,6 +113,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Vendor FlatBuffers headers
+        run: bash engine/vendor_flatbuffers.sh
+
       - name: Build C++ Engine
         run: |
           cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
@@ -111,6 +123,9 @@ jobs:
 
       - name: Build NAPI-RS
         run: npm run build
+
+      - name: Smoke test package
+        run: node tools/smoke_napi.cjs
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

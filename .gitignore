@@ -6,7 +6,9 @@ Cargo.lock
 # C++ Build
 /engine/build/
 /engine/build-tests/
+/engine/build-tests-*/
 /engine/out/
+/engine/deps/flatbuffers/
 *.o
 *.a
 *.lib
