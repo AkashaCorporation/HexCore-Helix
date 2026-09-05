@@ -367,23 +367,18 @@ impl HelixEngine {
             Error::from_reason("MLIR engine not initialized. Cannot decompile without C++ engine.")
         })?;
 
-        let source = handle
-            .decompile_ir_text(&ir_text)
+        let output = handle
+            .decompile_ir_combined(&ir_text)
             .map_err(|e| Error::from_reason(format!("MLIR pipeline failed: {}", e)))?;
 
-        // Retrieve the HAST FlatBuffer (runs pipeline a second time).
-        // The C++ engine produces both pseudo-C and FlatBuffer in each run;
-        // a future optimisation can add a combined C API to avoid the double run.
-        let ast_buffer = handle.decompile_ir(&ir_text).ok().map(Buffer::from);
-
         Ok(DecompileResult {
-            source,
+            source: output.pseudo_c,
             function_name: "mlir_decompiled".to_string(),
             entry_address: String::new(),
-            block_count: 0,
-            instruction_count: 0,
+            block_count: output.block_count,
+            instruction_count: output.instruction_count,
             cfg_buffer: None,
-            ast_buffer,
+            ast_buffer: Some(Buffer::from(output.flatbuffer)),
             pipeline: "mlir".to_string(),
         })
     }

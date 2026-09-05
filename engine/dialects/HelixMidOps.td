@@ -13,14 +13,51 @@ include "mlir/IR/EnumAttr.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/MemorySlotInterfaces.td"
 include "dialects/HelixMidDialect.td"
 include "dialects/HelixMidTypes.td"
+include "dialects/HelixEffects.td"
+include "dialects/HelixInterfaces.td"
 
 // ─── Base Class ──────────────────────────────────────────────────────────────
 
 class HelixMid_Op<string mnemonic, list<Trait> traits = []>
-    : Op<HelixMid_Dialect, mnemonic, traits>;
+    : Op<HelixMid_Dialect, mnemonic,
+         !listconcat(traits, [HelixAddressableOpInterface])>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MemorySlot pilot operations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+def HelixMid_SlotAllocOp : HelixMid_Op<"slot.alloc", [
+    DeclareOpInterfaceMethods<PromotableAllocationOpInterface>
+  ]> {
+  let summary = "Allocate an explicitly promotable recovered-variable slot";
+  let arguments = (ins OptionalAttr<UnitAttr>:$promotable);
+  let results = (outs HelixMid_SlotType:$slot);
+  let assemblyFormat = [{ (`promotable` $promotable^)? attr-dict `:` type($slot) }];
+}
+
+def HelixMid_SlotLoadOp : HelixMid_Op<"slot.load", [
+    MemoryEffects<[MemRead<Helix_VariableStateResource>]>,
+    DeclareOpInterfaceMethods<PromotableMemOpInterface>
+  ]> {
+  let summary = "Load a whole value from a recovered-variable slot";
+  let arguments = (ins HelixMid_SlotType:$slot);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{ $slot attr-dict `:` type($slot) `->` type($result) }];
+}
+
+def HelixMid_SlotStoreOp : HelixMid_Op<"slot.store", [
+    MemoryEffects<[MemWrite<Helix_VariableStateResource>]>,
+    DeclareOpInterfaceMethods<PromotableMemOpInterface>
+  ]> {
+  let summary = "Store a whole value into a recovered-variable slot";
+  let arguments = (ins HelixMid_SlotType:$slot, AnyType:$value);
+  let assemblyFormat = [{ $value `to` $slot attr-dict `:` type($value) `,` type($slot) }];
+}
 
 // ─── Binary Expression Kind ──────────────────────────────────────────────────
 
@@ -45,6 +82,16 @@ def HelixMid_BinExprKind : I32EnumAttr<
       I32EnumAttrCase<"Ge",    16>,
       I32EnumAttrCase<"LogAnd",17>,
       I32EnumAttrCase<"LogOr", 18>,
+      I32EnumAttrCase<"Ult",   19>,
+      I32EnumAttrCase<"Ule",   20>,
+      I32EnumAttrCase<"Ugt",   21>,
+      I32EnumAttrCase<"Uge",   22>,
+      I32EnumAttrCase<"UMul",  23>,
+      I32EnumAttrCase<"SMul",  24>,
+      I32EnumAttrCase<"UDiv",  25>,
+      I32EnumAttrCase<"SDiv",  26>,
+      I32EnumAttrCase<"Rol",   27>,
+      I32EnumAttrCase<"Ror",   28>,
     ]> {
   let cppNamespace = "::helix::mid";
 }
@@ -58,6 +105,28 @@ def HelixMid_UnExprKind : I32EnumAttr<
       I32EnumAttrCase<"BitNot",    2>,
       I32EnumAttrCase<"Deref",     3>,
       I32EnumAttrCase<"AddrOf",    4>,
+      I32EnumAttrCase<"Bswap",     5>,
+      I32EnumAttrCase<"Bsf",       6>,
+      I32EnumAttrCase<"Bsr",       7>,
+    ]> {
+  let cppNamespace = "::helix::mid";
+}
+
+def HelixMid_CastKind : I32EnumAttr<
+    "CastKind", "Exact conversion semantics", [
+      I32EnumAttrCase<"Unknown",     0>,
+      I32EnumAttrCase<"Bitcast",     1>,
+      I32EnumAttrCase<"ZeroExtend",  2>,
+      I32EnumAttrCase<"SignExtend",  3>,
+      I32EnumAttrCase<"Truncate",    4>,
+      I32EnumAttrCase<"PtrToInt",    5>,
+      I32EnumAttrCase<"IntToPtr",    6>,
+      I32EnumAttrCase<"FpExtend",    7>,
+      I32EnumAttrCase<"FpTruncate",  8>,
+      I32EnumAttrCase<"FpToSI",      9>,
+      I32EnumAttrCase<"FpToUI",     10>,
+      I32EnumAttrCase<"SIToFp",     11>,
+      I32EnumAttrCase<"UIToFp",     12>
     ]> {
   let cppNamespace = "::helix::mid";
 }
@@ -91,7 +160,9 @@ def HelixMid_VarDeclOp : HelixMid_Op<"var.decl", []> {
   }];
 }
 
-def HelixMid_VarRefOp : HelixMid_Op<"var.ref", [Pure]> {
+def HelixMid_VarRefOp : HelixMid_Op<"var.ref", [
+    MemoryEffects<[MemRead<Helix_VariableStateResource>]>
+  ]> {
   let summary = "Reference a previously declared variable slot";
 
   let arguments = (ins
@@ -105,7 +176,9 @@ def HelixMid_VarRefOp : HelixMid_Op<"var.ref", [Pure]> {
   }];
 }
 
-def HelixMid_AssignOp : HelixMid_Op<"assign", [MemoryEffects<[MemWrite]>]> {
+def HelixMid_AssignOp : HelixMid_Op<"assign", [
+    MemoryEffects<[MemWrite<Helix_VariableStateResource>]>
+  ]> {
   let summary = "Assign a value to a variable slot";
 
   let arguments = (ins
@@ -123,7 +196,9 @@ def HelixMid_AssignOp : HelixMid_Op<"assign", [MemoryEffects<[MemWrite]>]> {
 // Memory Operations (typed)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-def HelixMid_LoadOp : HelixMid_Op<"load", [MemoryEffects<[MemRead]>]> {
+def HelixMid_LoadOp : HelixMid_Op<"load", [
+    MemoryEffects<[MemRead<Helix_ProgramMemoryResource>]>
+  ]> {
   let summary = "Typed memory load";
   let description = [{
     Loads a typed value from memory at the given address.  Unlike
@@ -142,7 +217,9 @@ def HelixMid_LoadOp : HelixMid_Op<"load", [MemoryEffects<[MemRead]>]> {
   }];
 }
 
-def HelixMid_StoreOp : HelixMid_Op<"store", [MemoryEffects<[MemWrite]>]> {
+def HelixMid_StoreOp : HelixMid_Op<"store", [
+    MemoryEffects<[MemWrite<Helix_ProgramMemoryResource>]>
+  ]> {
   let summary = "Typed memory store";
 
   let arguments = (ins
@@ -183,7 +260,9 @@ def HelixMid_BinExprOp : HelixMid_Op<"binexpr", [Pure]> {
   }];
 }
 
-def HelixMid_UnExprOp : HelixMid_Op<"unexpr", [Pure]> {
+def HelixMid_UnExprOp : HelixMid_Op<"unexpr", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Typed unary expression";
 
   let arguments = (ins
@@ -204,13 +283,16 @@ def HelixMid_CastOp : HelixMid_Op<"cast", [Pure]> {
 
   let arguments = (ins
     AnyType:$input,
-    OptionalAttr<UI64Attr>:$address
+    OptionalAttr<UI64Attr>:$address,
+    OptionalAttr<HelixMid_CastKind>:$cast_kind
   );
   let results = (outs AnyType:$result);
 
   let assemblyFormat = [{
-    $input (`at` $address^)? attr-dict `:` type($input) `to` type($result)
+    (`kind` $cast_kind^)? $input (`at` $address^)? attr-dict
+    `:` type($input) `to` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 def HelixMid_SelectOp : HelixMid_Op<"select", [Pure]> {
@@ -306,7 +388,9 @@ def HelixMid_IndexPtrOp : HelixMid_Op<"index.ptr", [Pure]> {
 // Call Operation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-def HelixMid_CallOp : HelixMid_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> {
+def HelixMid_CallOp : HelixMid_Op<"call", [
+    MemoryEffects<[MemRead, MemWrite]>, CallOpInterface
+  ]> {
   let summary = "Typed function call with resolved arguments";
   let description = [{
     A function call where arguments have been resolved from register writes
@@ -327,6 +411,27 @@ def HelixMid_CallOp : HelixMid_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
     (`at` $address^)? attr-dict
     `:` functional-type($args, results)
   }];
+  let extraClassDeclaration = [{
+    ::mlir::Operation::operand_range getArgOperands() { return getArgs(); }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getArgsMutable();
+    }
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      if (auto name = getCalleeNameAttr())
+        return ::mlir::SymbolRefAttr::get(getContext(), name.getValue());
+      return {};
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      if (!callee) {
+        removeCalleeNameAttr();
+        return;
+      }
+      assert(callee.is<::mlir::SymbolRefAttr>() &&
+             "helix_mid.call supports symbol callees only");
+      setCalleeNameAttr(
+          callee.get<::mlir::SymbolRefAttr>().getRootReference());
+    }
+  }];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -334,7 +439,7 @@ def HelixMid_CallOp : HelixMid_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
 // ═══════════════════════════════════════════════════════════════════════════════
 
 def HelixMid_VariadicCallOp : HelixMid_Op<"variadic_call",
-    [MemoryEffects<[MemRead, MemWrite]>]> {
+    [MemoryEffects<[MemRead, MemWrite]>, CallOpInterface]> {
   let summary = "Typed variadic-signature call";
   let description = [{
     Mid-dialect variant of `helix_mid.call` for variadic callees. Carries the
@@ -356,6 +461,29 @@ def HelixMid_VariadicCallOp : HelixMid_Op<"variadic_call",
     ($callee_name^)? `target` $callee_addr `(` $fixed_args `)` `bundle` $raw_bundle
     (`at` $address^)? attr-dict
     `:` functional-type(operands, results)
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::Operation::operand_range getArgOperands() {
+      return getFixedArgs();
+    }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getFixedArgsMutable();
+    }
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      if (auto name = getCalleeNameAttr())
+        return ::mlir::SymbolRefAttr::get(getContext(), name.getValue());
+      return {};
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      if (!callee) {
+        removeCalleeNameAttr();
+        return;
+      }
+      assert(callee.is<::mlir::SymbolRefAttr>() &&
+             "helix_mid.variadic_call supports symbol callees only");
+      setCalleeNameAttr(
+          callee.get<::mlir::SymbolRefAttr>().getRootReference());
+    }
   }];
 }
 
@@ -462,7 +590,7 @@ def HelixMid_SwitchOp : HelixMid_Op<"switch", [RecursiveMemoryEffects]> {
 
 // ─── Terminators / Loop Control ──────────────────────────────────────────────
 
-def HelixMid_ReturnOp : HelixMid_Op<"return", [Terminator]> {
+def HelixMid_ReturnOp : HelixMid_Op<"return", [ReturnLike, Terminator]> {
   let summary = "Function return with optional value";
 
   let arguments = (ins
@@ -521,7 +649,7 @@ def HelixMid_YieldOp : HelixMid_Op<"yield", [Terminator]> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 def HelixMid_FuncOp : HelixMid_Op<"func", [
-    IsolatedFromAbove, Symbol
+    IsolatedFromAbove, Symbol, HelixDecompilableOpInterface
   ]> {
   let summary = "Typed function with abstract parameter slots";
   let description = [{
@@ -566,7 +694,10 @@ def HelixMid_ModuleOp : HelixMid_Op<"module", [
 // Intrinsic Operations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-def HelixMid_MemcpyOp : HelixMid_Op<"memcpy", []> {
+def HelixMid_MemcpyOp : HelixMid_Op<"memcpy", [MemoryEffects<[
+    MemRead<Helix_ProgramMemoryResource>,
+    MemWrite<Helix_ProgramMemoryResource>
+  ]>]> {
   let summary = "memcpy intrinsic (from REP MOVS)";
 
   let arguments = (ins
@@ -582,7 +713,9 @@ def HelixMid_MemcpyOp : HelixMid_Op<"memcpy", []> {
   }];
 }
 
-def HelixMid_MemsetOp : HelixMid_Op<"memset", []> {
+def HelixMid_MemsetOp : HelixMid_Op<"memset", [
+    MemoryEffects<[MemWrite<Helix_ProgramMemoryResource>]>
+  ]> {
   let summary = "memset intrinsic (from REP STOS)";
 
   let arguments = (ins
@@ -603,6 +736,67 @@ def HelixMid_CommentOp : HelixMid_Op<"comment", []> {
 
   let arguments = (ins StrAttr:$text);
   let assemblyFormat = [{ $text attr-dict }];
+}
+
+def HelixMid_DebugBreakOp : HelixMid_Op<"debug_break", [
+    MemoryEffects<[MemRead, MemWrite]>
+  ]> {
+  let summary = "Observable software breakpoint originating from INT3";
+  let arguments = (ins OptionalAttr<UI64Attr>:$address);
+  let assemblyFormat = [{ (`at` $address^)? attr-dict }];
+}
+
+def HelixMid_UnknownValueOp : HelixMid_Op<"unknown_value", []> {
+  let summary = "Explicitly unknown semantic value";
+  let arguments = (ins
+    StrAttr:$reason,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $reason (`at` $address^)? attr-dict `:` type($result)
+  }];
+}
+
+def HelixMid_XchgOp : HelixMid_Op<"xchg", [MemoryEffects<[
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>
+  ]>]> {
+  let summary = "Observable exchange of two recovered register identities";
+  let arguments = (ins
+    StrAttr:$reg_a,
+    StrAttr:$reg_b,
+    UI32Attr:$bit_width,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let assemblyFormat = [{
+    $reg_a `,` $reg_b `,` $bit_width (`at` $address^)? attr-dict
+  }];
+}
+
+def HelixMid_StackPushOp : HelixMid_Op<"stack.push", [MemoryEffects<[
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>,
+    MemWrite<Helix_ProgramMemoryResource>
+  ]>]> {
+  let summary = "Observable machine-stack push retained for source legalization";
+  let arguments = (ins AnyType:$value, OptionalAttr<UI64Attr>:$address);
+  let assemblyFormat = [{
+    $value (`at` $address^)? attr-dict `:` type($value)
+  }];
+}
+
+def HelixMid_StackPopOp : HelixMid_Op<"stack.pop", [MemoryEffects<[
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>,
+    MemRead<Helix_ProgramMemoryResource>
+  ]>]> {
+  let summary = "Observable machine-stack pop retained for source legalization";
+  let arguments = (ins OptionalAttr<UI64Attr>:$address);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    (`at` $address^)? attr-dict `:` type($result)
+  }];
 }
 
 #endif // HELIX_MID_OPS_TD

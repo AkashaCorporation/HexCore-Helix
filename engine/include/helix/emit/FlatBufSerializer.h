@@ -1,11 +1,11 @@
 #pragma once
 /// @file FlatBufSerializer.h
-/// @brief Serialize HelixHigh MLIR module or C AST to FlatBuffers AST format.
+/// @brief Serialize the canonical C AST to the HAST FlatBuffer contract.
 
 #ifndef HELIX_EMIT_FLATBUF_SERIALIZER_H
 #define HELIX_EMIT_FLATBUF_SERIALIZER_H
 
-#include "mlir/IR/BuiltinOps.h"
+#include "helix/Types.h"
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -18,12 +18,10 @@ namespace helix::cast {
 
 namespace helix {
 
-/// Serializes a HelixHigh MLIR module (or C AST tree) to the FlatBuffers
-/// AST schema (schemas/ast.fbs, file identifier "HAST").
-///
-/// Two serialization paths:
-///   1. MLIR path: serialize(ModuleOp)  — stub, walks HelixHigh ops
-///   2. C AST path: serialize(vector<CFuncDecl>) — full, walks C AST tree
+/// Serializes a canonical C AST tree to the FlatBuffers AST schema
+/// (schemas/ast.fbs, file identifier "HAST"). The former partial MLIR/stub
+/// representation is intentionally not part of this API: every successful
+/// serialization carries the HAST 1.x negotiation fields and full C-AST data.
 ///
 /// The C AST path produces a complete HAST with all node types:
 ///   CFuncDecl → DecompiledFunction
@@ -33,22 +31,22 @@ namespace helix {
 ///   CType     → DataType
 class FlatBufSerializer {
 public:
-    /// Serialize an entire MLIR module to FlatBuffer bytes (stub path).
-    std::vector<uint8_t> serialize(mlir::ModuleOp module);
-
-    /// Serialize C AST functions to FlatBuffer bytes (full path).
+    /// Serialize C AST functions to canonical HAST bytes.
     ///
-    /// This is the primary serialization method used when --use-cast-layer
-    /// is active. Produces a complete HAST consumable by HQL.
+    /// This is the only serialization method and produces a complete HAST
+    /// consumable by HQL and other semantic clients.
     ///
     /// @param funcs       C AST function declarations after CAstOptimizer.
     /// @param moduleName  Module name for the AstModule root table.
+    /// @param arch        Target architecture recorded in module metadata.
     /// @return            FlatBuffer bytes with "HAST" file identifier.
     std::vector<uint8_t> serialize(
         const std::vector<std::unique_ptr<cast::CFuncDecl>>& funcs,
-        const std::string& moduleName = "decompiled_module");
+        const std::string& moduleName = "decompiled_module",
+        HelixArch arch = HELIX_ARCH_X86_64);
 
-    /// Verify that a FlatBuffer is well-formed.
+    /// Verify the HAST identifier, root bounds, and canonical 1.0 negotiation
+    /// fields. Legacy identifier-only/name-only buffers are rejected.
     static bool verify(const uint8_t* data, size_t size);
 };
 

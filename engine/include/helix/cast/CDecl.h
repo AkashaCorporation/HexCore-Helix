@@ -59,11 +59,17 @@ public:
     std::string name;
     CTypePtr type;
     unsigned index;
+    /// Stable Helix variable identity. Kept optional because parameters
+    /// inferred only from a legacy ABI name do not necessarily have a source
+    /// VarDecl/argument identity. A present value of zero remains meaningful.
+    std::optional<uint32_t> varId;
 
     CParamDecl(std::string name, CTypePtr type, unsigned index,
-               uint64_t address = 0)
+               uint64_t address = 0,
+               std::optional<uint32_t> varId = std::nullopt)
         : CDecl(NodeKind::ParamDecl, address),
-          name(std::move(name)), type(std::move(type)), index(index) {}
+          name(std::move(name)), type(std::move(type)), index(index),
+          varId(varId) {}
 
     static bool classof(const CAstNode* n) {
         return n->getKind() == NodeKind::ParamDecl;

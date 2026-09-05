@@ -269,6 +269,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LLVM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=HELIX_ENGINE_LIB_HASH");
 
     let engine_lib_name = if cfg!(target_os = "windows") {
         "helix_engine.lib"

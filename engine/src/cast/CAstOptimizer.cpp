@@ -1254,10 +1254,15 @@ static void collectVarNamesInStmts(const std::vector<StmtPtr>& stmts,
 }
 
 void CAstOptimizer::renameRemainingRegisterVars(CFuncDecl& func) {
-    // Collect all existing names to avoid collisions.
+    // Reserve every name already present in the AST, including references
+    // whose declarations are synthesized later by declareUndeclaredVars.
+    // Looking only at params/localVars lets a register rename claim an orphan
+    // name (for example r8 -> v1 while a distinct SSA temporary is already
+    // referenced as v1), silently merging two variables in the printed C.
     std::unordered_set<std::string> usedNames;
     for (auto& d : func.localVars) usedNames.insert(d.varName);
     for (auto& p : func.params)    usedNames.insert(p.name);
+    collectVarNamesInStmts(func.body, usedNames);
 
     unsigned nextId = 1;
     auto makeUnique = [&]() -> std::string {
@@ -1289,13 +1294,16 @@ void CAstOptimizer::renameRemainingRegisterVars(CFuncDecl& func) {
     std::unordered_set<std::string> bodyNames;
     collectVarNamesInStmts(func.body, bodyNames);
 
-    // Rebuild usedNames after Phase 1 renames.
-    usedNames.clear();
-    for (auto& d : func.localVars) usedNames.insert(d.varName);
-    for (auto& p : func.params)    usedNames.insert(p.name);
+    // Track declarations separately from occupied names.  `usedNames` must
+    // retain orphan references so makeUnique cannot collide with them, while
+    // `declaredNames` tells Phase 2 which body-only register refs still need a
+    // declaration.
+    std::unordered_set<std::string> declaredNames;
+    for (auto& d : func.localVars) declaredNames.insert(d.varName);
+    for (auto& p : func.params)    declaredNames.insert(p.name);
 
     for (auto& name : bodyNames) {
-        if (usedNames.count(name)) continue;  // already a known var
+        if (declaredNames.count(name)) continue;  // already a known var
         if (!isPlainRegisterName(name) && !name.starts_with("_promoted_"))
             continue;
 
@@ -1308,6 +1316,7 @@ void CAstOptimizer::renameRemainingRegisterVars(CFuncDecl& func) {
         uint32_t varId = 90000 + static_cast<uint32_t>(func.localVars.size());
         func.localVars.emplace_back(
             varId, newName, CType::int64());
+        declaredNames.insert(newName);
     }
 }
 
@@ -1527,8 +1536,8 @@ static const llvm::StringMap<std::string>& getSemanticMap() {
         {"MOVUPD",     "simd_move_unaligned_packed_double"},
         {"MOVSS",      "simd_move_scalar_single"},
         {"MOVSD",      "simd_move_scalar_double"},
-        {"MOVSS_MEM",  "simd_load_scalar_single"},
-        {"MOVSD_MEM",  "simd_load_scalar_double"},
+        {"MOVSS_MEM",  "simd_move_scalar_single_memory"},
+        {"MOVSD_MEM",  "simd_move_scalar_double_memory"},
         // SSE/SIMD shifts
         {"PSRLDQ",     "simd_shift_right_dquad"},
         {"PSLLDQ",     "simd_shift_left_dquad"},
@@ -3039,8 +3048,9 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
     //     (rag/16 G3: kill the mis-attributed fixed phrase on leaf fns).
     auto damning = detectDamningDefects(func);
     bool d2Call = func.hasDamningHonestyDefect;
-    if ((damning.any() || d2Call) && func.confidenceScore > 50.0) {
-        func.confidenceScore = 50.0;
+    if (damning.any() || d2Call) {
+        if (func.confidenceScore > 50.0)
+            func.confidenceScore = 50.0;
         std::string reason = damning.reason();
         if (d2Call) {
             if (!reason.empty()) reason += "; ";
@@ -4419,6 +4429,90 @@ static bool containsLoopBreakOrContinue(const std::vector<StmtPtr>& stmts) {
     return false;
 }
 
+static std::optional<int64_t> evaluateSCFConstant(
+    const CExpr* expr,
+    const std::unordered_map<std::string, int64_t>& constants) {
+    if (!expr)
+        return std::nullopt;
+    if (auto* literal = llvm::dyn_cast<CIntLitExpr>(expr))
+        return literal->value;
+    if (auto* var = llvm::dyn_cast<CVarRefExpr>(expr)) {
+        auto it = constants.find(var->varName);
+        return it == constants.end() ? std::nullopt
+                                     : std::optional<int64_t>(it->second);
+    }
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return evaluateSCFConstant(cast->operand.get(), constants);
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(expr)) {
+        auto value = evaluateSCFConstant(unary->operand.get(), constants);
+        if (!value)
+            return std::nullopt;
+        if (unary->op == UnaryOp::LogNot)
+            return *value == 0 ? 1 : 0;
+        if (unary->op == UnaryOp::Neg)
+            return -*value;
+        if (unary->op == UnaryOp::BitNot)
+            return ~*value;
+    }
+    if (auto* binary = llvm::dyn_cast<CBinaryExpr>(expr)) {
+        auto lhs = evaluateSCFConstant(binary->lhs.get(), constants);
+        auto rhs = evaluateSCFConstant(binary->rhs.get(), constants);
+        if (!lhs || !rhs)
+            return std::nullopt;
+        switch (binary->op) {
+        case BinaryOp::Eq: return *lhs == *rhs;
+        case BinaryOp::Ne: return *lhs != *rhs;
+        case BinaryOp::LogAnd: return *lhs != 0 && *rhs != 0;
+        case BinaryOp::LogOr: return *lhs != 0 || *rhs != 0;
+        case BinaryOp::BitAnd: return *lhs & *rhs;
+        case BinaryOp::BitOr: return *lhs | *rhs;
+        case BinaryOp::BitXor: return *lhs ^ *rhs;
+        default: return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+static bool isSyntheticSCFGuard(const CExpr* expr) {
+    while (auto* cast = llvm::dyn_cast_or_null<CCastExpr>(expr))
+        expr = cast->operand.get();
+    auto* var = llvm::dyn_cast_or_null<CVarRefExpr>(expr);
+    return var && var->varName.starts_with("scf_w");
+}
+
+static bool hasProvablyFalseSyntheticGuard(const CDoWhileStmt& loop) {
+    if (!isSyntheticSCFGuard(loop.condition.get()))
+        return false;
+
+    std::unordered_map<std::string, int64_t> constants;
+    for (const auto& stmt : loop.body) {
+        if (!stmt)
+            continue;
+        if (stmt->getKind() == NodeKind::IfStmt ||
+            stmt->getKind() == NodeKind::WhileStmt ||
+            stmt->getKind() == NodeKind::DoWhileStmt ||
+            stmt->getKind() == NodeKind::ForStmt ||
+            stmt->getKind() == NodeKind::SwitchStmt ||
+            stmt->getKind() == NodeKind::BlockStmt)
+            return false;
+        auto* assign = llvm::dyn_cast<CAssignStmt>(stmt.get());
+        if (!assign)
+            continue;
+        auto* target = llvm::dyn_cast<CVarRefExpr>(assign->target.get());
+        if (!target || !target->varName.starts_with("scf_") ||
+            !assign->compoundOp.empty())
+            continue;
+        auto value = evaluateSCFConstant(assign->value.get(), constants);
+        if (value)
+            constants[target->varName] = *value;
+        else
+            constants.erase(target->varName);
+    }
+
+    auto condition = evaluateSCFConstant(loop.condition.get(), constants);
+    return condition && *condition == 0;
+}
+
 static void unwrapTrivialDoWhileInList(std::vector<StmtPtr>& stmts) {
     // First, recurse into nested scopes.
     for (auto& sp : stmts) {
@@ -4451,28 +4545,34 @@ static void unwrapTrivialDoWhileInList(std::vector<StmtPtr>& stmts) {
         }
     }
 
-    // Now scan for do-while loops that end with an unconditional break
-    // AND have no other break/continue statements (which would be left
-    // orphaned if we unwrapped the loop).
+    // Scan for loops that execute exactly once: either they end in an
+    // unconditional break, or their synthetic SCF guard is proven false by
+    // straight-line constant propagation over the body.
     for (size_t i = 0; i < stmts.size(); ++i) {
         if (!stmts[i] || stmts[i]->getKind() != NodeKind::DoWhileStmt)
             continue;
 
         auto& dw = static_cast<CDoWhileStmt&>(*stmts[i]);
 
-        // Check that the body's last statement is an unconditional break.
         if (dw.body.empty()) continue;
         auto& last = dw.body.back();
-        if (!last || last->getKind() != NodeKind::BreakStmt) continue;
+        const bool hasTrailingBreak =
+            last && last->getKind() == NodeKind::BreakStmt;
+        const bool hasFalseSyntheticGuard =
+            hasProvablyFalseSyntheticGuard(dw);
+        if (!hasTrailingBreak && !hasFalseSyntheticGuard) continue;
 
-        // Pop the trailing break temporarily to check the rest.
-        auto trailingBreak = std::move(dw.body.back());
-        dw.body.pop_back();
+        StmtPtr trailingBreak;
+        if (hasTrailingBreak) {
+            trailingBreak = std::move(dw.body.back());
+            dw.body.pop_back();
+        }
 
         // If the remaining body has any break/continue, we can't unwrap
         // (they would become orphaned).  Restore the break and skip.
         if (containsLoopBreakOrContinue(dw.body)) {
-            dw.body.push_back(std::move(trailingBreak));
+            if (trailingBreak)
+                dw.body.push_back(std::move(trailingBreak));
             continue;
         }
 
@@ -5778,6 +5878,38 @@ void CAstOptimizer::propagateCopies(CFuncDecl& func) {
 // Pass 5: simplifyExpressions
 // ═══════════════════════════════════════════════════════════════════════════════
 
+static bool exprMayHaveObservableEvaluation(const CExpr* expr) {
+    if (!expr)
+        return false;
+    switch (expr->getKind()) {
+    case NodeKind::CallExpr:
+    case NodeKind::SubscriptExpr:
+    case NodeKind::FieldAccessExpr:
+        return true;
+    case NodeKind::UnaryExpr: {
+        const auto& unary = static_cast<const CUnaryExpr&>(*expr);
+        return unary.op == UnaryOp::Deref ||
+               exprMayHaveObservableEvaluation(unary.operand.get());
+    }
+    case NodeKind::CastExpr:
+        return exprMayHaveObservableEvaluation(
+            static_cast<const CCastExpr&>(*expr).operand.get());
+    case NodeKind::BinaryExpr: {
+        const auto& binary = static_cast<const CBinaryExpr&>(*expr);
+        return exprMayHaveObservableEvaluation(binary.lhs.get()) ||
+               exprMayHaveObservableEvaluation(binary.rhs.get());
+    }
+    case NodeKind::TernaryExpr: {
+        const auto& ternary = static_cast<const CTernaryExpr&>(*expr);
+        return exprMayHaveObservableEvaluation(ternary.cond.get()) ||
+               exprMayHaveObservableEvaluation(ternary.trueVal.get()) ||
+               exprMayHaveObservableEvaluation(ternary.falseVal.get());
+    }
+    default:
+        return false;
+    }
+}
+
 ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr, bool isLValue) {
     if (!expr) return nullptr;
 
@@ -5858,19 +5990,15 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr, bool isLValue) {
             }
         }
 
-        // *((T)NULL) → 0   (FIX-042 bug B: unresolved-global sentinel)
+        // *((T)NULL) → explicit unknown (unresolved-global sentinel)
         //
         // When Helix can't resolve an absolute address into a named global,
         // the emitter surfaces the load as `*(int64_t)(void*)0` / `*(void*)0`.
         // Leaving this in the output is user-hostile (it looks like a real
         // NULL deref, and — worse — propagates through `+` arithmetic into
-        // shapes like `*(v2 + 8 + *(int64_t)(void*)0)`).  Treating the deref
-        // as 0 makes the containing expression compilable (the `+ 0` then
-        // folds via the existing `x + 0 → x` rule) and matches the
-        // observable semantics: on Windows i386 the `NULL` page is not
-        // mapped, so any real execution of this load would trap; emitting
-        // 0 is the best static approximation we have without the original
-        // global's address.
+        // shapes like `*(v2 + 8 + *(int64_t)(void*)0)`. A plausible zero is
+        // not equivalent to either an unresolved global
+        // load or a trapping null access. Preserve the gap explicitly.
         //
         // FIX-047): but only when this expression is used as an
         // rvalue.  Collapsing `*(T)(void*)0 = rhs` to `0 = rhs` produces
@@ -5886,8 +6014,12 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr, bool isLValue) {
             for (int depth = 0; depth < 3 && cur; ++depth) {
                 if (cur->getKind() == NodeKind::IntLitExpr &&
                     static_cast<const CIntLitExpr&>(*cur).value == 0) {
-                    return std::make_unique<CIntLitExpr>(
-                        0, u.type ? u.type : CType::int64(),
+                    std::vector<ExprPtr> args;
+                    args.push_back(std::make_unique<CStringLitExpr>(
+                        "null-based unresolved load", expr->getAddress()));
+                    return std::make_unique<CCallExpr>(
+                        "__helix_unknown", 0, std::move(args),
+                        u.type ? u.type : CType::int64(),
                         expr->getAddress());
                 }
                 if (cur->getKind() == NodeKind::CastExpr) {
@@ -6075,12 +6207,14 @@ ExprPtr CAstOptimizer::simplifyExpr(ExprPtr expr, bool isLValue) {
         if (b.op == BinaryOp::BitAnd && isIntLit(b.rhs.get(), -1))
             return std::move(b.lhs);
 
-        // x * 0 → 0
-        if (b.op == BinaryOp::Mul && isIntLit(b.rhs.get(), 0))
+        // x * 0 → 0 only when evaluating x cannot call or observe memory.
+        if (b.op == BinaryOp::Mul && isIntLit(b.rhs.get(), 0) &&
+            !exprMayHaveObservableEvaluation(b.lhs.get()))
             return std::make_unique<CIntLitExpr>(0, lhsType, b.getAddress());
 
-        // x & 0 → 0
-        if (b.op == BinaryOp::BitAnd && isIntLit(b.rhs.get(), 0))
+        // x & 0 → 0 under the same evaluation-preservation requirement.
+        if (b.op == BinaryOp::BitAnd && isIntLit(b.rhs.get(), 0) &&
+            !exprMayHaveObservableEvaluation(b.lhs.get()))
             return std::make_unique<CIntLitExpr>(0, lhsType, b.getAddress());
 
         // x * -1 → -(x)
@@ -9124,20 +9258,28 @@ ExprPtr CAstOptimizer::flattenZeroComparison(ExprPtr condition) {
         return static_cast<const CIntLitExpr&>(*e).value == 0;
     };
 
+    const bool lhsIsZero = isZeroLit(bin.lhs.get());
+    const bool rhsIsZero = isZeroLit(bin.rhs.get());
+    const bool lhsIsLiteral = bin.lhs &&
+        bin.lhs->getKind() == NodeKind::IntLitExpr;
+    const bool rhsIsLiteral = bin.rhs &&
+        bin.rhs->getKind() == NodeKind::IntLitExpr;
+
+    // Do not move an operand until every all-constant form has been rejected.
+    // Returning `condition` after moving the non-zero literal used to leave a
+    // malformed BinaryExpr that crashed CAstPrinter on `1 == 0` / `1 != 0`.
+    if (lhsIsLiteral && rhsIsLiteral)
+        return condition;
+
     ExprPtr nonZero;
-    if (isZeroLit(bin.rhs.get()))
+    if (rhsIsZero)
         nonZero = std::move(bin.lhs);
-    else if (isZeroLit(bin.lhs.get()))
+    else if (lhsIsZero)
         nonZero = std::move(bin.rhs);
     else
         return condition;
 
     if (!nonZero)
-        return condition;
-
-    // Guard against degenerate shapes where the nonZero operand is itself
-    // a zero literal (0 == 0, 0 != 0) — leave to constant folding.
-    if (nonZero->getKind() == NodeKind::IntLitExpr)
         return condition;
 
     uint64_t addr = condition->getAddress();

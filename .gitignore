@@ -1,7 +1,7 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Pin the validated native binding dependency graph for release builds.
 
 # C++ Build
 /engine/build/
@@ -9,6 +9,7 @@ Cargo.lock
 /engine/build-tests-*/
 /engine/out/
 /engine/deps/flatbuffers/
+/engine/deps/llvm-mlir/
 *.o
 *.a
 *.lib

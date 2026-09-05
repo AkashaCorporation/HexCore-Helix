@@ -2,7 +2,26 @@
 
 All notable changes to HexCore Helix are documented here.
 
-## [v0.9.3] - Unreleased
+## [0.9.4-rc.1] - Unreleased
+
+- Reconcile the current native implementation with the canonical release history,
+  preserving published compiler, feature-gating, test-registration and CI fixes.
+- Run the C++ pipeline once for pseudo-C, canonical HAST and operation metrics;
+  retain the existing C entrypoints and add an explicitly owned combined output.
+- Preserve native SCF through analysis and legalize it at the C-AST boundary;
+  carry function/call interfaces, type evidence, memory effects and explicit
+  unknown semantics across dialect boundaries. Residual SCF temporaries remain.
+- Preserve classify-before-erase DCE with deduplicated deferred operand cleanup.
+- Require real FlatBuffers for release builds. Canonical HAST requires schema and
+  producer metadata; the structurally different legacy Rust format uses HRST.
+- Keep EscapeAnalysis behind HELIX_ESCAPE_ANALYSIS_V2. Explicitly enabling that
+  pass by name alone does not override this experimental safety gate.
+- Align Rust, npm, native API, HAST producer and text-header version identity;
+  fingerprint the exact static engine library before Cargo linking.
+- Pin Cargo dependencies and update the NAPI CLI's transitive js-yaml dependency.
+- Keep npm publication opt-in and exclude GitHub prereleases from that job.
+
+## [0.9.3] - 2026-08-02
 
 This release promotes the validated v2 sandbox into the canonical Helix line.
 It is not a parallel product or a permanent fork: v2 existed to rebuild the

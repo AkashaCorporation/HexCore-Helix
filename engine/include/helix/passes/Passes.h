@@ -9,9 +9,15 @@
 #define HELIX_PASSES_H
 
 #include "mlir/Pass/Pass.h"
+#include "mlir/IR/BuiltinOps.h"
 #include <memory>
 
 namespace helix {
+
+/// Remove LLVM integer casts whose input and output types are identical.
+/// These can appear when Remill value replacement widens a previously narrow
+/// operand before its original cast is revisited.
+unsigned removeIdentityLLVMIntegerCasts(mlir::ModuleOp module);
 
 // ─── Conversion Pass (LLVM Dialect → HelixLow) ──────────────────────────────
 
@@ -61,7 +67,12 @@ std::unique_ptr<mlir::Pass> createApplyDebugTypesPass();
 /// (helix_high.if, helix_high.while, helix_high.for) using dominance
 /// analysis and back-edge detection. Falls back to goto/label for
 /// irreducible control flow.
-std::unique_ptr<mlir::Pass> createStructureControlFlowPass(bool preserveCfg = false);
+std::unique_ptr<mlir::Pass> createStructureControlFlowPass(
+    bool preserveCfg = false, bool bridgeToHigh = true);
+
+/// Materialize native SCF results/regions into HelixHigh source constructs.
+/// Kept separate so semantic analyses can operate on scf.* SSA first.
+std::unique_ptr<mlir::Pass> createBridgeStructuredControlFlowPass();
 
 /// Create the variable recovery pass.
 ///
@@ -154,6 +165,10 @@ std::unique_ptr<mlir::Pass> createRecoverSwitchTablesPass();
 /// Sets "helix.escapes" BoolAttr on var.decl ops.
 std::unique_ptr<mlir::Pass> createEscapeAnalysisPass();
 
+/// Run MLIR mem2reg only on explicit helix_mid.slot.alloc operations whose
+/// promotable marker proves the slot has no escaping aliases.
+std::unique_ptr<mlir::Pass> createMemorySlotPilotPass();
+
 /// Create the struct type recovery pass (Nightly P1.6).
 ///
 /// Detects struct types from base+offset memory access patterns.
@@ -177,7 +192,8 @@ std::unique_ptr<mlir::Pass> createConstantFoldingPass();
 ///   - flag-producing binop → pure value binexpr
 ///   - CMOV → select, CMP/TEST → comparison expressions
 ///   - REP MOVS/STOS → memcpy/memset intrinsics
-std::unique_ptr<mlir::Pass> createHelixLowToMidPass();
+std::unique_ptr<mlir::Pass> createHelixLowToMidPass(
+    bool strictClosure = false);
 
 /// Create the HelixMid → HelixHigh conversion pass.
 ///
@@ -185,7 +201,12 @@ std::unique_ptr<mlir::Pass> createHelixLowToMidPass();
 ///   - Abstract variable slots → named variables
 ///   - Typed expressions → C-level binary/unary ops
 ///   - select → ternary, memcpy/memset → call
-std::unique_ptr<mlir::Pass> createHelixMidToHighPass();
+std::unique_ptr<mlir::Pass> createHelixMidToHighPass(
+    bool strictClosure = false);
+
+/// Replace the compatibility low.func wrapper with the final high.func
+/// container after every Low-aware analysis has completed.
+std::unique_ptr<mlir::Pass> createLegalizeFunctionContainersPass();
 
 // ─── Pass Registration ───────────────────────────────────────────────────────
 

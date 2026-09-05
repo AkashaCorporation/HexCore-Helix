@@ -24,6 +24,7 @@
 ///   void* sub_401000(void* param_1, int32_t param_2);
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/dialects/HelixHighOps.h"
@@ -362,10 +363,12 @@ struct InterProceduralTypePropagationPass
                             "inferred_type");
                         if (!existingAttr ||
                             existingAttr.getValue() == "int64_t") {
-                            defOp->setAttr("inferred_type",
-                                StringAttr::get(defOp->getContext(), typeStr));
-                            changed = true;
-                            ++NumReturnTypesRefined;
+                            if (helix::applyTypeEvidence(
+                                    defOp, typeStr,
+                                    helix::TypeEvidenceSource::Interprocedural)) {
+                                changed = true;
+                                ++NumReturnTypesRefined;
+                            }
                         }
                     }
                 }
@@ -407,9 +410,9 @@ struct InterProceduralTypePropagationPass
                         return;
                 }
 
-                regRead->setAttr("inferred_type",
-                    StringAttr::get(regRead->getContext(),
-                        paramType.toString()));
+                helix::applyTypeEvidence(
+                    regRead, paramType.toString(),
+                    helix::TypeEvidenceSource::Interprocedural);
             });
         });
 

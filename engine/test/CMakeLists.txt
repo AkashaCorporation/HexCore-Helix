@@ -31,6 +31,9 @@ add_executable(helix_tests
     StructureControlFlowTest.cpp
     ApplyDebugTypesTest.cpp
     VectorLaneTest.cpp
+    EffectsContractTest.cpp
+    LowToMidSemanticsTest.cpp
+    VerifyAuditTest.cpp
 )
 
 target_include_directories(helix_tests PRIVATE

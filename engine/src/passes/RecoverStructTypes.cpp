@@ -18,6 +18,7 @@
 ///   - van Emmerik, "Using a Decompiler for Real-World Source Recovery" (2004)
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/dialects/HelixHighOps.h"
@@ -89,6 +90,11 @@ static std::optional<BaseOffset> decomposeAddress(Value addr) {
         // a mid::FieldPtrOp's base is a HIGH-dialect VarRefOp, not a mid one.
         if (auto varRef = fieldPtr.getBase().getDefiningOp<helix::high::VarRefOp>()) {
             return BaseOffset{varRef.getVarId(),
+                              static_cast<int64_t>(fieldPtr.getFieldOffset())};
+        }
+        if (auto varRef =
+                fieldPtr.getBase().getDefiningOp<helix::mid::VarRefOp>()) {
+            return BaseOffset{varRef.getSlotId(),
                               static_cast<int64_t>(fieldPtr.getFieldOffset())};
         }
         // A nested field.ptr base (chained field access, e.g. `p->pos.x`) is
@@ -348,77 +354,30 @@ private:
         for (const auto& s : structs)
             varToStruct[s.base_var_id] = &s;
 
-        // Annotate var.decl ops with struct metadata.
-        //
-        // FIX (Maya R. review, type-recovery trace): variable declarations at
-        // this pipeline point are `helix::high::VarDeclOp` (RecoverVariablesPass
-        // runs before HelixLowToMid and represents named variables via the
-        // High dialect regardless of the surrounding ops' tier -- the same
-        // reason `decomposeAddress`'s FieldPtrOp base is a high::VarRefOp, see
-        // above) -- walking `mid::VarDeclOp` here matched zero declarations on
-        // every input, so struct metadata never reached the AST even once
-        // `structs` was non-empty. `getVarId()` is the high-dialect identity
-        // accessor (mid dialect calls the analogous field getSlotId()).
-        body.walk([&](helix::high::VarDeclOp declOp) {
-            auto it = varToStruct.find(declOp.getVarId());
+        auto annotateDecl = [&](Operation* declOp, uint32_t identity) {
+            auto it = varToStruct.find(identity);
             if (it == varToStruct.end())
                 return;
 
             const auto* recovered = it->second;
-
-            // Set the struct name attribute.
             declOp->setAttr("helix.struct_name",
-                            StringAttr::get(declOp.getContext(),
+                            StringAttr::get(declOp->getContext(),
                                             recovered->name));
-
-            // FIX (Maya R. review, type-recovery trace): also set the generic
-            // `inferred_type` attribute (not just the helix.struct_name side
-            // attr) to "<name>*". PropagateTypesPass runs BEFORE this pass
-            // (Pipeline.cpp: PropagateTypes at line ~494, RecoverStructTypes at
-            // ~538) so it never sees the struct info and leaves this var typed
-            // generically (int64_t/void*). CAstBuilder already has a working,
-            // wired mechanism (var.decl ~1045 and the parameter path ~1169)
-            // that parses an `inferred_type` ending in `*` into a real
-            // `pointerTo(structTy(name))` -- it just never received a matching
-            // string before, since nothing set inferred_type to a struct-typed
-            // pointer. Every var reaching this point was matched via a
-            // FieldPtrOp base, i.e. used as a pointer by construction, so "*"
-            // is always semantically correct here. PropagateTypes' earlier,
-            // less-informed guess is intentionally overwritten -- struct
-            // recovery is strictly more specific for this variable.
-            declOp->setAttr("inferred_type",
-                            StringAttr::get(declOp.getContext(),
-                                            recovered->name + "*"));
-
-            // Set the total size.
+            helix::applyTypeEvidence(
+                declOp, recovered->name + "*",
+                helix::TypeEvidenceSource::Structural);
             declOp->setAttr("helix.struct_size",
                             IntegerAttr::get(
-                                IntegerType::get(declOp.getContext(), 32),
+                                IntegerType::get(declOp->getContext(), 32),
                                 recovered->total_size));
-
-            // Set alignment.
             declOp->setAttr("helix.struct_align",
                             IntegerAttr::get(
-                                IntegerType::get(declOp.getContext(), 32),
+                                IntegerType::get(declOp->getContext(), 32),
                                 recovered->alignment));
-
-            // Set field count.
             declOp->setAttr("helix.struct_field_count",
                             IntegerAttr::get(
-                                IntegerType::get(declOp.getContext(), 32),
+                                IntegerType::get(declOp->getContext(), 32),
                                 recovered->fields.size()));
-
-            // FIX (Maya R. review, type-recovery trace): the per-field layout
-            // (offset/size/inferred-type) is fully computed in `recovered->fields`
-            // -- until now it only reached an LLVM_DEBUG print (Phase 5 below) and
-            // was discarded at this annotation boundary, so CAstBuilder never saw
-            // anything past the aggregate struct_size/field_count and had to fall
-            // back to raw `field_0xN : int64_t` guessing. Serialize the layout as
-            // "off:size:ctype,off:size:ctype,..." (sorted by offset, matching
-            // `recovered->fields`' existing order) so a future CAstBuilder change
-            // can type struct-field accesses precisely instead of guessing. This
-            // change only ADDS an attribute nobody reads yet -- zero behavior
-            // change to the emitted C until a consumer is wired.
             if (!recovered->fields.empty()) {
                 std::string encoded;
                 for (const auto& f : recovered->fields) {
@@ -429,14 +388,21 @@ private:
                                f.type.toCTypeString();
                 }
                 declOp->setAttr("helix.struct_fields",
-                                StringAttr::get(declOp.getContext(), encoded));
+                                StringAttr::get(declOp->getContext(), encoded));
             }
-
-            // Mark union candidates.
             if (recovered->has_overlaps) {
                 declOp->setAttr("helix.is_union_candidate",
-                                BoolAttr::get(declOp.getContext(), true));
+                                BoolAttr::get(declOp->getContext(), true));
             }
+        };
+
+        // Compatibility lane contains High declarations; the normalized lane
+        // carries the same storage identities as Mid slots.
+        body.walk([&](helix::high::VarDeclOp declOp) {
+            annotateDecl(declOp, declOp.getVarId());
+        });
+        body.walk([&](helix::mid::VarDeclOp declOp) {
+            annotateDecl(declOp, declOp.getSlotId());
         });
 
         // ── Phase 5: Emit diagnostics ────────────────────────────────────

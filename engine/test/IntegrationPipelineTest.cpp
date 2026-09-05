@@ -108,6 +108,9 @@ protected:
     std::vector<std::string> mlirLines;
     /// Lines of Rust reference.
     std::vector<std::string> rustLines;
+    uint32_t functionCount = 0;
+    uint32_t blockCount = 0;
+    uint32_t instructionCount = 0;
 
     void SetUp() override {
         const std::string irPath =
@@ -126,6 +129,9 @@ protected:
         if (!output)
             return;
         mlirOutput = output->pseudo_c;
+        functionCount = output->function_count;
+        blockCount = output->block_count;
+        instructionCount = output->instruction_count;
         ASSERT_FALSE(mlirOutput.empty());
 
         rustReference = readFileToString(rustPath);
@@ -136,6 +142,42 @@ protected:
         rustLines = splitLines(rustReference);
     }
 };
+
+TEST_F(IntegrationPipelineTest, ReportsFinalStructuralAndSourceMetrics) {
+    EXPECT_EQ(functionCount, 1u);
+    EXPECT_GT(blockCount, 0u);
+    EXPECT_GT(instructionCount, 0u);
+}
+
+TEST(IntegrationPipelineRegressionTest,
+     CombinedCAbiReturnsBothProductsAndReleasesOwnership) {
+    const std::string ir = readFileToString(
+        HELIX_TEST_DATA_DIR "/remill-6/01-name-writing.ll");
+    ASSERT_FALSE(ir.empty());
+
+    HelixEngineHandle* engine = helix_engine_create(HELIX_ARCH_X86_64);
+    ASSERT_NE(engine, nullptr);
+    HelixCombinedDecompileOutput output{};
+    ASSERT_EQ(
+        helix_engine_decompile_ir_combined(
+            engine, ir.data(), ir.size(), &output),
+        HELIX_OK);
+
+    EXPECT_NE(output.pseudo_c, nullptr);
+    EXPECT_GT(output.pseudo_c_len, 0u);
+    EXPECT_NE(output.flatbuffer, nullptr);
+    EXPECT_GT(output.flatbuffer_len, 0u);
+    EXPECT_EQ(output.function_count, 1u);
+    EXPECT_GT(output.block_count, 0u);
+    EXPECT_GT(output.instruction_count, 0u);
+
+    helix_engine_free_decompile_output(&output);
+    EXPECT_EQ(output.pseudo_c, nullptr);
+    EXPECT_EQ(output.flatbuffer, nullptr);
+    EXPECT_EQ(output.pseudo_c_len, 0u);
+    EXPECT_EQ(output.flatbuffer_len, 0u);
+    helix_engine_destroy(engine);
+}
 
 // ============================================================================
 //  Property 27: Absence of Forbidden Patterns

@@ -575,3 +575,118 @@ TEST(ApplyDebugTypesTest, NestedRegisterWriteDoesNotMutateDebugParameter) {
         << "shadow must be initialized from the parameter and receive the "
            "nested register write";
 }
+
+TEST(ApplyDebugTypesTest, ExternalSignatureConstrainsLowCallArguments) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    module->setAttr("llvm.target_triple",
+                    builder.getStringAttr("x86_64-pc-windows-msvc"));
+    module->setAttr(
+        "helix.debug_type_info_json",
+        builder.getStringAttr(R"json({
+          "functions": {
+            "OpenProcess": {
+              "returnType": "HANDLE",
+              "params": [
+                {"index": 0, "name": "dwDesiredAccess", "type": "DWORD"},
+                {"index": 1, "name": "bInheritHandle", "type": "BOOL"},
+                {"index": 2, "name": "dwProcessId", "type": "DWORD"}
+              ]
+            }
+          },
+          "structs": {}
+        })json"));
+
+    builder.setInsertionPointToEnd(module.getBody());
+    auto func = builder.create<helix::low::FuncOp>(
+        loc, "caller", /*entry_address=*/0x1000,
+        /*original_name=*/mlir::StringAttr{});
+    auto* block = builder.createBlock(&func.getBody());
+    builder.setInsertionPointToStart(block);
+    auto i64 = builder.getI64Type();
+    for (auto reg : {"RCX", "RDX", "R8", "R9"}) {
+        auto value = builder.create<mlir::arith::ConstantIntOp>(loc, 7, 64);
+        builder.create<helix::low::RegWriteOp>(
+            loc, value.getResult(), reg, /*bit_width=*/64,
+            mlir::IntegerAttr{});
+    }
+    auto target = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    auto call = builder.create<helix::low::CallOp>(
+        loc, mlir::TypeRange{i64}, target.getResult(), mlir::ValueRange{},
+        builder.getStringAttr("OpenProcess"), mlir::IntegerAttr{});
+    builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.addPass(helix::createApplyDebugTypesPass());
+    pm.addPass(helix::createRecoverCallingConventionPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    auto exactCount = call->getAttrOfType<mlir::IntegerAttr>(
+        "helix.debug_param_count");
+    ASSERT_TRUE(exactCount);
+    EXPECT_EQ(exactCount.getInt(), 3);
+    EXPECT_EQ(call.getArgs().size(), 3u);
+    auto returnType = call->getAttrOfType<mlir::StringAttr>(
+        "inferred_return_type");
+    ASSERT_TRUE(returnType);
+    EXPECT_EQ(returnType.getValue(), "HANDLE");
+}
+
+TEST(ApplyDebugTypesTest, VariadicLowCallIsNotClampedToFixedParameters) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    module->setAttr("llvm.target_triple",
+                    builder.getStringAttr("x86_64-pc-windows-msvc"));
+    module->setAttr(
+        "helix.debug_type_info_json",
+        builder.getStringAttr(R"json({
+          "functions": {
+            "printf": {
+              "returnType": "int32_t",
+              "variadic": true,
+              "params": [
+                {"index": 0, "name": "format", "type": "const char *"}
+              ]
+            }
+          },
+          "structs": {}
+        })json"));
+
+    builder.setInsertionPointToEnd(module.getBody());
+    auto func = builder.create<helix::low::FuncOp>(
+        loc, "caller", /*entry_address=*/0x2000,
+        /*original_name=*/mlir::StringAttr{});
+    auto* block = builder.createBlock(&func.getBody());
+    builder.setInsertionPointToStart(block);
+    auto i64 = builder.getI64Type();
+    llvm::SmallVector<mlir::Value, 3> args;
+    for (int64_t value : {1, 2, 3})
+        args.push_back(builder.create<mlir::arith::ConstantIntOp>(
+            loc, value, 64).getResult());
+    auto target = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    auto call = builder.create<helix::low::CallOp>(
+        loc, mlir::TypeRange{i64}, target.getResult(), args,
+        builder.getStringAttr("printf"), mlir::IntegerAttr{});
+    builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.addPass(helix::createApplyDebugTypesPass());
+    pm.addPass(helix::createRecoverCallingConventionPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    EXPECT_TRUE(call->hasAttr("is_variadic"));
+    EXPECT_FALSE(call->hasAttr("helix.debug_param_count"));
+    EXPECT_EQ(call.getArgs().size(), 3u);
+}

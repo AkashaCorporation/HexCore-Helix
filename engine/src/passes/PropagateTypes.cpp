@@ -48,6 +48,7 @@
 ///   - HelixHigh Sar/Shr: SAR implies signed operand, SHR implies unsigned
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/SignatureDb.h"
@@ -265,10 +266,7 @@ struct CTypeInfo {
     }
 
     static CTypeInfo makePointer() {
-        CTypeInfo t;
-        t.kind = Pointer;
-        t.bit_width = 64;
-        return t;
+        return makePointer(CTypeInfo{});
     }
 
     static CTypeInfo makePointer(CTypeInfo pointeeType) {
@@ -2075,9 +2073,9 @@ private:
             std::string typeStr = rt.second.toCTypeString();
             if (typeStr.empty())
                 continue;
-            defOp->setAttr("inferred_type",
-                StringAttr::get(defOp->getContext(), typeStr));
-            ++numTypesSet;
+            if (helix::applyTypeEvidence(
+                    defOp, typeStr, helix::TypeEvidenceSource::DataFlow))
+                ++numTypesSet;
             if (rt.second.kind == CTypeInfo::Pointer)
                 ++numPtrTypes;
         }
@@ -2385,6 +2383,20 @@ private:
                             changed = true;
                     }
 
+                    if (opKind == helix::high::BinaryOpKind::Ult ||
+                        opKind == helix::high::BinaryOpKind::Ule ||
+                        opKind == helix::high::BinaryOpKind::Ugt ||
+                        opKind == helix::high::BinaryOpKind::Uge) {
+                        if (!isTypeLocked(binop.getLhs(), lockedValues) &&
+                                typeEnv[binop.getLhs()].applySignedness(
+                                    Signedness::Unsigned))
+                            changed = true;
+                        if (!isTypeLocked(binop.getRhs(), lockedValues) &&
+                                typeEnv[binop.getRhs()].applySignedness(
+                                    Signedness::Unsigned))
+                            changed = true;
+                    }
+
                     return;
                 }
 
@@ -2623,11 +2635,9 @@ private:
 
             func.walk([&](Operation* op) {
                 // Backward Rule HB1: BinaryOp comparison — for comparison
-                // operators (Eq, Ne, Lt, Le, Gt, Ge), both operands should have
+                // operators, both operands should have
                 // the same type. If one is known, propagate to the other.
-                // Additionally, Lt/Le/Gt/Ge imply signed comparisons in
-                // HelixHigh (the unsigned variants are expressed differently),
-                // so propagate Signed to both operands.
+                // Ordered predicates explicitly encode signedness.
                 if (auto binop = dyn_cast<helix::high::BinaryOp>(op)) {
                     auto opKind = binop.getOp();
                     if (opKind == helix::high::BinaryOpKind::Eq ||
@@ -2635,7 +2645,11 @@ private:
                         opKind == helix::high::BinaryOpKind::Lt ||
                         opKind == helix::high::BinaryOpKind::Le ||
                         opKind == helix::high::BinaryOpKind::Gt ||
-                        opKind == helix::high::BinaryOpKind::Ge) {
+                        opKind == helix::high::BinaryOpKind::Ge ||
+                        opKind == helix::high::BinaryOpKind::Ult ||
+                        opKind == helix::high::BinaryOpKind::Ule ||
+                        opKind == helix::high::BinaryOpKind::Ugt ||
+                        opKind == helix::high::BinaryOpKind::Uge) {
                         auto lhsType = typeEnv[binop.getLhs()];
                         auto rhsType = typeEnv[binop.getRhs()];
                         if (lhsType.isResolved() && !rhsType.isResolved() &&
@@ -2651,8 +2665,6 @@ private:
                         }
 
                         // Lt/Le/Gt/Ge are signed comparisons in HelixHigh.
-                        // (HelixHigh doesn't have separate ULt/ULe/UGt/UGe
-                        // enums — these originate from signed JccOp conditions.)
                         if (opKind == helix::high::BinaryOpKind::Lt ||
                             opKind == helix::high::BinaryOpKind::Le ||
                             opKind == helix::high::BinaryOpKind::Gt ||
@@ -2664,6 +2676,19 @@ private:
                             if (!isTypeLocked(binop.getRhs(), lockedValues) &&
                                     typeEnv[binop.getRhs()].applySignedness(
                                         Signedness::Signed))
+                                changed = true;
+                        }
+                        if (opKind == helix::high::BinaryOpKind::Ult ||
+                            opKind == helix::high::BinaryOpKind::Ule ||
+                            opKind == helix::high::BinaryOpKind::Ugt ||
+                            opKind == helix::high::BinaryOpKind::Uge) {
+                            if (!isTypeLocked(binop.getLhs(), lockedValues) &&
+                                    typeEnv[binop.getLhs()].applySignedness(
+                                        Signedness::Unsigned))
+                                changed = true;
+                            if (!isTypeLocked(binop.getRhs(), lockedValues) &&
+                                    typeEnv[binop.getRhs()].applySignedness(
+                                        Signedness::Unsigned))
                                 changed = true;
                         }
                     }
@@ -2948,6 +2973,7 @@ private:
                         if (typeEnv[target].mergeFrom(valueType))
                             changed = true;
                     }
+
                     if (targetType.isResolved() && !valueType.isResolved() &&
                             (!targetRef ||
                              canCarryAssignedType(targetRef.getVarId(),
@@ -3122,8 +3148,8 @@ private:
             // Find the var.decl with this ID and set the attribute.
             func.walk([&](helix::high::VarDeclOp decl) {
                 if (decl.getVarId() == varId) {
-                    decl->setAttr("inferred_type",
-                        StringAttr::get(decl->getContext(), typeStr));
+                    helix::applyTypeEvidence(
+                        decl, typeStr, helix::TypeEvidenceSource::DataFlow);
                 }
             });
         }
@@ -3155,8 +3181,8 @@ private:
                 it->second = {rn, typeStr};
         }
         for (auto& [defOp, rt] : chosenHigh)
-            defOp->setAttr("inferred_type",
-                StringAttr::get(defOp->getContext(), rt.second));
+            helix::applyTypeEvidence(
+                defOp, rt.second, helix::TypeEvidenceSource::DataFlow);
     }
 };
 

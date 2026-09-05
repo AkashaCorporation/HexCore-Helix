@@ -1,29 +1,35 @@
 @echo off
 setlocal
-
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
-if errorlevel 1 exit /b 1
-
-set "LLVM_DIR=C:\Users\Mazum\Desktop\caps\llvm-build\build-mlir\lib\cmake\llvm"
-set "MLIR_DIR=C:\Users\Mazum\Desktop\caps\llvm-build\build-mlir\lib\cmake\mlir"
-set "LLVM_LIB_DIR=C:\Users\Mazum\Desktop\caps\llvm-build\build-mlir\lib"
 cd /d "%~dp0"
 
-echo ==== 1/3 Build the current Helix engine ====
-ninja -C engine\build helix_engine.lib
+where cl.exe >nul 2>&1
+if errorlevel 1 (
+    echo Run from a Visual Studio x64 Native Tools command prompt.
+    exit /b 1
+)
+if not defined LLVM_DIR (
+    echo Set LLVM_DIR to the LLVM CMake package directory.
+    exit /b 1
+)
+if not defined MLIR_DIR (
+    echo Set MLIR_DIR to the matching MLIR CMake package directory.
+    exit /b 1
+)
+if not defined HELIX_BUILD_DIR set "HELIX_BUILD_DIR=engine\build"
+if not defined HELIX_BUILD_JOBS set "HELIX_BUILD_JOBS=2"
+
+cmake -S engine -B "%HELIX_BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DHELIX_BUILD_TESTS=ON -DLLVM_DIR="%LLVM_DIR%" -DMLIR_DIR="%MLIR_DIR%" %*
+if errorlevel 1 exit /b 1
+cmake --build "%HELIX_BUILD_DIR%" --parallel %HELIX_BUILD_JOBS% --target helix_engine helix_tests
+if errorlevel 1 exit /b 1
+ctest --test-dir "%HELIX_BUILD_DIR%" --output-on-failure
 if errorlevel 1 exit /b 1
 
-echo ==== 2/3 Stage the exact engine library used by Cargo ====
-copy /Y engine\build\helix_engine.lib engine\deps\llvm-mlir\engine\helix_engine.lib >nul
+if not exist engine\deps\llvm-mlir\engine mkdir engine\deps\llvm-mlir\engine
+copy /Y "%HELIX_BUILD_DIR%\helix_engine.lib" engine\deps\llvm-mlir\engine\helix_engine.lib >nul
 if errorlevel 1 exit /b 1
-
-echo ==== 3/3 Build the release N-API package ====
 call npm run build
 if errorlevel 1 exit /b 1
-
-if not exist hexcore-helix.win32-x64-msvc.node exit /b 1
-if not exist index.js exit /b 1
-if not exist index.d.ts exit /b 1
-echo Built hexcore-helix.win32-x64-msvc.node
-
+node tools\smoke_napi.cjs
+if errorlevel 1 exit /b 1
 endlocal

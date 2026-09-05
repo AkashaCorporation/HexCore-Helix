@@ -53,8 +53,10 @@ buildStubModule(mlir::MLIRContext& ctx, uint64_t entryAddr,
     builder.setInsertionPointToEnd(module->getBody());
     auto func = builder.create<helix::high::FuncOp>(
         loc, /*sym_name=*/"sub_140001000", /*entry_address=*/entryAddr,
+        builder.getFunctionType({}, {}),
         /*calling_convention=*/mlir::StringAttr{},
-        /*is_variadic=*/mlir::UnitAttr{});
+        /*is_variadic=*/mlir::UnitAttr{},
+        /*arg_attrs=*/mlir::ArrayAttr{}, /*res_attrs=*/mlir::ArrayAttr{});
     // A single empty entry block -> stub-shaped (no statements, no ops).
     builder.createBlock(&func.getBody());
     outFunc = func.getOperation();

@@ -143,4 +143,80 @@ TEST(BindReturnValuesTest, LeavesMissingResultEvidenceImplicit) {
     EXPECT_EQ(lowReturns, 1u);
 }
 
+TEST(BindReturnValuesTest, BindsUniqueLiveAapcsX0Fallback) {
+    mlir::MLIRContext ctx;
+    auto fixture = buildReturnFixture(
+        ctx, /*hasReturnValue=*/true, /*resultCount=*/0,
+        /*nestedReturn=*/false);
+    mlir::OpBuilder builder(&ctx);
+    fixture.func->setAttr(
+        "calling_convention", builder.getStringAttr("aapcs64"));
+    auto& block = fixture.func.getBody().front();
+    builder.setInsertionPointToStart(&block);
+    builder.create<helix::high::VarDeclOp>(
+        builder.getUnknownLoc(), /*var_id=*/1, "param_1",
+        helix::high::StorageKind::Parameter, mlir::IntegerAttr{},
+        mlir::Value{}, mlir::IntegerAttr{});
+    builder.create<helix::high::VarDeclOp>(
+        builder.getUnknownLoc(), /*var_id=*/9, "param_1",
+        helix::high::StorageKind::Parameter, mlir::IntegerAttr{},
+        mlir::Value{}, mlir::IntegerAttr{});
+    auto liveX0 = builder.create<helix::high::VarRefOp>(
+        builder.getUnknownLoc(), builder.getI64Type(), /*var_id=*/9,
+        "param_1", mlir::IntegerAttr{});
+    auto one = builder.create<mlir::arith::ConstantIntOp>(
+        builder.getUnknownLoc(), 1, 64);
+    builder.create<helix::high::AssignOp>(
+        builder.getUnknownLoc(), liveX0, one, mlir::IntegerAttr{});
+
+    runPass(ctx, *fixture.module);
+
+    unsigned lowReturns = 0;
+    unsigned highReturns = 0;
+    fixture.func.walk([&](helix::low::RetOp) { ++lowReturns; });
+    fixture.func.walk([&](helix::high::ReturnOp ret) {
+        ++highReturns;
+        auto ref = ret.getValue().getDefiningOp<helix::high::VarRefOp>();
+        ASSERT_TRUE(ref);
+        EXPECT_EQ(ref.getVarId(), 9u);
+        EXPECT_EQ(ref.getVarName(), "param_1");
+        EXPECT_EQ(ret->getAttrOfType<mlir::StringAttr>("helix.return_binding")
+                      .getValue(),
+                  "aapcs64-live-x0-var-id");
+    });
+    EXPECT_EQ(lowReturns, 0u);
+    EXPECT_EQ(highReturns, 1u);
+}
+
+TEST(BindReturnValuesTest, LeavesAmbiguousLiveAapcsX0FallbackImplicit) {
+    mlir::MLIRContext ctx;
+    auto fixture = buildReturnFixture(
+        ctx, /*hasReturnValue=*/true, /*resultCount=*/0,
+        /*nestedReturn=*/false);
+    mlir::OpBuilder builder(&ctx);
+    fixture.func->setAttr(
+        "calling_convention", builder.getStringAttr("aapcs64"));
+    auto& block = fixture.func.getBody().front();
+    builder.setInsertionPointToStart(&block);
+
+    for (uint32_t varId : {9u, 10u}) {
+        builder.create<helix::high::VarDeclOp>(
+            builder.getUnknownLoc(), varId, "param_1",
+            helix::high::StorageKind::Parameter, mlir::IntegerAttr{},
+            mlir::Value{}, mlir::IntegerAttr{});
+        builder.create<helix::high::VarRefOp>(
+            builder.getUnknownLoc(), builder.getI64Type(), varId,
+            "param_1", mlir::IntegerAttr{});
+    }
+
+    runPass(ctx, *fixture.module);
+
+    unsigned lowReturns = 0;
+    unsigned highReturns = 0;
+    fixture.func.walk([&](helix::low::RetOp) { ++lowReturns; });
+    fixture.func.walk([&](helix::high::ReturnOp) { ++highReturns; });
+    EXPECT_EQ(lowReturns, 1u);
+    EXPECT_EQ(highReturns, 0u);
+}
+
 } // namespace
