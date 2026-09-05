@@ -18,10 +18,14 @@
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
+#include "helix/dialects/HelixHighOps.h"
 #include "helix/utils/Debug.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -33,6 +37,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <format>
+#include <cstdlib>
 #include <string>
 
 #define DEBUG_TYPE "helix-low-to-mid"
@@ -45,6 +50,272 @@ using namespace helix;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace {
+
+static void copyRecoveryAttrs(Operation* source, Operation* target) {
+    for (NamedAttribute attribute : source->getAttrs()) {
+        StringRef name = attribute.getName().getValue();
+        if (name.starts_with("helix.") || name == "inferred_type")
+            target->setAttr(attribute.getName(), attribute.getValue());
+    }
+}
+
+static mid::SlotKind mapRecoveredStorage(high::StorageKind storage) {
+    switch (storage) {
+    case high::StorageKind::Stack:     return mid::SlotKind::Stack;
+    case high::StorageKind::Register:  return mid::SlotKind::Register;
+    case high::StorageKind::Global:    return mid::SlotKind::Global;
+    case high::StorageKind::Parameter: return mid::SlotKind::Param;
+    case high::StorageKind::Temporary: return mid::SlotKind::Temp;
+    }
+    return mid::SlotKind::Temp;
+}
+
+static mid::CastKind mapRecoveredCast(high::CastKind kind) {
+    return static_cast<mid::CastKind>(static_cast<uint32_t>(kind));
+}
+
+static void normalizeRecoveredHighToMid(ModuleOp module) {
+    SmallVector<high::AssignOp, 64> assignments;
+    SmallVector<high::ReturnOp, 8> returns;
+    SmallVector<high::CastOp, 64> casts;
+    SmallVector<high::IntLitOp, 16> literals;
+    SmallVector<high::VarRefOp, 128> references;
+    SmallVector<high::VarDeclOp, 64> declarations;
+    module.walk([&](high::AssignOp op) { assignments.push_back(op); });
+    module.walk([&](high::ReturnOp op) { returns.push_back(op); });
+    module.walk([&](high::CastOp op) { casts.push_back(op); });
+    module.walk([&](high::IntLitOp op) { literals.push_back(op); });
+    module.walk([&](high::VarRefOp op) { references.push_back(op); });
+    module.walk([&](high::VarDeclOp op) { declarations.push_back(op); });
+
+    for (high::AssignOp op : assignments) {
+        auto target = op.getTarget().getDefiningOp<high::VarRefOp>();
+        if (!target)
+            continue;
+        OpBuilder builder(op);
+        auto replacement = builder.create<mid::AssignOp>(
+            op.getLoc(), target.getVarIdAttr(), op.getValue(),
+            op.getAddressAttr());
+        copyRecoveryAttrs(op, replacement);
+        op.erase();
+    }
+
+    for (high::ReturnOp op : returns) {
+        OpBuilder builder(op);
+        auto replacement = builder.create<mid::ReturnOp>(
+            op.getLoc(), op.getValue(), op.getAddressAttr());
+        copyRecoveryAttrs(op, replacement);
+        op.erase();
+    }
+
+    for (high::CastOp op : casts) {
+        if (!op)
+            continue;
+        OpBuilder builder(op);
+        mid::CastKindAttr kindAttr;
+        if (auto kind = op.getCastKind()) {
+            kindAttr = mid::CastKindAttr::get(
+                module.getContext(), mapRecoveredCast(*kind));
+        }
+        auto replacement = builder.create<mid::CastOp>(
+            op.getLoc(), op.getResult().getType(), op.getInput(),
+            op.getAddressAttr(), kindAttr);
+        copyRecoveryAttrs(op, replacement);
+        op.getResult().replaceAllUsesWith(replacement.getResult());
+        op.erase();
+    }
+
+    for (high::IntLitOp op : literals) {
+        if (!op)
+            continue;
+        OpBuilder builder(op);
+        auto replacement = builder.create<mid::ConstantOp>(
+            op.getLoc(), op.getResult().getType(), op.getValueAttr(),
+            op.getAddressAttr());
+        copyRecoveryAttrs(op, replacement);
+        op.getResult().replaceAllUsesWith(replacement.getResult());
+        op.erase();
+    }
+
+    for (high::VarRefOp op : references) {
+        if (!op)
+            continue;
+        OpBuilder builder(op);
+        auto replacement = builder.create<mid::VarRefOp>(
+            op.getLoc(), op.getResult().getType(), op.getVarIdAttr(),
+            op.getAddressAttr());
+        replacement->setAttr(
+            "helix.recovered_name", builder.getStringAttr(op.getVarName()));
+        copyRecoveryAttrs(op, replacement);
+        op.getResult().replaceAllUsesWith(replacement.getResult());
+        op.erase();
+    }
+
+    for (high::VarDeclOp op : declarations) {
+        if (!op)
+            continue;
+        OpBuilder builder(op);
+        auto replacement = builder.create<mid::VarDeclOp>(
+            op.getLoc(), op.getVarIdAttr(),
+            mid::SlotKindAttr::get(
+                module.getContext(), mapRecoveredStorage(op.getStorage())),
+            op.getStackOffsetAttr(), op.getInit(), op.getAddressAttr());
+        replacement->setAttr(
+            "helix.recovered_name", builder.getStringAttr(op.getVarName()));
+        copyRecoveryAttrs(op, replacement);
+        op.erase();
+    }
+}
+
+static IntegerAttr getUI64Attr(Builder& builder, uint64_t value) {
+    auto type = IntegerType::get(
+        builder.getContext(), 64, IntegerType::Unsigned);
+    return IntegerAttr::get(type, llvm::APInt(64, value, false));
+}
+
+static IntegerAttr getSI64Attr(Builder& builder, int64_t value) {
+    auto type = IntegerType::get(
+        builder.getContext(), 64, IntegerType::Signed);
+    return IntegerAttr::get(type, llvm::APInt(64, value, true));
+}
+
+/// Collapse the temporary Low variadic-call bundle carriage before dialect
+/// conversion. Full conversion must see the resulting Mid call, not reject
+/// bundle.create before the old post-conversion cleanup gets a chance to run.
+static unsigned collapseVariadicCallsToMid(ModuleOp module) {
+    SmallVector<low::VariadicCallOp, 16> calls;
+    module.walk([&](low::VariadicCallOp op) { calls.push_back(op); });
+
+    for (low::VariadicCallOp call : calls) {
+        OpBuilder builder(call);
+        uint64_t calleeAddress = 0;
+        if (Value target = call.getTargetAddr()) {
+            if (auto constant = target.getDefiningOp<LLVM::ConstantOp>()) {
+                if (auto value = dyn_cast<IntegerAttr>(constant.getValue()))
+                    calleeAddress = value.getValue().getZExtValue();
+            } else if (auto constant =
+                           target.getDefiningOp<arith::ConstantOp>()) {
+                if (auto value = dyn_cast<IntegerAttr>(constant.getValue()))
+                    calleeAddress = value.getValue().getZExtValue();
+            }
+        }
+
+        auto replacement = builder.create<mid::CallOp>(
+            call.getLoc(), call->getResultTypes(),
+            getUI64Attr(builder, calleeAddress), call.getTargetNameAttr(),
+            call.getFixedArgs(), call.getAddressAttr());
+
+        if (auto bundle =
+                call.getRawBundle().getDefiningOp<low::BundleCreateOp>()) {
+            const char* state = "opaque";
+            switch (bundle.getState()) {
+            case low::BundleState::Zeroed:
+                state = "zeroed";
+                break;
+            case low::BundleState::PartiallyRecovered:
+                state = "partially_recovered";
+                break;
+            case low::BundleState::Recovered:
+                state = "recovered";
+                break;
+            case low::BundleState::Opaque:
+                break;
+            }
+            replacement->setAttr(
+                "helix.variadic_state", builder.getStringAttr(state));
+            replacement->setAttr(
+                "helix.variadic_fixed_args_count",
+                builder.getI64IntegerAttr(
+                    static_cast<int64_t>(call.getFixedArgs().size())));
+            if (auto provenance = bundle.getProvenance()) {
+                replacement->setAttr(
+                    "helix.variadic_provenance",
+                    builder.getStringAttr(*provenance));
+            }
+        }
+
+        if (call->getNumResults() > 0) {
+            for (auto [oldResult, newResult] :
+                 llvm::zip(call->getResults(), replacement->getResults())) {
+                oldResult.replaceAllUsesWith(newResult);
+            }
+        }
+        call.erase();
+    }
+
+    SmallVector<low::BundleCreateOp, 16> unusedBundles;
+    module.walk([&](low::BundleCreateOp bundle) {
+        if (bundle->use_empty())
+            unusedBundles.push_back(bundle);
+    });
+    for (low::BundleCreateOp bundle : unusedBundles)
+        bundle.erase();
+
+    return calls.size();
+}
+
+struct ResultFlags {
+    Value zero;
+    Value sign;
+};
+
+static Value createBoolBinary(
+        ConversionPatternRewriter& rewriter, Location loc,
+        mid::BinExprKind kind, Value lhs, Value rhs, IntegerAttr address) {
+    return rewriter.create<mid::BinExprOp>(
+        loc, rewriter.getI1Type(),
+        mid::BinExprKindAttr::get(rewriter.getContext(), kind),
+        lhs, rhs, address).getResult();
+}
+
+static Value createUnknownValue(
+        ConversionPatternRewriter& rewriter, Location loc, Type type,
+        llvm::StringRef reason, IntegerAttr address) {
+    return rewriter.create<mid::UnknownValueOp>(
+        loc, type, rewriter.getStringAttr(reason), address).getResult();
+}
+
+static Value coerceToIntegerType(
+        ConversionPatternRewriter& rewriter, Location loc, Value value,
+        Type targetType) {
+    if (value.getType() == targetType)
+        return value;
+    return rewriter.create<mid::CastOp>(
+        loc, targetType, value, IntegerAttr{},
+        mid::CastKindAttr{}).getResult();
+}
+
+static mid::BinExprOp createFixedWidthBinary(
+        ConversionPatternRewriter& rewriter, Location loc,
+        mid::BinExprKind kind, Value lhs, Value rhs, Type resultType,
+        IntegerAttr address) {
+    auto result = rewriter.create<mid::BinExprOp>(
+        loc, resultType,
+        mid::BinExprKindAttr::get(rewriter.getContext(), kind),
+        lhs, rhs, address);
+    result->setAttr("helix.fixed_width_unsigned", rewriter.getUnitAttr());
+    return result;
+}
+
+static ResultFlags createZeroAndSignFlags(
+        ConversionPatternRewriter& rewriter, Location loc, Value result,
+        Type arithmeticType, IntegerAttr address, bool forceWidth = false) {
+    auto zero = rewriter.create<mid::ConstantOp>(
+        loc, arithmeticType, getSI64Attr(rewriter, 0), IntegerAttr{});
+    auto zeroFlag = rewriter.create<mid::BinExprOp>(
+        loc, rewriter.getI1Type(),
+        mid::BinExprKindAttr::get(
+            rewriter.getContext(), mid::BinExprKind::Eq),
+        result, zero.getResult(), address);
+    if (forceWidth)
+        zeroFlag->setAttr("helix.fixed_width_compare", rewriter.getUnitAttr());
+    auto signFlag = rewriter.create<mid::BinExprOp>(
+        loc, rewriter.getI1Type(),
+        mid::BinExprKindAttr::get(
+            rewriter.getContext(), mid::BinExprKind::Lt),
+        result, zero.getResult(), address);
+    return {zeroFlag.getResult(), signFlag.getResult()};
+}
 
 /// Allocates unique slot IDs for variables during HelixLow → HelixMid
 /// conversion.  Maps register names and stack offsets to slot IDs.
@@ -78,24 +349,24 @@ struct SlotAllocator {
 // Helper: Map HelixLow BinOpKind → HelixMid BinExprKind
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static mid::BinExprKind mapBinOpKind(low::BinOpKind kind) {
+static std::optional<mid::BinExprKind> mapBinOpKind(low::BinOpKind kind) {
     switch (kind) {
     case low::BinOpKind::Add:  return mid::BinExprKind::Add;
     case low::BinOpKind::Sub:  return mid::BinExprKind::Sub;
-    case low::BinOpKind::Mul:  return mid::BinExprKind::Mul;
-    case low::BinOpKind::IMul: return mid::BinExprKind::Mul;
-    case low::BinOpKind::Div:  return mid::BinExprKind::Div;
-    case low::BinOpKind::IDiv: return mid::BinExprKind::Div;
+    case low::BinOpKind::Mul:  return mid::BinExprKind::UMul;
+    case low::BinOpKind::IMul: return mid::BinExprKind::SMul;
+    case low::BinOpKind::Div:  return mid::BinExprKind::UDiv;
+    case low::BinOpKind::IDiv: return mid::BinExprKind::SDiv;
     case low::BinOpKind::And:  return mid::BinExprKind::BitAnd;
     case low::BinOpKind::Or:   return mid::BinExprKind::BitOr;
     case low::BinOpKind::Xor:  return mid::BinExprKind::BitXor;
     case low::BinOpKind::Shl:  return mid::BinExprKind::Shl;
     case low::BinOpKind::Shr:  return mid::BinExprKind::Shr;
     case low::BinOpKind::Sar:  return mid::BinExprKind::Sar;
-    case low::BinOpKind::Rol:  return mid::BinExprKind::Shl;  // approx
-    case low::BinOpKind::Ror:  return mid::BinExprKind::Shr;  // approx
+    case low::BinOpKind::Rol:  return mid::BinExprKind::Rol;
+    case low::BinOpKind::Ror:  return mid::BinExprKind::Ror;
     }
-    return mid::BinExprKind::Add;
+    return std::nullopt;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -161,12 +432,13 @@ struct RegWriteToAssign : public OpConversionPattern<low::RegWriteOp> {
         auto reg_name = op.getRegName();
         uint32_t slot_id = computeSlotIdFromRegOp(op.getOperation(), reg_name);
 
-        rewriter.create<mid::AssignOp>(
+        auto assignment = rewriter.create<mid::AssignOp>(
             op.getLoc(),
             rewriter.getUI32IntegerAttr(slot_id),
             adaptor.getValue(),
             op.getAddressAttr()
         );
+        copyRecoveryAttrs(op, assignment);
 
         rewriter.eraseOp(op);
         return success();
@@ -329,6 +601,8 @@ struct BinOpToBinExpr : public OpConversionPattern<low::BinOp> {
         ConversionPatternRewriter &rewriter) const override
     {
         auto mid_kind = mapBinOpKind(op.getKind());
+        if (!mid_kind)
+            return failure();
         auto loc = op.getLoc();
         auto result_type = op.getResult().getType();
 
@@ -340,35 +614,117 @@ struct BinOpToBinExpr : public OpConversionPattern<low::BinOp> {
 
         auto lhs = adaptor.getLhs();
         auto rhs = adaptor.getRhs();
-        if (!isa<IntegerType>(lhs.getType()))
-            lhs = rewriter.create<mid::CastOp>(loc, arith_type, lhs, IntegerAttr{}).getResult();
-        if (!isa<IntegerType>(rhs.getType()))
-            rhs = rewriter.create<mid::CastOp>(loc, arith_type, rhs, IntegerAttr{}).getResult();
+        lhs = coerceToIntegerType(rewriter, loc, lhs, arith_type);
+        rhs = coerceToIntegerType(rewriter, loc, rhs, arith_type);
 
-        auto new_op = rewriter.create<mid::BinExprOp>(
-            loc,
-            arith_type,
-            mid::BinExprKindAttr::get(rewriter.getContext(), mid_kind),
-            lhs, rhs,
-            op.getAddressAttr()
-        );
+        const bool exactAddSub = op.getKind() == low::BinOpKind::Add ||
+                                 op.getKind() == low::BinOpKind::Sub;
+        const bool exactLogic = op.getKind() == low::BinOpKind::And ||
+                                op.getKind() == low::BinOpKind::Or ||
+                                op.getKind() == low::BinOpKind::Xor;
+        const bool carryLive = !op.getCarryFlag().use_empty();
+        const bool zeroLive = !op.getZeroFlag().use_empty();
+        const bool signLive = !op.getSignFlag().use_empty();
+        const bool overflowLive = !op.getOverflowFlag().use_empty();
 
-        // Cast back to original type if it was pointer
-        Value result_val = new_op.getResult();
+        auto falseValue = rewriter.create<mlir::arith::ConstantOp>(
+            loc, rewriter.getI1Type(), rewriter.getBoolAttr(false));
+        ResultFlags resultFlags{falseValue, falseValue};
+        Value carryFlag = falseValue;
+        Value overflowFlag = falseValue;
+
+        const bool needsFixedResult = exactAddSub &&
+            (zeroLive || signLive || overflowLive ||
+             (carryLive && op.getKind() == low::BinOpKind::Add));
+        auto newOp = needsFixedResult
+            ? createFixedWidthBinary(
+                rewriter, loc, *mid_kind, lhs, rhs, arith_type,
+                op.getAddressAttr())
+            : rewriter.create<mid::BinExprOp>(
+                loc, arith_type,
+                mid::BinExprKindAttr::get(rewriter.getContext(), *mid_kind),
+                lhs, rhs, op.getAddressAttr());
+
+        // The arithmetic result and every derived flag must share one SSA
+        // definition. Duplicating the Add/Sub for flags becomes a second
+        // source expression after de-SSA and can re-evaluate against a mutated
+        // recovered variable (e.g. `result--; if (result - 1)`).
+        Value flagResult = newOp.getResult();
+
+        // Cast back to original type if it was pointer.
+        Value resultVal = flagResult;
         if (result_type != arith_type) {
-            result_val = rewriter.create<mid::CastOp>(
-                loc, result_type, result_val, IntegerAttr{}).getResult();
+            resultVal = rewriter.create<mid::CastOp>(
+                loc, result_type, resultVal, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
+        }
+        if ((exactAddSub && (zeroLive || signLive || overflowLive)) ||
+            (exactLogic && (zeroLive || signLive))) {
+            resultFlags = createZeroAndSignFlags(
+                rewriter, loc, flagResult, arith_type, op.getAddressAttr(),
+                exactAddSub);
         }
 
-        // Replace the value result.  Flag results are constant false
-        // (dead flags eliminated by DCE).
-        auto i1_type = rewriter.getI1Type();
-        auto false_val = rewriter.create<mlir::arith::ConstantOp>(
-            loc, i1_type, rewriter.getBoolAttr(false));
+        if (exactAddSub && carryLive) {
+            carryFlag = op.getKind() == low::BinOpKind::Add
+                ? createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Ult, flagResult, lhs,
+                    op.getAddressAttr())
+                : createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Ult, lhs, rhs,
+                    op.getAddressAttr());
+        }
+
+        if (exactAddSub && overflowLive) {
+            auto zero = rewriter.create<mid::ConstantOp>(
+                loc, arith_type, getSI64Attr(rewriter, 0), IntegerAttr{});
+            Value lhsSign = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::Lt, lhs, zero,
+                op.getAddressAttr());
+            Value rhsSign = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::Lt, rhs, zero,
+                op.getAddressAttr());
+            Value signsRelation = op.getKind() == low::BinOpKind::Add
+                ? createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Eq, lhsSign, rhsSign,
+                    op.getAddressAttr())
+                : createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Ne, lhsSign, rhsSign,
+                    op.getAddressAttr());
+            Value resultDiffersFromLhs = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::Ne,
+                resultFlags.sign, lhsSign, op.getAddressAttr());
+            overflowFlag = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::LogAnd,
+                signsRelation, resultDiffersFromLhs, op.getAddressAttr());
+        }
+
+        if (!exactAddSub && !exactLogic) {
+            if (carryLive)
+                carryFlag = createUnknownValue(
+                    rewriter, loc, rewriter.getI1Type(),
+                    "carry flag undefined for lowered operation",
+                    op.getAddressAttr());
+            if (zeroLive)
+                resultFlags.zero = createUnknownValue(
+                    rewriter, loc, rewriter.getI1Type(),
+                    "zero flag undefined for lowered operation",
+                    op.getAddressAttr());
+            if (signLive)
+                resultFlags.sign = createUnknownValue(
+                    rewriter, loc, rewriter.getI1Type(),
+                    "sign flag undefined for lowered operation",
+                    op.getAddressAttr());
+            if (overflowLive)
+                overflowFlag = createUnknownValue(
+                    rewriter, loc, rewriter.getI1Type(),
+                    "overflow flag undefined for lowered operation",
+                    op.getAddressAttr());
+        }
 
         rewriter.replaceOp(op, {
-            result_val,
-            false_val, false_val, false_val, false_val
+            resultVal,
+            carryFlag, resultFlags.zero, resultFlags.sign, overflowFlag
         });
         return success();
     }
@@ -382,44 +738,118 @@ struct CmpToComparison : public OpConversionPattern<low::CmpOp> {
         low::CmpOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
-        auto i1_type = rewriter.getI1Type();
         auto loc = op.getLoc();
 
-        // CMP produces flags.  Create individual comparison expressions
-        // for each flag that is actually used.
-        // ZF: lhs == rhs
-        auto zero_flag = rewriter.create<mid::BinExprOp>(
-            loc, i1_type,
-            mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::Eq),
-            adaptor.getLhs(), adaptor.getRhs(),
-            op.getAddressAttr()
-        );
+        SmallVector<arith::XOrIOp, 4> signedLessOps;
+        SmallVector<arith::OrIOp, 4> signedLessEqualOps;
+        SmallVector<arith::OrIOp, 4> unsignedLessEqualOps;
+        for (Operation* user : op.getSignFlag().getUsers()) {
+            auto xorOp = dyn_cast<arith::XOrIOp>(user);
+            if (!xorOp)
+                continue;
+            Value other = xorOp.getLhs() == op.getSignFlag()
+                ? xorOp.getRhs() : xorOp.getLhs();
+            if (other != op.getOverflowFlag())
+                continue;
+            signedLessOps.push_back(xorOp);
+            for (Operation* xorUser : xorOp.getResult().getUsers()) {
+                auto orOp = dyn_cast<arith::OrIOp>(xorUser);
+                if (!orOp)
+                    continue;
+                Value orOther = orOp.getLhs() == xorOp.getResult()
+                    ? orOp.getRhs() : orOp.getLhs();
+                if (orOther == op.getZeroFlag())
+                    signedLessEqualOps.push_back(orOp);
+            }
+        }
+        for (Operation* user : op.getCarryFlag().getUsers()) {
+            auto orOp = dyn_cast<arith::OrIOp>(user);
+            if (!orOp)
+                continue;
+            Value other = orOp.getLhs() == op.getCarryFlag()
+                ? orOp.getRhs() : orOp.getLhs();
+            if (other == op.getZeroFlag())
+                unsignedLessEqualOps.push_back(orOp);
+        }
 
-        // SF: (lhs - rhs) < 0  →  lhs < rhs (signed)
-        auto sign_flag = rewriter.create<mid::BinExprOp>(
-            loc, i1_type,
-            mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::Lt),
-            adaptor.getLhs(), adaptor.getRhs(),
-            op.getAddressAttr()
-        );
+        Type arithmeticType = adaptor.getLhs().getType();
+        if (!isa<IntegerType>(arithmeticType))
+            arithmeticType = isa<IntegerType>(adaptor.getRhs().getType())
+                ? adaptor.getRhs().getType()
+                : rewriter.getI64Type();
+        Value lhs = coerceToIntegerType(
+            rewriter, loc, adaptor.getLhs(), arithmeticType);
+        Value rhs = coerceToIntegerType(
+            rewriter, loc, adaptor.getRhs(), arithmeticType);
+        auto replaceComparison = [&](Operation* oldOp, mid::BinExprKind kind) {
+            rewriter.setInsertionPoint(oldOp);
+            Value comparison = createBoolBinary(
+                rewriter, oldOp->getLoc(), kind, lhs, rhs,
+                op.getAddressAttr());
+            oldOp->getResult(0).replaceAllUsesWith(comparison);
+            rewriter.eraseOp(oldOp);
+        };
+        for (auto orOp : signedLessEqualOps)
+            replaceComparison(orOp, mid::BinExprKind::Le);
+        for (auto orOp : unsignedLessEqualOps)
+            replaceComparison(orOp, mid::BinExprKind::Ule);
+        for (auto xorOp : signedLessOps)
+            replaceComparison(xorOp, mid::BinExprKind::Lt);
 
-        // CF: lhs < rhs (unsigned) — approximated as same comparison
-        auto carry_flag = rewriter.create<mid::BinExprOp>(
-            loc, i1_type,
-            mid::BinExprKindAttr::get(rewriter.getContext(), mid::BinExprKind::Lt),
-            adaptor.getLhs(), adaptor.getRhs(),
-            op.getAddressAttr()
-        );
+        rewriter.setInsertionPoint(op);
 
-        // OF: overflow — approximate as false for now
-        auto of_val = rewriter.create<mlir::arith::ConstantOp>(
-            loc, i1_type, rewriter.getBoolAttr(false));
+        const bool carryLive = !op.getCarryFlag().use_empty();
+        const bool zeroLive = !op.getZeroFlag().use_empty();
+        const bool signLive = !op.getSignFlag().use_empty();
+        const bool overflowLive = !op.getOverflowFlag().use_empty();
+        auto falseValue = rewriter.create<mlir::arith::ConstantOp>(
+            loc, rewriter.getI1Type(), rewriter.getBoolAttr(false));
+        Value carryFlag = falseValue;
+        Value zeroFlag = falseValue;
+        Value signFlag = falseValue;
+        Value overflowFlag = falseValue;
+
+        if (carryLive) {
+            carryFlag = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::Ult, lhs, rhs,
+                op.getAddressAttr());
+        }
+        if (zeroLive) {
+            zeroFlag = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::Eq, lhs, rhs,
+                op.getAddressAttr());
+        }
+        if (signLive || overflowLive) {
+            auto zero = rewriter.create<mid::ConstantOp>(
+                loc, arithmeticType, getSI64Attr(rewriter, 0), IntegerAttr{});
+            auto subtraction = createFixedWidthBinary(
+                rewriter, loc, mid::BinExprKind::Sub, lhs, rhs,
+                arithmeticType, op.getAddressAttr());
+            signFlag = createBoolBinary(
+                rewriter, loc, mid::BinExprKind::Lt, subtraction, zero,
+                op.getAddressAttr());
+            if (overflowLive) {
+                Value lhsSign = createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Lt, lhs, zero,
+                    op.getAddressAttr());
+                Value rhsSign = createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Lt, rhs, zero,
+                    op.getAddressAttr());
+                Value signsDiffer = createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Ne, lhsSign, rhsSign,
+                    op.getAddressAttr());
+                Value resultDiffersFromLhs = createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::Ne, signFlag, lhsSign,
+                    op.getAddressAttr());
+                overflowFlag = createBoolBinary(
+                    rewriter, loc, mid::BinExprKind::LogAnd,
+                    signsDiffer, resultDiffersFromLhs,
+                    op.getAddressAttr());
+            }
+        }
 
         rewriter.replaceOp(op, {
-            carry_flag.getResult(),
-            zero_flag.getResult(),
-            sign_flag.getResult(),
-            of_val
+            carryFlag, zeroFlag, signFlag, overflowFlag
         });
         return success();
     }
@@ -444,9 +874,13 @@ struct TestToComparison : public OpConversionPattern<low::TestOp> {
         auto lhs = adaptor.getLhs();
         auto rhs = adaptor.getRhs();
         if (!isa<IntegerType>(lhs.getType()))
-            lhs = rewriter.create<mid::CastOp>(loc, arith_type, lhs, IntegerAttr{}).getResult();
+            lhs = rewriter.create<mid::CastOp>(
+                loc, arith_type, lhs, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
         if (!isa<IntegerType>(rhs.getType()))
-            rhs = rewriter.create<mid::CastOp>(loc, arith_type, rhs, IntegerAttr{}).getResult();
+            rhs = rewriter.create<mid::CastOp>(
+                loc, arith_type, rhs, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
 
         auto and_result = rewriter.create<mid::BinExprOp>(
             loc, arith_type,
@@ -457,7 +891,7 @@ struct TestToComparison : public OpConversionPattern<low::TestOp> {
 
         auto zero = rewriter.create<mid::ConstantOp>(
             loc, arith_type,
-            rewriter.getIntegerAttr(arith_type, 0),
+            getSI64Attr(rewriter, 0),
             /*address=*/mlir::IntegerAttr{}
         );
 
@@ -626,7 +1060,7 @@ struct CallToMidCall : public OpConversionPattern<low::CallOp> {
         auto midCall = rewriter.create<mid::CallOp>(
             op.getLoc(),
             /*result=*/op.getResultTypes(),
-            rewriter.getI64IntegerAttr(callee_addr),
+            getUI64Attr(rewriter, callee_addr),
             callee_name_attr,
             adaptor.getArgs(),
             op.getAddressAttr()
@@ -698,14 +1132,18 @@ struct LeaToBinExpr : public OpConversionPattern<low::LeaOp> {
         auto base = adaptor.getBase();
         auto index = adaptor.getIndex();
         if (!isa<IntegerType>(base.getType()))
-            base = rewriter.create<mid::CastOp>(loc, arith_type, base, IntegerAttr{}).getResult();
+            base = rewriter.create<mid::CastOp>(
+                loc, arith_type, base, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
         if (!isa<IntegerType>(index.getType()))
-            index = rewriter.create<mid::CastOp>(loc, arith_type, index, IntegerAttr{}).getResult();
+            index = rewriter.create<mid::CastOp>(
+                loc, arith_type, index, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
 
         // LEA: base + index * scale + displacement
         auto scale_val = rewriter.create<mid::ConstantOp>(
             loc, arith_type,
-            rewriter.getIntegerAttr(arith_type, op.getScale()),
+            getSI64Attr(rewriter, static_cast<int64_t>(op.getScale())),
             /*address=*/mlir::IntegerAttr{}
         );
         auto scaled_index = rewriter.create<mid::BinExprOp>(
@@ -726,7 +1164,7 @@ struct LeaToBinExpr : public OpConversionPattern<low::LeaOp> {
         if (op.getDisplacement() != 0) {
             auto disp_val = rewriter.create<mid::ConstantOp>(
                 loc, arith_type,
-                rewriter.getIntegerAttr(arith_type, op.getDisplacement()),
+                getSI64Attr(rewriter, op.getDisplacement()),
                 /*address=*/mlir::IntegerAttr{}
             );
             auto sum = rewriter.create<mid::BinExprOp>(
@@ -743,7 +1181,8 @@ struct LeaToBinExpr : public OpConversionPattern<low::LeaOp> {
         // Cast back to original type if it was pointer
         if (result_type != arith_type) {
             final_result = rewriter.create<mid::CastOp>(
-                loc, result_type, final_result, IntegerAttr{}).getResult();
+                loc, result_type, final_result, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
         }
 
         rewriter.replaceOp(op, final_result);
@@ -763,7 +1202,9 @@ struct MovZxToCast : public OpConversionPattern<low::MovZxOp> {
             op.getLoc(),
             op.getResult().getType(),
             adaptor.getSrc(),
-            op.getAddressAttr()
+            op.getAddressAttr(),
+            mid::CastKindAttr::get(
+                rewriter.getContext(), mid::CastKind::ZeroExtend)
         );
         rewriter.replaceOp(op, new_op.getResult());
         return success();
@@ -782,7 +1223,9 @@ struct MovSxToCast : public OpConversionPattern<low::MovSxOp> {
             op.getLoc(),
             op.getResult().getType(),
             adaptor.getSrc(),
-            op.getAddressAttr()
+            op.getAddressAttr(),
+            mid::CastKindAttr::get(
+                rewriter.getContext(), mid::CastKind::SignExtend)
         );
         rewriter.replaceOp(op, new_op.getResult());
         return success();
@@ -838,15 +1281,78 @@ struct NopErase : public OpConversionPattern<low::NopOp> {
     }
 };
 
-/// Convert helix_low.int3 → erase
-struct Int3Erase : public OpConversionPattern<low::Int3Op> {
+/// Convert helix_low.int3 → helix_mid.debug_break.
+struct Int3ToDebugBreak : public OpConversionPattern<low::Int3Op> {
     using OpConversionPattern::OpConversionPattern;
 
     LogicalResult matchAndRewrite(
         low::Int3Op op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
-        rewriter.eraseOp(op);
+        rewriter.replaceOpWithNewOp<mid::DebugBreakOp>(
+            op, op.getAddressAttr());
+        return success();
+    }
+};
+
+struct UnknownValueToMid
+    : public OpConversionPattern<low::UnknownValueOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(
+        low::UnknownValueOp op, OpAdaptor,
+        ConversionPatternRewriter &rewriter) const override
+    {
+        rewriter.replaceOpWithNewOp<mid::UnknownValueOp>(
+            op, op.getResult().getType(), op.getReasonAttr(),
+            op.getAddressAttr());
+        return success();
+    }
+};
+
+struct XchgToMid : public OpConversionPattern<low::XchgOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(
+        low::XchgOp op, OpAdaptor,
+        ConversionPatternRewriter& rewriter) const override {
+        rewriter.replaceOpWithNewOp<mid::XchgOp>(
+            op, op.getRegAAttr(), op.getRegBAttr(), op.getBitWidthAttr(),
+            op.getAddressAttr());
+        return success();
+    }
+};
+
+struct PushToMidStack : public OpConversionPattern<low::PushOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(
+        low::PushOp op, OpAdaptor adaptor,
+        ConversionPatternRewriter &rewriter) const override
+    {
+        if (op->hasAttr("is_callee_save_push"))
+            rewriter.eraseOp(op);
+        else
+            rewriter.replaceOpWithNewOp<mid::StackPushOp>(
+                op, adaptor.getValue(), op.getAddressAttr());
+        return success();
+    }
+};
+
+struct PopToMidStack : public OpConversionPattern<low::PopOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(
+        low::PopOp op, OpAdaptor,
+        ConversionPatternRewriter &rewriter) const override
+    {
+        if (op->hasAttr("is_callee_save_pop") &&
+            op.getResult().use_empty()) {
+            rewriter.eraseOp(op);
+        } else {
+            rewriter.replaceOpWithNewOp<mid::StackPopOp>(
+                op, op.getResult().getType(), op.getAddressAttr());
+        }
         return success();
     }
 };
@@ -863,10 +1369,6 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
     {
         auto loc = op.getLoc();
         auto result_type = op.getResult().getType();
-        auto i1_type = rewriter.getI1Type();
-        auto false_val = rewriter.create<mlir::arith::ConstantOp>(
-            loc, i1_type, rewriter.getBoolAttr(false));
-
         // Inc/Dec → BinExpr(Add/Sub, operand, 1)
         if (op.getKind() == low::UnaryOpKind::Inc ||
             op.getKind() == low::UnaryOpKind::Dec) {
@@ -874,7 +1376,7 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
             auto arith_type = isa<IntegerType>(result_type) ? result_type : rewriter.getI64Type();
             auto one = rewriter.create<mid::ConstantOp>(
                 loc, arith_type,
-                rewriter.getIntegerAttr(arith_type, 1),
+                getSI64Attr(rewriter, 1),
                 /*address=*/mlir::IntegerAttr{}
             );
             auto bin_kind = (op.getKind() == low::UnaryOpKind::Inc)
@@ -883,7 +1385,9 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
             // Cast operand to integer if pointer-typed
             auto operand = adaptor.getOperand();
             if (!isa<IntegerType>(operand.getType()))
-                operand = rewriter.create<mid::CastOp>(loc, arith_type, operand, IntegerAttr{}).getResult();
+                operand = rewriter.create<mid::CastOp>(
+                    loc, arith_type, operand, IntegerAttr{},
+                    mid::CastKindAttr{}).getResult();
 
             auto new_op = rewriter.create<mid::BinExprOp>(
                 loc, arith_type,
@@ -895,27 +1399,40 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
             // Cast back if original was pointer
             Value inc_result = new_op.getResult();
             if (result_type != arith_type)
-                inc_result = rewriter.create<mid::CastOp>(loc, result_type, inc_result, IntegerAttr{}).getResult();
+                inc_result = rewriter.create<mid::CastOp>(
+                    loc, result_type, inc_result, IntegerAttr{},
+                    mid::CastKindAttr{}).getResult();
+
+            auto resultFlags = createZeroAndSignFlags(
+                rewriter, loc, new_op.getResult(), arith_type,
+                op.getAddressAttr());
 
             rewriter.replaceOp(op, {
-                inc_result, false_val, false_val
+                inc_result, resultFlags.zero, resultFlags.sign
             });
             return success();
         }
 
-        // Neg, Not, Bswap, BSF, BSR → UnExpr
+        // Every remaining Low unary kind has an exact Mid identity. Bit-scan
+        // source-zero behavior stays explicit in its Mid kind and is emitted
+        // through a Helix helper rather than invoking a C builtin on zero.
         mid::UnExprKind mid_kind;
         switch (op.getKind()) {
         case low::UnaryOpKind::Neg:   mid_kind = mid::UnExprKind::Neg; break;
         case low::UnaryOpKind::Not:   mid_kind = mid::UnExprKind::BitNot; break;
-        default:                       mid_kind = mid::UnExprKind::Neg; break;
+        case low::UnaryOpKind::Bswap: mid_kind = mid::UnExprKind::Bswap; break;
+        case low::UnaryOpKind::Bsf:   mid_kind = mid::UnExprKind::Bsf; break;
+        case low::UnaryOpKind::Bsr:   mid_kind = mid::UnExprKind::Bsr; break;
+        default:                       return failure();
         }
 
         // Cast operand to integer if pointer-typed
         auto unary_type = isa<IntegerType>(result_type) ? result_type : rewriter.getI64Type();
         auto unary_operand = adaptor.getOperand();
         if (!isa<IntegerType>(unary_operand.getType()))
-            unary_operand = rewriter.create<mid::CastOp>(loc, unary_type, unary_operand, IntegerAttr{}).getResult();
+            unary_operand = rewriter.create<mid::CastOp>(
+                loc, unary_type, unary_operand, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
 
         auto new_op = rewriter.create<mid::UnExprOp>(
             loc, unary_type,
@@ -926,10 +1443,54 @@ struct UnaryOpToUnExpr : public OpConversionPattern<low::UnaryOp> {
 
         Value unary_result = new_op.getResult();
         if (result_type != unary_type)
-            unary_result = rewriter.create<mid::CastOp>(loc, result_type, unary_result, IntegerAttr{}).getResult();
+            unary_result = rewriter.create<mid::CastOp>(
+                loc, result_type, unary_result, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
+
+        ResultFlags resultFlags;
+        if (op.getKind() == low::UnaryOpKind::Not ||
+            op.getKind() == low::UnaryOpKind::Bswap) {
+            auto falseValue = rewriter.create<arith::ConstantOp>(
+                loc, rewriter.getI1Type(), rewriter.getBoolAttr(false));
+            resultFlags.zero = op.getZeroFlag().use_empty()
+                ? falseValue.getResult()
+                : createUnknownValue(
+                    rewriter, loc, rewriter.getI1Type(),
+                    "zero flag preserved but prior state unavailable",
+                    op.getAddressAttr());
+            resultFlags.sign = op.getSignFlag().use_empty()
+                ? falseValue.getResult()
+                : createUnknownValue(
+                    rewriter, loc, rewriter.getI1Type(),
+                    "sign flag preserved but prior state unavailable",
+                    op.getAddressAttr());
+        } else if (op.getKind() == low::UnaryOpKind::Bsf ||
+                   op.getKind() == low::UnaryOpKind::Bsr) {
+            auto zero = rewriter.create<mid::ConstantOp>(
+                loc, unary_type, getSI64Attr(rewriter, 0), IntegerAttr{});
+            resultFlags.zero = op.getZeroFlag().use_empty()
+                ? rewriter.create<arith::ConstantOp>(
+                      loc, rewriter.getI1Type(),
+                      rewriter.getBoolAttr(false)).getResult()
+                : createBoolBinary(
+                      rewriter, loc, mid::BinExprKind::Eq,
+                      unary_operand, zero.getResult(), op.getAddressAttr());
+            resultFlags.sign = op.getSignFlag().use_empty()
+                ? rewriter.create<arith::ConstantOp>(
+                      loc, rewriter.getI1Type(),
+                      rewriter.getBoolAttr(false)).getResult()
+                : createUnknownValue(
+                      rewriter, loc, rewriter.getI1Type(),
+                      "sign flag undefined for bit scan",
+                      op.getAddressAttr());
+        } else {
+            resultFlags = createZeroAndSignFlags(
+                rewriter, loc, new_op.getResult(), unary_type,
+                op.getAddressAttr());
+        }
 
         rewriter.replaceOp(op, {
-            unary_result, false_val, false_val
+            unary_result, resultFlags.zero, resultFlags.sign
         });
         return success();
     }
@@ -943,6 +1504,9 @@ struct HelixLowToMidPass
     : public PassWrapper<HelixLowToMidPass, OperationPass<ModuleOp>>
 {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HelixLowToMidPass)
+
+    explicit HelixLowToMidPass(bool strictClosure = false)
+        : strictClosure_(strictClosure) {}
 
     StringRef getArgument() const final { return "helix-low-to-mid"; }
     StringRef getDescription() const final {
@@ -958,6 +1522,19 @@ struct HelixLowToMidPass
         auto module = getOperation();
         auto *ctx = &getContext();
 
+        const char* disableNormalization =
+            std::getenv("HELIX_DISABLE_RECOVERED_HIGH_NORMALIZATION");
+        const bool normalizationDisabled = disableNormalization &&
+            disableNormalization[0] != '\0' &&
+            StringRef(disableNormalization) != "0";
+        // RecoverVariables historically materialized six source-facing High
+        // families before Low->Mid. Normalize them back into Mid by default so
+        // the tier boundary is closed. Strict mode cannot be opted out; the
+        // environment switch exists only for compatibility A/B comparisons.
+        if (strictClosure_ || !normalizationDisabled) {
+            normalizeRecoveredHighToMid(module);
+        }
+
         if (helix::pipelineDebugEnabled()) {
             unsigned lowCalls = 0;
             module.walk([&](low::CallOp) { ++lowCalls; });
@@ -968,18 +1545,23 @@ struct HelixLowToMidPass
         // Set up conversion target: HelixMid is legal, HelixLow is illegal
         ConversionTarget target(*ctx);
         target.addLegalDialect<helix::mid::HelixMidDialect>();
+        // High ops already produced by the current SCF bridge are accepted by
+        // dialect conversion so the explicit postcondition below can count
+        // and diagnose them instead of failing with an opaque legalization
+        // error at the first High op.
+        target.addLegalDialect<helix::high::HelixHighDialect>();
         target.addLegalDialect<mlir::arith::ArithDialect>();
+        target.addLegalDialect<mlir::cf::ControlFlowDialect>();
+        target.addLegalDialect<mlir::func::FuncDialect>();
         target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+        target.addLegalDialect<mlir::scf::SCFDialect>();
+        target.addLegalOp<mlir::ModuleOp>();
         target.addIllegalDialect<helix::low::HelixLowDialect>();
 
         // Allow HelixLow ops that we don't convert yet (JmpOp, JccOp, etc.)
         // to survive — they'll be handled by subsequent passes.
         target.addLegalOp<low::JmpOp>();
         target.addLegalOp<low::JccOp>();
-        target.addLegalOp<low::PushOp>();
-        target.addLegalOp<low::PopOp>();
-        target.addLegalOp<low::XchgOp>();
-
         target.addLegalOp<low::FuncOp>();
 
         // Populate patterns
@@ -1001,197 +1583,35 @@ struct HelixLowToMidPass
             RepMovsToMemcpy,
             RepStosToMemset,
             NopErase,
-            Int3Erase,
+            PushToMidStack,
+            PopToMidStack,
+            Int3ToDebugBreak,
+            UnknownValueToMid,
+            XchgToMid,
             UnaryOpToUnExpr
         >(ctx);
 
+        // Bundle carriage is a temporary import representation. Normalize it
+        // before conversion so strict mode can enforce a real closed tier.
+        const unsigned collapsedVariadicCalls =
+            collapseVariadicCallsToMid(module);
+
         // Run partial conversion (some HelixLow ops may remain for now)
-        if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+        LogicalResult conversionResult = strictClosure_
+            ? applyFullConversion(module, target, std::move(patterns))
+            : applyPartialConversion(module, target, std::move(patterns));
+        if (failed(conversionResult)) {
             LLVM_DEBUG(llvm::dbgs() << "HelixLowToMid: partial conversion "
                                     << "completed with unconverted ops\n");
-            // Don't signal failure — partial conversion is expected during
-            // incremental evolution of the pipeline.
-        }
-
-        // ── Manual CallOp conversion for ops inside low::FuncOp ──────────
-        // The dialect conversion framework does not recurse into regions of
-        // ops marked as legal (low::FuncOp).  Any low::CallOps that live
-        // inside a FuncOp region are invisible to applyPartialConversion.
-        // Walk them manually and convert to mid::CallOp in-place.
-        {
-            SmallVector<low::CallOp, 16> callsToConvert;
-            module.walk([&](low::CallOp call) {
-                callsToConvert.push_back(call);
-            });
-
-            unsigned converted = 0;
-            for (auto callOp : callsToConvert) {
-                OpBuilder builder(callOp);
-
-                uint64_t callee_addr = 0;
-                bool is_indirect = false;
-                StringAttr callee_name_attr = callOp.getTargetNameAttr();
-
-                if (callee_name_attr) {
-                    auto name = callee_name_attr.getValue();
-                    if (name.starts_with("sub_")) {
-                        auto hexPart = name.drop_front(4);
-                        uint64_t parsed = 0;
-                        if (!hexPart.getAsInteger(16, parsed))
-                            callee_addr = parsed;
-                    }
-                }
-
-                if (callee_addr == 0) {
-                    auto targetVal = callOp.getTargetAddr();
-                    if (auto constOp = targetVal.getDefiningOp<LLVM::ConstantOp>()) {
-                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
-                            callee_addr = intAttr.getValue().getZExtValue();
-                    } else if (auto constOp = targetVal.getDefiningOp<arith::ConstantOp>()) {
-                        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
-                            callee_addr = intAttr.getValue().getZExtValue();
-                    }
-                }
-
-                int64_t vtable_offset = -1;
-                if (callee_addr == 0) {
-                    is_indirect = true;
-                    auto targetVal = callOp.getTargetAddr();
-                    if (auto addOp = targetVal.getDefiningOp<LLVM::AddOp>()) {
-                        if (auto rhsConst = addOp.getRhs().getDefiningOp<LLVM::ConstantOp>()) {
-                            if (auto intAttr = dyn_cast<IntegerAttr>(rhsConst.getValue()))
-                                vtable_offset = intAttr.getValue().getSExtValue();
-                        }
-                        if (vtable_offset < 0) {
-                            if (auto lhsConst = addOp.getLhs().getDefiningOp<LLVM::ConstantOp>()) {
-                                if (auto intAttr = dyn_cast<IntegerAttr>(lhsConst.getValue()))
-                                    vtable_offset = intAttr.getValue().getSExtValue();
-                            }
-                        }
-                    }
-                }
-
-                auto midCall = builder.create<mid::CallOp>(
-                    callOp.getLoc(),
-                    /*result=*/callOp->getResultTypes(),
-                    builder.getI64IntegerAttr(callee_addr),
-                    callee_name_attr,
-                    callOp.getArgs(),
-                    callOp.getAddressAttr()
-                );
-
-                if (is_indirect) {
-                    midCall->setAttr("is_indirect", builder.getUnitAttr());
-                    if (vtable_offset >= 0)
-                        midCall->setAttr("vtable_offset",
-                            builder.getI64IntegerAttr(vtable_offset));
-                }
-
-                if (helix::pipelineDebugEnabled()) {
-                    llvm::errs() << "[P0-DEBUG] Manual CallOp→MidCall: "
-                                 << (callee_name_attr ? callee_name_attr.getValue() : "indirect")
-                                 << " addr=" << callee_addr << "\n";
-                }
-
-                // Transfer any SSA uses of the low.call's result (e.g. the
-                // synthetic RegWrite RAX from RemillToHelixLow) onto the new
-                // mid.call.  Without this, erase() aborts with "operation
-                // destroyed but still has uses" once the call produces a
-                // value.
-                if (callOp->getNumResults() > 0) {
-                    callOp->getResult(0).replaceAllUsesWith(
-                        midCall->getResult(0));
-                }
-
-                callOp->erase();
-                ++converted;
-            }
-
-            if (helix::pipelineDebugEnabled()) {
-                llvm::errs() << "[P0-DEBUG] HelixLowToMid: manually converted "
-                             << converted << " CallOps\n";
+            if (strictClosure_) {
+                signalPassFailure();
+                return;
             }
         }
 
-        // ── Wave 22 Step 3-lite: variadic_call + bundle.create → mid.call ──────
-        //
-        // Full Step 3 (a first-class variadic_call op carried through every
-        // tier with a bundle operand) is deferred as an architectural
-        // follow-up — see project_wave22_step3_full_carriage_followup. Until
-        // then we collapse to a plain mid::CallOp but, instead of dropping the
-        // bundle, carry its recovery state forward as `helix.*` attributes.
-        // HelixMidToHigh already forwards `helix.*` attrs onto the high::CallOp,
-        // so CAstBuilder (Step 4) can read `helix.variadic_state` to emit the
-        // opacity marker.  This attribute-based carriage is the trade-off
-        // catalogued as Divergence 1 in project_wave22_step1_divergences.
-        {
-            SmallVector<low::VariadicCallOp, 16> vcallsToConvert;
-            module.walk([&](low::VariadicCallOp v) {
-                vcallsToConvert.push_back(v);
-            });
-            for (auto vCall : vcallsToConvert) {
-                OpBuilder builder(vCall);
-                StringAttr calleeNameAttr = vCall.getTargetNameAttr();
-                uint64_t calleeAddr = 0;
-                if (auto targetVal = vCall.getTargetAddr()) {
-                    if (auto cOp = targetVal.getDefiningOp<LLVM::ConstantOp>()) {
-                        if (auto ia = dyn_cast<IntegerAttr>(cOp.getValue()))
-                            calleeAddr = ia.getValue().getZExtValue();
-                    } else if (auto cOp =
-                               targetVal.getDefiningOp<arith::ConstantOp>()) {
-                        if (auto ia = dyn_cast<IntegerAttr>(cOp.getValue()))
-                            calleeAddr = ia.getValue().getZExtValue();
-                    }
-                }
-                auto midCall = builder.create<mid::CallOp>(
-                    vCall.getLoc(), /*result=*/vCall->getResultTypes(),
-                    builder.getI64IntegerAttr(calleeAddr), calleeNameAttr,
-                    vCall.getFixedArgs(), vCall.getAddressAttr());
-
-                // Carry the bundle's recovery state forward as helix.* attrs.
-                // These are auto-propagated mid→high by HelixMidToHigh's
-                // existing `helix.*` attribute forwarding, so they reach the
-                // high::CallOp that Step 4 (CAstBuilder) inspects.
-                if (auto bundleOp = vCall.getRawBundle()
-                                         .getDefiningOp<low::BundleCreateOp>()) {
-                    const char* stateStr = "opaque";
-                    switch (bundleOp.getState()) {
-                    case low::BundleState::Zeroed:
-                        stateStr = "zeroed"; break;
-                    case low::BundleState::PartiallyRecovered:
-                        stateStr = "partially_recovered"; break;
-                    case low::BundleState::Recovered:
-                        stateStr = "recovered"; break;
-                    case low::BundleState::Opaque:
-                        stateStr = "opaque"; break;
-                    }
-                    midCall->setAttr("helix.variadic_state",
-                                     builder.getStringAttr(stateStr));
-                    midCall->setAttr(
-                        "helix.variadic_fixed_args_count",
-                        builder.getI64IntegerAttr(
-                            static_cast<int64_t>(vCall.getFixedArgs().size())));
-                    if (auto prov = bundleOp.getProvenance())
-                        midCall->setAttr("helix.variadic_provenance",
-                                         builder.getStringAttr(*prov));
-                }
-
-                if (vCall->getNumResults() > 0) {
-                    vCall->getResult(0).replaceAllUsesWith(
-                        midCall->getResult(0));
-                }
-                vCall->erase();
-            }
-            SmallVector<low::BundleCreateOp, 16> bundlesToErase;
-            module.walk([&](low::BundleCreateOp b) {
-                if (b->use_empty()) bundlesToErase.push_back(b);
-            });
-            for (auto b : bundlesToErase) b->erase();
-            if (!vcallsToConvert.empty() && helix::pipelineDebugEnabled()) {
-                llvm::errs() << "[P0-DEBUG] Wave22-Step2.5 stopgap: "
-                             << vcallsToConvert.size()
-                             << " variadic_call->mid.call\n";
-            }
+        if (collapsedVariadicCalls > 0 && helix::pipelineDebugEnabled()) {
+            llvm::errs() << "[P0-DEBUG] variadic_call+bundle->mid.call: "
+                         << collapsedVariadicCalls << "\n";
         }
 
         if (helix::pipelineDebugEnabled()) {
@@ -1202,9 +1622,46 @@ struct HelixLowToMidPass
             });
             llvm::errs() << "[P0-DEBUG] HelixLowToMid exit: "
                          << lowCalls << " low.call, "
-                         << midCalls << " mid.call\n";
+                          << midCalls << " mid.call\n";
+        }
+
+        unsigned residualLowOps = 0;
+        unsigned lowContainers = 0;
+        unsigned preexistingHighOps = 0;
+        module.walk([&](Operation* op) {
+            StringRef dialect = op->getName().getDialectNamespace();
+            if (dialect == "helix_low") {
+                if (isa<low::FuncOp>(op))
+                    ++lowContainers;
+                else
+                    ++residualLowOps;
+            } else if (dialect == "helix_high") {
+                ++preexistingHighOps;
+            }
+        });
+        Builder metricBuilder(ctx);
+        module->setAttr(
+            "helix.tier_closure.low_to_mid.residual_low_ops",
+            metricBuilder.getI64IntegerAttr(residualLowOps));
+        module->setAttr(
+            "helix.tier_closure.low_to_mid.low_containers",
+            metricBuilder.getI64IntegerAttr(lowContainers));
+        module->setAttr(
+            "helix.tier_closure.low_to_mid.preexisting_high_ops",
+            metricBuilder.getI64IntegerAttr(preexistingHighOps));
+
+        if (strictClosure_ && (residualLowOps != 0 ||
+                              preexistingHighOps != 0)) {
+            module.emitError()
+                << "HelixLowToMid strict tier closure failed: "
+                << residualLowOps << " residual Low op(s), "
+                << preexistingHighOps << " pre-existing High op(s)";
+            signalPassFailure();
         }
     }
+
+private:
+    bool strictClosure_ = false;
 };
 
 } // anonymous namespace
@@ -1213,6 +1670,7 @@ struct HelixLowToMidPass
 // Pass Registration
 // ═══════════════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<mlir::Pass> helix::createHelixLowToMidPass() {
-    return std::make_unique<HelixLowToMidPass>();
+std::unique_ptr<mlir::Pass> helix::createHelixLowToMidPass(
+        bool strictClosure) {
+    return std::make_unique<HelixLowToMidPass>(strictClosure);
 }

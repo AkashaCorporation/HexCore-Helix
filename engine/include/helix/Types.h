@@ -51,6 +51,20 @@ typedef enum HelixArch {
 /// The actual struct is defined in C++ (Engine.h).
 typedef struct HelixEngineHandle HelixEngineHandle;
 
+// ─── Owned Combined Output ───────────────────────────────────────────────────
+
+/// Output allocated by `helix_engine_decompile_ir_combined`.
+/// The caller must release it with `helix_engine_free_decompile_output`.
+typedef struct HelixCombinedDecompileOutput {
+    char* pseudo_c;
+    size_t pseudo_c_len;
+    uint8_t* flatbuffer;
+    size_t flatbuffer_len;
+    uint32_t function_count;
+    uint32_t block_count;
+    uint32_t instruction_count;
+} HelixCombinedDecompileOutput;
+
 #ifdef __cplusplus
 }
 #endif

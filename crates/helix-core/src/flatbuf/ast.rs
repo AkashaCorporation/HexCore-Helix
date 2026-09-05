@@ -271,7 +271,7 @@ mod tests {
         };
 
         let buf = serialize_ast(&data).expect("serialize falhou");
-        assert_eq!(&buf[4..8], b"HAST");
+        assert_eq!(&buf[4..8], b"HRST");
 
         let decoded = deserialize_ast(&buf).expect("deserialize falhou");
         assert_eq!(decoded.module_name, data.module_name);

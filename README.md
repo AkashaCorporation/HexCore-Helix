@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-v0.9.3--rc-8a6d3b">
+  <img alt="version" src="https://img.shields.io/badge/version-v0.9.4--rc.1-8a6d3b">
   <img alt="engine" src="https://img.shields.io/badge/engine-C%2B%2B23%20%2F%20MLIR%2018-8a6d3b">
   <img alt="lifter" src="https://img.shields.io/badge/lifter-Remill%20(LLVM%20IR)-8a6d3b">
   <img alt="bridge" src="https://img.shields.io/badge/bridge-Rust%20%2F%20N--API-8a6d3b">
@@ -34,6 +34,16 @@
 ---
 
 ## Overview
+
+The `0.9.4-rc.1` candidate consolidates the validated native implementation into
+the canonical repository. It retains LLVM/MLIR 18; the upstream toolchain migration
+is a separate future release. Candidate status is not stable-release acceptance.
+
+Native decompilation now produces pseudo-C, canonical HAST and retained-operation
+metrics in one pipeline invocation. Canonical HAST is versioned and requires real
+FlatBuffers support; the legacy Rust pseudo-AST uses `HRST` and must not be passed
+to a canonical HAST consumer. SCF temporaries and explicit unknown semantics can
+still remain. More readable output is not substituted for semantic evidence.
 
 **Helix** is the decompiler engine inside [HexCore](https://github.com/AkashaCorporation/HikariSystem-HexCore). It takes lifted LLVM IR (from a patched Remill fork), lowers it through three custom **MLIR dialects**, and emits readable pseudo-C with calling-convention recovery, stack reconstruction, variable naming, type propagation, and control-flow structuring.
 

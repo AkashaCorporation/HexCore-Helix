@@ -15,6 +15,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "helix/dialects/HelixHighDialect.h"
 #include "helix/dialects/HelixHighTypes.h"
+#include "helix/dialects/HelixEffects.h"
+#include "helix/Interfaces.h"
 
 // Include the auto-generated enum declarations (guarded: may already be
 // included transitively through HelixHighTypes.h)

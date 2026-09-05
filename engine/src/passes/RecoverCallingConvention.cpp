@@ -635,8 +635,13 @@ private:
             //   mutex_unlock(var_70)                              (correct)
             std::optional<size_t> maxArgs;
             if (targetName.has_value() && !isDirectNamedCall) {
-                if (auto sig = lookupSignature(*targetName))
+                if (auto exactCount = call->getAttrOfType<IntegerAttr>(
+                        "helix.debug_param_count")) {
+                    maxArgs = static_cast<size_t>(exactCount.getInt());
+                } else if (auto sig = lookupSignature(*targetName);
+                           sig && !sig->is_variadic) {
                     maxArgs = sig->param_types.size();
+                }
 
                 // Fallback: inline table of common Linux kernel primitives
                 // that SignatureDb doesn't know about.  This prevents

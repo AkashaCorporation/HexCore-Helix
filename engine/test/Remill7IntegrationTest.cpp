@@ -57,6 +57,39 @@ static size_t countOccurrences(
     return count;
 }
 
+static std::string findSimpleAssignmentTarget(
+    const std::string& text,
+    const std::string& rhs) {
+    const std::string suffix = " = " + rhs + ";";
+    const size_t suffixPos = text.find(suffix);
+    if (suffixPos == std::string::npos)
+        return {};
+
+    const size_t lineStart = text.rfind('\n', suffixPos);
+    size_t targetStart = lineStart == std::string::npos ? 0 : lineStart + 1;
+    while (targetStart < suffixPos && text[targetStart] == ' ')
+        ++targetStart;
+    return text.substr(targetStart, suffixPos - targetStart);
+}
+
+static size_t countCallsWithArgumentFragment(
+    const std::string& text,
+    const std::string& callee,
+    const std::string& fragment) {
+    size_t count = 0;
+    const std::string prefix = callee + "(";
+    for (size_t pos = 0;
+         (pos = text.find(prefix, pos)) != std::string::npos;
+         pos += prefix.size()) {
+        const size_t end = text.find(");", pos + prefix.size());
+        if (end == std::string::npos)
+            break;
+        if (text.find(fragment, pos + prefix.size()) < end)
+            ++count;
+    }
+    return count;
+}
+
 } // namespace
 
 TEST(Remill7IntegrationTest, BonePosCalc3RecoversStackParamAndReturnType) {
@@ -71,9 +104,11 @@ TEST(Remill7IntegrationTest, BonePosCalc3InitializesRaxFromRecoveredArg5) {
     const std::string pseudoC = decompileFile("remill-7/bone_pos_calc3.ll");
     ASSERT_FALSE(pseudoC.empty());
 
+    const std::string arg5Alias =
+        findSimpleAssignmentTarget(pseudoC, "param_5");
     EXPECT_NE(pseudoC.find("field_0x100"), std::string::npos);
-    EXPECT_NE(pseudoC.find("v8 = param_5;"), std::string::npos);
-    EXPECT_NE(pseudoC.find("v8->field_0x100"), std::string::npos);
+    ASSERT_FALSE(arg5Alias.empty());
+    EXPECT_NE(pseudoC.find(arg5Alias + "->field_0x100"), std::string::npos);
     EXPECT_EQ(pseudoC.find("rsi = *(rbp + 0x50);"), std::string::npos);
 }
 
@@ -81,8 +116,10 @@ TEST(Remill7IntegrationTest, BonePosCalc3EmitsMemoryIncAndDecForReentrancy) {
     const std::string pseudoC = decompileFile("remill-7/bone_pos_calc3.ll");
     ASSERT_FALSE(pseudoC.empty());
 
-    EXPECT_NE(pseudoC.find("field_0x100++"), std::string::npos);
-    EXPECT_NE(pseudoC.find("field_0x100--"), std::string::npos);
+    EXPECT_NE(pseudoC.find("field_0x100)++"), std::string::npos);
+    EXPECT_NE(pseudoC.find("field_0x100)--"), std::string::npos);
+    EXPECT_EQ(pseudoC.find("field_0x100++"), std::string::npos);
+    EXPECT_EQ(pseudoC.find("field_0x100--"), std::string::npos);
 }
 
 TEST(Remill7IntegrationTest, ProjectileConstructor2RecoversDenseStackArgs) {
@@ -114,7 +151,7 @@ TEST(Remill7IntegrationTest, BonePosCalc9PropagatesCallArgumentsAcrossBlocks) {
     const std::string pseudoC = decompileFile("remill-7/bone_pos_calc9.ll");
     ASSERT_FALSE(pseudoC.empty());
 
-    EXPECT_NE(pseudoC.find("v8 = param_5;"), std::string::npos);
+    EXPECT_FALSE(findSimpleAssignmentTarget(pseudoC, "param_5").empty());
     EXPECT_NE(pseudoC.find("sub_141431250("), std::string::npos);
     EXPECT_NE(pseudoC.find("sub_14142fe90(param_5,"),
               std::string::npos);
@@ -148,7 +185,10 @@ TEST(Remill7IntegrationTest, BonePosCalc9RecoversStackBackedDirectCallReceiver) 
     const std::string pseudoC = decompileFile("remill-7/bone_pos_calc9.ll");
     ASSERT_FALSE(pseudoC.empty());
 
-    EXPECT_GE(countOccurrences(pseudoC, "sub_140241c70(v2 - 40"), 2u);
+    EXPECT_GE(
+        countCallsWithArgumentFragment(
+            pseudoC, "sub_140241c70", " - 40"),
+        2u);
     EXPECT_EQ(pseudoC.find("*(rbp - 0x28)"), std::string::npos);
 }
 

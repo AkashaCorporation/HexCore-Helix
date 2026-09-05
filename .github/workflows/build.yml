@@ -134,10 +134,10 @@ jobs:
           path: "*.node"
           if-no-files-found: error
 
-  # ─── Publish (on release) ───────────────────────────────────────────────────
+  # npm distribution is a separate acceptance gate from native GitHub assets.
   publish:
     name: Publish to npm
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !github.event.release.prerelease && vars.HELIX_ENABLE_NPM_PUBLISH == 'true'
     needs: [napi-build]
     runs-on: ubuntu-latest
     steps:

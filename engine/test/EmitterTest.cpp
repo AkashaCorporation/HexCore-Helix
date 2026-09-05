@@ -7,7 +7,13 @@
 #include "helix/cast/CAstPrinter.h"
 #include "helix/cast/CDecl.h"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <limits>
+#include <optional>
 #include <vector>
 #include <cstdint>
 #include <memory>
@@ -26,6 +32,69 @@ ExprPtr makeVar(std::string name) {
 
 ExprPtr makeInt(int64_t value) {
     return std::make_unique<CIntLitExpr>(value, CType::int64());
+}
+
+template <typename T>
+std::optional<T> readScalar(const std::vector<uint8_t>& buffer, size_t pos) {
+    if (pos > buffer.size() || buffer.size() - pos < sizeof(T))
+        return std::nullopt;
+    T value{};
+    std::memcpy(&value, buffer.data() + pos, sizeof(T));
+    return value;
+}
+
+std::optional<size_t> tableField(
+    const std::vector<uint8_t>& buffer, size_t table,
+    uint16_t vtableSlot, size_t width) {
+    auto distance = readScalar<int32_t>(buffer, table);
+    if (!distance)
+        return std::nullopt;
+    const int64_t vtableSigned = int64_t(table) - int64_t(*distance);
+    if (vtableSigned < 0 || uint64_t(vtableSigned) >= buffer.size())
+        return std::nullopt;
+    const size_t vtable = size_t(vtableSigned);
+    auto vtableSize = readScalar<uint16_t>(buffer, vtable);
+    auto objectSize = readScalar<uint16_t>(buffer, vtable + 2);
+    if (!vtableSize || !objectSize || vtableSlot + 2 > *vtableSize)
+        return std::nullopt;
+    auto objectOffset = readScalar<uint16_t>(buffer, vtable + vtableSlot);
+    if (!objectOffset || *objectOffset == 0 ||
+        *objectOffset + width > *objectSize ||
+        table + *objectOffset > buffer.size() ||
+        buffer.size() - table - *objectOffset < width) {
+        return std::nullopt;
+    }
+    return table + *objectOffset;
+}
+
+std::optional<size_t> offsetField(
+    const std::vector<uint8_t>& buffer, size_t table, uint16_t vtableSlot) {
+    auto field = tableField(buffer, table, vtableSlot, sizeof(uint32_t));
+    if (!field)
+        return std::nullopt;
+    auto relative = readScalar<uint32_t>(buffer, *field);
+    if (!relative || *relative == 0 || *relative > buffer.size() - *field)
+        return std::nullopt;
+    return *field + *relative;
+}
+
+std::optional<size_t> vectorTableElement(
+    const std::vector<uint8_t>& buffer, size_t vector, size_t index) {
+    auto count = readScalar<uint32_t>(buffer, vector);
+    if (!count || index >= *count)
+        return std::nullopt;
+    const size_t element = vector + sizeof(uint32_t) + index * sizeof(uint32_t);
+    auto relative = readScalar<uint32_t>(buffer, element);
+    if (!relative || *relative == 0 || *relative > buffer.size() - element)
+        return std::nullopt;
+    return element + *relative;
+}
+
+std::optional<size_t> rootTable(const std::vector<uint8_t>& buffer) {
+    auto root = readScalar<uint32_t>(buffer, 0);
+    if (!root || *root >= buffer.size())
+        return std::nullopt;
+    return size_t(*root);
 }
 
 } // namespace
@@ -47,15 +116,16 @@ TEST(FlatBufSerializerTest, VerifyBadIdentifier) {
     EXPECT_FALSE(FlatBufSerializer::verify(data, sizeof(data)));
 }
 
-TEST(FlatBufSerializerTest, VerifyCorrectIdentifier) {
+TEST(FlatBufSerializerTest, RejectsIdentifierOnlyBuffer) {
     uint8_t data[] = {
         8, 0, 0, 0,  // root offset (points to byte 8)
         'H', 'A', 'S', 'T',  // correct file identifier
         // ... minimal valid table data would follow
         0, 0, 0, 0,  // padding
     };
-    // This has HAST identifier and root offset within bounds
-    EXPECT_TRUE(FlatBufSerializer::verify(data, sizeof(data)));
+    // The identifier alone is not a semantic contract. HAST 1.x negotiation
+    // fields and a structurally valid root table are mandatory.
+    EXPECT_FALSE(FlatBufSerializer::verify(data, sizeof(data)));
 }
 
 TEST(FlatBufSerializerTest, VerifyRootOffsetOutOfBounds) {
@@ -80,6 +150,185 @@ TEST(FlatBufSerializerTest, OmitsAbsentExpressionChildren) {
 
     ASSERT_FALSE(buffer.empty());
     EXPECT_TRUE(FlatBufSerializer::verify(buffer.data(), buffer.size()));
+}
+
+TEST(FlatBufSerializerTest, CanonicalContractIsExactAndDeterministic) {
+    constexpr uint64_t kFunctionAddress = 0xFEDCBA9876543210ULL;
+    constexpr uint64_t kIfAddress = 0xF123456789ABCDE0ULL;
+    constexpr uint64_t kFieldAddress = 0xE123456789ABCDE0ULL;
+    constexpr uint64_t kCallTarget = 0xD123456789ABCDE0ULL;
+
+    std::vector<CParamDecl> params;
+    params.emplace_back("zero_param", CType::uint64(), 0,
+                        /*address=*/0, uint32_t(0));
+
+    auto function = std::make_unique<CFuncDecl>(
+        "canonical_hast", kFunctionAddress, CType::uint64(),
+        std::move(params));
+
+    std::vector<StmtPtr> thenBody;
+    thenBody.push_back(std::make_unique<CExprStmt>(
+        std::make_unique<CFieldAccessExpr>(
+            std::make_unique<CVarRefExpr>(
+                0, "zero_param", CType::voidPtr(), kFieldAddress - 1),
+            "field_0x0", 0, true, CType::uint64(), kFieldAddress),
+        kFieldAddress - 2));
+
+    std::vector<StmtPtr> elseBody;
+    elseBody.push_back(std::make_unique<CExprStmt>(
+        std::make_unique<CCallExpr>(
+            "direct_target", kCallTarget, std::vector<ExprPtr>{},
+            CType::uint64(), kCallTarget - 1),
+        kCallTarget - 2));
+
+    function->body.push_back(std::make_unique<CIfStmt>(
+        std::make_unique<CIntLitExpr>(
+            1, CType::boolTy(), kIfAddress - 1),
+        std::move(thenBody), std::move(elseBody), kIfAddress));
+
+    std::vector<std::unique_ptr<CFuncDecl>> functions;
+    functions.push_back(std::move(function));
+
+    FlatBufSerializer serializer;
+    const auto first = serializer.serialize(
+        functions, "canonical_test", HELIX_ARCH_AARCH64);
+    const auto second = serializer.serialize(
+        functions, "canonical_test", HELIX_ARCH_AARCH64);
+
+    ASSERT_TRUE(FlatBufSerializer::verify(first.data(), first.size()));
+    EXPECT_EQ(first, second);
+
+    // Cross-language acceptance hook. The fixture is exactly the buffer
+    // asserted below, never a separately maintained encoder. Ordinary test
+    // runs remain side-effect free; callers opt in with an explicit path.
+    if (const char* output = std::getenv("HELIX_HAST_FIXTURE_OUT");
+        output && *output) {
+        const std::filesystem::path outputPath(output);
+        std::error_code directoryError;
+        if (outputPath.has_parent_path()) {
+            std::filesystem::create_directories(
+                outputPath.parent_path(), directoryError);
+        }
+        ASSERT_FALSE(directoryError) << directoryError.message();
+
+        std::ofstream stream(
+            outputPath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(stream.is_open()) << outputPath.string();
+        stream.write(reinterpret_cast<const char*>(first.data()),
+                     static_cast<std::streamsize>(first.size()));
+        stream.close();
+        ASSERT_TRUE(stream.good()) << outputPath.string();
+    }
+
+    auto module = rootTable(first);
+    ASSERT_TRUE(module);
+    auto major = tableField(first, *module, 12, sizeof(uint16_t));
+    auto minor = tableField(first, *module, 14, sizeof(uint16_t));
+    auto capabilities = offsetField(first, *module, 16);
+    auto producer = offsetField(first, *module, 18);
+    auto version = offsetField(first, *module, 20);
+    auto arch = tableField(first, *module, 22, sizeof(uint8_t));
+    auto pointerBits = tableField(first, *module, 24, sizeof(uint16_t));
+    ASSERT_TRUE(major && minor && capabilities && producer && version &&
+                arch && pointerBits);
+    EXPECT_EQ(*readScalar<uint16_t>(first, *major), 1);
+    EXPECT_EQ(*readScalar<uint16_t>(first, *minor), 0);
+    EXPECT_EQ(*readScalar<uint32_t>(first, *capabilities), 7u);
+    EXPECT_EQ(first[*arch], 3u);
+    EXPECT_EQ(*readScalar<uint16_t>(first, *pointerBits), 64u);
+
+    auto functionsVector = offsetField(first, *module, 6);
+    ASSERT_TRUE(functionsVector);
+    auto functionTable = vectorTableElement(first, *functionsVector, 0);
+    ASSERT_TRUE(functionTable);
+    auto functionAddress = tableField(
+        first, *functionTable, 6, sizeof(uint64_t));
+    ASSERT_TRUE(functionAddress);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *functionAddress),
+              kFunctionAddress);
+
+    auto paramsVector = offsetField(first, *functionTable, 10);
+    ASSERT_TRUE(paramsVector);
+    auto parameter = vectorTableElement(first, *paramsVector, 0);
+    ASSERT_TRUE(parameter);
+    auto identity = tableField(first, *parameter, 12, sizeof(uint64_t));
+    auto parameterIndex = tableField(first, *parameter, 14, sizeof(uint32_t));
+    ASSERT_TRUE(identity && parameterIndex);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *identity), 0u);
+    EXPECT_EQ(*readScalar<uint32_t>(first, *parameterIndex), 0u);
+
+    auto bodyVector = offsetField(first, *functionTable, 14);
+    ASSERT_TRUE(bodyVector);
+    auto ifStatement = vectorTableElement(first, *bodyVector, 0);
+    ASSERT_TRUE(ifStatement);
+    auto ifNodeId = tableField(first, *ifStatement, 16, sizeof(uint64_t));
+    auto ifSource = tableField(first, *ifStatement, 18, sizeof(uint64_t));
+    auto childRoles = offsetField(first, *ifStatement, 20);
+    ASSERT_TRUE(ifNodeId && ifSource && childRoles);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *ifNodeId), 1u);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *ifSource), kIfAddress);
+    ASSERT_EQ(*readScalar<uint32_t>(first, *childRoles), 2u);
+    EXPECT_EQ(first[*childRoles + 4], 1u); // Then
+    EXPECT_EQ(first[*childRoles + 5], 2u); // Else
+
+    auto ifExpressions = offsetField(first, *ifStatement, 8);
+    auto ifChildren = offsetField(first, *ifStatement, 10);
+    ASSERT_TRUE(ifExpressions && ifChildren);
+    auto condition = vectorTableElement(first, *ifExpressions, 0);
+    auto thenStatement = vectorTableElement(first, *ifChildren, 0);
+    auto elseStatement = vectorTableElement(first, *ifChildren, 1);
+    ASSERT_TRUE(condition && thenStatement && elseStatement);
+    EXPECT_EQ(*readScalar<uint64_t>(
+                  first, *tableField(first, *condition, 24, sizeof(uint64_t))),
+              2u);
+    EXPECT_EQ(*readScalar<uint64_t>(
+                  first, *tableField(first, *thenStatement, 16, sizeof(uint64_t))),
+              3u);
+    EXPECT_EQ(*readScalar<uint64_t>(
+                  first, *tableField(first, *elseStatement, 16, sizeof(uint64_t))),
+              6u);
+
+    auto thenExpressions = offsetField(first, *thenStatement, 8);
+    ASSERT_TRUE(thenExpressions);
+    auto fieldExpression = vectorTableElement(first, *thenExpressions, 0);
+    ASSERT_TRUE(fieldExpression);
+    auto fieldNodeId = tableField(
+        first, *fieldExpression, 24, sizeof(uint64_t));
+    auto fieldSource = tableField(
+        first, *fieldExpression, 26, sizeof(uint64_t));
+    auto fieldOffset = tableField(
+        first, *fieldExpression, 30, sizeof(uint64_t));
+    auto resultType = offsetField(first, *fieldExpression, 22);
+    ASSERT_TRUE(fieldNodeId && fieldSource && fieldOffset && resultType);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *fieldNodeId), 4u);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *fieldSource), kFieldAddress);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *fieldOffset), 0u);
+
+    auto fieldChildren = offsetField(first, *fieldExpression, 16);
+    ASSERT_TRUE(fieldChildren);
+    auto baseExpression = vectorTableElement(first, *fieldChildren, 0);
+    ASSERT_TRUE(baseExpression);
+    EXPECT_EQ(*readScalar<uint64_t>(
+                  first, *tableField(first, *baseExpression, 24, sizeof(uint64_t))),
+              5u);
+    auto baseVariable = offsetField(first, *baseExpression, 18);
+    ASSERT_TRUE(baseVariable);
+    auto baseIdentity = tableField(
+        first, *baseVariable, 12, sizeof(uint64_t));
+    ASSERT_TRUE(baseIdentity);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *baseIdentity), 0u);
+
+    auto elseExpressions = offsetField(first, *elseStatement, 8);
+    ASSERT_TRUE(elseExpressions);
+    auto callExpression = vectorTableElement(first, *elseExpressions, 0);
+    ASSERT_TRUE(callExpression);
+    auto callNodeId = tableField(
+        first, *callExpression, 24, sizeof(uint64_t));
+    auto callTarget = tableField(
+        first, *callExpression, 28, sizeof(uint64_t));
+    ASSERT_TRUE(callNodeId && callTarget);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *callNodeId), 7u);
+    EXPECT_EQ(*readScalar<uint64_t>(first, *callTarget), kCallTarget);
 }
 
 TEST(PseudoCEmitterHeuristicsTest, InfersWin64StackParameterIndices) {
@@ -143,6 +392,28 @@ TEST(CAstPrinterTest, PrintsIncrementCompoundWithoutRhs) {
     EXPECT_EQ(code.find("v1 + 1"), std::string::npos);
 }
 
+TEST(CAstPrinterTest, ParenthesizesDereferenceIncrementTarget) {
+    using namespace helix::cast;
+
+    CFuncDecl func("deref_inc_test", 0, CType::voidTy());
+    auto target = std::make_unique<CUnaryExpr>(
+        UnaryOp::Deref, makeVar("ptr"), CType::int32());
+    auto oldValue = std::make_unique<CUnaryExpr>(
+        UnaryOp::Deref, makeVar("ptr"), CType::int32());
+    auto value = std::make_unique<CBinaryExpr>(
+        BinaryOp::Add, std::move(oldValue), makeInt(1), CType::int32());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        std::move(target), std::move(value)));
+
+    CAstOptimizer optimizer;
+    optimizer.synthesizeCompoundAssign(func);
+    CAstPrinter printer;
+    const std::string code = printer.print(func);
+
+    EXPECT_NE(code.find("(*ptr)++;"), std::string::npos);
+    EXPECT_EQ(code.find("*ptr++;"), std::string::npos);
+}
+
 TEST(CAstOptimizerTest, SynthesizesCompoundAssignWithReducedRhs) {
     using namespace helix::cast;
 
@@ -160,6 +431,90 @@ TEST(CAstOptimizerTest, SynthesizesCompoundAssignWithReducedRhs) {
 
     EXPECT_NE(code.find("v5 += 208;"), std::string::npos);
     EXPECT_EQ(code.find("v5 += v5 + 208"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, PreservesConstantZeroComparisonOperands) {
+    using namespace helix::cast;
+
+    CFuncDecl func("zero_comparison_test", 0, CType::voidTy());
+    std::vector<StmtPtr> thenBody;
+    thenBody.push_back(std::make_unique<CReturnStmt>());
+    func.body.push_back(std::make_unique<CIfStmt>(
+        std::make_unique<CBinaryExpr>(
+            BinaryOp::Eq, makeInt(1), makeInt(0), CType::boolTy()),
+        std::move(thenBody)));
+
+    CAstOptimizer optimizer;
+    optimizer.simplifyConditionPolarity(func);
+
+    ASSERT_EQ(func.body.size(), 1u);
+    const auto* ifStmt = llvm::dyn_cast<CIfStmt>(func.body.front().get());
+    ASSERT_NE(ifStmt, nullptr);
+    const auto* condition =
+        llvm::dyn_cast<CBinaryExpr>(ifStmt->condition.get());
+    ASSERT_NE(condition, nullptr);
+    ASSERT_NE(condition->lhs, nullptr);
+    ASSERT_NE(condition->rhs, nullptr);
+
+    CAstPrinter printer;
+    EXPECT_NE(printer.print(func).find("if (1 == 0)"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, DoesNotFoldSideEffectingCallTimesZero) {
+    using namespace helix::cast;
+
+    CFuncDecl func("call_times_zero", 0, CType::voidTy());
+    auto call = std::make_unique<CCallExpr>(
+        "side_effect", 0, std::vector<ExprPtr>{}, CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("result"), std::make_unique<CBinaryExpr>(
+            BinaryOp::Mul, std::move(call), makeInt(0), CType::int64())));
+
+    CAstOptimizer optimizer;
+    optimizer.simplifyExpressions(func);
+    CAstPrinter printer;
+    const std::string code = printer.print(func);
+    EXPECT_NE(code.find("side_effect()"), std::string::npos);
+    EXPECT_EQ(code.find("result = 0;"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, DoesNotFoldMemoryReadAndZero) {
+    using namespace helix::cast;
+
+    CFuncDecl func("read_and_zero", 0, CType::voidTy());
+    auto read = std::make_unique<CUnaryExpr>(
+        UnaryOp::Deref, makeVar("ptr"), CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("result"), std::make_unique<CBinaryExpr>(
+            BinaryOp::BitAnd, std::move(read), makeInt(0), CType::int64())));
+
+    CAstOptimizer optimizer;
+    optimizer.simplifyExpressions(func);
+    CAstPrinter printer;
+    const std::string code = printer.print(func);
+    EXPECT_NE(code.find("*ptr"), std::string::npos);
+    EXPECT_EQ(code.find("result = 0;"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, NullBasedLoadBecomesExplicitUnknown) {
+    using namespace helix::cast;
+
+    CFuncDecl func("null_load", 0, CType::voidTy());
+    auto nullPointer = std::make_unique<CCastExpr>(
+        CType::voidPtr(), makeInt(0));
+    auto read = std::make_unique<CUnaryExpr>(
+        UnaryOp::Deref, std::move(nullPointer), CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("result"), std::move(read)));
+
+    CAstOptimizer optimizer;
+    optimizer.simplifyExpressions(func);
+    CAstPrinter printer;
+    const std::string code = printer.print(func);
+    EXPECT_NE(code.find(
+        "__helix_unknown(\"null-based unresolved load\")"),
+        std::string::npos);
+    EXPECT_EQ(code.find("result = 0;"), std::string::npos);
 }
 
 TEST(CAstOptimizerTest, PreservesSemanticCalleeSavedRegisterCopy) {
@@ -182,6 +537,83 @@ TEST(CAstOptimizerTest, PreservesSemanticCalleeSavedRegisterCopy) {
     ASSERT_NE(value, nullptr);
     EXPECT_EQ(target->varName, "rbx");
     EXPECT_EQ(value->varName, "param_1");
+}
+
+TEST(CAstOptimizerTest, RegisterRenameReservesUndeclaredBodyNames) {
+    using namespace helix::cast;
+
+    CFuncDecl func("register_orphan_collision_test", 0, CType::voidTy());
+    func.localVars.emplace_back(
+        1, "r8", CType::voidPtr(), StorageKind::Register);
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("r8"), makeInt(0x14000)));
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v1"), makeVar("result")));
+    func.body.push_back(std::make_unique<CExprStmt>(makeVar("r8")));
+    func.body.push_back(std::make_unique<CExprStmt>(makeVar("v1")));
+
+    CAstOptimizer optimizer;
+    optimizer.renameRemainingRegisterVars(func);
+
+    ASSERT_EQ(func.localVars.size(), 1u);
+    EXPECT_EQ(func.localVars.front().varName, "v2");
+    const auto* pointerAssign =
+        llvm::dyn_cast<CAssignStmt>(func.body[0].get());
+    const auto* scalarAssign =
+        llvm::dyn_cast<CAssignStmt>(func.body[1].get());
+    ASSERT_NE(pointerAssign, nullptr);
+    ASSERT_NE(scalarAssign, nullptr);
+    const auto* pointerTarget =
+        llvm::dyn_cast<CVarRefExpr>(pointerAssign->target.get());
+    const auto* scalarTarget =
+        llvm::dyn_cast<CVarRefExpr>(scalarAssign->target.get());
+    ASSERT_NE(pointerTarget, nullptr);
+    ASSERT_NE(scalarTarget, nullptr);
+    EXPECT_EQ(pointerTarget->varName, "v2");
+    EXPECT_EQ(scalarTarget->varName, "v1");
+    EXPECT_NE(pointerTarget->varName, scalarTarget->varName);
+}
+
+TEST(CAstOptimizerTest, PreservesLoopIterationAccumulatorCopies) {
+    using namespace helix::cast;
+
+    CFuncDecl func("loop_accumulator_copy_test", 0, CType::int64());
+    func.localVars.emplace_back(
+        1, "result", CType::int64(), StorageKind::Register);
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v0"), std::make_unique<CCastExpr>(
+                           CType::uint64(), makeVar("result"))));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v0"), std::make_unique<CBinaryExpr>(
+                           BinaryOp::Shl, makeVar("v0"), makeInt(5),
+                           CType::int64())));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v1"), std::make_unique<CCastExpr>(
+                           CType::uint64(), makeVar("result"))));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v1"), std::make_unique<CBinaryExpr>(
+                           BinaryOp::Shr, makeVar("v1"), makeInt(2),
+                           CType::int64())));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("v0"), std::make_unique<CBinaryExpr>(
+                           BinaryOp::Add, makeVar("v0"), makeVar("v1"),
+                           CType::int64())));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("result"), std::make_unique<CBinaryExpr>(
+                               BinaryOp::BitXor, makeVar("result"),
+                               makeVar("v0"), CType::int64())));
+    func.body.push_back(std::make_unique<CDoWhileStmt>(
+        std::move(body), makeVar("keep_going")));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeVar("result")));
+
+    CAstOptimizer optimizer;
+    optimizer.optimize(func);
+
+    CAstPrinter printer;
+    const std::string code = printer.print(func);
+    EXPECT_NE(code.find("v0 = result;"), std::string::npos) << code;
+    EXPECT_NE(code.find("v1 = result;"), std::string::npos) << code;
 }
 
 TEST(CAstOptimizerTest, RemovesOnlyDemonstrableFrameSetup) {
@@ -398,6 +830,51 @@ TEST(CAstOptimizerTest, PreservesNestedSCFCanaryTerminationTuple) {
     EXPECT_EQ(continueValue->value, 0);
 }
 
+TEST(CAstOptimizerTest, UnwrapsProvablySingleIterationSyntheticSCFLoop) {
+    using namespace helix::cast;
+
+    CFuncDecl func("single_iteration_scf", 0, CType::voidTy());
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<CExprStmt>(
+        std::make_unique<CCallExpr>(
+            "payload", 0, std::vector<ExprPtr>{}, CType::voidTy())));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("scf_r900001"), makeInt(0)));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("scf_w900002"), std::make_unique<CCastExpr>(
+            CType::boolTy(), makeVar("scf_r900001"))));
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("scf_w900003"), makeInt(42)));
+    func.body.push_back(std::make_unique<CDoWhileStmt>(
+        std::move(body), makeVar("scf_w900002")));
+
+    CAstOptimizer optimizer;
+    optimizer.unwrapTrivialDoWhile(func);
+
+    ASSERT_EQ(func.body.size(), 4u);
+    EXPECT_TRUE(std::none_of(func.body.begin(), func.body.end(),
+        [](const StmtPtr& stmt) {
+            return llvm::isa<CDoWhileStmt>(stmt.get());
+        }));
+}
+
+TEST(CAstOptimizerTest, KeepsSyntheticSCFLoopWhenGuardIsNotProvenFalse) {
+    using namespace helix::cast;
+
+    CFuncDecl func("real_scf_loop", 0, CType::voidTy());
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("scf_w900002"), makeInt(1)));
+    func.body.push_back(std::make_unique<CDoWhileStmt>(
+        std::move(body), makeVar("scf_w900002")));
+
+    CAstOptimizer optimizer;
+    optimizer.unwrapTrivialDoWhile(func);
+
+    ASSERT_EQ(func.body.size(), 1u);
+    EXPECT_NE(llvm::dyn_cast<CDoWhileStmt>(func.body.front().get()), nullptr);
+}
+
 TEST(CAstOptimizerTest, KeepsDefinitionReadOnlyInDeepStructuredScope) {
     using namespace helix::cast;
 
@@ -586,6 +1063,36 @@ TEST(CAstOptimizerTest, CapsConditionallyAssignedReturnValue) {
     std::vector<StmtPtr> thenBody;
     thenBody.push_back(std::make_unique<CAssignStmt>(
         makeVar("result"), makeInt(7)));
+    func.body.push_back(std::make_unique<CIfStmt>(
+        makeVar("condition"), std::move(thenBody)));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeVar("result")));
+
+    CAstOptimizer optimizer;
+    optimizer.reanalyzeConfidence(func);
+
+    EXPECT_LE(func.confidenceScore, 50.0);
+    EXPECT_TRUE(std::any_of(
+        func.confidenceIssues.begin(), func.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("uninitialized return value 'result'") !=
+                   std::string::npos;
+    }));
+}
+
+TEST(CAstOptimizerTest, CapsConditionalReturnAroundNestedLoop) {
+    using namespace helix::cast;
+
+    CFuncDecl func("conditional_loop_return_test", 0x1000, CType::int64());
+    func.localVars.emplace_back(
+        1, "result", CType::int64(), StorageKind::Temporary);
+
+    std::vector<StmtPtr> loopBody;
+    loopBody.push_back(std::make_unique<CExprStmt>(makeVar("side_effect")));
+    std::vector<StmtPtr> thenBody;
+    thenBody.push_back(std::make_unique<CAssignStmt>(
+        makeVar("result"), makeInt(7)));
+    thenBody.push_back(std::make_unique<CDoWhileStmt>(
+        std::move(loopBody), makeVar("keep_going")));
     func.body.push_back(std::make_unique<CIfStmt>(
         makeVar("condition"), std::move(thenBody)));
     func.body.push_back(std::make_unique<CReturnStmt>(makeVar("result")));

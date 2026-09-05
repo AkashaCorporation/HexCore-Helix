@@ -199,11 +199,13 @@ RemillSemantic classifySemantic(std::string_view name) {
     // ---- SSE/AVX packed & misc ------------------------------------------
     if (name == "MOVxPS")                       return RemillSemantic::MOVxPS;
     if (name == "MOVSS_MEM")                    return RemillSemantic::MOVSS_MEM;
+    if (name == "MOVSD_MEM")                    return RemillSemantic::MOVSD_MEM;
     if (name == "SHUFPS" || name == "SHUFPSI")  return RemillSemantic::SHUFPS;
     if (name == "SUBPS"  || name == "SUBPSI")   return RemillSemantic::SUBPS;
     if (name == "ADDPS"  || name == "ADDPSI")   return RemillSemantic::ADDPS;
     if (name == "MULPS"  || name == "MULPSI")   return RemillSemantic::MULPS;
     if (name == "COMISS" || name == "COMISSI")  return RemillSemantic::COMISS;
+    if (name == "UNPCKLPS")                     return RemillSemantic::UNPCKLPS;
     if (name == "UNPCKHPS")                     return RemillSemantic::UNPCKHPS;
 
     // ---- PREFETCH (hint, no semantic effect) ----------------------------
@@ -271,11 +273,11 @@ RemillSemantic classifySemantic(std::string_view name) {
     if (name == "STOSD" || name == "STOSB" || name == "STOSW" ||
         name == "STOSQ")
         return RemillSemantic::REP_STOS;
-    if (name == "LAHF")  return RemillSemantic::NOP;   // flags→AH (no semantic effect for decompiler)
-    if (name == "SAHF")  return RemillSemantic::NOP;   // AH→flags (no semantic effect for decompiler)
+    if (name == "LAHF" || name == "SAHF")
+        return RemillSemantic::HANDLE_UNSUPPORTED;
     if (name == "CLC" || name == "STC" || name == "CMC" ||
         name == "CLD" || name == "STD" || name == "STI" || name == "CLI")
-        return RemillSemantic::NOP;   // flag manipulation (no semantic effect)
+        return RemillSemantic::HANDLE_UNSUPPORTED;
 
     // Exchange and add (XADD) -- present in the Rust reference but not as a
     // dedicated enum value in the C++ header, so map to Unknown.  If the header
@@ -332,11 +334,26 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
         bool has_mem_src = false;
         bool has_mem_dst = false;
         unsigned src_w = 64;
+		unsigned dst_w = 64;
+
+		// Register destinations encode their exact view in RnWI<T>.
+		// Keep this separate from the source width for MOVZX/MOVSX.
+		if (auto rnwPos = suffix.find("RnWI");
+			rnwPos != std::string_view::npos && rnwPos + 4 < suffix.size()) {
+			char typeChar = suffix[rnwPos + 4];
+			if (typeChar == 'j') dst_w = 32;
+			else if (typeChar == 'm') dst_w = 64;
+			else if (typeChar == 'h') dst_w = 8;
+			else if (typeChar == 't') dst_w = 16;
+		}
 
         // Find the first operand type (destination):
         // "3MnW" = memory write destination
         // "3RnW" = register write destination
-        if (auto mnwPos = suffix.find("MnW"); mnwPos != std::string_view::npos) {
+        auto mnwPos = suffix.find("MnW");
+        auto mvnwPos = suffix.find("MVnW");
+        if (mnwPos != std::string_view::npos ||
+            mvnwPos != std::string_view::npos) {
             has_mem_dst = true;
             // Infer width from the destination memory operand for forms like:
             //   MnWIjE -> 32-bit store
@@ -350,6 +367,7 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
                 else if (typeChar == 'm') src_w = 64;
                 else if (typeChar == 'h') src_w = 8;
                 else if (typeChar == 't') src_w = 16;
+				dst_w = src_w;
             }
         }
 
@@ -358,13 +376,16 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
         // Pattern: "2MnI" = memory read source.
         {
             auto pos = suffix.find("MnI");
+            auto vectorPos = suffix.find("MVnI");
             // MnW also has Mn, so check it's not MnW
-            if (pos != std::string_view::npos) {
+            if (pos != std::string_view::npos ||
+                vectorPos != std::string_view::npos) {
                 // Check that this Mn is NOT preceded by a context that makes it MnW.
                 // If "MnW" exists, the "MnI" we found might be a second one (the source).
                 // Just check: if the "MnI" is at a different position than where "MnW" starts.
                 auto mnw_pos = suffix.find("MnW");
-                if (mnw_pos == std::string_view::npos || pos != mnw_pos) {
+                if (vectorPos != std::string_view::npos ||
+                    mnw_pos == std::string_view::npos || pos != mnw_pos) {
                     has_mem_src = true;
                     // Infer width from the type char after "MnI":
                     // IjE = uint32 (32-bit), ImE = uint64 (64-bit),
@@ -380,8 +401,15 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
             }
         }
 
+        // Remill's scalar SSE memory operands use MVnI/MVnW wrappers whose
+        // payload type carries the width instead of an Itanium primitive code.
+        if (suffix.find("vec32_t") != std::string_view::npos)
+            src_w = 32;
+        else if (suffix.find("vec64_t") != std::string_view::npos)
+            src_w = 64;
+
         return RemillSemanticInfo{sem, std::move(raw), /*is_helper=*/false,
-                                  has_mem_src, has_mem_dst, src_w};
+								  has_mem_src, has_mem_dst, src_w, dst_w};
     }
 
     // ---- Pattern 2: __remill_{read,write}_memory_<N> intrinsics -------------
@@ -573,11 +601,13 @@ llvm::StringRef semanticToString(RemillSemantic semantic) {
     // SSE/AVX packed & misc
     case RemillSemantic::MOVxPS:      return "MOVxPS";
     case RemillSemantic::MOVSS_MEM:   return "MOVSS_MEM";
+    case RemillSemantic::MOVSD_MEM:   return "MOVSD_MEM";
     case RemillSemantic::SHUFPS:      return "SHUFPS";
     case RemillSemantic::SUBPS:       return "SUBPS";
     case RemillSemantic::ADDPS:       return "ADDPS";
     case RemillSemantic::MULPS:       return "MULPS";
     case RemillSemantic::COMISS:      return "COMISS";
+    case RemillSemantic::UNPCKLPS:    return "UNPCKLPS";
     case RemillSemantic::UNPCKHPS:    return "UNPCKHPS";
 
     // SETcc

@@ -87,6 +87,17 @@ TEST(RemillDemanglerTest, DemangleMovzx) {
         "_ZN12_GLOBAL__N_15MOVZXI3RnWImE2RnIhEEEP6MemoryS6_R5StateT_T0_");
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->semantic, RemillSemantic::MOVZX);
+	EXPECT_EQ(result->dst_width, 64u);
+}
+
+TEST(RemillDemanglerTest, DemangleMovzxKeepsSourceAndDestinationWidths) {
+	auto result = demangleRemillSemantic(
+		"_ZN12_GLOBAL__N_15MOVZXI3RnWIjE2MnIhEEEP6MemoryS6_R5StateT_T0_");
+	ASSERT_TRUE(result.has_value());
+	EXPECT_EQ(result->semantic, RemillSemantic::MOVZX);
+	EXPECT_TRUE(result->has_memory_src);
+	EXPECT_EQ(result->src_width, 8u);
+	EXPECT_EQ(result->dst_width, 32u);
 }
 
 TEST(RemillDemanglerTest, DemangleJz) {
@@ -122,6 +133,81 @@ TEST(RemillDemanglerTest, DemangleAnd) {
         "_ZN12_GLOBAL__N_13ANDI3MnWImE2MnImE2RnImLb1EEEEP6MemoryS8_R5StateT_T0_T1_");
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->semantic, RemillSemantic::AND);
+}
+
+TEST(RemillDemanglerTest, DemangleMovssMemoryLoadAndStore) {
+    auto load = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_19MOVSS_MEMI3VnWI8vec128_tE3MVnI7vec32_tEEEP6MemoryS8_R5StateT_T0_");
+    ASSERT_TRUE(load.has_value());
+    EXPECT_EQ(load->semantic, RemillSemantic::MOVSS_MEM);
+    EXPECT_TRUE(load->has_memory_src);
+    EXPECT_FALSE(load->has_memory_dst);
+    EXPECT_EQ(load->src_width, 32u);
+
+    auto store = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_19MOVSS_MEMI4MVnWI7vec32_tE2VnI8vec128_tEEEP6MemoryS8_R5StateT_T0_");
+    ASSERT_TRUE(store.has_value());
+    EXPECT_EQ(store->semantic, RemillSemantic::MOVSS_MEM);
+    EXPECT_FALSE(store->has_memory_src);
+    EXPECT_TRUE(store->has_memory_dst);
+    EXPECT_EQ(store->src_width, 32u);
+}
+
+TEST(RemillDemanglerTest, DemangleMovsdMemoryLoadAndStore) {
+    auto load = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_19MOVSD_MEMI3VnWI8vec128_tE3MVnI7vec64_tEEEP6MemoryS8_R5StateT_T0_");
+    ASSERT_TRUE(load.has_value());
+    EXPECT_EQ(load->semantic, RemillSemantic::MOVSD_MEM);
+    EXPECT_TRUE(load->has_memory_src);
+    EXPECT_FALSE(load->has_memory_dst);
+    EXPECT_EQ(load->src_width, 64u);
+
+    auto store = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_19MOVSD_MEMI4MVnWI7vec64_tE2VnI8vec128_tEEEP6MemoryS8_R5StateT_T0_");
+    ASSERT_TRUE(store.has_value());
+    EXPECT_EQ(store->semantic, RemillSemantic::MOVSD_MEM);
+    EXPECT_FALSE(store->has_memory_src);
+    EXPECT_TRUE(store->has_memory_dst);
+    EXPECT_EQ(store->src_width, 64u);
+}
+
+TEST(RemillDemanglerTest, DemangleUnpackLowPackedSingle) {
+    auto result = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_18UNPCKLPSI3VnWI8vec128_tE2VnIS2_ES5_EEP6MemoryS7_R5StateT_T0_T1_");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->semantic, RemillSemantic::UNPCKLPS);
+    EXPECT_FALSE(result->has_memory_src);
+    EXPECT_FALSE(result->has_memory_dst);
+}
+
+TEST(RemillDemanglerTest, DemangleRegisterAndMemoryXchgShapes) {
+    auto regReg = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14XCHGI3RnWImE2RnIjLb1EES2_S4_EEP6MemoryS6_R5StateT_T0_T1_T2_");
+    ASSERT_TRUE(regReg.has_value());
+    EXPECT_EQ(regReg->semantic, RemillSemantic::XCHG);
+    EXPECT_FALSE(regReg->has_memory_src);
+    EXPECT_FALSE(regReg->has_memory_dst);
+
+    auto memReg = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14XCHGI3MnWIjE2MnIjE3RnWImE2RnIjLb1EEEEP6MemorySA_R5StateT_T0_T1_T2_");
+    ASSERT_TRUE(memReg.has_value());
+    EXPECT_EQ(memReg->semantic, RemillSemantic::XCHG);
+    EXPECT_TRUE(memReg->has_memory_src);
+    EXPECT_TRUE(memReg->has_memory_dst);
+    EXPECT_EQ(memReg->src_width, 32u);
+}
+
+TEST(RemillDemanglerTest, FlagStateInstructionsAreNotNops) {
+    for (const char* name : {
+             "_ZN12_GLOBAL__N_14LAHFEP6MemoryR5State",
+             "_ZN12_GLOBAL__N_14SAHFEP6MemoryR5State",
+             "_ZN12_GLOBAL__N_13CLCEP6MemoryR5State",
+             "_ZN12_GLOBAL__N_13STCEP6MemoryR5State"}) {
+        auto result = demangleRemillSemantic(name);
+        ASSERT_TRUE(result.has_value()) << name;
+        EXPECT_EQ(result->semantic, RemillSemantic::HANDLE_UNSUPPORTED)
+            << name;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

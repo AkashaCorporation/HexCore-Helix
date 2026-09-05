@@ -51,12 +51,14 @@
 #include <vector>
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
 #include "helix/utils/CallOpHelpers.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
@@ -149,6 +151,15 @@ static std::optional<SubRegInfo> getSubRegInfo(llvm::StringRef reg) {
     if (auto a64 = getAArch64SubRegInfo(reg))
         return a64;
     return helix::analysis::getX86SubRegInfo(reg);
+}
+
+static unsigned getParentRegisterWidth(const SubRegInfo& info,
+                                       bool isX86Cdecl32 = false) {
+    if (info.parent.starts_with("XMM"))
+        return 128u;
+    if (isX86Cdecl32 && info.parent.starts_with("R"))
+        return 32u;
+    return 64u;
 }
 
 /// Convert a canonical 64-bit register name to its lowercase variable name.
@@ -685,7 +696,8 @@ static Value emitTruncation(Value fullValue, unsigned targetWidth,
         return fullValue;
 
     return builder.create<helix::high::CastOp>(
-        loc, targetTy, fullValue);
+        loc, targetTy, fullValue, mlir::IntegerAttr{},
+        helix::high::CastKindAttr{});
 }
 
 /// Emit a right-shift + truncation for high-byte registers (AH, BH, CH, DH).
@@ -702,11 +714,15 @@ static Value emitTruncation(Value fullValue, unsigned targetWidth,
 static Value emitHighByteExtract(Value fullValue, unsigned bitOffset,
                                  unsigned targetWidth,
                                  OpBuilder& builder, Location loc) {
-    auto i64Ty = builder.getIntegerType(64);
+	auto parentTy = dyn_cast<IntegerType>(fullValue.getType());
+	if (!parentTy)
+		parentTy = builder.getIntegerType(64);
 
     // Shift right by the bit offset.
-    auto shiftAmount = builder.create<arith::ConstantOp>(
-        loc, i64Ty, builder.getI64IntegerAttr(bitOffset));
+	auto shiftAmount = builder.create<arith::ConstantOp>(
+		loc, parentTy,
+		IntegerAttr::get(parentTy,
+			llvm::APInt(parentTy.getWidth(), bitOffset)));
     auto shifted = builder.create<arith::ShRUIOp>(
         loc, fullValue, shiftAmount);
 
@@ -730,17 +746,22 @@ static Value emitHighByteExtract(Value fullValue, unsigned bitOffset,
 static Value emitSubRegInsert(Value parentVar, Value newValue,
                               const SubRegInfo& info,
                               OpBuilder& builder, Location loc) {
-    auto i64Ty = builder.getIntegerType(64);
+	auto parentTy = dyn_cast<IntegerType>(parentVar.getType());
+	if (!parentTy)
+		parentTy = builder.getIntegerType(64);
+	const unsigned parentWidth = parentTy.getWidth();
 
-    if (info.width == 64) {
+    if (info.width >= parentWidth) {
         // Full-width write — no insertion needed.
-        return newValue;
+		return emitTruncation(newValue, parentWidth, builder, loc);
     }
 
-    if (info.width == 32 && info.bitOffset == 0) {
+    if (info.width == 32 && info.bitOffset == 0 && parentWidth == 64) {
         // x86-64: writing a 32-bit register zero-extends to 64 bits.
         // This is a simple zero-extension cast.
-        return builder.create<helix::high::CastOp>(loc, i64Ty, newValue);
+        return builder.create<helix::high::CastOp>(
+			loc, parentTy, newValue, mlir::IntegerAttr{},
+            helix::high::CastKindAttr{});
     }
 
     // For 16-bit and 8-bit writes, we need a read-modify-write pattern:
@@ -748,17 +769,23 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
 
     // Build the mask to clear the target bits.
     uint64_t valueMask = (1ULL << info.width) - 1;
-    uint64_t clearMask = ~(valueMask << info.bitOffset);
+	const uint64_t parentMask = parentWidth == 64
+		? ~uint64_t{0}
+		: ((uint64_t{1} << parentWidth) - 1);
+	uint64_t clearMask = ~(valueMask << info.bitOffset) & parentMask;
 
     auto clearMaskConst = builder.create<arith::ConstantOp>(
-        loc, i64Ty, builder.getI64IntegerAttr(static_cast<int64_t>(clearMask)));
+		loc, parentTy,
+		IntegerAttr::get(parentTy, llvm::APInt(parentWidth, clearMask)));
     auto clearedParent = builder.create<arith::AndIOp>(
         loc, parentVar, clearMaskConst);
 
     // Zero-extend the new value to 64 bits.
     Value extendedNew;
-    if (newValue.getType() != i64Ty) {
-        extendedNew = builder.create<helix::high::CastOp>(loc, i64Ty, newValue);
+	if (newValue.getType() != parentTy) {
+        extendedNew = builder.create<helix::high::CastOp>(
+			loc, parentTy, newValue, mlir::IntegerAttr{},
+            helix::high::CastKindAttr{});
     } else {
         extendedNew = newValue;
     }
@@ -766,16 +793,19 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
     // Shift the new value to the correct bit position.
     if (info.bitOffset > 0) {
         auto shiftAmount = builder.create<arith::ConstantOp>(
-            loc, i64Ty, builder.getI64IntegerAttr(info.bitOffset));
+			loc, parentTy,
+			IntegerAttr::get(parentTy,
+				llvm::APInt(parentWidth, info.bitOffset)));
         extendedNew = builder.create<arith::ShLIOp>(
             loc, extendedNew, shiftAmount);
     }
 
     // Mask the new value to prevent overflow into adjacent bits.
     auto valueMaskConst = builder.create<arith::ConstantOp>(
-        loc, i64Ty,
-        builder.getI64IntegerAttr(
-            static_cast<int64_t>(valueMask << info.bitOffset)));
+		loc, parentTy,
+		IntegerAttr::get(parentTy,
+			llvm::APInt(parentWidth,
+				(valueMask << info.bitOffset) & parentMask)));
     auto maskedNew = builder.create<arith::AndIOp>(
         loc, extendedNew, valueMaskConst);
 
@@ -1266,7 +1296,14 @@ private:
                         continue;
                     }
 
-                    auto& subReg = *subRegOpt;
+					auto subReg = *subRegOpt;
+					const unsigned parentWidth =
+						getParentRegisterWidth(subReg, isCdecl32);
+					if (auto readType =
+							dyn_cast<IntegerType>(readOp.getResult().getType()))
+						subReg.width = std::min(
+							subReg.width,
+							std::min(parentWidth, readType.getWidth()));
 
                     // Get the current SSA version for this register.
                     // If no version exists yet (read before any write),
@@ -1290,18 +1327,23 @@ private:
                             readOp->getAttrOfType<StringAttr>(
                                 "inferred_type")) {
                         bool shouldSet = !varDeclOp->hasAttr("inferred_type");
+                        bool pointerRefinement = false;
                         if (!shouldSet) {
                             // Pointer overrides int (more specific type)
                             auto curType = varDeclOp->getAttrOfType<
                                 StringAttr>("inferred_type");
                             if (curType &&
                                 !curType.getValue().ends_with("*") &&
-                                inferredType.getValue().ends_with("*"))
+                                inferredType.getValue().ends_with("*")) {
                                 shouldSet = true;
+                                pointerRefinement = true;
+                            }
                         }
                         if (shouldSet)
-                            varDeclOp->setAttr("inferred_type",
-                                               inferredType);
+                            helix::applyTypeEvidence(
+                                varDeclOp, inferredType.getValue(),
+                                helix::TypeEvidenceSource::DataFlow,
+                                pointerRefinement ? 45u : 40u);
                     }
 
                     // Track param naming statistics.
@@ -1313,16 +1355,16 @@ private:
                         ++NumReturnVarsNamed;
 
                     // Create VarRef with THIS version's var_id.
-                    auto i64Ty = builder.getIntegerType(64);
+					auto parentType = builder.getIntegerType(parentWidth);
                     auto varRef = builder.create<helix::high::VarRefOp>(
-                        readOp.getLoc(), i64Ty,
+                        readOp.getLoc(), parentType,
                         ver->varId,
                         builder.getStringAttr(ver->varName),
                         mlir::IntegerAttr{});
 
                     // Handle sub-register truncation.
                     Value result;
-                    if (subReg.width == 64 && subReg.bitOffset == 0) {
+                    if (subReg.width == parentWidth && subReg.bitOffset == 0) {
                         result = varRef.getResult();
                     } else if (subReg.bitOffset == 0) {
                         result = emitTruncation(varRef.getResult(),
@@ -1387,12 +1429,19 @@ private:
                         continue;
                     }
 
-                    auto& subReg = *subRegOpt;
+					auto subReg = *subRegOpt;
 
-                    builder.setInsertionPoint(writeOp);
+					builder.setInsertionPoint(writeOp);
 
-                    Value valueToStore;
-                    if (subReg.width == 64 && subReg.bitOffset == 0) {
+					Value valueToStore;
+					const unsigned parentWidth =
+						getParentRegisterWidth(subReg, isCdecl32);
+					if (auto writeType =
+							dyn_cast<IntegerType>(writeOp.getValue().getType()))
+						subReg.width = std::min(
+							subReg.width,
+							std::min(parentWidth, writeType.getWidth()));
+                    if (subReg.width == parentWidth && subReg.bitOffset == 0) {
                         // Full-width write — direct assignment.
                         valueToStore = writeOp.getValue();
                     } else {
@@ -1409,10 +1458,10 @@ private:
                                 subReg.parent);
                         }
 
-                        auto i64Ty = builder.getIntegerType(64);
+                        auto parentType = builder.getIntegerType(parentWidth);
                         auto currentVar =
                             builder.create<helix::high::VarRefOp>(
-                                writeOp.getLoc(), i64Ty,
+                                writeOp.getLoc(), parentType,
                                 prevVer->varId,
                                 builder.getStringAttr(prevVer->varName),
                                 mlir::IntegerAttr{});
@@ -1435,18 +1484,10 @@ private:
                     if (!newDeclTyped->hasAttr("inferred_type")) {
                         if (auto* valDef =
                                 writeOp.getValue().getDefiningOp()) {
-                            if (auto inferredType =
-                                    valDef->getAttrOfType<StringAttr>(
-                                        "inferred_type"))
-                                newDeclTyped->setAttr("inferred_type",
-                                                      inferredType);
+                            helix::copyTypeEvidence(newDeclTyped, valDef);
                         }
                         if (!newDeclTyped->hasAttr("inferred_type")) {
-                            if (auto inferredType =
-                                    writeOp->getAttrOfType<StringAttr>(
-                                        "inferred_type"))
-                                newDeclTyped->setAttr("inferred_type",
-                                                      inferredType);
+                            helix::copyTypeEvidence(newDeclTyped, writeOp);
                         }
                     }
 
@@ -1591,11 +1632,21 @@ private:
             for (auto writeOp : survivingWrites) {
                 auto subReg = getSubRegInfo(writeOp.getRegName());
                 Operation* topOp = findTopLevelAncestor(writeOp);
-                if (!subReg || !topOp ||
-                    subReg->width != 64 || subReg->bitOffset != 0)
+                if (!subReg || !topOp)
                     continue;
+				auto constrained = *subReg;
+				const unsigned parentWidth =
+					getParentRegisterWidth(constrained, isCdecl32);
+				if (auto valueType = dyn_cast<IntegerType>(
+						writeOp.getValue().getType()))
+					constrained.width = std::min(
+						constrained.width,
+						std::min(parentWidth, valueType.getWidth()));
+				if (constrained.width != parentWidth ||
+					constrained.bitOffset != 0)
+					continue;
                 nestedWrittenRegs.emplace(topOp->getBlock(),
-                                          subReg->parent);
+									  constrained.parent);
             }
 
             std::map<RegionRegKey, SSAVersionTracker::Version>
@@ -1721,7 +1772,11 @@ private:
                     if (isa<helix::high::DoWhileOp,
                             helix::high::WhileOp,
                             helix::high::ForOp,
-                            helix::high::IfOp>(cur))
+                            helix::high::IfOp,
+                            mlir::scf::IfOp,
+                            mlir::scf::WhileOp,
+                            mlir::scf::ForOp,
+                            mlir::scf::IndexSwitchOp>(cur))
                         return true;
                 }
                 return false;
@@ -1733,8 +1788,19 @@ private:
                 bool hasInRegionFullRaxWrite = false;
                 for (auto w : survivingWrites) {
                     auto sr = getSubRegInfo(w.getRegName());
-                    if (sr && sr->parent == "RAX"
-                        && sr->width == 64 && sr->bitOffset == 0
+					if (!sr)
+						continue;
+					auto constrained = *sr;
+					const unsigned parentWidth =
+						getParentRegisterWidth(constrained, isCdecl32);
+					if (auto valueType = dyn_cast<IntegerType>(
+							w.getValue().getType()))
+						constrained.width = std::min(
+							constrained.width,
+							std::min(parentWidth, valueType.getWidth()));
+                    if (constrained.parent == "RAX"
+						&& constrained.width == parentWidth
+						&& constrained.bitOffset == 0
                         && isInsideLoopOrIfRegion(w)) {
                         hasInRegionFullRaxWrite = true;
                         break;
@@ -1782,7 +1848,14 @@ private:
                 auto subRegOpt = getSubRegInfo(regName);
                 if (!subRegOpt)
                     continue;
-                auto& subReg = *subRegOpt;
+				auto subReg = *subRegOpt;
+				const unsigned parentWidth =
+					getParentRegisterWidth(subReg, isCdecl32);
+				if (auto readType =
+						dyn_cast<IntegerType>(readOp.getResult().getType()))
+					subReg.width = std::min(
+						subReg.width,
+						std::min(parentWidth, readType.getWidth()));
 
                 const SSAVersionTracker::Version* verPtr = nullptr;
                 if (useResultOverrideForRAX && subReg.parent == "RAX"
@@ -1806,15 +1879,15 @@ private:
                                  << " -> bound:" << ver.varName << "\n";
 
                 OpBuilder b(readOp);
-                auto i64Ty = b.getIntegerType(64);
+				auto parentType = b.getIntegerType(parentWidth);
                 auto varRef = b.create<helix::high::VarRefOp>(
-                    readOp.getLoc(), i64Ty,
+					readOp.getLoc(), parentType,
                     ver.varId,
                     b.getStringAttr(ver.varName),
                     mlir::IntegerAttr{});
 
                 Value result;
-                if (subReg.width == 64 && subReg.bitOffset == 0) {
+				if (subReg.width == parentWidth && subReg.bitOffset == 0) {
                     result = varRef.getResult();
                 } else if (subReg.bitOffset == 0) {
                     result = emitTruncation(varRef.getResult(),
@@ -1847,8 +1920,16 @@ private:
                 auto subRegOpt = getSubRegInfo(regName);
                 if (!subRegOpt)
                     continue;
-                auto& subReg = *subRegOpt;
-                if (!(subReg.width == 64 && subReg.bitOffset == 0))
+				auto subReg = *subRegOpt;
+				const unsigned parentWidth =
+					getParentRegisterWidth(subReg, isCdecl32);
+				if (auto writeType = dyn_cast<IntegerType>(
+						writeOp.getValue().getType()))
+					subReg.width = std::min(
+						subReg.width,
+						std::min(parentWidth, writeType.getWidth()));
+				if (!(subReg.width == parentWidth &&
+						subReg.bitOffset == 0))
                     continue;
 
                 const SSAVersionTracker::Version* verPtr = nullptr;
@@ -2459,7 +2540,7 @@ private:
 
                     // Propagate type from ver → base if base lacks one.
                     if (!baseTypeAttr && verTypeAttr)
-                        base.decl->setAttr("inferred_type", verTypeAttr);
+                        helix::copyTypeEvidence(base.decl, ver.decl);
 
                     // Erase ver's VarDeclOp.
                     ver.decl->erase();
@@ -3022,6 +3103,12 @@ private:
             << " SSA versions, merged " << totalMerged
             << " variables, inlined " << NumTempsInlined
             << " temporaries\n");
+
+        // Replacing a recovered VarRef with its assigned value can turn an
+        // existing LLVM extension/truncation into an identity cast. Remove
+        // only those exact no-ops before the verifier observes the function.
+        helix::removeIdentityLLVMIntegerCasts(
+            func->getParentOfType<mlir::ModuleOp>());
 
         return success();
     }

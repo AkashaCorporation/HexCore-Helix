@@ -15,13 +15,16 @@ include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
+include "dialects/HelixInterfaces.td"
 include "dialects/HelixHighDialect.td"
 include "dialects/HelixHighTypes.td"
+include "dialects/HelixEffects.td"
 
 // ─── Base Class ──────────────────────────────────────────────────────────────
 
 class HelixHigh_Op<string mnemonic, list<Trait> traits = []>
-    : Op<HelixHigh_Dialect, mnemonic, traits>;
+    : Op<HelixHigh_Dialect, mnemonic,
+         !listconcat(traits, [HelixAddressableOpInterface])>;
 
 // ─── Binary Operator Enum ────────────────────────────────────────────────────
 
@@ -46,6 +49,10 @@ def HelixHigh_BinaryOpKind : I32EnumAttr<
       I32EnumAttrCase<"Ge",    16>,
       I32EnumAttrCase<"LogAnd",17>,
       I32EnumAttrCase<"LogOr", 18>,
+      I32EnumAttrCase<"Ult",   19>,
+      I32EnumAttrCase<"Ule",   20>,
+      I32EnumAttrCase<"Ugt",   21>,
+      I32EnumAttrCase<"Uge",   22>,
     ]> {
   let cppNamespace = "::helix::high";
 }
@@ -59,6 +66,25 @@ def HelixHigh_UnaryOpKind : I32EnumAttr<
       I32EnumAttrCase<"BitNot",    2>,
       I32EnumAttrCase<"Deref",     3>,
       I32EnumAttrCase<"AddressOf", 4>,
+    ]> {
+  let cppNamespace = "::helix::high";
+}
+
+def HelixHigh_CastKind : I32EnumAttr<
+    "CastKind", "Exact conversion semantics", [
+      I32EnumAttrCase<"Unknown",     0>,
+      I32EnumAttrCase<"Bitcast",     1>,
+      I32EnumAttrCase<"ZeroExtend",  2>,
+      I32EnumAttrCase<"SignExtend",  3>,
+      I32EnumAttrCase<"Truncate",    4>,
+      I32EnumAttrCase<"PtrToInt",    5>,
+      I32EnumAttrCase<"IntToPtr",    6>,
+      I32EnumAttrCase<"FpExtend",    7>,
+      I32EnumAttrCase<"FpTruncate",  8>,
+      I32EnumAttrCase<"FpToSI",      9>,
+      I32EnumAttrCase<"FpToUI",     10>,
+      I32EnumAttrCase<"SIToFp",     11>,
+      I32EnumAttrCase<"UIToFp",     12>
     ]> {
   let cppNamespace = "::helix::high";
 }
@@ -113,7 +139,9 @@ def HelixHigh_StringLitOp : HelixHigh_Op<"string.lit", [Pure]> {
   }];
 }
 
-def HelixHigh_VarRefOp : HelixHigh_Op<"var.ref", [Pure]> {
+def HelixHigh_VarRefOp : HelixHigh_Op<"var.ref", [
+    MemoryEffects<[MemRead<Helix_VariableStateResource>]>
+  ]> {
   let summary = "Reference to a local variable or parameter";
   let description = [{
     References a previously declared variable by its unique ID within the
@@ -168,7 +196,9 @@ def HelixHigh_BinaryOp : HelixHigh_Op<"binary", [Pure]> {
   }];
 }
 
-def HelixHigh_UnaryOp : HelixHigh_Op<"unary", [Pure]> {
+def HelixHigh_UnaryOp : HelixHigh_Op<"unary", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Unary operation expression";
 
   let arguments = (ins
@@ -189,16 +219,21 @@ def HelixHigh_CastOp : HelixHigh_Op<"cast", [Pure]> {
 
   let arguments = (ins
     AnyType:$input,
-    OptionalAttr<UI64Attr>:$address
+    OptionalAttr<UI64Attr>:$address,
+    OptionalAttr<HelixHigh_CastKind>:$cast_kind
   );
   let results = (outs AnyType:$result);
 
   let assemblyFormat = [{
-    $input (`at` $address^)? attr-dict `:` type($input) `to` type($result)
+    (`kind` $cast_kind^)? $input (`at` $address^)? attr-dict
+    `:` type($input) `to` type($result)
   }];
+  let hasVerifier = 1;
 }
 
-def HelixHigh_CallOp : HelixHigh_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> {
+def HelixHigh_CallOp : HelixHigh_Op<"call", [
+    MemoryEffects<[MemRead, MemWrite]>, CallOpInterface
+  ]> {
   let summary = "Function call with recovered arguments";
   let description = [{
     A function call with explicitly recovered arguments (folded from register
@@ -219,12 +254,24 @@ def HelixHigh_CallOp : HelixHigh_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]
     (`at` $address^)? attr-dict
     `:` functional-type($args, results)
   }];
+  let extraClassDeclaration = [{
+    ::mlir::Operation::operand_range getArgOperands() { return getArgs(); }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getArgsMutable();
+    }
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      return ::mlir::SymbolRefAttr::get(getContext(), getTargetName());
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      setTargetName(callee.get<::mlir::SymbolRefAttr>().getRootReference());
+    }
+  }];
 }
 
 // ─── Variadic Call (Wave 22 — variadic call mini-ISA) ────────────────────────
 
 def HelixHigh_VariadicCallOp : HelixHigh_Op<"variadic_call",
-    [MemoryEffects<[MemRead, MemWrite]>]> {
+    [MemoryEffects<[MemRead, MemWrite]>, CallOpInterface]> {
   let summary = "Variadic-signature call with recovered fixed-arg prefix";
   let description = [{
     High-dialect variant of `helix_high.call` for variadic callees. The fixed
@@ -251,6 +298,20 @@ def HelixHigh_VariadicCallOp : HelixHigh_Op<"variadic_call",
     $target_name `(` $fixed_args `)` `bundle` $raw_bundle `target` $target_addr
     (`at` $address^)? attr-dict
     `:` functional-type(operands, results)
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::Operation::operand_range getArgOperands() {
+      return getFixedArgs();
+    }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getFixedArgsMutable();
+    }
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      return ::mlir::SymbolRefAttr::get(getContext(), getTargetName());
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      setTargetName(callee.get<::mlir::SymbolRefAttr>().getRootReference());
+    }
   }];
 }
 
@@ -335,7 +396,9 @@ def HelixHigh_VarDeclOp : HelixHigh_Op<"var.decl", []> {
   }];
 }
 
-def HelixHigh_AssignOp : HelixHigh_Op<"assign", [MemoryEffects<[MemWrite]>]> {
+def HelixHigh_AssignOp : HelixHigh_Op<"assign", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Assignment statement: target = value";
 
   let arguments = (ins
@@ -466,7 +529,7 @@ def HelixHigh_SwitchOp : HelixHigh_Op<"switch", [RecursiveMemoryEffects]> {
 
 // ─── Loop/Switch Control ─────────────────────────────────────────────────────
 
-def HelixHigh_ReturnOp : HelixHigh_Op<"return", [Terminator]> {
+def HelixHigh_ReturnOp : HelixHigh_Op<"return", [ReturnLike, Terminator]> {
   let summary = "Return from function with optional value";
 
   let arguments = (ins
@@ -477,6 +540,7 @@ def HelixHigh_ReturnOp : HelixHigh_Op<"return", [Terminator]> {
   let assemblyFormat = [{
     ($value^ `:` type($value))? (`at` $address^)? attr-dict
   }];
+  let hasVerifier = 1;
 }
 
 def HelixHigh_BreakOp : HelixHigh_Op<"break", [Terminator]> {
@@ -573,7 +637,8 @@ def HelixHigh_AsmOp : HelixHigh_Op<"asm", []> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 def HelixHigh_FuncOp : HelixHigh_Op<"func", [
-    IsolatedFromAbove, Symbol
+    IsolatedFromAbove, FunctionOpInterface,
+    HelixDecompilableOpInterface
   ]> {
   let summary = "A decompiled C function";
   let description = [{
@@ -587,16 +652,68 @@ def HelixHigh_FuncOp : HelixHigh_Op<"func", [
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     UI64Attr:$entry_address,
+    TypeAttrOf<FunctionType>:$function_type,
     OptionalAttr<StrAttr>:$calling_convention,
-    OptionalAttr<UnitAttr>:$is_variadic
+    OptionalAttr<UnitAttr>:$is_variadic,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
   );
-  let regions = (region SizedRegion<1>:$body);
+  // Real decompiler functions may retain an irreducible CFG fallback after
+  // structured regions have been recovered. FunctionOpInterface permits a
+  // multi-block callable region; constraining this to one block rejected such
+  // functions during the final low.func -> high.func container legalization.
+  let regions = (region AnyRegion:$body);
 
   let assemblyFormat = [{
     $sym_name `entry` $entry_address
     (`cc` $calling_convention^)?
     (`variadic` $is_variadic^)?
     attr-dict-with-keyword $body
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::Region *getCallableRegion() { return &getBody(); }
+    ::llvm::ArrayRef<::mlir::Type> getArgumentTypes() {
+      return ::llvm::cast<::mlir::FunctionType>(getFunctionType()).getInputs();
+    }
+    ::llvm::ArrayRef<::mlir::Type> getResultTypes() {
+      return ::llvm::cast<::mlir::FunctionType>(getFunctionType()).getResults();
+    }
+  }];
+}
+
+def HelixHigh_DebugBreakOp : HelixHigh_Op<"debug_break", [
+    MemoryEffects<[MemRead, MemWrite]>
+  ]> {
+  let summary = "Observable software breakpoint";
+  let arguments = (ins OptionalAttr<UI64Attr>:$address);
+  let assemblyFormat = [{ (`at` $address^)? attr-dict }];
+}
+
+def HelixHigh_UnknownValueOp : HelixHigh_Op<"unknown_value", []> {
+  let summary = "Explicitly unknown source-level value";
+  let arguments = (ins
+    StrAttr:$reason,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $reason (`at` $address^)? attr-dict `:` type($result)
+  }];
+}
+
+def HelixHigh_XchgOp : HelixHigh_Op<"xchg", [MemoryEffects<[
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>
+  ]>]> {
+  let summary = "Source-legalization exchange of two register variables";
+  let arguments = (ins
+    StrAttr:$reg_a,
+    StrAttr:$reg_b,
+    UI32Attr:$bit_width,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let assemblyFormat = [{
+    $reg_a `,` $reg_b `,` $bit_width (`at` $address^)? attr-dict
   }];
 }
 

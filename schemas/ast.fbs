@@ -16,7 +16,7 @@ enum TypeKind : byte {
     Struct = 6,
     Union = 7,
     FuncPtr = 8,
-    Unknown = 255,
+    Unknown = -1,
 }
 
 /// A recovered/inferred data type.
@@ -53,6 +53,7 @@ enum StorageClass : byte {
     Register = 1,
     Global = 2,
     Parameter = 3,
+    Temporary = 4,
 }
 
 /// A recovered variable.
@@ -61,6 +62,12 @@ table Variable {
     type: DataType;
     storage: StorageClass;
     stack_offset: int64;
+    /// Stable storage/value identity. Optional scalar presence distinguishes
+    /// an unknown identity from the valid identity value zero.
+    identity_id: uint64 = null;
+    /// Source/ABI parameter ordinal. Present only for parameters; ordinal zero
+    /// remains representable and distinct from an absent ordinal.
+    parameter_index: uint32 = null;
 }
 
 /// Expression node types.
@@ -78,7 +85,7 @@ enum ExprKind : byte {
     DerefMember = 10,
     Ternary = 11,
     AddressLit = 12,
-    Unknown = 255,
+    Unknown = -1,
 }
 
 /// An expression node (tree structure via children).
@@ -100,6 +107,16 @@ table Expression {
     variable: Variable;
     /// Address value (for AddressLit).
     address: Address;
+    /// Recovered result type for every expression kind.
+    result_type: DataType;
+    /// Stable canonical preorder ID. Zero is reserved for "not assigned".
+    node_id: uint64;
+    /// Address of the machine/IR operation that produced this expression.
+    source_address: Address;
+    /// Resolved direct target for Call expressions, when known.
+    call_target: Address;
+    /// Byte offset for Member/DerefMember. Optional so offset zero is exact.
+    field_offset: uint64 = null;
 }
 
 /// Statement node types.
@@ -119,12 +136,24 @@ enum StmtKind : byte {
     Label = 12,
     Asm = 13,
     Comment = 14,
+    Block = 15,
 }
 
 /// A switch case.
 table SwitchCase {
     values: [int64];
     body: [Statement];
+}
+
+/// Semantic role of an entry in Statement.children. Values are append-only.
+enum StatementChildRole : byte {
+    Unknown = 0,
+    Then = 1,
+    Else = 2,
+    Body = 3,
+    Init = 4,
+    Step = 5,
+    BlockItem = 6,
 }
 
 /// A statement node.
@@ -140,6 +169,12 @@ table Statement {
     cases: [SwitchCase];
     /// Label name / goto target / asm / comment text.
     text: string;
+    /// Stable canonical preorder ID. Zero is reserved for "not assigned".
+    node_id: uint64;
+    /// Address of the machine/IR operation that produced this statement.
+    source_address: Address;
+    /// One semantic role per entry in children, in identical order.
+    child_roles: [StatementChildRole];
 }
 
 /// A fully decompiled function.
@@ -154,12 +189,34 @@ table DecompiledFunction {
     is_variadic: bool;
 }
 
+/// Features guaranteed by a canonical HAST producer. Values are append-only.
+enum HastCapability : byte {
+    VariableIdentity = 0,
+    TypedExpressions = 1,
+    StableNodeIds = 2,
+    SourceAddresses = 3,
+    DirectCallTargets = 4,
+    StructFieldOffsets = 5,
+    StatementChildRoles = 6,
+}
+
 /// Top-level decompiled module.
 table AstModule {
     name: string;
     functions: [DecompiledFunction];
     global_vars: [Variable];
     type_defs: [DataType];
+    /// Canonical HAST contract version. Schema changes are append-only within
+    /// a major version; consumers reject unsupported majors.
+    schema_major: uint16;
+    schema_minor: uint16;
+    /// Explicit feature negotiation for fields introduced after the legacy
+    /// four-field AstModule prefix.
+    capabilities: [HastCapability];
+    producer: string;
+    version: string;
+    arch: Arch;
+    pointer_bits: uint16;
 }
 
 root_type AstModule;

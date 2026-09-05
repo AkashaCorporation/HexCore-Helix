@@ -2,6 +2,7 @@
 /// @brief Seed nominal DWARF/BTF/PDB types into HelixHigh operations.
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/dialects/HelixHighDialect.h"
 #include "helix/dialects/HelixLowOps.h"
@@ -278,8 +279,9 @@ static void propagateNominalCopyAliases(
             if (sourceStruct.empty() || !db.structs.contains(sourceStruct))
                 return;
 
-            targetIt->second->setAttr("inferred_type", sourceType);
-            changed = true;
+            changed |= helix::applyTypeEvidence(
+                targetIt->second, sourceType.getValue(),
+                helix::TypeEvidenceSource::DebugInfo);
         });
     }
 }
@@ -465,8 +467,9 @@ struct ApplyDebugTypesPass
                         return;
                     const DebugParam& param = signature.params[*index];
                     if (!param.type.empty()) {
-                        decl->setAttr("inferred_type",
-                            StringAttr::get(decl.getContext(), param.type));
+                        helix::applyTypeEvidence(
+                            decl, param.type,
+                            helix::TypeEvidenceSource::DebugInfo);
                     }
                     if (!param.name.empty() &&
                         !llvm::StringRef(param.name).starts_with("param_")) {
@@ -475,6 +478,41 @@ struct ApplyDebugTypesPass
                     }
                 });
             }
+
+            // The first ApplyDebugTypes run happens before calling-convention
+            // recovery, while calls are still HelixLow operations. Preserve
+            // exact external signatures here so RecoverCallingConvention can
+            // clamp ABI register arguments without relying on its small
+            // built-in signature table.
+            func.walk([&](helix::low::CallOp call) {
+                auto targetName = call.getTargetName();
+                if (!targetName)
+                    return;
+                auto callIt = db->functions.find(targetName->str());
+                if (callIt == db->functions.end())
+                    return;
+                const DebugFunction& signature = callIt->second;
+                if (!signature.returnType.empty() && call.getResult()) {
+                    auto typeAttr = StringAttr::get(
+                        call.getContext(), signature.returnType);
+                    helix::applyTypeEvidence(
+                        call, signature.returnType,
+                        helix::TypeEvidenceSource::DebugInfo);
+                    call->setAttr("inferred_return_type", typeAttr);
+                }
+                if (signature.isVariadic) {
+                    call->setAttr("is_variadic",
+                        UnitAttr::get(call.getContext()));
+                    call->removeAttr("helix.debug_param_count");
+                } else {
+                    call->removeAttr("is_variadic");
+                    call->setAttr(
+                        "helix.debug_param_count",
+                        IntegerAttr::get(
+                            IntegerType::get(call.getContext(), 32),
+                            signature.params.size()));
+                }
+            });
 
             // Preserve the call's own nominal return type for C emission. Do
             // not use helix.type_hint here: the recovered `result` variable is
@@ -487,7 +525,9 @@ struct ApplyDebugTypesPass
                     return;
                 auto typeAttr = StringAttr::get(
                     call.getContext(), callIt->second.returnType);
-                call->setAttr("inferred_type", typeAttr);
+                helix::applyTypeEvidence(
+                    call, callIt->second.returnType,
+                    helix::TypeEvidenceSource::DebugInfo);
                 call->setAttr("inferred_return_type", typeAttr);
             });
 
@@ -533,7 +573,9 @@ struct ApplyDebugTypesPass
                             continue;
                         auto declIt = decls.find(target.getVarId());
                         if (declIt != decls.end())
-                            declIt->second->setAttr("inferred_type", returnType);
+                            helix::applyTypeEvidence(
+                                declIt->second, returnType.getValue(),
+                                helix::TypeEvidenceSource::DebugInfo);
                         break;
                     }
                 }
@@ -568,7 +610,9 @@ struct ApplyDebugTypesPass
                     auto typeAttr = StringAttr::get(
                         field.getContext(), resolved->type);
                     field->setAttr("helix.type_hint", typeAttr);
-                    field->setAttr("inferred_type", typeAttr);
+                    helix::applyTypeEvidence(
+                        field, resolved->type,
+                        helix::TypeEvidenceSource::DebugInfo);
                 }
             });
         });

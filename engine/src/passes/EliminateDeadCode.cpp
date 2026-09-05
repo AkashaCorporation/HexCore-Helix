@@ -598,10 +598,21 @@ static bool isLiveConsumer(Operation* op) {
              isa<helix::high::ForOp>(op->getParentOp()))) ||
            isa<helix::low::CallOp>(op) ||
            isa<helix::low::VariadicCallOp>(op) ||
+           isa<helix::mid::CallOp>(op) ||
+           isa<helix::mid::VariadicCallOp>(op) ||
            isa<helix::high::CallOp>(op) ||
+           isa<helix::mid::IfOp>(op) ||
+           isa<helix::mid::WhileOp>(op) ||
+           isa<helix::mid::DoWhileOp>(op) ||
+           isa<helix::mid::ForOp>(op) ||
+           isa<helix::mid::SwitchOp>(op) ||
            isa<helix::low::RetOp>(op) ||
+           isa<helix::mid::ReturnOp>(op) ||
            isa<helix::high::ReturnOp>(op) ||
-           isa<helix::low::MemWriteOp>(op);
+           isa<helix::low::MemWriteOp>(op) ||
+           isa<helix::mid::StoreOp>(op) ||
+           isa<helix::mid::MemcpyOp>(op) ||
+           isa<helix::mid::MemsetOp>(op);
 }
 
 /// Check whether an op, if found on the RHS of a now-dead assignment,
@@ -1121,14 +1132,14 @@ private:
             llvm::dbgs() << "  Phase 0: removed " << infraRemoved
                          << " infrastructure ops\n");
 
-        // ── Phase 1: Remove NOP and INT3 markers ────────────────────────
+        // ── Phase 1: Remove NOP markers ─────────────────────────────────
 
-        unsigned nopsRemoved  = removeNopsAndInt3(funcBody);
+        unsigned nopsRemoved  = removeNops(funcBody);
         NumNopsRemoved  += nopsRemoved;
 
         LLVM_DEBUG(if (nopsRemoved > 0)
             llvm::dbgs() << "  Phase 1: removed " << nopsRemoved
-                         << " NOP/INT3 ops\n");
+                         << " NOP ops\n");
 
         // ── Phase 2: Remove prologue/epilogue push/pop pairs ────────────
 
@@ -1292,18 +1303,48 @@ private:
                     toErase.push_back(op);
             });
 
-            for (Operation* op : toErase) {
-                if (helix::pipelineDebugEnabled() &&
-                    isa<helix::low::CallOp, helix::low::VariadicCallOp>(op)) {
-                    llvm::errs() << "[P0-DEBUG] WARNING: Phase 0 erasing a CallOp! "
-                                 << *op << "\n";
+            // Erase consumers before producers. `dropAllUses()` used to hide
+            // ordering mistakes here and could silently disconnect a user
+            // that had been misclassified as infrastructure. If the selected
+            // subgraph cannot become use-empty, preserve the remainder.
+            while (!toErase.empty()) {
+                bool erasedAny = false;
+                for (size_t index = 0; index < toErase.size();) {
+                    Operation* op = toErase[index];
+                    bool useEmpty = true;
+                    for (Value result : op->getResults()) {
+                        if (!result.use_empty()) {
+                            useEmpty = false;
+                            break;
+                        }
+                    }
+                    if (!useEmpty) {
+                        ++index;
+                        continue;
+                    }
+
+                    if (helix::pipelineDebugEnabled() &&
+                        isa<helix::low::CallOp,
+                            helix::low::VariadicCallOp>(op)) {
+                        llvm::errs()
+                            << "[P0-DEBUG] WARNING: Phase 0 erasing a CallOp! "
+                            << *op << "\n";
+                    }
+                    op->erase();
+                    toErase[index] = toErase.back();
+                    toErase.pop_back();
+                    ++totalRemoved;
+                    changed = true;
+                    erasedAny = true;
                 }
-                // Drop all uses before erasing to avoid dangling references.
-                for (Value result : op->getResults())
-                    result.dropAllUses();
-                op->erase();
-                ++totalRemoved;
-                changed = true;
+
+                if (!erasedAny) {
+                    LLVM_DEBUG(llvm::dbgs()
+                        << "EliminateDeadCode: preserving "
+                        << toErase.size()
+                        << " infrastructure op(s) with live uses\n");
+                    break;
+                }
             }
         }
 
@@ -1312,20 +1353,20 @@ private:
 
     // ─── Phase 1: NOP / INT3 Removal ─────────────────────────────────────
 
-    /// Remove all `helix_low.nop` and `helix_low.int3` operations.
+    /// Remove all `helix_low.nop` operations.
     ///
-    /// These are padding/debug markers emitted by the compiler or debugger
-    /// and carry no semantic information in the decompiled output.
+    /// INT3 is deliberately excluded: padding should never enter a function's
+    /// semantic lift, while an in-body INT3 is an observable breakpoint.
     ///
     /// @param funcBody  The function's region.
     /// @return          The number of operations removed.
-    unsigned removeNopsAndInt3(Region& funcBody) {
+    unsigned removeNops(Region& funcBody) {
         unsigned removed = 0;
 
         llvm::SmallVector<Operation*, 16> toErase;
 
         funcBody.walk([&](Operation* op) {
-            if (isa<helix::low::NopOp>(op) || isa<helix::low::Int3Op>(op)) {
+            if (isa<helix::low::NopOp>(op)) {
                 toErase.push_back(op);
             }
         });
@@ -1383,6 +1424,29 @@ private:
                 LLVM_DEBUG(llvm::dbgs() << "  Removed push/pop pair for "
                                         << pair.reg << "\n");
             }
+        }
+
+        // In the deferred-SCF pipeline this DCE runs after register reads and
+        // writes have been legalized, so the original def-use shape used by
+        // `findPrologueEpiloguePairs` no longer exists. RemillToHelixLow has
+        // already classified callee-save operations explicitly; consume that
+        // evidence late, preserving any pop whose value still has a user.
+        llvm::SmallVector<Operation*, 16> annotated;
+        func.getBody().walk([&](Operation* op) {
+            if (auto push = dyn_cast<helix::low::PushOp>(op)) {
+                if (push->hasAttr("is_callee_save_push"))
+                    annotated.push_back(op);
+                return;
+            }
+            if (auto pop = dyn_cast<helix::low::PopOp>(op)) {
+                if (pop->hasAttr("is_callee_save_pop") &&
+                    pop.getResult().use_empty())
+                    annotated.push_back(op);
+            }
+        });
+        for (Operation* op : annotated) {
+            op->erase();
+            ++removed;
         }
 
         return removed;
@@ -1859,6 +1923,11 @@ private:
             changed = false;
             ++iteration;
 
+            // Build the VarRefMap once per iteration for SSA-aware
+            // liveness analysis.  This is rebuilt after each iteration
+            // because erasing ops invalidates the map.
+            VarRefMap refMap = buildVarRefMap(funcBody);
+
             // ── Step 0: Remove infrastructure-marked assignments ────────
             //
             // AssignOps tagged with "helix.infrastructure" by
@@ -1887,11 +1956,12 @@ private:
                 }
             }
 
+            // Step 0 can erase both assignments and their VarRef operands.
+            // Never carry those op handles into the following liveness walks.
+            refMap = buildVarRefMap(funcBody);
+
             // ── Step 1: Remove dead __undef assignments ─────────────────
             {
-                // Step 0 may erase VarRefOps, so build the map only after
-                // its cleanup has finished.
-                VarRefMap refMap = buildVarRefMap(funcBody);
                 llvm::SmallVector<helix::high::AssignOp, 16> deadUndefs;
 
                 funcBody.walk([&](helix::high::AssignOp assignOp) {
@@ -1917,27 +1987,30 @@ private:
                 }
             }
 
+            // Step 1 invalidates entries for the removed target/RHS refs.
+            refMap = buildVarRefMap(funcBody);
+
             // ── Step 2: Remove dead assignment chains ───────────────────
             //
             // An assignment is dead if its target variable has no live
             // consumers.  We remove assignments in reverse order so that
             // removing a later assignment may expose an earlier one as dead.
             {
-                // Step 1 erases operand definitions. Never reuse its map.
-                VarRefMap refMap = buildVarRefMap(funcBody);
                 llvm::SmallVector<helix::high::AssignOp, 16> allAssigns;
+                llvm::SmallVector<helix::high::AssignOp, 16> deadAssigns;
                 llvm::SmallVector<Operation*, 32> orphanDefs;
                 llvm::SmallPtrSet<Operation*, 32> seenOrphanDefs;
-                funcBody.walk([&](helix::high::AssignOp assignOp) {
-                    allAssigns.push_back(assignOp);
-                });
-
                 auto rememberOrphanDef = [&](Operation* op) {
                     if (op && seenOrphanDefs.insert(op).second)
                         orphanDefs.push_back(op);
                 };
+                funcBody.walk([&](helix::high::AssignOp assignOp) {
+                    allAssigns.push_back(assignOp);
+                });
 
-                // Process in reverse order (reverse dependency).
+                // Classify against one immutable snapshot. Erasing while
+                // consulting refMap used to leave dangling VarRefOp handles
+                // and caused a use-after-free on large JIT functions.
                 for (auto it = allAssigns.rbegin(); it != allAssigns.rend();
                      ++it) {
                     auto assignOp = *it;
@@ -1990,37 +2063,39 @@ private:
                         }
                     }
 
-                    if (!anyLive) {
-                        auto* rhsDef = assignOp.getValue().getDefiningOp();
-                        auto* lhsOp  = assignOp.getTarget().getDefiningOp();
-
-                        assignOp.erase();
-                        ++totalAssigns;
-                        changed = true;
-
-                        // Keep operand definitions alive until the reverse
-                        // sweep finishes. The liveness map owns VarRefOp
-                        // handles; erasing one here would leave dangling
-                        // entries for the next assignment in the sweep.
-                        rememberOrphanDef(rhsDef);
-                        rememberOrphanDef(lhsOp);
-                    }
+                    if (!anyLive)
+                        deadAssigns.push_back(assignOp);
                 }
 
-                // The map is no longer consulted, so orphaned definitions can
-                // now be removed safely. Side-effecting RHS operations remain
-                // observable even when their result assignment is dead.
+                for (auto assignOp : deadAssigns) {
+                    auto* rhsDef = assignOp.getValue().getDefiningOp();
+                    auto* lhsOp  = assignOp.getTarget().getDefiningOp();
+
+                    assignOp.erase();
+                    ++totalAssigns;
+                    changed = true;
+
+                    // Clean up orphaned operand definitions — but never
+                    // erase side-effecting ops (calls, memory writes)
+                    // just because their result became unused.  A call
+                    // like `sub_foo()` whose return value is ignored
+                    // still needs to emit for its side effects.
+                    rememberOrphanDef(rhsDef);
+                    rememberOrphanDef(lhsOp);
+                }
+
                 for (Operation* op : orphanDefs) {
                     if (op->use_empty() && !isSideEffectingRhs(op))
                         op->erase();
                 }
             }
 
+            // Step 2 also removes VarRef operands. Step 3 must see only live
+            // operation handles.
+            refMap = buildVarRefMap(funcBody);
+
             // ── Step 3: Remove dead variable declarations ───────────────
             {
-                // Step 2 changes both assignments and VarRefOps. Its liveness
-                // map is invalid after orphan cleanup.
-                VarRefMap refMap = buildVarRefMap(funcBody);
                 llvm::SmallVector<helix::high::VarDeclOp, 16> deadDecls;
 
                 funcBody.walk([&](helix::high::VarDeclOp declOp) {

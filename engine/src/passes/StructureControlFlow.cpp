@@ -31,6 +31,7 @@
 
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
+#include "helix/dialects/HelixMidOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/utils/Debug.h"
 
@@ -486,7 +487,154 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
     mlir::Block& beforeBlk = wh.getBefore().front();
     auto cond = mlir::cast<mlir::scf::ConditionOp>(beforeBlk.getTerminator());
     mlir::Type condTy = cond.getCondition().getType();
-    unsigned n = wh.getNumOperands();  // loop-carried count
+    unsigned n = wh.getNumOperands();  // before-region carried count
+
+    // Canonicalization may legitimately produce an asymmetric scf.while:
+    // the before region has N inputs, scf.condition forwards M values to the
+    // after region / final results, and the after yield maps those M values
+    // back to N inputs. The original bridge assumed N == M and left results
+    // live when N was zero (e.g. `scf.while : () -> i32`), then erased the
+    // still-used operation. Handle the canonical trivial-after form exactly.
+    if (n != wh.getNumResults()) {
+        if (!wh.getAfter().hasOneBlock()) {
+            if (helix::scfDebugEnabled())
+                llvm::errs() << "[SCF-BRIDGE] asymmetric while has "
+                             << "multi-block after region; left intact\n";
+            return;
+        }
+        mlir::Block& afterBlk = wh.getAfter().front();
+        auto afterYield = mlir::dyn_cast_or_null<mlir::scf::YieldOp>(
+            afterBlk.getTerminator());
+        if (!afterYield ||
+            afterBlk.getOperations().size() != 1 ||
+            cond.getArgs().size() != wh.getNumResults() ||
+            afterYield.getNumOperands() != n) {
+            if (helix::scfDebugEnabled())
+                llvm::errs() << "[SCF-BRIDGE] unsupported asymmetric while "
+                             << "after-region shape; left intact\n";
+            return;
+        }
+
+        llvm::SmallVector<unsigned> nextInputFromResult;
+        nextInputFromResult.reserve(n);
+        for (mlir::Value value : afterYield.getOperands()) {
+            auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+            if (!argument || argument.getOwner() != &afterBlk) {
+                if (helix::scfDebugEnabled())
+                    llvm::errs() << "[SCF-BRIDGE] asymmetric while after "
+                                 << "yield is not a block-argument mapping\n";
+                return;
+            }
+            nextInputFromResult.push_back(argument.getArgNumber());
+        }
+
+        llvm::SmallVector<std::pair<uint32_t, std::string>> inputVars;
+        llvm::SmallVector<std::pair<uint32_t, std::string>> resultVars;
+        inputVars.reserve(n);
+        resultVars.reserve(wh.getNumResults());
+        b.setInsertionPoint(wh);
+        auto createTemp = [&](mlir::Type type, llvm::StringRef prefix) {
+            uint32_t id = g_scfBridgeVarId++;
+            std::string name = std::format("{}{}", prefix.str(), id);
+            b.create<helix::high::VarDeclOp>(
+                loc, id, name, helix::high::StorageKind::Temporary,
+                mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+            return std::pair{id, std::move(name)};
+        };
+        for (mlir::Value operand : wh.getOperands())
+            inputVars.push_back(createTemp(operand.getType(), "scf_w"));
+        for (mlir::Type type : wh.getResultTypes())
+            resultVars.push_back(createTemp(type, "scf_r"));
+        auto conditionVar = createTemp(condTy, "scf_w");
+
+        for (unsigned i = 0; i < n; ++i) {
+            auto target = b.create<helix::high::VarRefOp>(
+                loc, wh.getOperand(i).getType(), inputVars[i].first,
+                inputVars[i].second, mlir::IntegerAttr{});
+            b.create<helix::high::AssignOp>(
+                loc, target.getResult(), wh.getOperand(i),
+                mlir::IntegerAttr{});
+        }
+
+        {
+            mlir::OpBuilder entryBuilder(&beforeBlk, beforeBlk.begin());
+            for (unsigned i = 0; i < n; ++i) {
+                mlir::BlockArgument argument = beforeBlk.getArgument(i);
+                auto read = entryBuilder.create<helix::high::VarRefOp>(
+                    loc, argument.getType(), inputVars[i].first,
+                    inputVars[i].second, mlir::IntegerAttr{});
+                argument.replaceAllUsesWith(read.getResult());
+            }
+        }
+
+        {
+            mlir::OpBuilder condBuilder(cond);
+            for (unsigned i = 0; i < wh.getNumResults(); ++i) {
+                auto target = condBuilder.create<helix::high::VarRefOp>(
+                    loc, cond.getArgs()[i].getType(), resultVars[i].first,
+                    resultVars[i].second, mlir::IntegerAttr{});
+                condBuilder.create<helix::high::AssignOp>(
+                    loc, target.getResult(), cond.getArgs()[i],
+                    mlir::IntegerAttr{});
+            }
+            auto conditionTarget = condBuilder.create<helix::high::VarRefOp>(
+                loc, condTy, conditionVar.first, conditionVar.second,
+                mlir::IntegerAttr{});
+            condBuilder.create<helix::high::AssignOp>(
+                loc, conditionTarget.getResult(), cond.getCondition(),
+                mlir::IntegerAttr{});
+
+            // Result temporaries are a parallel snapshot of cond.getArgs(),
+            // so routing next inputs from them cannot clobber another source.
+            for (unsigned i = 0; i < n; ++i) {
+                unsigned sourceIndex = nextInputFromResult[i];
+                auto target = condBuilder.create<helix::high::VarRefOp>(
+                    loc, beforeBlk.getArgument(i).getType(),
+                    inputVars[i].first, inputVars[i].second,
+                    mlir::IntegerAttr{});
+                auto source = condBuilder.create<helix::high::VarRefOp>(
+                    loc, wh.getResult(sourceIndex).getType(),
+                    resultVars[sourceIndex].first,
+                    resultVars[sourceIndex].second, mlir::IntegerAttr{});
+                condBuilder.create<helix::high::AssignOp>(
+                    loc, target.getResult(), source.getResult(),
+                    mlir::IntegerAttr{});
+            }
+            condBuilder.create<helix::high::YieldOp>(loc, mlir::Value{});
+            cond.erase();
+        }
+        beforeBlk.eraseArguments(0, n);
+
+        auto loop = b.create<helix::high::DoWhileOp>(
+            loc, mlir::IntegerAttr{});
+        loop.getBodyRegion().takeBody(wh.getBefore());
+        {
+            auto* conditionBlock = new mlir::Block();
+            loop.getCondRegion().push_back(conditionBlock);
+            mlir::OpBuilder conditionBuilder(
+                conditionBlock, conditionBlock->begin());
+            auto read = conditionBuilder.create<helix::high::VarRefOp>(
+                loc, condTy, conditionVar.first, conditionVar.second,
+                mlir::IntegerAttr{});
+            conditionBuilder.create<helix::high::YieldOp>(
+                loc, read.getResult());
+        }
+
+        b.setInsertionPointAfter(loop);
+        for (unsigned i = 0; i < wh.getNumResults(); ++i) {
+            auto read = b.create<helix::high::VarRefOp>(
+                loc, wh.getResult(i).getType(), resultVars[i].first,
+                resultVars[i].second, mlir::IntegerAttr{});
+            wh.getResult(i).replaceAllUsesWith(read.getResult());
+        }
+
+        // The after region is proven to contain only its yield. Remove the
+        // consumer before its block arguments, then erase the now-empty while.
+        afterYield.erase();
+        afterBlk.erase();
+        wh.erase();
+        return;
+    }
 
     // A component forwarded as the exact before-block argument is invariant
     // across every iteration. Its initial operand already dominates both the
@@ -643,27 +791,128 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
     wh.erase();  // drops the trivial AFTER region too
 }
 
-static void bridgeSCFToHelixHigh(helix::low::FuncOp func) {
+static void bridgeSCFToHelixHigh(Operation* func) {
     // Collect innermost-first so a child scf op is bridged before its parent
     // (the parent then just takes a region already full of helix_high ops).
     llvm::SmallVector<mlir::Operation*> worklist;
-    func.walk<mlir::WalkOrder::PostOrder>([&](mlir::Operation* op) {
+    func->walk<mlir::WalkOrder::PostOrder>([&](mlir::Operation* op) {
         if (mlir::isa<mlir::scf::IfOp, mlir::scf::IndexSwitchOp,
                       mlir::scf::WhileOp>(op))
             worklist.push_back(op);
     });
     for (mlir::Operation* op : worklist) {
+        if (helix::scfDebugEnabled()) {
+            llvm::errs() << "[SCF-BRIDGE] begin " << op->getName()
+                         << " results=" << op->getNumResults()
+                         << " regions=" << op->getNumRegions() << "\n";
+        }
         if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op))
             bridgeSCFIfToHelixHigh(ifOp);
         else if (auto sw = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(op))
             bridgeSCFIndexSwitchToHelixHigh(sw);
         else if (auto wh = mlir::dyn_cast<mlir::scf::WhileOp>(op))
             bridgeSCFWhileToHelixHigh(wh);
+        if (helix::scfDebugEnabled())
+            llvm::errs() << "[SCF-BRIDGE] done\n";
     }
 }
 
+static LogicalResult eraseUnreachableBlocksSafely(
+        ArrayRef<Block*> deadBlocks, Operation* owner) {
+    if (deadBlocks.empty())
+        return success();
+
+    llvm::SmallPtrSet<Block*, 32> deadSet(
+        deadBlocks.begin(), deadBlocks.end());
+
+    auto isExternalUser = [&](Operation* user) {
+        return !user || !deadSet.contains(user->getBlock());
+    };
+    for (Block* block : deadBlocks) {
+        for (Block* predecessor : block->getPredecessors()) {
+            if (!deadSet.contains(predecessor)) {
+                owner->emitError(
+                    "unreachable-block deletion found a live predecessor");
+                return failure();
+            }
+        }
+        for (BlockArgument argument : block->getArguments()) {
+            for (Operation* user : argument.getUsers()) {
+                if (isExternalUser(user)) {
+                    owner->emitError(
+                        "unreachable block argument has a live external user");
+                    return failure();
+                }
+            }
+        }
+        for (Operation& operation : *block) {
+            for (Value result : operation.getResults()) {
+                for (Operation* user : result.getUsers()) {
+                    if (isExternalUser(user)) {
+                        owner->emitError(
+                            "unreachable operation result has a live external user");
+                        return failure();
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove terminators first. This destroys successor references normally
+    // and breaks cycles among unreachable blocks without `dropAllReferences`.
+    for (Block* block : deadBlocks) {
+        if (block->empty())
+            continue;
+        Operation& last = block->back();
+        if (last.hasTrait<OpTrait::IsTerminator>())
+            last.erase();
+    }
+
+    SmallVector<Operation*, 64> pending;
+    for (Block* block : deadBlocks)
+        for (Operation& operation : *block)
+            pending.push_back(&operation);
+
+    while (!pending.empty()) {
+        bool erasedAny = false;
+        for (size_t index = 0; index < pending.size();) {
+            Operation* operation = pending[index];
+            bool useEmpty = llvm::all_of(
+                operation->getResults(), [](Value value) {
+                    return value.use_empty();
+                });
+            if (!useEmpty) {
+                ++index;
+                continue;
+            }
+            operation->erase();
+            pending[index] = pending.back();
+            pending.pop_back();
+            erasedAny = true;
+        }
+        if (!erasedAny) {
+            owner->emitError(
+                "unreachable-block deletion found a cyclic/live SSA use");
+            return failure();
+        }
+    }
+
+    for (Block* block : deadBlocks) {
+        if (llvm::any_of(block->getArguments(), [](BlockArgument argument) {
+                return !argument.use_empty();
+            })) {
+            owner->emitError(
+                "unreachable block argument remained live after cleanup");
+            return failure();
+        }
+        block->erase();
+    }
+    return success();
+}
+
 // Run the spike on one HelixLow function: convert jmp/jcc -> cf, then lift to scf.
-static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
+static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
+                                      bool bridgeToHigh) {
     if (func.getBody().empty())
         return mlir::success();
 
@@ -685,11 +934,8 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
         for (auto& blk : func.getBody())
             if (!reachable.contains(&blk))
                 dead.push_back(&blk);
-        for (auto* blk : dead) {
-            blk->dropAllDefinedValueUses();
-            blk->dropAllReferences();
-            blk->erase();
-        }
+        if (failed(eraseUnreachableBlocksSafely(dead, func)))
+            return failure();
     }
 
     // 1) Collect every non-cf block terminator with successors (helix_low.jmp/jcc
@@ -838,12 +1084,13 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
         std::fflush(stderr);
     }
 
-    // [M1] bridge scf.if -> helix_high.if (switch/while still TODO).
-    bridgeSCFToHelixHigh(func);
-    if (helix::scfDebugEnabled()) {
-        std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-bridge\n",
-                     func.getSymName().str().c_str());
-        std::fflush(stderr);
+    if (bridgeToHigh) {
+        bridgeSCFToHelixHigh(func);
+        if (helix::scfDebugEnabled()) {
+            std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-bridge\n",
+                         func.getSymName().str().c_str());
+            std::fflush(stderr);
+        }
     }
     if (mlir::failed(changed)) {
         std::fprintf(stderr, "[SCF-SPIKE] transformCFGToSCF FAILED on %s\n",
@@ -2147,6 +2394,10 @@ struct StructureControlFlowPass
 
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StructureControlFlowPass)
 
+    StructureControlFlowPass(bool preserveCfg = false,
+                             bool bridgeToHigh = true)
+        : preserveCfg_(preserveCfg), bridgeToHigh_(bridgeToHigh) {}
+
     StringRef getArgument() const final { return "structure-control-flow"; }
     StringRef getDescription() const final {
         return "Transform flat basic blocks into structured control flow "
@@ -2155,6 +2406,7 @@ struct StructureControlFlowPass
 
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
+        registry.insert<helix::mid::HelixMidDialect>();
         registry.insert<helix::high::HelixHighDialect>();
         registry.insert<mlir::arith::ArithDialect>();
         registry.insert<mlir::cf::ControlFlowDialect>();
@@ -2168,6 +2420,7 @@ struct StructureControlFlowPass
     // loop with one latch per opcode handler).  Default false → normal lifts
     // keep the conservative guard and are byte-for-byte unchanged.
     bool preserveCfg_ = false;
+    bool bridgeToHigh_ = true;
 
     void runOnOperation() override {
         auto module = getOperation();
@@ -2307,7 +2560,7 @@ private:
         // regressions). Set HELIX_SCF_LEGACY=1 to force the old block-moving
         // structurer. (HELIX_SCF_SPIKE still forces it on too, for back-compat.)
         if (std::getenv("HELIX_SCF_SPIKE") || !std::getenv("HELIX_SCF_LEGACY"))
-            return runSCFSpike(func);
+            return runSCFSpike(func, bridgeToHigh_);
 
         OpBuilder builder(func->getContext());
 
@@ -2355,11 +2608,8 @@ private:
                     toErase.push_back(&blk);
             }
 
-            for (auto* blk : toErase) {
-                blk->dropAllDefinedValueUses();
-                blk->dropAllReferences();
-                blk->erase();
-            }
+            if (failed(eraseUnreachableBlocksSafely(toErase, func)))
+                return failure();
         }
 
         // After removing unreachable blocks, re-check single-block.
@@ -3670,14 +3920,48 @@ private:
     }
 };
 
+struct BridgeStructuredControlFlowPass
+    : public PassWrapper<BridgeStructuredControlFlowPass,
+                         OperationPass<ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+        BridgeStructuredControlFlowPass)
+
+    StringRef getArgument() const final {
+        return "bridge-structured-control-flow";
+    }
+    StringRef getDescription() const final {
+        return "Legalize native SCF SSA into HelixHigh source constructs";
+    }
+
+    void getDependentDialects(DialectRegistry& registry) const override {
+        registry.insert<helix::low::HelixLowDialect>();
+        registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<mlir::arith::ArithDialect>();
+        registry.insert<mlir::scf::SCFDialect>();
+    }
+
+    void runOnOperation() override {
+        getOperation().walk([&](Operation* func) {
+            if (!isa<helix::low::FuncOp, helix::mid::FuncOp>(func))
+                return;
+            g_scfBridgeVarId = 900000;
+            bridgeSCFToHelixHigh(func);
+        });
+    }
+};
+
 } // anonymous namespace
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pass Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<mlir::Pass> helix::createStructureControlFlowPass(bool preserveCfg) {
-    auto pass = std::make_unique<StructureControlFlowPass>();
-    pass->preserveCfg_ = preserveCfg;
-    return pass;
+std::unique_ptr<mlir::Pass> helix::createStructureControlFlowPass(
+        bool preserveCfg, bool bridgeToHigh) {
+    return std::make_unique<StructureControlFlowPass>(
+        preserveCfg, bridgeToHigh);
+}
+
+std::unique_ptr<mlir::Pass> helix::createBridgeStructuredControlFlowPass() {
+    return std::make_unique<BridgeStructuredControlFlowPass>();
 }

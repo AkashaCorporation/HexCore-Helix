@@ -13,14 +13,18 @@ include "mlir/IR/EnumAttr.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "dialects/HelixEffects.td"
 include "dialects/HelixLowDialect.td"
 include "dialects/HelixLowTypes.td"
+include "dialects/HelixInterfaces.td"
 
 // ─── Base Class ──────────────────────────────────────────────────────────────
 
 class HelixLow_Op<string mnemonic, list<Trait> traits = []>
-    : Op<HelixLow_Dialect, mnemonic, traits>;
+    : Op<HelixLow_Dialect, mnemonic,
+         !listconcat(traits, [HelixAddressableOpInterface])>;
 
 // ─── Enums ───────────────────────────────────────────────────────────────────
 
@@ -59,7 +63,9 @@ def HelixLow_UnaryOpKind : I32EnumAttr<
 
 // ─── Register Operations ─────────────────────────────────────────────────────
 
-def HelixLow_RegReadOp : HelixLow_Op<"reg.read", [Pure]> {
+def HelixLow_RegReadOp : HelixLow_Op<"reg.read", [
+    MemoryEffects<[MemRead<Helix_RegisterStateResource>]>
+  ]> {
   let summary = "Read a value from a CPU register";
   let description = [{
     Reads the current value of a CPU register. The register is identified by
@@ -78,9 +84,12 @@ def HelixLow_RegReadOp : HelixLow_Op<"reg.read", [Pure]> {
   let assemblyFormat = [{
     $reg_name `,` $bit_width (`at` $address^)? attr-dict `:` type($result)
   }];
+  let hasVerifier = 1;
 }
 
-def HelixLow_RegWriteOp : HelixLow_Op<"reg.write", [MemoryEffects<[MemWrite]>]> {
+def HelixLow_RegWriteOp : HelixLow_Op<"reg.write", [
+    MemoryEffects<[MemWrite<Helix_RegisterStateResource>]>
+  ]> {
   let summary = "Write a value to a CPU register";
   let description = [{
     Writes a value to a CPU register. Generated from Remill's `store` to a
@@ -98,11 +107,14 @@ def HelixLow_RegWriteOp : HelixLow_Op<"reg.write", [MemoryEffects<[MemWrite]>]> 
   let assemblyFormat = [{
     $value `,` $reg_name `,` $bit_width (`at` $address^)? attr-dict `:` type($value)
   }];
+  let hasVerifier = 1;
 }
 
 // ─── Memory Operations ───────────────────────────────────────────────────────
 
-def HelixLow_MemReadOp : HelixLow_Op<"mem.read", [MemoryEffects<[MemRead]>]> {
+def HelixLow_MemReadOp : HelixLow_Op<"mem.read", [
+    MemoryEffects<[MemRead<Helix_ProgramMemoryResource>]>
+  ]> {
   let summary = "Read from memory at an address";
   let description = [{
     Reads a value from memory at the given virtual address. Generated from
@@ -120,9 +132,12 @@ def HelixLow_MemReadOp : HelixLow_Op<"mem.read", [MemoryEffects<[MemRead]>]> {
   let assemblyFormat = [{
     $addr `,` $bit_width (`at` $address^)? attr-dict `:` type($addr) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
-def HelixLow_MemWriteOp : HelixLow_Op<"mem.write", [MemoryEffects<[MemWrite]>]> {
+def HelixLow_MemWriteOp : HelixLow_Op<"mem.write", [
+    MemoryEffects<[MemWrite<Helix_ProgramMemoryResource>]>
+  ]> {
   let summary = "Write to memory at an address";
   let description = [{
     Writes a value to memory at the given virtual address. Generated from
@@ -139,6 +154,7 @@ def HelixLow_MemWriteOp : HelixLow_Op<"mem.write", [MemoryEffects<[MemWrite]>]> 
   let assemblyFormat = [{
     $addr `,` $value `,` $bit_width (`at` $address^)? attr-dict `:` type($addr) `,` type($value)
   }];
+  let hasVerifier = 1;
 }
 
 // ─── Arithmetic/Logic Operations ─────────────────────────────────────────────
@@ -170,6 +186,7 @@ def HelixLow_BinOp : HelixLow_Op<"binop", [Pure]> {
     $kind $lhs `,` $rhs (`at` $address^)? (`self_xor` $is_self_xor^)? attr-dict
     `:` type($lhs) `,` type($rhs) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 def HelixLow_UnaryOp : HelixLow_Op<"unaryop", [Pure]> {
@@ -194,6 +211,7 @@ def HelixLow_UnaryOp : HelixLow_Op<"unaryop", [Pure]> {
     $kind $operand (`at` $address^)? attr-dict
     `:` type($operand) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 // ─── Comparison/Test Operations ──────────────────────────────────────────────
@@ -220,6 +238,7 @@ def HelixLow_CmpOp : HelixLow_Op<"cmp", []> {
   let assemblyFormat = [{
     $lhs `,` $rhs (`at` $address^)? attr-dict `:` type($lhs) `,` type($rhs)
   }];
+  let hasVerifier = 1;
 }
 
 def HelixLow_TestOp : HelixLow_Op<"test", []> {
@@ -243,11 +262,14 @@ def HelixLow_TestOp : HelixLow_Op<"test", []> {
   let assemblyFormat = [{
     $lhs `,` $rhs (`at` $address^)? attr-dict `:` type($lhs) `,` type($rhs)
   }];
+  let hasVerifier = 1;
 }
 
 // ─── Control Flow Operations ─────────────────────────────────────────────────
 
-def HelixLow_CallOp : HelixLow_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> {
+def HelixLow_CallOp : HelixLow_Op<"call", [
+    MemoryEffects<[MemRead, MemWrite]>, CallOpInterface
+  ]> {
   let summary = "Function call (direct or indirect)";
   let description = [{
     Calls a function at the given target address. The target_name is set if
@@ -274,6 +296,26 @@ def HelixLow_CallOp : HelixLow_Op<"call", [MemoryEffects<[MemRead, MemWrite]>]> 
   let assemblyFormat = [{
     $target_addr (`name` $target_name^)? `(` $args `)` (`at` $address^)? attr-dict
     `:` type($target_addr) (`,` type($args)^)? (`->` type($result)^)?
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::Operation::operand_range getArgOperands() { return getArgs(); }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getArgsMutable();
+    }
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      if (auto name = getTargetNameAttr())
+        return ::mlir::SymbolRefAttr::get(getContext(), name.getValue());
+      return getTargetAddr();
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      if (callee.is<::mlir::SymbolRefAttr>()) {
+        setTargetNameAttr(
+            callee.get<::mlir::SymbolRefAttr>().getRootReference());
+        return;
+      }
+      removeTargetNameAttr();
+      getTargetAddrMutable().assign(callee.get<::mlir::Value>());
+    }
   }];
 }
 
@@ -305,7 +347,7 @@ def HelixLow_BundleCreateOp : HelixLow_Op<"bundle.create", [Pure]> {
 }
 
 def HelixLow_VariadicCallOp : HelixLow_Op<"variadic_call",
-    [MemoryEffects<[MemRead, MemWrite]>]> {
+    [MemoryEffects<[MemRead, MemWrite]>, CallOpInterface]> {
   let summary = "Call into a variadic-signature function";
   let description = [{
     Variant of `helix_low.call` for variadic callees (printk family, sprintf,
@@ -334,9 +376,31 @@ def HelixLow_VariadicCallOp : HelixLow_Op<"variadic_call",
     `:` type($target_addr) (`,` type($fixed_args)^)? `,` type($raw_bundle)
     (`->` type($result)^)?
   }];
+  let extraClassDeclaration = [{
+    ::mlir::Operation::operand_range getArgOperands() {
+      return getFixedArgs();
+    }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getFixedArgsMutable();
+    }
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      if (auto name = getTargetNameAttr())
+        return ::mlir::SymbolRefAttr::get(getContext(), name.getValue());
+      return getTargetAddr();
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      if (callee.is<::mlir::SymbolRefAttr>()) {
+        setTargetNameAttr(
+            callee.get<::mlir::SymbolRefAttr>().getRootReference());
+        return;
+      }
+      removeTargetNameAttr();
+      getTargetAddrMutable().assign(callee.get<::mlir::Value>());
+    }
+  }];
 }
 
-def HelixLow_RetOp : HelixLow_Op<"ret", [Terminator]> {
+def HelixLow_RetOp : HelixLow_Op<"ret", [ReturnLike, Terminator]> {
   let summary = "Function return";
   let description = [{
     Returns from the current function. At this level, the return value is
@@ -409,7 +473,11 @@ def HelixLow_JccOp : HelixLow_Op<"jcc", [
 
 // ─── Stack Operations ────────────────────────────────────────────────────────
 
-def HelixLow_PushOp : HelixLow_Op<"push", [MemoryEffects<[MemWrite]>]> {
+def HelixLow_PushOp : HelixLow_Op<"push", [MemoryEffects<[
+    MemWrite<Helix_ProgramMemoryResource>,
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>
+  ]>]> {
   let summary = "Push value onto the stack";
   let description = [{
     Pushes a value onto the stack (decrements RSP and stores). Generated from
@@ -426,7 +494,11 @@ def HelixLow_PushOp : HelixLow_Op<"push", [MemoryEffects<[MemWrite]>]> {
   }];
 }
 
-def HelixLow_PopOp : HelixLow_Op<"pop", [MemoryEffects<[MemRead]>]> {
+def HelixLow_PopOp : HelixLow_Op<"pop", [MemoryEffects<[
+    MemRead<Helix_ProgramMemoryResource>,
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>
+  ]>]> {
   let summary = "Pop value from the stack";
   let description = [{
     Pops a value from the stack (loads from RSP and increments). Generated from
@@ -462,6 +534,7 @@ def HelixLow_MovZxOp : HelixLow_Op<"movzx", [Pure]> {
   let assemblyFormat = [{
     $src `,` $dst_width (`at` $address^)? attr-dict `:` type($src) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 def HelixLow_MovSxOp : HelixLow_Op<"movsx", [Pure]> {
@@ -481,6 +554,7 @@ def HelixLow_MovSxOp : HelixLow_Op<"movsx", [Pure]> {
   let assemblyFormat = [{
     $src `,` $dst_width (`at` $address^)? attr-dict `:` type($src) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 // ─── Conditional Move ────────────────────────────────────────────────────────
@@ -506,11 +580,15 @@ def HelixLow_CMovOp : HelixLow_Op<"cmov", [Pure]> {
     (`at` $address^)? attr-dict
     `:` type($true_val) `,` type($false_val) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 // ─── Exchange ────────────────────────────────────────────────────────────────
 
-def HelixLow_XchgOp : HelixLow_Op<"xchg", []> {
+def HelixLow_XchgOp : HelixLow_Op<"xchg", [MemoryEffects<[
+    MemRead<Helix_RegisterStateResource>,
+    MemWrite<Helix_RegisterStateResource>
+  ]>]> {
   let summary = "Exchange two register values";
   let description = [{
     Atomically swaps two register values. Generated from Remill XCHG semantic.
@@ -526,6 +604,7 @@ def HelixLow_XchgOp : HelixLow_Op<"xchg", []> {
   let assemblyFormat = [{
     $reg_a `,` $reg_b `,` $bit_width (`at` $address^)? attr-dict
   }];
+  let hasVerifier = 1;
 }
 
 // ─── LEA (Address Computation) ───────────────────────────────────────────────
@@ -555,7 +634,10 @@ def HelixLow_LeaOp : HelixLow_Op<"lea", [Pure]> {
 
 // ─── REP String Operations ───────────────────────────────────────────────────
 
-def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", [MemoryEffects<[MemRead, MemWrite]>]> {
+def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", [MemoryEffects<[
+    MemRead<Helix_ProgramMemoryResource>,
+    MemWrite<Helix_ProgramMemoryResource>
+  ]>]> {
   let summary = "REP MOVS — block memory copy (promoted to memcpy)";
   let description = [{
     Repeating string move operation. Copies RCX bytes from RSI to RDI.
@@ -577,7 +659,9 @@ def HelixLow_RepMovsOp : HelixLow_Op<"rep.movs", [MemoryEffects<[MemRead, MemWri
   }];
 }
 
-def HelixLow_RepStosOp : HelixLow_Op<"rep.stos", [MemoryEffects<[MemWrite]>]> {
+def HelixLow_RepStosOp : HelixLow_Op<"rep.stos", [
+    MemoryEffects<[MemWrite<Helix_ProgramMemoryResource>]>
+  ]> {
   let summary = "REP STOS — block memory fill (promoted to memset)";
   let description = [{
     Repeating string store operation. Fills RCX elements at RDI with AL/AX/EAX.
@@ -613,7 +697,7 @@ def HelixLow_NopOp : HelixLow_Op<"nop", []> {
   }];
 }
 
-def HelixLow_Int3Op : HelixLow_Op<"int3", []> {
+def HelixLow_Int3Op : HelixLow_Op<"int3", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "INT3 breakpoint marker";
 
   let arguments = (ins
@@ -625,10 +709,22 @@ def HelixLow_Int3Op : HelixLow_Op<"int3", []> {
   }];
 }
 
+def HelixLow_UnknownValueOp : HelixLow_Op<"unknown_value", []> {
+  let summary = "Explicitly unknown machine-semantic value";
+  let arguments = (ins
+    StrAttr:$reason,
+    OptionalAttr<UI64Attr>:$address
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $reason (`at` $address^)? attr-dict `:` type($result)
+  }];
+}
+
 // ─── Function Operation ──────────────────────────────────────────────────────
 
 def HelixLow_FuncOp : HelixLow_Op<"func", [
-    IsolatedFromAbove, Symbol
+    IsolatedFromAbove, Symbol, HelixDecompilableOpInterface
   ]> {
   let summary = "A lifted function in the HelixLow dialect";
   let description = [{

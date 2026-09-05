@@ -10,6 +10,7 @@
 /// to the same offset into a single named variable.
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 
@@ -407,6 +408,8 @@ private:
 
         std::map<SlotKey, std::pair<uint32_t, std::string>> offsetToVar;
         uint32_t varId = getNextAvailableVarId(func);
+        auto signedI64 = IntegerType::get(
+            builder.getContext(), 64, IntegerType::Signed);
 
         for (auto& [key, slot] : sortedSlots) {
             auto storageKind = slot.is_parameter
@@ -419,15 +422,17 @@ private:
                 builder.getStringAttr(slot.var_name),
                 helix::high::StorageKindAttr::get(
                     builder.getContext(), storageKind),
-                builder.getI64IntegerAttr(slot.offset),
+                IntegerAttr::get(signedI64, slot.offset),
                 /*init=*/Value{},
                 /*address=*/IntegerAttr{});
 
-            // Set inferred_type from the access width so the emitter
-            // can display proper C types instead of generic int64_t.
+            // Access width is a physical storage hint, not recovered source
+            // semantics. Keep it at legacy authority so later dataflow,
+            // struct, signature, and debug evidence can refine the slot.
             if (!slot.c_type.empty()) {
-                declOp->setAttr("inferred_type",
-                    builder.getStringAttr(slot.c_type));
+                helix::applyTypeEvidence(
+                    declOp, slot.c_type,
+                    helix::TypeEvidenceSource::Legacy);
             }
 
             offsetToVar[key] = {varId, declOp.getVarName().str()};

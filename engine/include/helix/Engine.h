@@ -90,6 +90,15 @@ public:
         size_t* out_len
     );
 
+    /// Decompile LLVM IR once and return both emission products plus metrics.
+    /// This is the canonical integration entry point; the two buffer-oriented
+    /// methods above remain for ABI compatibility.
+    HelixStatus decompileIRCombined(
+        const char* ir_text,
+        size_t ir_len,
+        DecompileOutput& output
+    );
+
     /// Set whether to skip optimization passes in the pipeline.
     /// Must be called BEFORE the first decompile call (pipeline is lazily built).
     /// Controls Tier 2.5 passes (magic division, devirtualization).
@@ -242,6 +251,22 @@ int helix_engine_decompile_ir_text(
     size_t ir_len,
     char* out_buf,
     size_t* out_len
+);
+
+/// Decompile LLVM IR exactly once and return both pseudo-C and HAST.
+/// Buffers in `output` are engine-allocated and must be released with
+/// `helix_engine_free_decompile_output`, including after partial failure.
+int helix_engine_decompile_ir_combined(
+    HelixEngineHandle* engine,
+    const char* ir_text,
+    size_t ir_len,
+    HelixCombinedDecompileOutput* output
+);
+
+/// Release buffers returned by `helix_engine_decompile_ir_combined` and reset
+/// every field to zero/null. Safe to call on an empty output.
+void helix_engine_free_decompile_output(
+    HelixCombinedDecompileOutput* output
 );
 
 /// Set whether to skip optimization passes. Call before first decompile.

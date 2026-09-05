@@ -30,6 +30,42 @@ pub struct HelixEngineHandle {
     _opaque: [u8; 0],
 }
 
+/// Owned output returned by the combined C ABI. The pointers remain owned by
+/// C++ until `helix_engine_free_decompile_output` is called.
+#[repr(C)]
+struct HelixCombinedDecompileOutput {
+    pseudo_c: *mut c_char,
+    pseudo_c_len: usize,
+    flatbuffer: *mut u8,
+    flatbuffer_len: usize,
+    function_count: u32,
+    block_count: u32,
+    instruction_count: u32,
+}
+
+impl Default for HelixCombinedDecompileOutput {
+    fn default() -> Self {
+        Self {
+            pseudo_c: ptr::null_mut(),
+            pseudo_c_len: 0,
+            flatbuffer: ptr::null_mut(),
+            flatbuffer_len: 0,
+            function_count: 0,
+            block_count: 0,
+            instruction_count: 0,
+        }
+    }
+}
+
+/// Safe Rust representation of one combined MLIR pipeline result.
+pub struct CombinedDecompileOutput {
+    pub pseudo_c: String,
+    pub flatbuffer: Vec<u8>,
+    pub function_count: u32,
+    pub block_count: u32,
+    pub instruction_count: u32,
+}
+
 // ─── C API Declarations ────────────────────────────────────────────────────────
 
 extern "C" {
@@ -71,6 +107,17 @@ extern "C" {
         out_buf: *mut c_char,
         out_len: *mut usize,
     ) -> c_int;
+
+    /// Decompile LLVM IR once, returning pseudo-C, HAST, and final IR metrics.
+    fn helix_engine_decompile_ir_combined(
+        engine: *mut HelixEngineHandle,
+        ir_text: *const c_char,
+        ir_len: usize,
+        output: *mut HelixCombinedDecompileOutput,
+    ) -> c_int;
+
+    /// Release every buffer in a combined output and reset it.
+    fn helix_engine_free_decompile_output(output: *mut HelixCombinedDecompileOutput);
 
     /// Set whether to skip optimization passes. Call before first decompile.
     /// skip=1 skips, skip=0 enables (default).
@@ -374,6 +421,69 @@ impl EngineHandle {
                 "Engine output exceeded configured buffer growth policy (max {} bytes)",
                 MAX_OUTPUT_CAPACITY
             ),
+        })
+    }
+
+    /// Run the MLIR pipeline once and retrieve both emission products plus
+    /// metrics derived from the final legalized IR.
+    pub fn decompile_ir_combined(&mut self, ir_text: &str) -> HelixResult<CombinedDecompileOutput> {
+        let mut output = HelixCombinedDecompileOutput::default();
+        let status = unsafe {
+            helix_engine_decompile_ir_combined(
+                self.handle,
+                ir_text.as_ptr() as *const c_char,
+                ir_text.len(),
+                &mut output,
+            )
+        };
+        let status = HelixStatus::from(status);
+        if status != HelixStatus::Ok {
+            unsafe { helix_engine_free_decompile_output(&mut output) };
+            let msg = self.last_error().unwrap_or_else(|| status.to_string());
+            return Err(HelixError::Ffi {
+                status_code: status as i32,
+                message: msg,
+            });
+        }
+
+        let invalid_pointers = (output.pseudo_c.is_null() && output.pseudo_c_len != 0)
+            || (output.flatbuffer.is_null() && output.flatbuffer_len != 0);
+        if invalid_pointers {
+            unsafe { helix_engine_free_decompile_output(&mut output) };
+            return Err(HelixError::Ffi {
+                status_code: HelixStatus::ErrorInternal as i32,
+                message: "Engine returned a null combined-output buffer".to_string(),
+            });
+        }
+
+        let pseudo_bytes = if output.pseudo_c_len == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(output.pseudo_c as *const u8, output.pseudo_c_len)
+                    .to_vec()
+            }
+        };
+        let flatbuffer = if output.flatbuffer_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(output.flatbuffer, output.flatbuffer_len).to_vec() }
+        };
+        let function_count = output.function_count;
+        let block_count = output.block_count;
+        let instruction_count = output.instruction_count;
+        unsafe { helix_engine_free_decompile_output(&mut output) };
+
+        let pseudo_c = String::from_utf8(pseudo_bytes).map_err(|error| HelixError::Ffi {
+            status_code: HelixStatus::ErrorInternal as i32,
+            message: format!("Engine returned invalid UTF-8: {}", error),
+        })?;
+        Ok(CombinedDecompileOutput {
+            pseudo_c,
+            flatbuffer,
+            function_count,
+            block_count,
+            instruction_count,
         })
     }
 

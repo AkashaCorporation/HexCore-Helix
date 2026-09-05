@@ -1,9 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(helix_engine
-    VERSION 0.9.3
+    VERSION 0.9.4
     LANGUAGES CXX C
     DESCRIPTION "HexCore Helix Decompilation Engine — C++23/MLIR 3-Tier Architecture"
 )
+
+# Keep prerelease identity aligned with the package without using a nonnumeric
+# CMake project version. CMake 3.20 provides a structured JSON reader.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../package.json" HELIX_PACKAGE_JSON)
+string(JSON HELIX_RELEASE_VERSION GET "${HELIX_PACKAGE_JSON}" version)
 
 # ─── C++23 Standard ─────────────────────────────────────────────────────────────
 
@@ -49,6 +54,7 @@ if(HELIX_USE_LLVM)
     include(${MLIR_DIR}/AddMLIR.cmake OPTIONAL)
 
     set(HELIX_TABLEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dialects)
+    file(GLOB HELIX_TABLEGEN_INPUTS CONFIGURE_DEPENDS "${HELIX_TABLEGEN_DIR}/*.td")
     set(HELIX_TABLEGEN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/helix/dialects)
     set(HELIX_IFACE_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/helix)
 
@@ -82,14 +88,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Ops.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-op-decls ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Ops.h.inc
-                DEPENDS ${_OPS_TD_PATH}
+                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} op declarations"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Ops.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-op-defs ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Ops.cpp.inc
-                DEPENDS ${_OPS_TD_PATH}
+                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} op definitions"
             )
 
@@ -98,14 +104,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Dialect.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-decls ${TBLGEN_INCLUDES}
                     ${_DIALECT_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Dialect.h.inc
-                DEPENDS ${_DIALECT_TD_PATH}
+                DEPENDS ${_DIALECT_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} dialect declaration"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Dialect.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-defs ${TBLGEN_INCLUDES}
                     ${_DIALECT_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Dialect.cpp.inc
-                DEPENDS ${_DIALECT_TD_PATH}
+                DEPENDS ${_DIALECT_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} dialect definition"
             )
 
@@ -114,14 +120,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Enums.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-decls ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Enums.h.inc
-                DEPENDS ${_OPS_TD_PATH}
+                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} enum declarations"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Enums.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-defs ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Enums.cpp.inc
-                DEPENDS ${_OPS_TD_PATH}
+                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} enum definitions"
             )
 
@@ -130,14 +136,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Types.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-decls ${TBLGEN_INCLUDES}
                     ${_TYPES_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Types.h.inc
-                DEPENDS ${_TYPES_TD_PATH}
+                DEPENDS ${_TYPES_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} type declarations"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Types.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-defs ${TBLGEN_INCLUDES}
                     ${_TYPES_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Types.cpp.inc
-                DEPENDS ${_TYPES_TD_PATH}
+                DEPENDS ${_TYPES_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
                 COMMENT "Generating ${DIALECT_NAME} type definitions"
             )
         endmacro()
@@ -153,14 +159,14 @@ if(HELIX_USE_LLVM)
             OUTPUT ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
             COMMAND ${MLIR_TBLGEN_EXE} -gen-op-interface-decls ${TBLGEN_INCLUDES}
                 ${HELIX_IFACE_TD} -o ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
-            DEPENDS ${HELIX_IFACE_TD}
+            DEPENDS ${HELIX_IFACE_TD} ${HELIX_TABLEGEN_INPUTS}
             COMMENT "Generating Helix interface declarations"
         )
         add_custom_command(
             OUTPUT ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
             COMMAND ${MLIR_TBLGEN_EXE} -gen-op-interface-defs ${TBLGEN_INCLUDES}
                 ${HELIX_IFACE_TD} -o ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
-            DEPENDS ${HELIX_IFACE_TD}
+            DEPENDS ${HELIX_IFACE_TD} ${HELIX_TABLEGEN_INPUTS}
             COMMENT "Generating Helix interface definitions"
         )
 
@@ -207,6 +213,8 @@ set(HELIX_SOURCES
     src/Engine.cpp
     src/CApi.cpp
     src/Pipeline.cpp
+    src/Interfaces.cpp
+    src/diagnostics/VerifyAudit.cpp
 
     # Dialects — 3-tier architecture (Low → Mid → High)
     src/dialects/HelixLowDialect.cpp
@@ -223,6 +231,7 @@ set(HELIX_SOURCES
 
     # Analysis — Helix-Nightly
     src/analysis/TypeLattice.cpp               # P1.5 Type lattice
+    src/analysis/TypeEvidence.cpp
     src/analysis/JumpTableAnalysis.cpp         # P0.2 Jump table detection
     src/analysis/DataSectionProvider.cpp       # P0.2 Binary data access
     src/analysis/StructRecovery.cpp            # P1.6 Struct recovery
@@ -243,6 +252,7 @@ set(HELIX_SOURCES
     src/passes/RecoverVariablesFactory.cpp
     src/passes/BindReturnValues.cpp
     src/passes/EliminateDeadCode.cpp
+    src/passes/MemorySlotPilot.cpp
     src/passes/RegisterSSARename.cpp          # FIX-087: per-fn SSA versioning
 
     # Passes — v3.8.0 optimization passes
@@ -306,6 +316,9 @@ set(HELIX_HEADERS
     # Helix-Nightly headers
     include/helix/passes/Patterns.h
     include/helix/analysis/TypeLattice.h
+    include/helix/analysis/TypeEvidence.h
+    include/helix/diagnostics/VerifyAudit.h
+    include/helix/dialects/HelixEffects.h
     include/helix/analysis/JumpTableAnalysis.h
     include/helix/analysis/DataSectionProvider.h
     include/helix/analysis/CallingConventionDb.h
@@ -328,7 +341,7 @@ set(HELIX_HEADERS
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})
-target_compile_definitions(helix_engine PRIVATE HELIX_ENGINE_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(helix_engine PRIVATE HELIX_ENGINE_VERSION="${HELIX_RELEASE_VERSION}")
 
 target_include_directories(helix_engine
     PUBLIC
@@ -422,6 +435,7 @@ endif()
 # ─── FlatBuffers (optional) ──────────────────────────────────────────────────────
 
 set(HELIX_FLATBUFFERS_STATUS "disabled")
+option(HELIX_REQUIRE_FLATBUFFERS "Reject builds without canonical HAST serialization" ON)
 find_package(flatbuffers QUIET)
 if(flatbuffers_FOUND)
     message(STATUS "Found FlatBuffers (package) -- enabling real serialization")
@@ -438,7 +452,10 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include/flatbuffers/
     target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
     set(HELIX_FLATBUFFERS_STATUS "vendored")
 else()
-    message(STATUS "FlatBuffers not found -- stub HAST serialization (HQL gets module name only).")
+    if(HELIX_REQUIRE_FLATBUFFERS)
+        message(FATAL_ERROR "FlatBuffers is required for canonical HAST; vendor headers before configuring.")
+    endif()
+    message(WARNING "FlatBuffers not found -- canonical HAST serialization will fail closed.")
     message(STATUS "  To enable: run  bash engine/vendor_flatbuffers.sh  then reconfigure.")
 endif()
 
