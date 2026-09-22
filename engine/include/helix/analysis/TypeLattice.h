@@ -91,7 +91,8 @@ public:
     static HelixTypeInfo makeBool();
     static HelixTypeInfo makeInt(unsigned bits, bool isSigned);
     static HelixTypeInfo makeFloat(unsigned bits);
-    static HelixTypeInfo makePointer(HelixTypeInfo pointee = {});
+    static HelixTypeInfo makePointer();
+    static HelixTypeInfo makePointer(HelixTypeInfo pointee);
     static HelixTypeInfo makeArray(HelixTypeInfo element, uint64_t length);
     static HelixTypeInfo makeStruct(std::string name,
                                      std::vector<FieldInfo> fields);
