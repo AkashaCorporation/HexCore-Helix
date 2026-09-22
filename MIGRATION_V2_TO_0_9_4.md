@@ -36,6 +36,8 @@ with SHA-256
   being linked through fallback discovery.
 - Kept legacy Rust-pipeline-only helpers feature-gated so canonical Clippy
   remains warning-free.
+- Restored dependent-template qualification in generated MLIR interfaces; the
+  Windows build and the GCC/Linux PR lane compile the same TableGen contract.
 
 ## Acceptance
 
@@ -48,13 +50,13 @@ with SHA-256
 - Smoke pseudo-C and HAST were non-empty and deterministic across fresh engine
   instances.
 - Windows x64 addon SHA-256:
-  `C16F6FB7197F1CA2AA1A9EBC483199C4EEF2100027A9B9CEB9CFAD8FAA180842`.
+  `6400FCC56D2A7F889EE60CDC6E24829EE05E92EE57B7CACA8DA5C1F194E3ABA8`.
 - The addon was loaded and exercised from an isolated artifact directory,
   outside both source trees.
 
 ## Remaining Release Gates
 
-The local evidence does not publish or qualify a GitHub artifact. The branch
-must still be reviewed/pushed, receive its version-matched dependency bundle,
-pass GitHub Actions, and be consumed by an extracted HexCore 3.8.5 candidate.
+The source branch is published for review in PR #18, but no tag/release asset
+has been published. It must still receive its version-matched dependency
+bundle, pass GitHub Actions, and be consumed by an extracted HexCore 3.8.5 candidate.
 Stable `0.9.4` remains reserved until those gates pass.
