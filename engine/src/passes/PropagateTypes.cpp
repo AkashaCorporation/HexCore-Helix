@@ -265,7 +265,11 @@ struct CTypeInfo {
         return t;
     }
 
-    static CTypeInfo makePointer(CTypeInfo pointeeType = {}) {
+    static CTypeInfo makePointer() {
+        return makePointer(CTypeInfo{});
+    }
+
+    static CTypeInfo makePointer(CTypeInfo pointeeType) {
         CTypeInfo t;
         t.kind = Pointer;
         t.bit_width = 64;
@@ -2949,7 +2953,7 @@ private:
                         // attribute set by an earlier pass.
                         if (!isTypeLocked(retVal, lockedValues)) {
                             if (auto retTypeAttr =
-                                    func->getAttrOfType<StringAttr>(
+                                    func->template getAttrOfType<StringAttr>(
                                         "inferred_return_type")) {
                                 CTypeInfo retType =
                                     typeFromSignatureStr(retTypeAttr.getValue());
