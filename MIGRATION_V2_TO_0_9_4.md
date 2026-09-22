@@ -50,7 +50,10 @@ with SHA-256
 - Smoke pseudo-C and HAST were non-empty and deterministic across fresh engine
   instances.
 - Windows x64 addon SHA-256:
-  `6400FCC56D2A7F889EE60CDC6E24829EE05E92EE57B7CACA8DA5C1F194E3ABA8`.
+  `D2E2F000D7B8EB74044FFF34A1E2A67F1859392E2B8C7760AA5AA0B9649F4DC0`.
+- Clean-build engine tree:
+  `427602F3919C655ECF480BD1E756796FE6716A30`; static library SHA-256:
+  `8C7DCCC9F69EBCE0EAB0A59D37DEA5E831520269A73F8ED38586DD924952ADF5`.
 - The addon was loaded and exercised from an isolated artifact directory,
   outside both source trees.
 
