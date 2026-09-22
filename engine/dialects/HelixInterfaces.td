@@ -36,7 +36,7 @@ def HelixAddressableOpInterface : OpInterface<"HelixAddressableOp"> {
       "std::optional<uint64_t>", "getSourceAddress", (ins),
       /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
-        auto attr = $_op->getAttrOfType<mlir::IntegerAttr>("address");
+        auto attr = $_op->template getAttrOfType<mlir::IntegerAttr>("address");
         if (!attr) return std::nullopt;
         return attr.getUInt();
       }]
@@ -93,7 +93,7 @@ def HelixDecompilableOpInterface : OpInterface<"HelixDecompilableOp"> {
       "uint64_t", "getEntryAddress", (ins),
       /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
-        return $_op->getAttrOfType<mlir::IntegerAttr>("entry_address").getUInt();
+        return $_op->template getAttrOfType<mlir::IntegerAttr>("entry_address").getUInt();
       }]
     >,
     InterfaceMethod<
@@ -101,7 +101,7 @@ def HelixDecompilableOpInterface : OpInterface<"HelixDecompilableOp"> {
       "std::optional<llvm::StringRef>", "getOriginalName", (ins),
       /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
-        auto attr = $_op->getAttrOfType<mlir::StringAttr>("original_name");
+        auto attr = $_op->template getAttrOfType<mlir::StringAttr>("original_name");
         if (!attr) return std::nullopt;
         return attr.getValue();
       }]
