@@ -1998,12 +1998,6 @@ private:
             {
                 llvm::SmallVector<helix::high::AssignOp, 16> allAssigns;
                 llvm::SmallVector<helix::high::AssignOp, 16> deadAssigns;
-                llvm::SmallVector<Operation*, 32> orphanDefs;
-                llvm::SmallPtrSet<Operation*, 32> seenOrphanDefs;
-                auto rememberOrphanDef = [&](Operation* op) {
-                    if (op && seenOrphanDefs.insert(op).second)
-                        orphanDefs.push_back(op);
-                };
                 funcBody.walk([&](helix::high::AssignOp assignOp) {
                     allAssigns.push_back(assignOp);
                 });
@@ -2080,13 +2074,11 @@ private:
                     // just because their result became unused.  A call
                     // like `sub_foo()` whose return value is ignored
                     // still needs to emit for its side effects.
-                    rememberOrphanDef(rhsDef);
-                    rememberOrphanDef(lhsOp);
-                }
-
-                for (Operation* op : orphanDefs) {
-                    if (op->use_empty() && !isSideEffectingRhs(op))
-                        op->erase();
+                    if (rhsDef && rhsDef->use_empty() &&
+                        !isSideEffectingRhs(rhsDef))
+                        rhsDef->erase();
+                    if (lhsOp && lhsOp->use_empty())
+                        lhsOp->erase();
                 }
             }
 

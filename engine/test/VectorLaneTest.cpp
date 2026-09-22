@@ -8,6 +8,8 @@
 #include "helix/dialects/HelixHighOps.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
 
@@ -16,6 +18,47 @@
 #include <string>
 
 using namespace helix;
+
+TEST(CAstBuilderTest, KeepsDefinitionReadInsideNativeScfBeforeOverwrite) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<high::HelixHighDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto func = b.create<high::FuncOp>(loc, "structured_store", 0x1000,
+        b.getFunctionType({}, {}), mlir::StringAttr{}, mlir::UnitAttr{},
+        mlir::ArrayAttr{}, mlir::ArrayAttr{});
+    auto* block = b.createBlock(&func.getBody());
+    b.setInsertionPointToEnd(block);
+    b.create<high::VarDeclOp>(loc, 1, "result", high::StorageKind::Register,
+        mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+    auto ref = [&]() { return b.create<high::VarRefOp>(loc, b.getI64Type(), 1,
+        b.getStringAttr("result"), mlir::IntegerAttr{}).getResult(); };
+    auto seven = b.create<mlir::arith::ConstantIntOp>(loc, 7, 64);
+    b.create<high::AssignOp>(loc, ref(), seven.getResult(), mlir::IntegerAttr{});
+    auto condition = b.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+    auto branch = b.create<mlir::scf::IfOp>(loc, mlir::TypeRange{}, condition.getResult());
+    b.setInsertionPointToStart(b.createBlock(&branch.getThenRegion()));
+    auto pointer = b.create<high::VarRefOp>(loc, b.getI64Type(), 2,
+        b.getStringAttr("destination"), mlir::IntegerAttr{});
+    auto deref = b.create<high::UnaryOp>(loc, b.getI64Type(), high::UnaryOpKind::Deref,
+        pointer.getResult(), mlir::IntegerAttr{});
+    b.create<high::AssignOp>(loc, deref.getResult(), ref(), mlir::IntegerAttr{});
+    b.create<mlir::scf::YieldOp>(loc);
+    b.setInsertionPointToEnd(block);
+    auto seventeen = b.create<mlir::arith::ConstantIntOp>(loc, 17, 64);
+    b.create<high::AssignOp>(loc, ref(), seventeen.getResult(), mlir::IntegerAttr{});
+    b.create<high::ReturnOp>(loc, ref(), mlir::IntegerAttr{});
+    cast::CAstBuilder astBuilder;
+    auto declaration = astBuilder.buildFunction(func.getOperation());
+    ASSERT_NE(declaration, nullptr);
+    const auto code = cast::CAstPrinter().print(*declaration);
+    const auto initial = code.find("result = 7;");
+    ASSERT_NE(initial, std::string::npos) << code;
+    EXPECT_LT(initial, code.find("if (")) << code;
+    EXPECT_NE(code.find("result = 17;"), std::string::npos) << code;
+}
 
 TEST(VectorLaneTest, LaneZeroOfScalarizedVectorIsNotSubscripted) {
     mlir::MLIRContext ctx;

@@ -6,7 +6,6 @@
 #define HELIX_INTERFACES_H
 
 #include "mlir/IR/OpDefinition.h"
-#include "mlir/IR/BuiltinTypes.h"
 
 // TableGen-generated interface declarations
 #include "helix/HelixInterfaces.h.inc"

@@ -505,6 +505,65 @@ TEST(RecoverVariablesTest, ReusesResultInsideNativeScfRegions) {
     EXPECT_EQ(resultAssignments, 2u);
 }
 
+TEST(RecoverVariablesTest, VoidCallCannotTypeLaterRegisterValueAsVoid) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto func = builder.create<helix::low::FuncOp>(loc, "saved_over_void", 0x1000, mlir::StringAttr{});
+    func->setAttr("has_return_value", builder.getUnitAttr());
+    func->setAttr("calling_convention", builder.getStringAttr("sysv"));
+    func->setAttr("inferred_return_type", builder.getStringAttr("uint64_t"));
+    builder.setInsertionPointToStart(builder.createBlock(&func.getBody()));
+    auto input = builder.create<helix::low::RegReadOp>(loc, builder.getI64Type(), "RDI", 64, mlir::IntegerAttr{});
+    builder.create<helix::low::RegWriteOp>(loc, input.getResult(), "RBX", 64, mlir::IntegerAttr{});
+    auto target = builder.create<mlir::LLVM::ConstantOp>(loc, builder.getI64Type(), builder.getI64IntegerAttr(0x2000));
+    auto call = builder.create<helix::low::CallOp>(loc, mlir::TypeRange{builder.getI64Type()}, target.getResult(),
+        mlir::ValueRange{}, builder.getStringAttr("opaque_callback"), mlir::IntegerAttr{});
+    call->setAttr("inferred_type", builder.getStringAttr("void"));
+    call->setAttr("inferred_return_type", builder.getStringAttr("void"));
+    builder.create<helix::low::RegWriteOp>(loc, call.getResult(), "RAX", 64, mlir::IntegerAttr{});
+    auto saved = builder.create<helix::low::RegReadOp>(loc, builder.getI64Type(), "RBX", 64, mlir::IntegerAttr{});
+    saved->setAttr("inferred_type", builder.getStringAttr("int64_t"));
+    builder.create<helix::low::RegWriteOp>(loc, saved.getResult(), "RAX", 64, mlir::IntegerAttr{});
+    builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+    mlir::PassManager pm(&ctx);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+    mlir::PassManager returns(&ctx);
+    returns.addPass(helix::createBindReturnValuesPass());
+    ASSERT_TRUE(mlir::succeeded(returns.run(module)));
+    unsigned declarations = 0;
+    func.walk([&](helix::high::VarDeclOp decl) {
+        ++declarations;
+        if (auto type = decl->getAttrOfType<mlir::StringAttr>("inferred_type"))
+            EXPECT_NE(type.getValue(), "void");
+    });
+    EXPECT_GT(declarations, 0u);
+    bool voidCall = false;
+    func.walk([&](mlir::Operation* op) {
+        if (!mlir::isa<helix::low::CallOp, helix::high::CallOp>(op)) return;
+        auto type = op->getAttrOfType<mlir::StringAttr>("inferred_return_type");
+        voidCall |= type && type.getValue() == "void";
+    });
+    EXPECT_TRUE(voidCall);
+    unsigned explicitReturns = 0;
+    func.walk([&](helix::high::ReturnOp ret) {
+        auto ref = ret.getValue().getDefiningOp<helix::high::VarRefOp>();
+        ASSERT_TRUE(ref);
+        EXPECT_FALSE(ref.getVarName().empty());
+        ++explicitReturns;
+    });
+    EXPECT_EQ(explicitReturns, 1u);
+    EXPECT_TRUE(mlir::succeeded(mlir::verify(module)));
+}
+
 TEST(RecoverVariablesTest, PreservesDistinctSCFBridgeStorageIdentities) {
     mlir::MLIRContext ctx;
     auto module = buildDisjointSCFBridgeVariables(ctx);
@@ -529,4 +588,472 @@ TEST(RecoverVariablesTest, PreservesDistinctSCFBridgeStorageIdentities) {
     EXPECT_EQ(scfDecls.count("scf_w900001"), 1u);
     EXPECT_EQ(scfDecls.count("scf_w900002"), 1u);
     EXPECT_EQ(scfRefIds.size(), 3u);
+}
+
+TEST(RecoverVariablesTest, NestedReadKeepsEntryValueBeforeLaterReturnWrite) {
+    mlir::MLIRContext ctx;
+    auto module = buildTopLevelAndNativeScfReturnWrites(ctx);
+    mlir::scf::IfOp branch;
+    module->walk([&](mlir::scf::IfOp op) { branch = op; });
+    ASSERT_TRUE(branch);
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    builder.setInsertionPointToStart(&branch.getThenRegion().front());
+    auto read = builder.create<helix::low::RegReadOp>(
+        loc, builder.getI64Type(), "RAX", 64, mlir::IntegerAttr{});
+    auto address = builder.create<mlir::arith::ConstantIntOp>(loc, 0x2000, 64);
+    auto store = builder.create<helix::low::MemWriteOp>(
+        loc, address.getResult(), read.getResult(), 64, mlir::IntegerAttr{});
+    builder.setInsertionPointAfter(branch);
+    auto finalValue = builder.create<mlir::arith::ConstantIntOp>(loc, 17, 64);
+    builder.create<helix::low::RegWriteOp>(
+        loc, finalValue.getResult(), "RAX", 64, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
+    bool entrySeven = false;
+    bool finalSeventeen = false;
+    bool frozenNestedRead = false;
+    auto stored = store.getValue().getDefiningOp<helix::high::VarRefOp>();
+    ASSERT_TRUE(stored);
+    module->walk([&](helix::high::AssignOp assign) {
+        auto target = assign.getTarget().getDefiningOp<helix::high::VarRefOp>();
+        if (!target) return;
+        if (target.getVarName() == "result" && assign->getBlock() == branch->getBlock()) {
+            auto constant = assign.getValue().getDefiningOp<mlir::arith::ConstantIntOp>();
+            if (!constant) return;
+            entrySeven |= constant.value() == 7 && assign->isBeforeInBlock(branch);
+            finalSeventeen |= constant.value() == 17 && branch->isBeforeInBlock(assign);
+        }
+        if (target.getVarId() == stored.getVarId() && assign->getBlock() == store->getBlock()) {
+            auto source = assign.getValue().getDefiningOp<helix::high::VarRefOp>();
+            frozenNestedRead |= source && source.getVarName() == "result" && assign->isBeforeInBlock(store);
+        }
+    });
+    EXPECT_TRUE(entrySeven);
+    EXPECT_TRUE(finalSeventeen);
+    EXPECT_TRUE(frozenNestedRead);
+}
+
+TEST(RecoverVariablesTest, StructuredNonReturnRegisterKeepsComputedReachingValue) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    b.setInsertionPointToEnd(module.getBody());
+    auto func = b.create<helix::low::FuncOp>(loc, "structured_rdx", 0x3100,
+                                             mlir::StringAttr{});
+    func->setAttr("calling_convention", b.getStringAttr("sysv"));
+    func->setAttr("has_return_value", b.getUnitAttr());
+    func->setAttr("reg_param_indices", b.getDenseI32ArrayAttr({5}));
+    auto* block = b.createBlock(&func.getBody());
+    b.setInsertionPointToStart(block);
+    auto input = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "R8", 64, mlir::IntegerAttr{});
+    auto five = b.create<mlir::arith::ConstantIntOp>(loc, 5, 64);
+    auto computed = b.create<mlir::arith::AddIOp>(
+        loc, input.getResult(), five.getResult());
+    b.create<helix::low::RegWriteOp>(
+        loc, computed.getResult(), "RDX", 64, mlir::IntegerAttr{});
+    auto condition = b.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+    auto branch = b.create<mlir::scf::IfOp>(
+        loc, mlir::TypeRange{}, condition.getResult());
+    auto* thenBlock = b.createBlock(&branch.getThenRegion());
+    b.setInsertionPointToStart(thenBlock);
+    auto nestedRead = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto address = b.create<mlir::arith::ConstantIntOp>(loc, 0x2000, 64);
+    auto store = b.create<helix::low::MemWriteOp>(
+        loc, address.getResult(), nestedRead.getResult(), 64,
+        mlir::IntegerAttr{});
+    auto nine = b.create<mlir::arith::ConstantIntOp>(loc, 9, 64);
+    b.create<helix::low::RegWriteOp>(
+        loc, nine.getResult(), "RDX", 64, mlir::IntegerAttr{});
+    b.create<mlir::scf::YieldOp>(loc);
+    auto* elseBlock = b.createBlock(&branch.getElseRegion());
+    b.setInsertionPointToStart(elseBlock);
+    b.create<mlir::scf::YieldOp>(loc);
+    b.setInsertionPointToEnd(block);
+    auto seventeen = b.create<mlir::arith::ConstantIntOp>(loc, 17, 64);
+    b.create<helix::low::RegWriteOp>(
+        loc, seventeen.getResult(), "RDX", 64, mlir::IntegerAttr{});
+    auto twentyThree = b.create<mlir::arith::ConstantIntOp>(loc, 23, 64);
+    b.create<helix::low::RegWriteOp>(
+        loc, twentyThree.getResult(), "RAX", 64, mlir::IntegerAttr{});
+    b.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+    unsigned paramFive = 0, rdxSlots = 0;
+    func.walk([&](helix::high::VarDeclOp decl) {
+        paramFive += decl.getVarName() == "param_5";
+        if (auto slot = decl->getAttrOfType<mlir::StringAttr>(
+                "helix.region_register_slot"))
+            rdxSlots += slot.getValue() == "RDX";
+    });
+    EXPECT_EQ(paramFive, 1u);
+    EXPECT_EQ(rdxSlots, 0u);
+    auto stored = store.getValue().getDefiningOp<helix::high::VarRefOp>();
+    ASSERT_TRUE(stored);
+    EXPECT_NE(stored.getVarName(), "param_5");
+    bool assignedComputedValue = false;
+    func.walk([&](helix::high::AssignOp assign) {
+        auto target = assign.getTarget().getDefiningOp<helix::high::VarRefOp>();
+        assignedComputedValue |= target &&
+            target.getVarId() == stored.getVarId() &&
+            assign.getValue() == computed.getResult();
+    });
+    EXPECT_TRUE(assignedComputedValue);
+}
+
+TEST(RecoverVariablesTest, NestedParameterReadBeforeWriteKeepsEntryIdentity) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    b.setInsertionPointToEnd(module.getBody());
+    auto func = b.create<helix::low::FuncOp>(
+        loc, "nested_parameter_lifetime", 0x3150, mlir::StringAttr{});
+    func->setAttr("calling_convention", b.getStringAttr("sysv"));
+    func->setAttr("reg_param_indices", b.getDenseI32ArrayAttr({3}));
+    auto* block = b.createBlock(&func.getBody());
+    b.setInsertionPointToStart(block);
+    auto condition = b.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+    auto branch = b.create<mlir::scf::IfOp>(
+        loc, mlir::TypeRange{}, condition.getResult());
+    auto* thenBlock = b.createBlock(&branch.getThenRegion());
+    b.setInsertionPointToStart(thenBlock);
+    auto entryRead = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto entryLoad = b.create<helix::low::MemReadOp>(
+        loc, b.getI64Type(), entryRead.getResult(), 64,
+        mlir::IntegerAttr{});
+    auto replacement = b.create<mlir::arith::ConstantIntOp>(
+        loc, 0x8000, 64);
+    b.create<helix::low::RegWriteOp>(
+        loc, replacement.getResult(), "RDX", 64, mlir::IntegerAttr{});
+    auto lateReadA = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto lateReadB = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto sink = b.create<mlir::arith::ConstantIntOp>(loc, 0x9000, 64);
+    auto lateStoreA = b.create<helix::low::MemWriteOp>(
+        loc, sink.getResult(), lateReadA.getResult(), 64,
+        mlir::IntegerAttr{});
+    auto lateStoreB = b.create<helix::low::MemWriteOp>(
+        loc, sink.getResult(), lateReadB.getResult(), 64,
+        mlir::IntegerAttr{});
+    b.create<mlir::scf::YieldOp>(loc);
+    auto* elseBlock = b.createBlock(&branch.getElseRegion());
+    b.setInsertionPointToStart(elseBlock);
+    b.create<mlir::scf::YieldOp>(loc);
+    b.setInsertionPointToEnd(block);
+    b.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    auto entryRef = entryLoad.getAddr()
+        .getDefiningOp<helix::high::VarRefOp>();
+    auto lateRefA = lateStoreA.getValue()
+        .getDefiningOp<helix::high::VarRefOp>();
+    auto lateRefB = lateStoreB.getValue()
+        .getDefiningOp<helix::high::VarRefOp>();
+    ASSERT_TRUE(entryRef);
+    ASSERT_TRUE(lateRefA);
+    ASSERT_TRUE(lateRefB);
+    EXPECT_EQ(entryRef.getVarName(), "param_3");
+    EXPECT_NE(lateRefA.getVarId(), entryRef.getVarId());
+    EXPECT_EQ(lateRefA.getVarId(), lateRefB.getVarId());
+    EXPECT_NE(lateRefA.getVarName(), "param_3");
+}
+
+TEST(RecoverVariablesTest, LoopEntryReadUsesLoopCarriedParameterShadow) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    b.setInsertionPointToEnd(module.getBody());
+    auto func = b.create<helix::low::FuncOp>(
+        loc, "loop_parameter_shadow", 0x3180, mlir::StringAttr{});
+    func->setAttr("calling_convention", b.getStringAttr("sysv"));
+    func->setAttr("reg_param_indices", b.getDenseI32ArrayAttr({3}));
+    auto* block = b.createBlock(&func.getBody());
+    b.setInsertionPointToStart(block);
+    auto loop = b.create<mlir::scf::WhileOp>(
+        loc, mlir::TypeRange{}, mlir::ValueRange{});
+    auto* before = b.createBlock(&loop.getBefore());
+    b.setInsertionPointToStart(before);
+    auto condition = b.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+    b.create<mlir::scf::ConditionOp>(
+        loc, condition.getResult(), mlir::ValueRange{});
+    auto* body = b.createBlock(&loop.getAfter());
+    b.setInsertionPointToStart(body);
+    auto entryRead = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto sink = b.create<mlir::arith::ConstantIntOp>(loc, 0x9000, 64);
+    auto store = b.create<helix::low::MemWriteOp>(
+        loc, sink.getResult(), entryRead.getResult(), 64,
+        mlir::IntegerAttr{});
+    auto replacement = b.create<mlir::arith::ConstantIntOp>(loc, 9, 64);
+    b.create<helix::low::RegWriteOp>(
+        loc, replacement.getResult(), "RDX", 64, mlir::IntegerAttr{});
+    b.create<mlir::scf::YieldOp>(loc);
+    b.setInsertionPointToEnd(block);
+    b.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    auto stored = store.getValue()
+        .getDefiningOp<helix::high::VarRefOp>();
+    ASSERT_TRUE(stored);
+    EXPECT_NE(stored.getVarName(), "param_3");
+    bool initializedFromParameter = false;
+    func.walk([&](helix::high::AssignOp assign) {
+        auto target = assign.getTarget()
+            .getDefiningOp<helix::high::VarRefOp>();
+        auto source = assign.getValue()
+            .getDefiningOp<helix::high::VarRefOp>();
+        initializedFromParameter |= target && source &&
+            target.getVarId() == stored.getVarId() &&
+            source.getVarName() == "param_3";
+    });
+    EXPECT_TRUE(initializedFromParameter);
+}
+
+TEST(RecoverVariablesTest, AbiParameterEntryValueDoesNotAbsorbLaterRegisterLifetime) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    b.setInsertionPointToEnd(module.getBody());
+    auto func = b.create<helix::low::FuncOp>(
+        loc, "abi_parameter_lifetime", 0x3200, mlir::StringAttr{});
+    func->setAttr("calling_convention", b.getStringAttr("sysv"));
+    func->setAttr("reg_param_indices", b.getDenseI32ArrayAttr({3}));
+    b.setInsertionPointToStart(b.createBlock(&func.getBody()));
+
+    auto input = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto one = b.create<mlir::arith::ConstantIntOp>(loc, 1, 64);
+    auto scalarUse = b.create<mlir::arith::AddIOp>(
+        loc, input.getResult(), one.getResult());
+    auto sink = b.create<mlir::arith::ConstantIntOp>(loc, 0x5000, 64);
+    b.create<helix::low::MemWriteOp>(
+        loc, sink.getResult(), scalarUse.getResult(), 64,
+        mlir::IntegerAttr{});
+
+    auto callee =
+        b.create<mlir::arith::ConstantIntOp>(loc, 0x7000, 64);
+    auto pointerValue = b.create<helix::low::CallOp>(
+        loc, mlir::TypeRange{b.getI64Type()}, callee.getResult(),
+        mlir::ValueRange{}, b.getStringAttr("sub_7000"),
+        mlir::IntegerAttr{});
+    b.create<helix::low::RegWriteOp>(
+        loc, pointerValue.getResult(), "RDX", 64, mlir::IntegerAttr{});
+    auto later = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RDX", 64, mlir::IntegerAttr{});
+    auto load = b.create<helix::low::MemReadOp>(
+        loc, b.getI64Type(), later.getResult(), 64, mlir::IntegerAttr{});
+    b.create<helix::low::MemReadOp>(
+        loc, b.getI64Type(), later.getResult(), 64, mlir::IntegerAttr{});
+    b.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    auto parameterRef = scalarUse.getLhs()
+        .getDefiningOp<helix::high::VarRefOp>();
+    auto laterRef = load.getAddr()
+        .getDefiningOp<helix::high::VarRefOp>();
+    ASSERT_TRUE(parameterRef);
+    ASSERT_TRUE(laterRef);
+    EXPECT_EQ(parameterRef.getVarName(), "param_3");
+    EXPECT_NE(laterRef.getVarId(), parameterRef.getVarId());
+    EXPECT_NE(laterRef.getVarName(), "param_3");
+
+    helix::high::StorageKind laterStorage =
+        helix::high::StorageKind::Parameter;
+    func.walk([&](helix::high::VarDeclOp decl) {
+        if (decl.getVarId() == laterRef.getVarId())
+            laterStorage = decl.getStorage();
+    });
+    EXPECT_EQ(laterStorage, helix::high::StorageKind::Register);
+}
+
+TEST(RecoverVariablesTest, DirectParameterCopySurvivesCoverBasedMerging) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    b.setInsertionPointToEnd(module.getBody());
+    auto func = b.create<helix::low::FuncOp>(
+        loc, "parameter_copy_cover", 0x3300, mlir::StringAttr{});
+    func->setAttr("calling_convention", b.getStringAttr("sysv"));
+    func->setAttr("reg_param_indices", b.getDenseI32ArrayAttr({2}));
+    auto* parameterBlock = b.createBlock(&func.getBody());
+    auto* unrelatedBlock = b.createBlock(&func.getBody());
+
+    b.setInsertionPointToStart(parameterBlock);
+    auto offsetA = b.create<mlir::LLVM::ConstantOp>(
+        loc, b.getI64Type(), b.getI64IntegerAttr(8));
+    auto parameter = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RSI", 64, mlir::IntegerAttr{});
+    b.create<helix::low::RegWriteOp>(
+        loc, parameter.getResult(), "R15", 64, mlir::IntegerAttr{});
+    auto alias = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "R15", 64, mlir::IntegerAttr{});
+    auto addressA = b.create<mlir::LLVM::AddOp>(
+        loc, alias.getResult(), offsetA.getResult());
+    auto loadA = b.create<helix::low::MemReadOp>(
+        loc, b.getI64Type(), addressA.getResult(), 64,
+        mlir::IntegerAttr{});
+    b.create<helix::low::JmpOp>(
+        loc, mlir::ValueRange{}, mlir::IntegerAttr{}, mlir::IntegerAttr{},
+        unrelatedBlock);
+
+    b.setInsertionPointToStart(unrelatedBlock);
+    auto calleeB = b.create<mlir::LLVM::ConstantOp>(
+        loc, b.getI64Type(), b.getI64IntegerAttr(0x9000));
+    auto baseB = b.create<helix::low::CallOp>(
+        loc, mlir::TypeRange{b.getI64Type()}, calleeB.getResult(),
+        mlir::ValueRange{}, b.getStringAttr("sub_9000"),
+        mlir::IntegerAttr{});
+    auto offsetB = b.create<mlir::LLVM::ConstantOp>(
+        loc, b.getI64Type(), b.getI64IntegerAttr(16));
+    b.create<helix::low::RegWriteOp>(
+        loc, baseB.getResult(), "R14", 64, mlir::IntegerAttr{});
+    auto unrelated = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "R14", 64, mlir::IntegerAttr{});
+    auto addressB = b.create<mlir::LLVM::AddOp>(
+        loc, unrelated.getResult(), offsetB.getResult());
+    auto loadB = b.create<helix::low::MemReadOp>(
+        loc, b.getI64Type(), addressB.getResult(), 64,
+        mlir::IntegerAttr{});
+    b.create<helix::low::MemReadOp>(
+        loc, b.getI64Type(), unrelated.getResult(), 64,
+        mlir::IntegerAttr{});
+    b.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    auto findAddressVar = [](mlir::Value address) {
+        auto add = address.getDefiningOp<mlir::LLVM::AddOp>();
+        if (!add)
+            return helix::high::VarRefOp{};
+        for (mlir::Value operand : add->getOperands()) {
+            if (auto ref = operand.getDefiningOp<helix::high::VarRefOp>())
+                return ref;
+        }
+        return helix::high::VarRefOp{};
+    };
+    auto aliasRef = findAddressVar(loadA.getAddr());
+    auto unrelatedRef = findAddressVar(loadB.getAddr());
+    ASSERT_TRUE(aliasRef);
+    ASSERT_TRUE(unrelatedRef);
+    EXPECT_NE(aliasRef.getVarId(), unrelatedRef.getVarId());
+
+    bool aliasInitializedFromParameter = false;
+    func.walk([&](helix::high::AssignOp assign) {
+        auto target = assign.getTarget()
+            .getDefiningOp<helix::high::VarRefOp>();
+        auto source = assign.getValue()
+            .getDefiningOp<helix::high::VarRefOp>();
+        aliasInitializedFromParameter |= target && source &&
+            target.getVarId() == aliasRef.getVarId() &&
+            source.getVarName() == "param_2";
+    });
+    EXPECT_TRUE(aliasInitializedFromParameter ||
+                aliasRef.getVarName() == "param_2");
+}
+
+TEST(RecoverVariablesTest, ReturnRegisterParameterCaptureDoesNotHideCallResult) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    b.setInsertionPointToEnd(module.getBody());
+    auto func = b.create<helix::low::FuncOp>(
+        loc, "return_after_parameter_capture", 0x3400,
+        mlir::StringAttr{});
+    func->setAttr("calling_convention", b.getStringAttr("sysv"));
+    func->setAttr("has_return_value", b.getUnitAttr());
+    func->setAttr("reg_param_indices", b.getDenseI32ArrayAttr({2}));
+    b.setInsertionPointToStart(b.createBlock(&func.getBody()));
+
+    auto input = b.create<helix::low::RegReadOp>(
+        loc, b.getI64Type(), "RSI", 64, mlir::IntegerAttr{});
+    b.create<helix::low::RegWriteOp>(
+        loc, input.getResult(), "RAX", 64, mlir::IntegerAttr{});
+    auto scratch = b.create<mlir::arith::ConstantIntOp>(loc, 99, 64);
+    b.create<helix::low::RegWriteOp>(
+        loc, scratch.getResult(), "RAX", 64, mlir::IntegerAttr{});
+    auto target = b.create<mlir::arith::ConstantIntOp>(loc, 0x2000, 64);
+    auto call = b.create<helix::low::CallOp>(
+        loc, mlir::TypeRange{b.getI64Type()}, target.getResult(),
+        mlir::ValueRange{}, b.getStringAttr("sub_2000"),
+        mlir::IntegerAttr{});
+    b.create<helix::low::RegWriteOp>(
+        loc, call.getResult(), "RAX", 64, mlir::IntegerAttr{});
+    b.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.enableVerifier(true);
+    pm.addPass(helix::createRecoverVariablesPass());
+    pm.addPass(helix::createBindReturnValuesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    unsigned explicitReturns = 0;
+    bool returnedCallResult = false;
+    func.walk([&](helix::high::ReturnOp ret) {
+        ++explicitReturns;
+        auto ref = ret.getValue()
+            .getDefiningOp<helix::high::VarRefOp>();
+        ASSERT_TRUE(ref);
+        func.walk([&](helix::high::AssignOp assign) {
+            auto targetRef = assign.getTarget()
+                .getDefiningOp<helix::high::VarRefOp>();
+            returnedCallResult |= targetRef &&
+                targetRef.getVarId() == ref.getVarId() &&
+                assign.getValue() == call.getResult();
+        });
+    });
+    EXPECT_EQ(explicitReturns, 1u);
+    EXPECT_TRUE(returnedCallResult);
 }

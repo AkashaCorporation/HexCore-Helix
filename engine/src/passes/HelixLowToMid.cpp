@@ -393,6 +393,12 @@ static uint32_t computeSlotIdFromRegOp(Operation* op, llvm::StringRef reg_name) 
     return (name_hash << 16) | (version & 0xFFFFu);
 }
 
+static bool isOpaqueEntryRegister(llvm::StringRef name) {
+    return name == "FSBASE" || name == "GSBASE" ||
+           name == "CSBASE" || name == "SSBASE" ||
+           name == "DSBASE" || name == "ESBASE";
+}
+
 /// Convert helix_low.reg.read → helix_mid.var.ref
 struct RegReadToVarRef : public OpConversionPattern<low::RegReadOp> {
     using OpConversionPattern::OpConversionPattern;
@@ -406,6 +412,17 @@ struct RegReadToVarRef : public OpConversionPattern<low::RegReadOp> {
         // FIX-087: slot_id now encodes (name_hash << 16) | ssa_version,
         // disambiguating distinct logical defs of the same physical register.
         auto reg_name = op.getRegName();
+        const auto version = op->getAttrOfType<IntegerAttr>("ssa_version");
+        if (isOpaqueEntryRegister(reg_name) &&
+            (!version || version.getValue().isZero())) {
+            auto unknown = rewriter.create<mid::UnknownValueOp>(
+                op.getLoc(), result_type,
+                rewriter.getStringAttr(std::format(
+                    "entry register {} unavailable", reg_name.str())),
+                op.getAddressAttr());
+            rewriter.replaceOp(op, unknown.getResult());
+            return success();
+        }
         uint32_t slot_id = computeSlotIdFromRegOp(op.getOperation(), reg_name);
 
         auto new_op = rewriter.create<mid::VarRefOp>(
@@ -1330,7 +1347,8 @@ struct PushToMidStack : public OpConversionPattern<low::PushOp> {
         low::PushOp op, OpAdaptor adaptor,
         ConversionPatternRewriter &rewriter) const override
     {
-        if (op->hasAttr("is_callee_save_push"))
+        if (op->hasAttr("is_callee_save_push") ||
+            op->hasAttr("helix.recovered_stack_argument"))
             rewriter.eraseOp(op);
         else
             rewriter.replaceOpWithNewOp<mid::StackPushOp>(
@@ -1346,7 +1364,8 @@ struct PopToMidStack : public OpConversionPattern<low::PopOp> {
         low::PopOp op, OpAdaptor,
         ConversionPatternRewriter &rewriter) const override
     {
-        if (op->hasAttr("is_callee_save_pop") &&
+        if ((op->hasAttr("is_callee_save_pop") ||
+             op->hasAttr("helix.recovered_stack_argument_cleanup")) &&
             op.getResult().use_empty()) {
             rewriter.eraseOp(op);
         } else {

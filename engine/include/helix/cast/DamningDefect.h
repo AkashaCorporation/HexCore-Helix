@@ -45,9 +45,12 @@
 #include "helix/cast/CStmt.h"
 
 #include "llvm/Support/Casting.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -70,11 +73,13 @@ struct DamningDefectInfo {
     int postReturnCount = 0;            //     how many (for the reason string)
     bool emptyStubBody = false;         // (7) #56: no body or only bare return
     bool explicitUnknown = false;       // (8) localized semantic gap survived
+    bool uninitRead = false;            // (9) intermediate read has no reaching initialization
+    std::string uninitReadVarName;
 
     bool any() const {
         return codeAddrLeak || uninitReturn || irreducibleNoReturn ||
                droppedControlFlow || floatSubscript || postReturnUnreachable ||
-               emptyStubBody || explicitUnknown;
+               emptyStubBody || explicitUnknown || uninitRead;
     }
 
     /// One-line, ASCII, located reason naming the ACTUAL surviving defect(s).
@@ -110,6 +115,8 @@ struct DamningDefectInfo {
             add("stub/empty body; no recovered behavior");
         if (explicitUnknown)
             add("explicit unknown machine semantics survived");
+        if (uninitRead)
+            add("read without any reaching initialization '" + uninitReadVarName + "'");
         return r;
     }
 };
@@ -163,36 +170,59 @@ inline std::string plainVarName(const CExpr* e) {
 // A returned local is genuinely uninitialized if its ONLY assignments sit on
 // provably-dead branches (e.g. `if (!!v1) { v2 = ...; }` where v1 is a const-0
 // local).  We fold a condition against the set of locals that are provably the
-// constant 0 (initialised to 0 and never reassigned), peeling casts and `!`.
-inline bool isProvablyNonzero(const CExpr* e,
-                              const std::unordered_set<std::string>& zeroLocals);
+// constant 0 (initialised to 0 and never reassigned). Integer casts must be
+// evaluated before truth conversion: (uint8_t)256 is zero, not true.
+struct KnownConditionInteger {
+    llvm::APInt bits;
+    bool isSigned;
+};
+
+inline std::optional<KnownConditionInteger> knownConditionInteger(
+        const CExpr* e, const std::unordered_set<std::string>& zeroLocals,
+        unsigned depth = 0) {
+    if (!e || depth >= 64) return std::nullopt;
+    if (auto* literal = llvm::dyn_cast<CIntLitExpr>(e))
+        return KnownConditionInteger{llvm::APInt(64, static_cast<uint64_t>(literal->value)),
+            !literal->type || literal->type->isSigned};
+    if (auto* variable = llvm::dyn_cast<CVarRefExpr>(e)) {
+        if (zeroLocals.count(variable->varName))
+            return KnownConditionInteger{llvm::APInt(64, 0), true};
+        return std::nullopt;
+    }
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(e)) {
+        if (unary->op != UnaryOp::LogNot) return std::nullopt;
+        auto operand = knownConditionInteger(unary->operand.get(), zeroLocals, depth + 1);
+        if (!operand) return std::nullopt;
+        return KnownConditionInteger{llvm::APInt(1, operand->bits.isZero()), false};
+    }
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(e)) {
+        if (!cast->targetType) return std::nullopt;
+        auto operand = knownConditionInteger(cast->operand.get(), zeroLocals, depth + 1);
+        if (!operand) return std::nullopt;
+        const auto& target = *cast->targetType;
+        if (target.kind == TypeKind::Bool)
+            return KnownConditionInteger{llvm::APInt(1, !operand->bits.isZero()), false};
+        if (target.kind == TypeKind::Int && target.bitWidth > 0 && target.bitWidth <= 64)
+            return KnownConditionInteger{
+                operand->isSigned ? operand->bits.sextOrTrunc(target.bitWidth)
+                                  : operand->bits.zextOrTrunc(target.bitWidth),
+                target.isSigned};
+        if ((target.kind == TypeKind::Pointer || target.kind == TypeKind::Float) && operand->bits.isZero())
+            return KnownConditionInteger{llvm::APInt(64, 0), false};
+    }
+    return std::nullopt;
+}
 
 inline bool isProvablyZero(const CExpr* e,
                            const std::unordered_set<std::string>& zeroLocals) {
-    if (!e) return false;
-    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
-        return isProvablyZero(c->operand.get(), zeroLocals);
-    if (auto* lit = llvm::dyn_cast<CIntLitExpr>(e))
-        return lit->value == 0;
-    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e))
-        return zeroLocals.count(v->varName) != 0;
-    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
-        if (u->op == UnaryOp::LogNot)            // !x is zero iff x is nonzero
-            return isProvablyNonzero(u->operand.get(), zeroLocals);
-    return false;
+    const auto value = knownConditionInteger(e, zeroLocals);
+    return value && value->bits.isZero();
 }
 
 inline bool isProvablyNonzero(const CExpr* e,
                               const std::unordered_set<std::string>& zeroLocals) {
-    if (!e) return false;
-    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
-        return isProvablyNonzero(c->operand.get(), zeroLocals);
-    if (auto* lit = llvm::dyn_cast<CIntLitExpr>(e))
-        return lit->value != 0;
-    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
-        if (u->op == UnaryOp::LogNot)            // !x is nonzero iff x is zero
-            return isProvablyZero(u->operand.get(), zeroLocals);
-    return false;
+    const auto value = knownConditionInteger(e, zeroLocals);
+    return value && !value->bits.isZero();
 }
 
 /// Collect whole-variable assignment targets that sit on a REACHABLE path.
@@ -237,7 +267,7 @@ inline void collectLiveAssigned(
 //
 // Keep this deliberately narrow.  We only perform definite-assignment flow on
 // straight-line code, if/else, lexical blocks, and loop bodies. Loop-body
-// assignments are deliberately not propagated to the exit. Switches, gotos,
+// assignments from potentially zero-trip loops are not propagated to the exit. Switches, gotos,
 // labels, break/continue, and inline asm retain the older conservative check.
 // A local whose address is taken is also excluded because a call may initialize
 // it indirectly.  This makes the new detector additive without pretending to
@@ -312,6 +342,10 @@ inline bool supportsDefiniteAssignmentScan(const std::vector<StmtPtr>& body) {
             continue;
         }
         if (auto* loop = llvm::dyn_cast<CForStmt>(s)) {
+            auto simple = [](const CStmt* stmt) {
+                return !stmt || llvm::isa<CAssignStmt, CExprStmt>(stmt);
+            };
+            if (!simple(loop->init.get()) || !simple(loop->step.get())) return false;
             if (!supportsDefiniteAssignmentScan(loop->body))
                 return false;
             continue;
@@ -365,10 +399,107 @@ inline void collectAddressTakenInStmts(
 
 struct DefiniteAssignmentFlow {
     std::unordered_set<std::string> assigned;
+    std::unordered_set<std::string> mayAssigned;
     bool fallsThrough = true;
     bool uninitReturn = false;
     std::string uninitVar;
+    std::string uninitReadVar;
 };
+
+inline std::string firstUninitializedRead(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& assigned,
+        const std::unordered_set<std::string>& candidates,
+        const std::unordered_set<std::string>& addressTaken,
+        const std::unordered_set<std::string>& zeroLocals) {
+    if (!expr) return {};
+    auto check = [&](const CExpr* child) {
+        return firstUninitializedRead(child, assigned, candidates, addressTaken, zeroLocals);
+    };
+    if (auto* ref = llvm::dyn_cast<CVarRefExpr>(expr))
+        return candidates.count(ref->varName) && !assigned.count(ref->varName) &&
+            !addressTaken.count(ref->varName) ? ref->varName : std::string{};
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr)) return check(cast->operand.get());
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(expr)) {
+        // Address-taking itself does not read the stored local value. Indirect
+        // initialization remains outside this alias-safe detector's scope.
+        return unary->op == UnaryOp::AddressOf ? std::string{} : check(unary->operand.get());
+    }
+    if (auto* binary = llvm::dyn_cast<CBinaryExpr>(expr)) {
+        auto left = check(binary->lhs.get());
+        if (!left.empty()) return left;
+        if (binary->op == BinaryOp::LogAnd && isProvablyZero(binary->lhs.get(), zeroLocals)) return {};
+        if (binary->op == BinaryOp::LogOr && isProvablyNonzero(binary->lhs.get(), zeroLocals)) return {};
+        return check(binary->rhs.get());
+    }
+    if (auto* ternary = llvm::dyn_cast<CTernaryExpr>(expr)) {
+        auto condition = check(ternary->cond.get());
+        if (!condition.empty()) return condition;
+        if (!isProvablyZero(ternary->cond.get(), zeroLocals)) {
+            auto yes = check(ternary->trueVal.get());
+            if (!yes.empty()) return yes;
+        }
+        return isProvablyNonzero(ternary->cond.get(), zeroLocals) ? std::string{} : check(ternary->falseVal.get());
+    }
+    if (auto* subscript = llvm::dyn_cast<CSubscriptExpr>(expr)) {
+        auto base = check(subscript->base.get());
+        return base.empty() ? check(subscript->index.get()) : base;
+    }
+    if (auto* field = llvm::dyn_cast<CFieldAccessExpr>(expr)) return check(field->base.get());
+    if (auto* call = llvm::dyn_cast<CCallExpr>(expr)) {
+        for (const auto& arg : call->args) {
+            auto found = check(arg.get());
+            if (!found.empty()) return found;
+        }
+    }
+    return {};
+}
+
+inline bool exprReferencesVariable(const CExpr* e, llvm::StringRef name) {
+    if (!e || name.empty()) return false;
+    if (auto* v = llvm::dyn_cast<CVarRefExpr>(e)) return v->varName == name;
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
+        return exprReferencesVariable(c->operand.get(), name);
+    if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
+        return exprReferencesVariable(u->operand.get(), name);
+    if (auto* b = llvm::dyn_cast<CBinaryExpr>(e))
+        return exprReferencesVariable(b->lhs.get(), name) ||
+               exprReferencesVariable(b->rhs.get(), name);
+    if (auto* t = llvm::dyn_cast<CTernaryExpr>(e))
+        return exprReferencesVariable(t->cond.get(), name) ||
+               exprReferencesVariable(t->trueVal.get(), name) ||
+               exprReferencesVariable(t->falseVal.get(), name);
+    if (auto* s = llvm::dyn_cast<CSubscriptExpr>(e))
+        return exprReferencesVariable(s->base.get(), name) ||
+               exprReferencesVariable(s->index.get(), name);
+    if (auto* f = llvm::dyn_cast<CFieldAccessExpr>(e))
+        return exprReferencesVariable(f->base.get(), name);
+    if (auto* call = llvm::dyn_cast<CCallExpr>(e)) {
+        for (const auto& arg : call->args)
+            if (exprReferencesVariable(arg.get(), name)) return true;
+    }
+    return false;
+}
+
+/// `x = cond ? replacement : x` (or the swapped-arm form) preserves the old
+/// value on one edge and replaces it on the other. This is a canonical select/
+/// cmov update, not a circular definition. Keep the recognition narrow: the
+/// preserved arm must be a direct x, and the replacement must not depend on x.
+inline bool isConditionalPreserveUpdate(const CExpr* e,
+                                        llvm::StringRef target) {
+    auto* ternary = llvm::dyn_cast_or_null<CTernaryExpr>(e);
+    if (!ternary || target.empty()) return false;
+    auto isExactTarget = [&](const CExpr* arm) {
+        auto* ref = llvm::dyn_cast_or_null<CVarRefExpr>(arm);
+        return ref && ref->varName == target;
+    };
+    const bool truePreserves = isExactTarget(ternary->trueVal.get());
+    const bool falsePreserves = isExactTarget(ternary->falseVal.get());
+    if (truePreserves == falsePreserves) return false;
+    const CExpr* replacement = truePreserves ? ternary->falseVal.get()
+                                             : ternary->trueVal.get();
+    return !exprReferencesVariable(replacement, target);
+}
 
 inline std::unordered_set<std::string> intersectAssigned(
         const std::unordered_set<std::string>& a,
@@ -385,10 +516,38 @@ inline std::unordered_set<std::string> intersectAssigned(
 inline DefiniteAssignmentFlow analyzeDefiniteAssignments(
         const std::vector<StmtPtr>& body,
         std::unordered_set<std::string> incoming,
+        std::unordered_set<std::string> incomingMay,
         const std::unordered_set<std::string>& candidates,
+        const std::unordered_set<std::string>& readCandidates,
         const std::unordered_set<std::string>& addressTaken,
         const std::unordered_set<std::string>& zeroLocals) {
-    DefiniteAssignmentFlow flow{std::move(incoming)};
+    DefiniteAssignmentFlow flow{std::move(incoming), std::move(incomingMay)};
+    auto checkRead = [&](const CExpr* expr) {
+        if (flow.uninitReadVar.empty())
+            flow.uninitReadVar = firstUninitializedRead(
+                expr, flow.mayAssigned, readCandidates, addressTaken, zeroLocals);
+    };
+    auto preserveFailure = [&](const DefiniteAssignmentFlow& nested) {
+        if (nested.uninitReturn && !flow.uninitReturn) {
+            flow.uninitReturn = true;
+            flow.uninitVar = nested.uninitVar;
+        }
+        if (flow.uninitReadVar.empty()) flow.uninitReadVar = nested.uninitReadVar;
+    };
+    auto applySimpleStatement = [&](const CStmt* statement) {
+        if (auto* assign = llvm::dyn_cast_or_null<CAssignStmt>(statement)) {
+            checkRead(assign->value.get());
+            if (!assign->compoundOp.empty() || !llvm::isa_and_nonnull<CVarRefExpr>(assign->target.get()))
+                checkRead(assign->target.get());
+            if (assign->compoundOp.empty())
+                if (auto name = plainVarName(assign->target.get()); !name.empty()) {
+                    flow.assigned.insert(name);
+                    flow.mayAssigned.insert(name);
+                }
+        } else if (auto* expr = llvm::dyn_cast_or_null<CExprStmt>(statement)) {
+            checkRead(expr->expr.get());
+        }
+    };
 
     for (auto& sp : body) {
         const CStmt* s = sp.get();
@@ -397,14 +556,16 @@ inline DefiniteAssignmentFlow analyzeDefiniteAssignments(
         if (auto* assign = llvm::dyn_cast<CAssignStmt>(s)) {
             // Compound assignment and ++/-- read the old value first, so they
             // cannot establish initialization of a previously undefined local.
-            if (assign->compoundOp.empty()) {
-                if (auto name = plainVarName(assign->target.get()); !name.empty())
-                    flow.assigned.insert(name);
-            }
+            applySimpleStatement(assign);
+            continue;
+        }
+        if (auto* expr = llvm::dyn_cast<CExprStmt>(s)) {
+            applySimpleStatement(expr);
             continue;
         }
 
         if (auto* ret = llvm::dyn_cast<CReturnStmt>(s)) {
+            checkRead(ret->value.get());
             auto name = plainVarName(ret->value.get());
             if (!name.empty() && candidates.count(name) &&
                 !addressTaken.count(name) && !flow.assigned.count(name)) {
@@ -417,81 +578,109 @@ inline DefiniteAssignmentFlow analyzeDefiniteAssignments(
 
         if (auto* block = llvm::dyn_cast<CBlockStmt>(s)) {
             auto nested = analyzeDefiniteAssignments(
-                block->stmts, flow.assigned, candidates, addressTaken,
+                block->stmts, flow.assigned, flow.mayAssigned,
+                candidates, readCandidates, addressTaken,
                 zeroLocals);
-            if (nested.uninitReturn && !flow.uninitReturn) {
-                flow.uninitReturn = true;
-                flow.uninitVar = nested.uninitVar;
-            }
+            preserveFailure(nested);
             flow.assigned = std::move(nested.assigned);
+            flow.mayAssigned = std::move(nested.mayAssigned);
             flow.fallsThrough = nested.fallsThrough;
             continue;
         }
 
         auto analyzeLoopBody = [&](const std::vector<StmtPtr>& loopBody) {
             auto nested = analyzeDefiniteAssignments(
-                loopBody, flow.assigned, candidates, addressTaken, zeroLocals);
-            if (nested.uninitReturn && !flow.uninitReturn) {
-                flow.uninitReturn = true;
-                flow.uninitVar = nested.uninitVar;
-            }
-            // Do not propagate assignments out of a loop. While/for may execute
-            // zero times, and even a do-while may exit through control flow the
-            // narrow analysis intentionally does not model.
+                loopBody, flow.assigned, flow.mayAssigned,
+                candidates, readCandidates, addressTaken, zeroLocals);
+            preserveFailure(nested);
+            // The caller decides whether the loop can execute zero times.
+            return nested;
         };
         if (auto* loop = llvm::dyn_cast<CWhileStmt>(s)) {
-            analyzeLoopBody(loop->body);
+            checkRead(loop->condition.get());
+            if (!isProvablyZero(loop->condition.get(), zeroLocals)) {
+                auto nested = analyzeLoopBody(loop->body);
+                flow.mayAssigned.insert(nested.mayAssigned.begin(),
+                                        nested.mayAssigned.end());
+            }
             continue;
         }
         if (auto* loop = llvm::dyn_cast<CDoWhileStmt>(s)) {
-            analyzeLoopBody(loop->body);
+            auto nested = analyzeLoopBody(loop->body);
+            // The supported subset excludes break, continue, labels and goto.
+            // A falling-through do-body therefore executes at least once.
+            flow.assigned = std::move(nested.assigned);
+            flow.mayAssigned = std::move(nested.mayAssigned);
+            flow.fallsThrough = nested.fallsThrough;
+            if (flow.fallsThrough) checkRead(loop->condition.get());
             continue;
         }
         if (auto* loop = llvm::dyn_cast<CForStmt>(s)) {
-            analyzeLoopBody(loop->body);
+            applySimpleStatement(loop->init.get());
+            checkRead(loop->condition.get());
+            if (!isProvablyZero(loop->condition.get(), zeroLocals)) {
+                auto nested = analyzeLoopBody(loop->body);
+                if (nested.fallsThrough) {
+                    auto beforeLoop = flow.assigned;
+                    auto possibleAfterLoop = flow.mayAssigned;
+                    possibleAfterLoop.insert(nested.mayAssigned.begin(),
+                                             nested.mayAssigned.end());
+                    flow.assigned = std::move(nested.assigned);
+                    flow.mayAssigned = nested.mayAssigned;
+                    applySimpleStatement(loop->step.get());
+                    flow.assigned = std::move(beforeLoop);
+                    possibleAfterLoop.insert(flow.mayAssigned.begin(),
+                                             flow.mayAssigned.end());
+                    flow.mayAssigned = std::move(possibleAfterLoop);
+                }
+            }
             continue;
         }
 
         if (auto* ifS = llvm::dyn_cast<CIfStmt>(s)) {
+            checkRead(ifS->condition.get());
             bool onlyElse = isProvablyZero(ifS->condition.get(), zeroLocals);
             bool onlyThen =
                 isProvablyNonzero(ifS->condition.get(), zeroLocals);
 
-            DefiniteAssignmentFlow thenFlow{flow.assigned};
-            DefiniteAssignmentFlow elseFlow{flow.assigned};
+            DefiniteAssignmentFlow thenFlow{flow.assigned, flow.mayAssigned};
+            DefiniteAssignmentFlow elseFlow{flow.assigned, flow.mayAssigned};
             if (!onlyElse) {
                 thenFlow = analyzeDefiniteAssignments(
-                    ifS->thenBody, flow.assigned, candidates, addressTaken,
+                    ifS->thenBody, flow.assigned, flow.mayAssigned,
+                    candidates, readCandidates, addressTaken,
                     zeroLocals);
             }
             if (!onlyThen && !ifS->elseBody.empty()) {
                 elseFlow = analyzeDefiniteAssignments(
-                    ifS->elseBody, flow.assigned, candidates, addressTaken,
+                    ifS->elseBody, flow.assigned, flow.mayAssigned,
+                    candidates, readCandidates, addressTaken,
                     zeroLocals);
             }
 
-            auto preserveFirstFailure = [&](const DefiniteAssignmentFlow& f) {
-                if (f.uninitReturn && !flow.uninitReturn) {
-                    flow.uninitReturn = true;
-                    flow.uninitVar = f.uninitVar;
-                }
-            };
-            if (!onlyElse) preserveFirstFailure(thenFlow);
-            if (!onlyThen) preserveFirstFailure(elseFlow);
+            if (!onlyElse) preserveFailure(thenFlow);
+            if (!onlyThen) preserveFailure(elseFlow);
 
             if (onlyThen) {
                 flow.assigned = std::move(thenFlow.assigned);
+                flow.mayAssigned = std::move(thenFlow.mayAssigned);
                 flow.fallsThrough = thenFlow.fallsThrough;
             } else if (onlyElse) {
                 flow.assigned = std::move(elseFlow.assigned);
+                flow.mayAssigned = std::move(elseFlow.mayAssigned);
                 flow.fallsThrough = elseFlow.fallsThrough;
             } else if (thenFlow.fallsThrough && elseFlow.fallsThrough) {
                 flow.assigned = intersectAssigned(
                     thenFlow.assigned, elseFlow.assigned);
+                flow.mayAssigned = std::move(thenFlow.mayAssigned);
+                flow.mayAssigned.insert(elseFlow.mayAssigned.begin(),
+                                        elseFlow.mayAssigned.end());
             } else if (thenFlow.fallsThrough) {
                 flow.assigned = std::move(thenFlow.assigned);
+                flow.mayAssigned = std::move(thenFlow.mayAssigned);
             } else if (elseFlow.fallsThrough) {
                 flow.assigned = std::move(elseFlow.assigned);
+                flow.mayAssigned = std::move(elseFlow.mayAssigned);
             } else {
                 flow.fallsThrough = false;
             }
@@ -909,6 +1098,7 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
     if (!info.uninitReturn &&
         detail::supportsDefiniteAssignmentScan(func.body)) {
         std::unordered_set<std::string> candidates;
+        std::unordered_set<std::string> readCandidates;
         std::unordered_set<std::string> initiallyAssigned;
 
         for (const auto& p : func.params)
@@ -916,16 +1106,27 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
         for (const auto& lv : func.localVars) {
             if (lv.initExpr)
                 initiallyAssigned.insert(lv.varName);
-            else
+            else {
                 candidates.insert(lv.varName);
+                if (lv.type && (lv.type->kind == TypeKind::Int ||
+                     lv.type->kind == TypeKind::Bool || lv.type->kind == TypeKind::Float ||
+                     lv.type->kind == TypeKind::Pointer || lv.type->kind == TypeKind::FuncPtr) &&
+                     lv.storage != StorageKind::Global && lv.storage != StorageKind::Parameter)
+                    readCandidates.insert(lv.varName);
+            }
         }
 
         auto flow = detail::analyzeDefiniteAssignments(
-            func.body, std::move(initiallyAssigned), candidates,
+            func.body, initiallyAssigned, std::move(initiallyAssigned),
+            candidates, readCandidates,
             addressTaken, zeroLocals);
         if (flow.uninitReturn) {
             info.uninitReturn = true;
             info.uninitVarName = flow.uninitVar;
+        }
+        if (!flow.uninitReadVar.empty()) {
+            info.uninitRead = true;
+            info.uninitReadVarName = flow.uninitReadVar;
         }
     }
 

@@ -107,6 +107,26 @@ inline std::optional<X86SubRegInfo> getX86SubRegInfo(llvm::StringRef reg) {
         .Case("XMM13", X86SubRegInfo{"XMM13", 128, 0})
         .Case("XMM14", X86SubRegInfo{"XMM14", 128, 0})
         .Case("XMM15", X86SubRegInfo{"XMM15", 128, 0})
+        // Remill names the same architectural vector storage according to the
+        // accessor width. Scalar SSE helpers can therefore read YMMn and later
+        // write XMMn. Canonicalize both names to the XMM identity used by the
+        // Win64 FP argument/return ABI.
+        .Case("YMM0",  X86SubRegInfo{"XMM0",  256, 0})
+        .Case("YMM1",  X86SubRegInfo{"XMM1",  256, 0})
+        .Case("YMM2",  X86SubRegInfo{"XMM2",  256, 0})
+        .Case("YMM3",  X86SubRegInfo{"XMM3",  256, 0})
+        .Case("YMM4",  X86SubRegInfo{"XMM4",  256, 0})
+        .Case("YMM5",  X86SubRegInfo{"XMM5",  256, 0})
+        .Case("YMM6",  X86SubRegInfo{"XMM6",  256, 0})
+        .Case("YMM7",  X86SubRegInfo{"XMM7",  256, 0})
+        .Case("YMM8",  X86SubRegInfo{"XMM8",  256, 0})
+        .Case("YMM9",  X86SubRegInfo{"XMM9",  256, 0})
+        .Case("YMM10", X86SubRegInfo{"XMM10", 256, 0})
+        .Case("YMM11", X86SubRegInfo{"XMM11", 256, 0})
+        .Case("YMM12", X86SubRegInfo{"XMM12", 256, 0})
+        .Case("YMM13", X86SubRegInfo{"XMM13", 256, 0})
+        .Case("YMM14", X86SubRegInfo{"XMM14", 256, 0})
+        .Case("YMM15", X86SubRegInfo{"XMM15", 256, 0})
         .Default(std::nullopt);
 
     return result;

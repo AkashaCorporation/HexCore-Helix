@@ -231,7 +231,7 @@ set(HELIX_SOURCES
 
     # Analysis — Helix-Nightly
     src/analysis/TypeLattice.cpp               # P1.5 Type lattice
-    src/analysis/TypeEvidence.cpp
+    src/analysis/TypeEvidence.cpp              # provenance-aware type evidence
     src/analysis/JumpTableAnalysis.cpp         # P0.2 Jump table detection
     src/analysis/DataSectionProvider.cpp       # P0.2 Binary data access
     src/analysis/StructRecovery.cpp            # P1.6 Struct recovery

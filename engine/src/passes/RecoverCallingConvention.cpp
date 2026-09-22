@@ -18,11 +18,14 @@
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
 #include "helix/analysis/SignatureDb.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/utils/CallOpHelpers.h"
 #include "helix/utils/Debug.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
@@ -30,6 +33,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <array>
 #include <algorithm>
@@ -84,6 +88,12 @@ constexpr std::array<std::string_view, 5> kSysVCalleeSaved = {
 /// x86 Linux also defaults to cdecl for the same reason (stack-only args).
 enum class CallingConv { Win64, SysV, Cdecl32, Aapcs64 };
 
+static bool isAbiCallBarrier(Operation* op) {
+    return op && helix::isAnyCallOp(op) &&
+           !op->hasAttr("helix.machine_intrinsic") &&
+           !op->hasAttr("helix.unqualified_instrumentation");
+}
+
 static uint32_t getNextAvailableVarId(helix::low::FuncOp func) {
     uint32_t nextId = 0;
     func.walk([&](helix::high::VarDeclOp decl) {
@@ -107,30 +117,87 @@ static bool isReturnRegisterWrite(Operation& op) {
            name == "XMM0";
 }
 
-static bool hasReturnRegisterWriteInBlock(
+static helix::low::RegWriteOp findReturnRegisterWriteInBlock(
     Block* block, Block::iterator endIt) {
     if (!block)
-        return false;
+        return {};
 
     for (auto it = endIt; it != block->begin();) {
         --it;
         if (isReturnRegisterWrite(*it))
-            return true;
+            return cast<helix::low::RegWriteOp>(&*it);
 
-        if (helix::isAnyCallOp(&*it))
-            return false;
+        if (isAbiCallBarrier(&*it))
+            return {};
     }
 
+    return {};
+}
+
+/// True when at least one CFG path reads `registerName` before any write or
+/// ABI call clobbers it. This is the required live-in proof for Win64 floating
+/// argument registers; a lexical function walk is unsound when a default arm
+/// that writes XMM0 appears before another branch that reads the incoming XMM0.
+static bool hasLiveInRegisterRead(helix::low::FuncOp func,
+                                  llvm::StringRef registerName) {
+    if (func.getBody().empty())
+        return false;
+
+    llvm::SmallVector<std::pair<Block*, bool>, 16> worklist;
+    llvm::DenseMap<Block*, unsigned> visitedStates;
+    worklist.push_back({&func.getBody().front(), false});
+
+    while (!worklist.empty()) {
+        auto [block, written] = worklist.pop_back_val();
+        const unsigned stateBit = written ? 2u : 1u;
+        if (visitedStates[block] & stateBit)
+            continue;
+        visitedStates[block] |= stateBit;
+
+        for (Operation& op : *block) {
+            if (auto read = dyn_cast<helix::low::RegReadOp>(&op)) {
+                auto canonical = helix::analysis::getCanonicalX86Register(
+                    read.getRegName());
+                auto identity = canonical.empty()
+                    ? read.getRegName() : canonical;
+                if (!written && identity.equals_insensitive(registerName))
+                    return true;
+            }
+            if (auto write = dyn_cast<helix::low::RegWriteOp>(&op)) {
+                auto canonical = helix::analysis::getCanonicalX86Register(
+                    write.getRegName());
+                auto identity = canonical.empty()
+                    ? write.getRegName() : canonical;
+                if (identity.equals_insensitive(registerName))
+                    written = true;
+            } else if (isAbiCallBarrier(&op)) {
+                written = true;
+            }
+        }
+
+        if (Operation* terminator = block->getTerminator()) {
+            for (Block* successor : terminator->getSuccessors())
+                worklist.push_back({successor, written});
+        }
+    }
     return false;
 }
 
 static std::optional<Value> findLatestRegWriteInBlock(
-    Block* block, Block::iterator endIt, llvm::StringRef canonicalReg) {
+    Block* block, Block::iterator endIt, llvm::StringRef canonicalReg,
+    bool* blockedByCall = nullptr) {
+    if (blockedByCall)
+        *blockedByCall = false;
     if (!block)
         return std::nullopt;
 
     for (auto it = endIt; it != block->begin();) {
         --it;
+        if (isAbiCallBarrier(&*it)) {
+            if (blockedByCall)
+                *blockedByCall = true;
+            return std::nullopt;
+        }
         auto regWrite = dyn_cast<helix::low::RegWriteOp>(&*it);
         if (!regWrite)
             continue;
@@ -154,8 +221,10 @@ static std::optional<Value> findLatestRegWriteInPredecessors(
 
     std::optional<Value> candidate;
     for (Block* pred : block->getPredecessors()) {
-        auto value = findLatestRegWriteInBlock(pred, pred->end(), canonicalReg);
-        if (!value) {
+        bool blockedByCall = false;
+        auto value = findLatestRegWriteInBlock(
+            pred, pred->end(), canonicalReg, &blockedByCall);
+        if (!value && !blockedByCall) {
             value = findLatestRegWriteInPredecessors(
                 pred, canonicalReg, depth - 1, visiting);
         }
@@ -172,6 +241,385 @@ static std::optional<Value> findLatestRegWriteInPredecessors(
 
     visiting.erase(block);
     return candidate;
+}
+
+static std::optional<size_t> knownCallArgCount(
+    helix::low::CallOp call) {
+    if (auto exactCount = call->getAttrOfType<IntegerAttr>(
+            "helix.debug_param_count")) {
+        return static_cast<size_t>(exactCount.getInt());
+    }
+    auto targetName = call.getTargetName();
+    if (!targetName || targetName->starts_with("sub_"))
+        return std::nullopt;
+    if (auto sig = lookupSignature(*targetName); sig && !sig->is_variadic)
+        return sig->param_types.size();
+
+    static const llvm::StringMap<size_t> kKernelArgs = {
+        {"mutex_lock", 1},
+        {"mutex_unlock", 1},
+        {"mutex_lock_nested", 2},
+        {"mutex_trylock", 1},
+        {"down_read", 1},
+        {"down_write", 1},
+        {"up_read", 1},
+        {"up_write", 1},
+        {"down_read_killable", 1},
+        {"down_write_killable", 1},
+        {"_raw_spin_lock", 1},
+        {"_raw_spin_unlock", 1},
+        {"_raw_spin_lock_irq", 1},
+        {"_raw_spin_unlock_irq", 1},
+        {"_raw_spin_lock_bh", 1},
+        {"_raw_spin_unlock_bh", 1},
+        {"spin_lock", 1},
+        {"spin_unlock", 1},
+        {"raw_spin_lock", 1},
+        {"raw_spin_unlock", 1},
+        {"read_lock", 1},
+        {"read_unlock", 1},
+        {"write_lock", 1},
+        {"write_unlock", 1},
+        {"__list_del_entry_valid_or_report", 1},
+        {"__list_add_valid_or_report", 3},
+        {"kfree", 1},
+        {"vfree", 1},
+        {"kmem_cache_free", 2},
+        {"atomic_inc", 1},
+        {"atomic_dec", 1},
+        {"atomic_read", 1},
+        {"atomic_set", 2},
+        {"kbase_mem_alloc", 7},
+        {"schedule", 0},
+        {"cond_resched", 0},
+        {"might_sleep", 0},
+    };
+    auto it = kKernelArgs.find(*targetName);
+    if (it != kKernelArgs.end())
+        return it->second;
+    return std::nullopt;
+}
+
+/// Whether the callee's complete parameter list is known to use only the
+/// integer/pointer ABI lane.  Stack recovery must not consume a nearby PUSH
+/// from arity alone: mixed FP/vector signatures require a different layout.
+static bool hasQualifiedIntegerAbiSignature(helix::low::CallOp call) {
+    if (call->hasAttr("helix.debug_integer_abi"))
+        return true;
+
+    auto targetName = call.getTargetName();
+    return targetName && *targetName == "kbase_mem_alloc";
+}
+
+static void markRecoveredSysVStackCleanup(helix::low::CallOp call,
+                                          size_t expectedPops) {
+    if (expectedPops == 0)
+        return;
+
+    llvm::SmallVector<helix::low::PopOp, 4> pops;
+    auto* block = call->getBlock();
+    for (auto it = std::next(call->getIterator()); it != block->end() &&
+         pops.size() < expectedPops; ++it) {
+        Operation* op = &*it;
+        if (auto pop = dyn_cast<helix::low::PopOp>(op)) {
+            if (!pop.getResult().use_empty())
+                return;
+            pops.push_back(pop);
+            continue;
+        }
+        if (isAbiCallBarrier(op) || op->hasTrait<OpTrait::IsTerminator>())
+            return;
+        if (auto write = dyn_cast<helix::low::RegWriteOp>(op)) {
+            if (write.getRegName() == "RSP" || write.getRegName() == "ESP")
+                return;
+            continue;
+        }
+        if (isa<helix::low::RegReadOp, helix::high::AssignOp,
+                helix::high::VarRefOp>(op))
+            continue;
+        if (!isMemoryEffectFree(op))
+            return;
+    }
+
+    if (pops.size() != expectedPops)
+        return;
+    for (auto pop : pops)
+        pop->setAttr("helix.recovered_stack_argument_cleanup",
+                     UnitAttr::get(pop.getContext()));
+}
+
+static bool hasPriorCallOnAnyPath(
+    Operation* beforeOp, llvm::DenseSet<Block*>& visited) {
+    auto* block = beforeOp ? beforeOp->getBlock() : nullptr;
+    if (!block)
+        return true;
+
+    for (auto& op : block->getOperations()) {
+        if (&op == beforeOp)
+            break;
+        if (isAbiCallBarrier(&op))
+            return true;
+    }
+
+    if (!visited.insert(block).second)
+        return false;
+    for (Block* pred : block->getPredecessors()) {
+        for (auto& op : pred->getOperations())
+            if (isAbiCallBarrier(&op))
+                return true;
+        Operation* terminator = pred->getTerminator();
+        if (terminator && hasPriorCallOnAnyPath(terminator, visited))
+            return true;
+    }
+    return false;
+}
+
+/// Recover a first-call forwarding prefix such as
+/// `callee(param_1, param_2, 0)` where the compiler leaves the first two ABI
+/// registers untouched and materializes only the third. Reading the untouched
+/// registers immediately before the call preserves their actual machine state;
+/// the normal parameter pass then classifies them as live-ins. Never infer this
+/// shape across a call barrier because caller-saved state is no longer input.
+static void materializeForwardedFirstCallArgs(
+    helix::low::FuncOp func,
+    llvm::ArrayRef<std::string_view> argRegs) {
+    if (argRegs.empty())
+        return;
+
+    llvm::SmallVector<helix::low::CallOp, 8> calls;
+    func.walk([&](helix::low::CallOp call) { calls.push_back(call); });
+    for (auto call : calls) {
+        if (call->hasAttr("helix.machine_intrinsic") || !call.getArgs().empty())
+            continue;
+
+        llvm::DenseSet<Block*> visited;
+        if (hasPriorCallOnAnyPath(call.getOperation(), visited))
+            continue;
+
+        llvm::DenseMap<llvm::StringRef, Value> localWrites;
+        for (auto& op : call->getBlock()->getOperations()) {
+            if (&op == call.getOperation())
+                break;
+            auto write = dyn_cast<helix::low::RegWriteOp>(&op);
+            if (!write)
+                continue;
+            auto canonical =
+                helix::analysis::getCanonicalX86Register(write.getRegName());
+            if (canonical.empty())
+                canonical = write.getRegName();
+            localWrites[canonical] = write.getValue();
+        }
+
+        std::optional<size_t> expected = knownCallArgCount(call);
+        if (!expected) {
+            for (size_t i = 0; i < argRegs.size(); ++i) {
+                llvm::StringRef key(argRegs[i]);
+                if (localWrites.contains(key))
+                    expected = i + 1;
+            }
+        }
+        if (!expected || *expected == 0)
+            continue;
+        const size_t count = std::min(*expected, argRegs.size());
+
+        OpBuilder builder(call);
+        llvm::SmallVector<Value, 8> args;
+        unsigned forwarded = 0;
+        for (size_t i = 0; i < count; ++i) {
+            llvm::StringRef key(argRegs[i]);
+            auto found = localWrites.find(key);
+            if (found != localWrites.end()) {
+                args.push_back(found->second);
+                continue;
+            }
+            auto read = builder.create<helix::low::RegReadOp>(
+                call.getLoc(), builder.getI64Type(), builder.getStringAttr(key),
+                builder.getUI32IntegerAttr(64), IntegerAttr{});
+            args.push_back(read.getResult());
+            ++forwarded;
+        }
+        call.getArgsMutable().assign(args);
+        call->setAttr("helix.forwarded_livein_arg_count",
+                      builder.getUI32IntegerAttr(forwarded));
+    }
+}
+
+static void recoverSysVPushArguments(helix::low::FuncOp func,
+                                     helix::low::CallOp call, size_t arity) {
+    if (!hasQualifiedIntegerAbiSignature(call) || arity <= 6 ||
+        call.getArgs().size() != 6)
+        return;
+    llvm::SmallVector<helix::low::PushOp, 4> pushes;
+    auto* block = call->getBlock();
+    for (auto it = call->getIterator(); it != block->begin() && pushes.size() < arity - 6;) {
+        --it;
+        if (auto push = dyn_cast<helix::low::PushOp>(&*it)) {
+            if (push->hasAttr("is_callee_save_push") ||
+                !push.getValue().getType().isInteger(64)) return;
+            pushes.push_back(push);
+            continue;
+        }
+        if (auto write = dyn_cast<helix::low::RegWriteOp>(&*it)) {
+            if (write.getRegName() == "RSP" || write.getRegName() == "ESP") return;
+            continue;
+        }
+        // Register reads observe machine state but cannot modify the captured
+        // stack argument. Remill commonly re-reads RBP while forming later
+        // register arguments after an earlier PUSH.
+        if (isa<helix::low::RegReadOp>(&*it))
+            continue;
+        // Remill-to-Low keeps next-PC bookkeeping as HelixHigh local
+        // assignments. These do not change the captured PUSH value or the
+        // physical stack and therefore are not outgoing-argument barriers.
+        if (isa<helix::high::AssignOp, helix::high::VarRefOp>(&*it))
+            continue;
+        if (!isMemoryEffectFree(&*it)) return;
+    }
+    if (pushes.size() != arity - 6) return;
+
+    // Preserve evaluation at PUSH, even if registers change before CALL.
+    uint32_t nextId = getNextAvailableVarId(func);
+    llvm::SmallVector<Value, 10> args(call.getArgs());
+    for (auto push : pushes) {
+        OpBuilder declarations(func.getContext());
+        declarations.setInsertionPointToStart(&func.getBody().front());
+        const std::string name = "stack_arg_" + std::to_string(nextId);
+        auto decl = declarations.create<helix::high::VarDeclOp>(
+            push.getLoc(), nextId++, name, helix::high::StorageKind::Temporary,
+            IntegerAttr{}, Value{}, IntegerAttr{});
+        decl->setAttr("helix.value_snapshot", declarations.getUnitAttr());
+        OpBuilder atPush(push);
+        auto target = atPush.create<helix::high::VarRefOp>(
+            push.getLoc(), atPush.getI64Type(), decl.getVarId(), name, IntegerAttr{});
+        atPush.create<helix::high::AssignOp>(
+            push.getLoc(), target.getResult(), push.getValue(), IntegerAttr{});
+        OpBuilder atCall(call);
+        args.push_back(atCall.create<helix::high::VarRefOp>(
+            call.getLoc(), atCall.getI64Type(), decl.getVarId(), name,
+            IntegerAttr{}).getResult());
+        push->setAttr("helix.recovered_stack_argument", atPush.getUnitAttr());
+    }
+    call.getArgsMutable().assign(args);
+    markRecoveredSysVStackCleanup(call, pushes.size());
+}
+
+static void recoverWin64StackArguments(helix::low::FuncOp func,
+                                       helix::low::CallOp call, size_t arity) {
+    if (!hasQualifiedIntegerAbiSignature(call) || arity <= 4 ||
+        call.getArgs().size() != 4) return;
+    llvm::DenseMap<size_t, helix::high::AssignOp> stores;
+    auto* block = call->getBlock();
+    for (auto it = call->getIterator(); it != block->begin() && stores.size() < arity - 4;) {
+        --it;
+        if (auto assign = dyn_cast<helix::high::AssignOp>(&*it)) {
+            auto offset = assign->getAttrOfType<IntegerAttr>("helix.rsp_store_offset");
+            if (!offset) return;
+            int64_t bytes = offset.getInt();
+            if (bytes < 0 || bytes % 8 != 0 || !assign.getValue().getType().isInteger(64)) return;
+            if (bytes >= 32) {
+                size_t index = 4 + static_cast<size_t>((bytes - 32) / 8);
+                if (index < arity && !stores.contains(index)) stores[index] = assign;
+            }
+            continue;
+        }
+        if (auto write = dyn_cast<helix::low::RegWriteOp>(&*it)) {
+            if (write.getRegName() == "RSP" || write.getRegName() == "ESP") return;
+            continue;
+        }
+        // Register reads observe state but cannot invalidate outgoing slots.
+        if (isa<helix::high::VarRefOp, helix::low::RegReadOp>(&*it)) continue;
+        if (!isMemoryEffectFree(&*it)) return;
+    }
+    if (stores.size() != arity - 4) return;
+    uint32_t nextId = getNextAvailableVarId(func);
+    llvm::SmallVector<Value, 10> args(call.getArgs());
+    for (size_t index = 4; index < arity; ++index) {
+        auto store = stores.lookup(index);
+        OpBuilder declarations(func.getContext());
+        declarations.setInsertionPointToStart(&func.getBody().front());
+        const std::string name = "stack_arg_" + std::to_string(nextId);
+        auto decl = declarations.create<helix::high::VarDeclOp>(
+            store.getLoc(), nextId++, name, helix::high::StorageKind::Temporary,
+            IntegerAttr{}, Value{}, IntegerAttr{});
+        decl->setAttr("helix.value_snapshot", declarations.getUnitAttr());
+        OpBuilder atStore(store);
+        auto target = atStore.create<helix::high::VarRefOp>(
+            store.getLoc(), atStore.getI64Type(), decl.getVarId(), name, IntegerAttr{});
+        atStore.create<helix::high::AssignOp>(
+            store.getLoc(), target.getResult(), store.getValue(), IntegerAttr{});
+        // Both the original store and the call consume the captured value.
+        auto captured = atStore.create<helix::high::VarRefOp>(
+            store.getLoc(), atStore.getI64Type(), decl.getVarId(), name, IntegerAttr{});
+        store.getValueMutable().assign(captured.getResult());
+        OpBuilder atCall(call);
+        args.push_back(atCall.create<helix::high::VarRefOp>(
+            call.getLoc(), atCall.getI64Type(), decl.getVarId(), name, IntegerAttr{}).getResult());
+    }
+    call.getArgsMutable().assign(args);
+}
+
+static bool valueNeedsRegisterStabilization(Value value) {
+    Operation* defining = value ? value.getDefiningOp() : nullptr;
+    if (!defining)
+        return false;
+    return !isa<helix::low::RegReadOp, arith::ConstantOp,
+                LLVM::ConstantOp, LLVM::AddressOfOp>(defining);
+}
+
+/// A call argument collected from a prior register write must observe the
+/// register's saved value, not recursively re-emit the defining expression
+/// after that expression's inputs may have changed. Otherwise both
+/// `rdi = load(slot); store(slot, 0); callee(rdi)` and
+/// `rdi = base + off; callee(rdi)` can rebuild stale expressions. Restrict the
+/// rewrite to nontrivial values with an exact latest write/value match.
+static void stabilizeMaterializedCallArgs(
+    helix::low::FuncOp func,
+    llvm::ArrayRef<std::string_view> argRegs) {
+    if (argRegs.empty())
+        return;
+
+    llvm::SmallVector<helix::low::CallOp, 16> calls;
+    func.walk([&](helix::low::CallOp call) { calls.push_back(call); });
+    for (auto call : calls) {
+        if (call->hasAttr("helix.machine_intrinsic"))
+            continue;
+        auto existing = call.getArgs();
+        if (existing.empty() || existing.size() > argRegs.size())
+            continue;
+
+        llvm::SmallVector<Value, 8> stable(existing.begin(), existing.end());
+        bool changed = false;
+        OpBuilder builder(call);
+        for (size_t i = 0; i < stable.size(); ++i) {
+            if (stable[i].getDefiningOp<helix::low::RegReadOp>())
+                continue;
+            if (!valueNeedsRegisterStabilization(stable[i]))
+                continue;
+
+            llvm::StringRef reg(argRegs[i]);
+            bool blockedByCall = false;
+            auto latest = findLatestRegWriteInBlock(
+                call->getBlock(), call->getIterator(), reg, &blockedByCall);
+            if (!latest && !blockedByCall) {
+                llvm::DenseSet<Block*> visiting;
+                latest = findLatestRegWriteInPredecessors(
+                    call->getBlock(), reg, /*depth=*/8, visiting);
+            }
+            if (!latest || *latest != stable[i])
+                continue;
+
+            auto read = builder.create<helix::low::RegReadOp>(
+                call.getLoc(), builder.getI64Type(), builder.getStringAttr(reg),
+                builder.getUI32IntegerAttr(64), IntegerAttr{});
+            stable[i] = read.getResult();
+            changed = true;
+        }
+        if (changed) {
+            call.getArgsMutable().assign(stable);
+            call->setAttr("helix.materialized_arg_single_evaluation",
+                          builder.getUnitAttr());
+        }
+    }
 }
 
 /// Collect argument values for a call by scanning the block before `beforeOp`
@@ -193,6 +641,7 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
     // `mutex_unlock(var_70, _promoted_0, 0xA0D, rsp)` when only the first
     // arg is real.
     llvm::DenseMap<llvm::StringRef, Value> regState;
+    bool sawCallBarrier = false;
     for (auto& op : block->getOperations()) {
         if (&op == beforeOp)
             break;
@@ -201,7 +650,8 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
         // (which includes every ABI arg register on both Win64 and SysV).
         // Drop the recorded state so we only collect args written by the
         // code between the previous call and this one.
-        if (helix::isAnyCallOp(&op)) {
+        if (isAbiCallBarrier(&op)) {
+            sawCallBarrier = true;
             regState.clear();
             continue;
         }
@@ -227,7 +677,7 @@ static llvm::SmallVector<Value, 6> collectAbiCallArgs(
         llvm::StringRef key(argReg);
         auto it = regState.find(key);
         if (it == regState.end()) {
-            if (anyFromCurrentBlock) {
+            if (anyFromCurrentBlock || sawCallBarrier) {
                 // We saw writes to other arg regs in this block after the
                 // last call barrier, but not this one — positional ABI
                 // means further args are also absent.  Stop here.
@@ -361,6 +811,100 @@ static bool valueFlowsToDeref(Value root) {
     return false;
 }
 
+static void preserveOpaquePostCallReads(helix::low::FuncOp func, CallingConv cc) {
+    if (cc != CallingConv::Win64 && cc != CallingConv::SysV) return;
+    constexpr std::array<std::string_view, 9> registers = {
+        "RAX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "R10", "R11"};
+    using State = std::array<uint64_t, registers.size()>;
+    State clobbered{};
+    for (size_t i = 0; i < registers.size(); ++i)
+        if (cc == CallingConv::SysV || (registers[i] != "RSI" && registers[i] != "RDI"))
+            clobbered[i] = ~uint64_t{0};
+    auto indexOf = [&](StringRef parent) -> std::optional<size_t> {
+        for (size_t i = 0; i < registers.size(); ++i)
+            if (parent == StringRef(registers[i].data(), registers[i].size())) return i;
+        return std::nullopt;
+    };
+    auto mask = [](unsigned width, unsigned offset) {
+        return width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1) << offset;
+    };
+    auto transfer = [&](Operation& op, State& state) {
+        if (isAbiCallBarrier(&op)) {
+            for (size_t i = 0; i < state.size(); ++i) state[i] |= clobbered[i];
+        } else if (auto write = dyn_cast<helix::low::RegWriteOp>(op)) {
+            auto slice = helix::analysis::getX86SubRegInfo(write.getRegName());
+            if (!slice) return;
+            auto index = indexOf(slice->parent);
+            if (!index) return;
+            auto producer = write.getValue().getDefiningOp<helix::low::CallOp>();
+            if (producer) {
+                auto type = producer->getAttrOfType<StringAttr>("inferred_return_type");
+                if (type && type.getValue() == "void") return;
+            }
+            const unsigned width = std::min<unsigned>(slice->width, write.getBitWidth());
+            const uint64_t written = width == 32 && slice->bitOffset == 0
+                ? ~uint64_t{0} : mask(width, slice->bitOffset);
+            state[*index] &= ~written;
+        }
+    };
+    llvm::DenseMap<Block*, State> exits;
+    llvm::SmallVector<Block*, 16> worklist;
+    llvm::DenseSet<Block*> queued;
+    for (Block& block : func.getBody()) {
+        exits[&block] = State{};
+        worklist.push_back(&block);
+        queued.insert(&block);
+    }
+    auto incoming = [&](Block& block) {
+        State state{};
+        for (Block* pred : block.getPredecessors()) {
+            auto found = exits.find(pred);
+            if (found == exits.end()) continue;
+            for (size_t i = 0; i < state.size(); ++i) state[i] |= found->second[i];
+        }
+        return state;
+    };
+    while (!worklist.empty()) {
+        Block* block = worklist.pop_back_val();
+        queued.erase(block);
+        State state = incoming(*block);
+        for (Operation& op : *block) transfer(op, state);
+        if (exits[block] == state) continue;
+        exits[block] = state;
+        for (Block* successor : block->getSuccessors())
+            if (exits.contains(successor) && queued.insert(successor).second)
+                worklist.push_back(successor);
+    }
+    for (Block& block : func.getBody()) {
+        State state = incoming(block);
+        for (auto it = block.begin(); it != block.end();) {
+            Operation* op = &*it++;
+            auto read = dyn_cast<helix::low::RegReadOp>(op);
+            if (read && !read.getResult().use_empty()) {
+                auto slice = helix::analysis::getX86SubRegInfo(read.getRegName());
+                auto index = slice ? indexOf(slice->parent) : std::nullopt;
+                if (slice && index && (state[*index] & mask(std::min<unsigned>(slice->width, read.getBitWidth()), slice->bitOffset))) {
+                    OpBuilder builder(read);
+                    auto target = builder.create<LLVM::ConstantOp>(read.getLoc(), builder.getI64Type(), builder.getI64IntegerAttr(0));
+                    const std::string name = "__helix_post_call_" + read.getRegName().lower() + "_" + std::to_string(read.getBitWidth());
+                    auto value = builder.create<helix::low::CallOp>(read.getLoc(), TypeRange{read.getResult().getType()},
+                        target.getResult(), ValueRange{}, builder.getStringAttr(name), read.getAddressAttr());
+                    value->setAttr("helix.machine_intrinsic", builder.getUnitAttr());
+                    value->setAttr("helix.opaque_post_call_register", builder.getStringAttr(read.getRegName()));
+                    read.getResult().replaceAllUsesWith(value.getResult());
+                    read.erase();
+                    continue;
+                }
+            }
+            transfer(*op, state);
+        }
+    }
+    unsigned count = 0;
+    func.walk([&](helix::low::CallOp call) { count += call->hasAttr("helix.opaque_post_call_register"); });
+    if (count) func->setAttr("helix.opaque_post_call_read_count", IntegerAttr::get(IntegerType::get(func.getContext(), 32), count));
+    else func->removeAttr("helix.opaque_post_call_read_count");
+}
+
 struct RecoverCallingConventionPass
     : public PassWrapper<RecoverCallingConventionPass, OperationPass<ModuleOp>> {
 
@@ -374,6 +918,7 @@ struct RecoverCallingConventionPass
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
         registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<LLVM::LLVMDialect>();
     }
 
     void runOnOperation() override {
@@ -458,6 +1003,22 @@ private:
         case CallingConv::Aapcs64: argRegs = kAapcs64IntArgs; break;
         }
 
+        unsigned instrumentationCalls = 0;
+        func.walk([&](helix::low::CallOp call) {
+            auto name = helix::getCallTargetName(call);
+            if (!name || *name != "__fentry__") return;
+            call->setAttr("helix.unqualified_instrumentation",
+                          UnitAttr::get(func->getContext()));
+            ++instrumentationCalls;
+        });
+        if (instrumentationCalls)
+            func->setAttr("helix.unqualified_instrumentation_call_count",
+                IntegerAttr::get(IntegerType::get(func.getContext(), 32),
+                                 instrumentationCalls));
+
+        materializeForwardedFirstCallArgs(func, argRegs);
+        stabilizeMaterializedCallArgs(func, argRegs);
+
         // --- Win64 entry-point detection ---
         // PE entry-point functions (start, hc_entry, Remill's generic
         // "entry_point", etc.) receive their argument registers from the OS
@@ -508,6 +1069,8 @@ private:
         // Scan from the top for reg.read operations that read argument registers
         // before any write to those registers — these are function parameters.
         llvm::SmallVector<unsigned> paramIndices;
+        llvm::SmallVector<unsigned> integerParamIndices;
+        llvm::SmallVector<unsigned> fpParamIndices;
 
         if (!skipParamInference) {
         llvm::DenseSet<llvm::StringRef> writtenRegs;
@@ -552,10 +1115,35 @@ private:
                         seenParamIndices.insert(*paramIndex).second) {
                         paramIndices.push_back(*paramIndex);
                     }
+                    if (passesGate)
+                        integerParamIndices.push_back(*paramIndex);
                 }
             }
         });
+        if (cc == CallingConv::Win64) {
+            static constexpr std::array<std::string_view, 4> kWin64FpArgs = {
+                "XMM0", "XMM1", "XMM2", "XMM3"
+            };
+            for (size_t i = 0; i < kWin64FpArgs.size(); ++i) {
+                const unsigned index = static_cast<unsigned>(i + 1);
+                llvm::StringRef reg(kWin64FpArgs[i].data(),
+                                    kWin64FpArgs[i].size());
+                if (hasLiveInRegisterRead(func, reg)) {
+                    fpParamIndices.push_back(index);
+                    if (seenParamIndices.insert(index).second)
+                        paramIndices.push_back(index);
+                }
+            }
+        }
         llvm::sort(paramIndices);
+        llvm::sort(integerParamIndices);
+        integerParamIndices.erase(
+            std::unique(integerParamIndices.begin(), integerParamIndices.end()),
+            integerParamIndices.end());
+        llvm::sort(fpParamIndices);
+        fpParamIndices.erase(
+            std::unique(fpParamIndices.begin(), fpParamIndices.end()),
+            fpParamIndices.end());
         // FIX-139: a non-variadic DWARF/BTF/PDB signature is authoritative
         // about the source-level parameter count. ABI registers beyond that
         // count can still be live-in scratch values, especially on AAPCS64;
@@ -564,6 +1152,12 @@ private:
                 "helix.debug_param_count")) {
             const uint64_t count = debugParamCount.getValue().getZExtValue();
             llvm::erase_if(paramIndices, [count](unsigned index) {
+                return index == 0 || index > count;
+            });
+            llvm::erase_if(integerParamIndices, [count](unsigned index) {
+                return index == 0 || index > count;
+            });
+            llvm::erase_if(fpParamIndices, [count](unsigned index) {
                 return index == 0 || index > count;
             });
         }
@@ -592,7 +1186,7 @@ private:
                 if (existingParams.contains(paramName))
                     continue;
 
-                builder.create<helix::high::VarDeclOp>(
+                auto declaration = builder.create<helix::high::VarDeclOp>(
                     func.getLoc(),
                     builder.getUI32IntegerAttr(paramId++),
                     builder.getStringAttr(paramName),
@@ -602,6 +1196,16 @@ private:
                     /*stack_offset=*/IntegerAttr{},
                     /*init=*/Value{},
                     /*address=*/IntegerAttr{});
+                const bool fpOnly =
+                    std::find(fpParamIndices.begin(), fpParamIndices.end(),
+                              paramIndex) != fpParamIndices.end() &&
+                    std::find(integerParamIndices.begin(),
+                              integerParamIndices.end(), paramIndex) ==
+                        integerParamIndices.end();
+                if (fpOnly)
+                    helix::applyTypeEvidence(
+                        declaration, "double",
+                        helix::TypeEvidenceSource::Structural);
             }
         }
 
@@ -620,7 +1224,10 @@ private:
         llvm::SmallVector<helix::low::CallOp, 16> calls;
         func.walk([&](helix::low::CallOp call) { calls.push_back(call); });
 
+        unsigned incompleteAbiCalls = 0;
         for (auto call : calls) {
+            if (call->hasAttr("helix.machine_intrinsic"))
+                continue;
             auto targetName = call.getTargetName();
             const bool isDirectNamedCall =
                 targetName.has_value() && targetName->starts_with("sub_");
@@ -633,68 +1240,7 @@ private:
             //   mutex_unlock(var_70, _promoted_0, 0xA0D, rsp)   (wrong!)
             // when the real signature is:
             //   mutex_unlock(var_70)                              (correct)
-            std::optional<size_t> maxArgs;
-            if (targetName.has_value() && !isDirectNamedCall) {
-                if (auto exactCount = call->getAttrOfType<IntegerAttr>(
-                        "helix.debug_param_count")) {
-                    maxArgs = static_cast<size_t>(exactCount.getInt());
-                } else if (auto sig = lookupSignature(*targetName);
-                           sig && !sig->is_variadic) {
-                    maxArgs = sig->param_types.size();
-                }
-
-                // Fallback: inline table of common Linux kernel primitives
-                // that SignatureDb doesn't know about.  This prevents
-                // stray register bleeding in kernel-module decompilation.
-                if (!maxArgs.has_value()) {
-                    static const llvm::StringMap<size_t> kKernelArgs = {
-                        // sync primitives (1 arg: lock pointer)
-                        {"mutex_lock",         1},
-                        {"mutex_unlock",       1},
-                        {"mutex_lock_nested",  2},
-                        {"mutex_trylock",      1},
-                        {"down_read",          1},
-                        {"down_write",         1},
-                        {"up_read",            1},
-                        {"up_write",           1},
-                        {"down_read_killable", 1},
-                        {"down_write_killable",1},
-                        {"_raw_spin_lock",         1},
-                        {"_raw_spin_unlock",       1},
-                        {"_raw_spin_lock_irq",     1},
-                        {"_raw_spin_unlock_irq",   1},
-                        {"_raw_spin_lock_bh",      1},
-                        {"_raw_spin_unlock_bh",    1},
-                        {"spin_lock",          1},
-                        {"spin_unlock",        1},
-                        {"raw_spin_lock",      1},
-                        {"raw_spin_unlock",    1},
-                        {"read_lock",          1},
-                        {"read_unlock",        1},
-                        {"write_lock",         1},
-                        {"write_unlock",       1},
-                        // list ops (1-2 args)
-                        {"__list_del_entry_valid_or_report", 1},
-                        {"__list_add_valid_or_report",       3},
-                        // memory (1 arg)
-                        {"kfree",              1},
-                        {"vfree",              1},
-                        {"kmem_cache_free",    2},
-                        // atomics (2-3 args)
-                        {"atomic_inc",         1},
-                        {"atomic_dec",         1},
-                        {"atomic_read",        1},
-                        {"atomic_set",         2},
-                        // barriers / no-arg
-                        {"schedule",           0},
-                        {"cond_resched",       0},
-                        {"might_sleep",        0},
-                    };
-                    auto it = kKernelArgs.find(*targetName);
-                    if (it != kKernelArgs.end())
-                        maxArgs = it->second;
-                }
-            }
+            std::optional<size_t> maxArgs = knownCallArgCount(call);
 
             auto argValues =
                 collectAbiCallArgs(call.getOperation(), phase3ArgRegs);
@@ -747,22 +1293,65 @@ private:
                 existingArgs = call.getArgs();
             }
 
+            if (cc == CallingConv::SysV && maxArgs) {
+                recoverSysVPushArguments(func, call, *maxArgs);
+                existingArgs = call.getArgs();
+            } else if (cc == CallingConv::Win64 && maxArgs) {
+                recoverWin64StackArguments(func, call, *maxArgs);
+                existingArgs = call.getArgs();
+            }
             auto i32Ty = IntegerType::get(call->getContext(), 32);
             call->setAttr("arg_count",
                 IntegerAttr::get(i32Ty, existingArgs.size()));
+            const bool incomplete = hasQualifiedIntegerAbiSignature(call) &&
+                maxArgs && existingArgs.size() < *maxArgs;
+            if (incomplete) {
+                ++incompleteAbiCalls;
+                call->setAttr("helix.abi.missing_argument_count",
+                    IntegerAttr::get(i32Ty, *maxArgs - existingArgs.size()));
+            } else {
+                call->removeAttr("helix.abi.missing_argument_count");
+            }
         }
+        if (incompleteAbiCalls)
+            func->setAttr("helix.abi.incomplete_call_count",
+                IntegerAttr::get(IntegerType::get(func.getContext(), 32), incompleteAbiCalls));
+        else
+            func->removeAttr("helix.abi.incomplete_call_count");
 
         // Phase 4: Identify return value.
         // If the function has a reg.write to RAX/XMM0 before its return, it
         // returns a value.
         bool hasReturnValue = false;
+        bool sawGpReturn = false;
+        bool sawFpReturn = false;
+        std::optional<unsigned> fpReturnWidth;
+        auto recordReturnWrite = [&](helix::low::RegWriteOp write) {
+            if (!write)
+                return;
+            auto name = write.getRegName().upper();
+            if (name == "XMM0" || name == "V0") {
+                sawFpReturn = true;
+                if (auto type = dyn_cast<IntegerType>(
+                        write.getValue().getType())) {
+                    if (!fpReturnWidth)
+                        fpReturnWidth = type.getWidth();
+                    else if (*fpReturnWidth != type.getWidth())
+                        fpReturnWidth.reset();
+                }
+            } else {
+                sawGpReturn = true;
+            }
+        };
         func.walk([&](helix::low::RetOp ret) {
             // Check if there's a reg.write to RAX before this return
             auto* block = ret->getBlock();
             if (!block) return;
 
-            if (hasReturnRegisterWriteInBlock(block, Block::iterator(ret))) {
+            if (auto write = findReturnRegisterWriteInBlock(
+                    block, Block::iterator(ret))) {
                 hasReturnValue = true;
+                recordReturnWrite(write);
                 return;
             }
 
@@ -779,9 +1368,11 @@ private:
                 if (!candidate || !visited.insert(candidate).second)
                     continue;
 
-                if (hasReturnRegisterWriteInBlock(candidate, candidate->end())) {
+                if (auto write = findReturnRegisterWriteInBlock(
+                        candidate, candidate->end())) {
                     hasReturnValue = true;
-                    return;
+                    recordReturnWrite(write);
+                    continue;
                 }
 
                 if (depth >= 1)
@@ -802,6 +1393,16 @@ private:
             llvm::StringRef type = debugReturn.getValue().trim();
             if (!type.empty())
                 hasReturnValue = type != "void";
+        }
+
+        if (hasReturnValue && sawFpReturn && !sawGpReturn && fpReturnWidth &&
+            !func->hasAttr("inferred_return_type")) {
+            if (*fpReturnWidth == 32)
+                func->setAttr("inferred_return_type",
+                    StringAttr::get(func.getContext(), "float"));
+            else if (*fpReturnWidth == 64)
+                func->setAttr("inferred_return_type",
+                    StringAttr::get(func.getContext(), "double"));
         }
 
         // Set calling convention attribute on the function.  The string is
@@ -832,10 +1433,14 @@ private:
             (cc == CallingConv::Aapcs64 &&
              func->hasAttr("helix.debug_param_count"));
         if (publishCertifiedParams) {
-            llvm::SmallVector<int32_t, 6> certifiedIdx(paramIndices.begin(),
-                                                       paramIndices.end());
+            llvm::SmallVector<int32_t, 6> certifiedIdx(
+                integerParamIndices.begin(), integerParamIndices.end());
             func->setAttr("reg_param_indices",
                 DenseI32ArrayAttr::get(func->getContext(), certifiedIdx));
+            llvm::SmallVector<int32_t, 4> certifiedFpIdx(
+                fpParamIndices.begin(), fpParamIndices.end());
+            func->setAttr("fp_reg_param_indices",
+                DenseI32ArrayAttr::get(func->getContext(), certifiedFpIdx));
         }
         // FIX-CC-THISCALL round 2: mark that the flows-to-deref gate actually
         // bound ECX as `this` (param_1) for this x86-32 function.
@@ -864,6 +1469,7 @@ private:
             func->setAttr("no_reg_params",
                 UnitAttr::get(func->getContext()));
         }
+        preserveOpaquePostCallReads(func, cc);
     }
 };
 

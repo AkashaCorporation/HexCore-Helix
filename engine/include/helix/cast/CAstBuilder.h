@@ -136,7 +136,9 @@ private:
     /// Recover a debug-proven unit-stride struct array element from an
     /// annotated address expression. Returns null when the address is not the
     /// exact `base + index + fieldOffset` shape.
-    ExprPtr buildDebugIndexedField(mlir::Value address);
+    ExprPtr buildDebugIndexedField(mlir::Value address, mlir::Type accessType);
+    ExprPtr preserveIntegerAddressOperand(ExprPtr value, CTypePtr integerType,
+                                         uint64_t address);
 
     // ── Filtering ───────────────────────────────────────────────────────
 
@@ -229,6 +231,8 @@ private:
 
     /// Per-variable use count for single-use temporary elimination.
     std::unordered_map<std::string, unsigned> varUseCount_;
+    std::unordered_map<uint32_t, CTypePtr> declaredVarTypes_;
+    std::unordered_map<uint32_t, CTypePtr> declaredPointerTypes_;
 
     /// Set of operations identified as dead stores.
     std::unordered_set<mlir::Operation*> deadStoreOps_;

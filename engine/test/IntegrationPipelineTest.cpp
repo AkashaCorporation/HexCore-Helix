@@ -518,6 +518,198 @@ TEST(IntegrationPipelineRegressionTest, NegWritesResultBackToDestinationRegister
         << "NEG must not disappear as a destination-pointer-only no-op";
 }
 
+TEST(IntegrationPipelineRegressionTest,
+     AArch64BitfieldSemanticsDoNotLeakNativePlaceholders) {
+    constexpr const char* ir = R"(
+        target triple = "aarch64-unknown-linux-gnu"
+
+        %State = type { %GPR }
+        %GPR = type { %Reg, %Reg }
+        %Reg = type { i64 }
+
+        declare ptr @_ZN12_GLOBAL__N_14UBFMI3RnWImE2RnIjLb1EE2InIjEEEP6MemoryS8_R5StateT_T0_T1_(
+            ptr, ptr, i64, i64, i64)
+        declare ptr @_ZN12_GLOBAL__N_14SBFMI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_SD_SD_SD_(
+            ptr, ptr, i64, i64, i64, i64, i64, i64)
+        declare ptr @_ZN12_GLOBAL__N_14MADDI3RnWImE2RnImLb1EEEP6MemoryS6_R5StateT_T0_SA_SA_(
+            ptr, ptr, i64, i64, i64, i64)
+
+        define ptr @lifted_4096(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %x0 = getelementptr %State, ptr %state, i64 0, i32 0, i32 0,
+              !remill_register !0
+          %x1 = getelementptr %State, ptr %state, i64 0, i32 0, i32 1,
+              !remill_register !1
+          %dst = ptrtoint ptr %x0 to i64
+          %src = load i64, ptr %x1
+          %ubfm = call ptr @_ZN12_GLOBAL__N_14UBFMI3RnWImE2RnIjLb1EE2InIjEEEP6MemoryS8_R5StateT_T0_T1_(
+              ptr %memory, ptr %state, i64 %dst, i64 %src, i64 255)
+          ret ptr %memory
+        }
+
+        define ptr @lifted_8192(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %x0 = getelementptr %State, ptr %state, i64 0, i32 0, i32 0,
+              !remill_register !0
+          %x1 = getelementptr %State, ptr %state, i64 0, i32 0, i32 1,
+              !remill_register !1
+          %dst = ptrtoint ptr %x0 to i64
+          %src = load i64, ptr %x1
+          %sbfm = call ptr @_ZN12_GLOBAL__N_14SBFMI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_SD_SD_SD_(
+              ptr %memory, ptr %state, i64 %dst, i64 %src,
+              i64 0, i64 31, i64 4294967295, i64 4294967295)
+          ret ptr %memory
+        }
+
+        define ptr @lifted_12288(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %x0 = getelementptr %State, ptr %state, i64 0, i32 0, i32 0,
+              !remill_register !0
+          %x1 = getelementptr %State, ptr %state, i64 0, i32 0, i32 1,
+              !remill_register !1
+          %dst = ptrtoint ptr %x0 to i64
+          %src = load i64, ptr %x1
+          %madd = call ptr @_ZN12_GLOBAL__N_14MADDI3RnWImE2RnImLb1EEEP6MemoryS6_R5StateT_T0_SA_SA_(
+              ptr %memory, ptr %state, i64 %dst, i64 %src, i64 3, i64 5)
+          ret ptr %memory
+        }
+
+        !0 = !{[3 x i8] c"X0\00"}
+        !1 = !{[3 x i8] c"X1\00"}
+    )";
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_AARCH64);
+    auto output = pipeline.decompile(ir);
+    ASSERT_TRUE(output.has_value()) << output.error();
+    ASSERT_FALSE(output->pseudo_c.empty());
+    EXPECT_EQ(output->pseudo_c.find("__native_UBFM"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("__native_SBFM"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("__native_MADD"), std::string::npos)
+        << output->pseudo_c;
+}
+
+TEST(IntegrationPipelineRegressionTest,
+     CurrentRemillFpFlagsDriveImmediateParityAndZeroBranches) {
+    constexpr const char* ir = R"(
+        target triple = "x86_64-pc-windows-msvc"
+
+        %X86State = type { i64, i64, [16 x i8] }
+
+        declare ptr @_ZN12_GLOBAL__N_12JPEP6MemoryR5State3RnWIhE2InImES7_S4_ImE(
+            ptr, ptr, ptr, i64, i64, ptr)
+        declare ptr @_ZN12_GLOBAL__N_12JZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE(
+            ptr, ptr, ptr, i64, i64, ptr)
+
+        define ptr @lifted_4096(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %cf = getelementptr %X86State, ptr %state, i64 0, i32 2, i32 1
+          %pf = getelementptr %X86State, ptr %state, i64 0, i32 2, i32 3
+          %zf = getelementptr %X86State, ptr %state, i64 0, i32 2, i32 7
+          %bt = alloca i8
+          %next = alloca i64
+          %unordered = fcmp uno double 1.000000e+00, 0.000000e+00
+          store i8 0, ptr %cf
+          store i8 0, ptr %pf
+          store i8 0, ptr %zf
+          %jpe = call ptr @_ZN12_GLOBAL__N_12JPEP6MemoryR5State3RnWIhE2InImES7_S4_ImE(
+              ptr %memory, ptr %state, ptr %bt, i64 4112, i64 4100, ptr %next)
+          %p = load i8, ptr %bt
+          %p.not = icmp eq i8 %p, 0
+          br i1 %p.not, label %ordered, label %taken
+        ordered:
+          %jz = call ptr @_ZN12_GLOBAL__N_12JZEP6MemoryR5State3RnWIhE2InImES7_S4_ImE(
+              ptr %memory, ptr %state, ptr %bt, i64 4112, i64 4104, ptr %next)
+          %z = load i8, ptr %bt
+          %z.not = icmp eq i8 %z, 0
+          br i1 %z.not, label %fallthrough, label %taken
+        taken:
+          ret ptr %memory
+        fallthrough:
+          ret ptr %memory
+        }
+    )";
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_X86_64);
+    auto output = pipeline.decompile(ir);
+
+    ASSERT_TRUE(output.has_value()) << output.error();
+    ASSERT_FALSE(output->pseudo_c.empty());
+    EXPECT_EQ(output->pseudo_c.find("branch condition unavailable from flag state"),
+              std::string::npos) << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("*(int8_t*)(int64_t)(void*)0"),
+              std::string::npos) << output->pseudo_c;
+}
+
+TEST(IntegrationPipelineRegressionTest,
+     Win64ScalarFpArgumentsAndReturnSurviveStructuredBranches) {
+    constexpr const char* ir = R"(
+        target triple = "x86_64-pc-windows-msvc"
+
+        %State = type { %X86State }
+        %X86State = type {
+            i64, [32 x double], [16 x i8], i64, i64, i64, [34 x i64]
+        }
+
+        define ptr @lifted_4096(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %xmm0 = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 1, i64 0,
+              !remill_register !0
+          %ymm1 = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 1, i64 1,
+              !remill_register !1
+          %r8b = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 6, i64 17,
+              !remill_register !2
+          %op = load i8, ptr %r8b
+          %is_mul = icmp eq i8 %op, 42
+          br i1 %is_mul, label %mul, label %divide
+        mul:
+          %a.mul = load double, ptr %xmm0
+          %b.mul = load double, ptr %ymm1
+          %product = fmul double %a.mul, %b.mul
+          store double %product, ptr %xmm0
+          br label %done
+        divide:
+          %a.div = load double, ptr %xmm0
+          %b.div = load double, ptr %ymm1
+          %quotient = fdiv double %a.div, %b.div
+          store double %quotient, ptr %ymm1
+          %moved = load double, ptr %ymm1
+          store double %moved, ptr %xmm0
+          br label %done
+        done:
+          ret ptr %memory
+        }
+
+        !0 = !{[5 x i8] c"XMM0\00"}
+        !1 = !{[5 x i8] c"YMM1\00"}
+        !2 = !{[4 x i8] c"R8B\00"}
+    )";
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_X86_64);
+    auto output = pipeline.decompile(ir);
+
+    ASSERT_TRUE(output.has_value()) << output.error();
+    ASSERT_FALSE(output->pseudo_c.empty());
+    EXPECT_NE(output->pseudo_c.find(
+        "double sub_1000(double param_1, double param_2, int8_t param_3)"),
+        std::string::npos) << output->pseudo_c;
+    EXPECT_NE(output->pseudo_c.find(" * "), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_NE(output->pseudo_c.find(" / "), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("(int64_t)param_"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("uninitialized return"), std::string::npos)
+        << output->pseudo_c;
+}
+
 TEST(IntegrationPipelineRegressionTest, CqoIdivPairRecoversSignedRemainder) {
     constexpr const char* ir = R"(
         target triple = "x86_64-pc-windows-msvc"

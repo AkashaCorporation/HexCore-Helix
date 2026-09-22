@@ -145,6 +145,11 @@ public:
     /// are handled conservatively (every selector kept live across them).
     void eliminateDeadSelectorStores(CFuncDecl& func);
 
+    /// Fold a synthetic boolean exit selector consumed only by a final
+    /// `if (!selector) target = fallback`. Every path in one structured
+    /// producer must define 0/1; success leaves must define target locally.
+    void foldBooleanExitSelectors(CFuncDecl& func);
+
     // ── Public expression utilities (used by free-function AST helpers) ───────
 
     /// Collect all CVarRefExpr names from an expression into the given set.

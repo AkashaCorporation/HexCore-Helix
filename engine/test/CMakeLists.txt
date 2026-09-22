@@ -12,6 +12,8 @@ if(NOT GTest_FOUND)
     FetchContent_MakeAvailable(googletest)
 endif()
 
+enable_testing()
+
 # ─── Test Data Directory (for integration tests) ────────────────────────────────
 
 set(HELIX_TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
@@ -19,6 +21,7 @@ set(HELIX_TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
 # ─── Test Executable ─────────────────────────────────────────────────────────────
 
 add_executable(helix_tests
+    EntryIdentityTest.cpp
     RemillDemanglerTest.cpp
     Remill6DemanglerTest.cpp
     Remill6IntegrationTest.cpp
@@ -31,9 +34,9 @@ add_executable(helix_tests
     StructureControlFlowTest.cpp
     ApplyDebugTypesTest.cpp
     VectorLaneTest.cpp
+    VerifyAuditTest.cpp
     EffectsContractTest.cpp
     LowToMidSemanticsTest.cpp
-    VerifyAuditTest.cpp
 )
 
 target_include_directories(helix_tests PRIVATE

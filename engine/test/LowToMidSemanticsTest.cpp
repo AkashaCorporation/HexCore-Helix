@@ -473,6 +473,45 @@ TEST(LowToMidSemanticsTest, RemovesOnlyAnnotatedCalleeSaveStackOps) {
     EXPECT_EQ(pops, 0u);
 }
 
+TEST(LowToMidSemanticsTest, RemovesRecoveredSysVArgumentStackPair) {
+    mlir::MLIRContext context;
+    context.getOrLoadDialect<mlir::func::FuncDialect>();
+    context.getOrLoadDialect<mlir::arith::ArithDialect>();
+    context.getOrLoadDialect<helix::low::HelixLowDialect>();
+    context.getOrLoadDialect<helix::mid::HelixMidDialect>();
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto function = builder.create<mlir::func::FuncOp>(
+        loc, "sysv_argument_cleanup", builder.getFunctionType({}, {}));
+    builder.setInsertionPointToStart(function.addEntryBlock());
+    auto value = builder.create<mlir::arith::ConstantIntOp>(loc, 2, 64);
+    auto push = builder.create<helix::low::PushOp>(
+        loc, value.getResult(), mlir::IntegerAttr{});
+    push->setAttr("helix.recovered_stack_argument", builder.getUnitAttr());
+    auto pop = builder.create<helix::low::PopOp>(
+        loc, builder.getI64Type(), mlir::IntegerAttr{});
+    pop->setAttr("helix.recovered_stack_argument_cleanup",
+                 builder.getUnitAttr());
+    builder.create<mlir::func::ReturnOp>(loc);
+
+    mlir::PassManager manager(&context);
+    manager.enableVerifier(true);
+    manager.addPass(helix::createHelixLowToMidPass());
+    ASSERT_TRUE(mlir::succeeded(manager.run(module)));
+
+    size_t lowPushes = 0, lowPops = 0, midPushes = 0, midPops = 0;
+    module.walk([&](helix::low::PushOp) { ++lowPushes; });
+    module.walk([&](helix::low::PopOp) { ++lowPops; });
+    module.walk([&](helix::mid::StackPushOp) { ++midPushes; });
+    module.walk([&](helix::mid::StackPopOp) { ++midPops; });
+    EXPECT_EQ(lowPushes, 0u);
+    EXPECT_EQ(lowPops, 0u);
+    EXPECT_EQ(midPushes, 0u);
+    EXPECT_EQ(midPops, 0u);
+}
+
 TEST(LowToMidSemanticsTest, KeepsMachineMulAndDivSignednessDistinct) {
     mlir::MLIRContext context;
     loadDialects(context);
@@ -775,6 +814,231 @@ TEST(LowToMidSemanticsTest, EmitsCastConsumedCallExactlyOnce) {
     EXPECT_EQ(count, 1u) << output;
 }
 
+TEST(LowToMidSemanticsTest, CAstPreservesIntegerExtensionSignedness) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+
+    auto buildFunction = [&](llvm::StringRef name, bool zeroExtend) {
+        auto function = builder.create<helix::low::FuncOp>(
+            loc, name, /*entry_address=*/0x405000,
+            /*original_name=*/mlir::StringAttr{});
+        function->setAttr("has_return_value", builder.getUnitAttr());
+        auto* block = builder.createBlock(&function.getBody());
+        builder.setInsertionPointToStart(block);
+        auto value = builder.create<helix::high::VarRefOp>(
+            loc, builder.getI32Type(), /*var_id=*/1, "value",
+            mlir::IntegerAttr{});
+        mlir::Value extended;
+        if (zeroExtend) {
+            extended = builder.create<mlir::LLVM::ZExtOp>(
+                loc, builder.getI64Type(), value.getResult());
+        } else {
+            extended = builder.create<mlir::LLVM::SExtOp>(
+                loc, builder.getI64Type(), value.getResult());
+        }
+        builder.create<helix::high::ReturnOp>(
+            loc, extended, mlir::IntegerAttr{});
+        builder.setInsertionPointToEnd(module.getBody());
+    };
+
+    buildFunction("zero_extend", true);
+    buildFunction("sign_extend", false);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+
+    helix::cast::CAstBuilder astBuilder;
+    auto functions = astBuilder.buildModule(module);
+    ASSERT_EQ(functions.size(), 2u);
+    helix::cast::CAstOptimizer optimizer;
+    helix::cast::CAstPrinter printer;
+    for (auto& function : functions)
+        optimizer.eliminateRedundantCasts(*function);
+
+    const std::string zeroOutput = printer.print(*functions[0]);
+    const std::string signOutput = printer.print(*functions[1]);
+    EXPECT_NE(zeroOutput.find("(uint64_t)(uint32_t)value"),
+              std::string::npos) << zeroOutput;
+    EXPECT_NE(signOutput.find("(int64_t)value"),
+              std::string::npos) << signOutput;
+}
+
+TEST(LowToMidSemanticsTest, CAstSignExtendsOneBitToNegativeOne) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    for (unsigned lane = 0; lane < 3; ++lane) {
+    for (unsigned width : {8u, 16u, 32u, 64u}) {
+        builder.setInsertionPointToEnd(module.getBody());
+        auto function = builder.create<helix::low::FuncOp>(
+            loc, "sext_bit_" + std::to_string(lane) + "_" + std::to_string(width),
+            0x407000 + lane * 256 + width,
+            mlir::StringAttr{});
+        function->setAttr("has_return_value", builder.getUnitAttr());
+        auto* block = builder.createBlock(&function.getBody());
+        builder.setInsertionPointToStart(block);
+        auto bit = builder.create<helix::high::VarRefOp>(
+            loc, builder.getI1Type(), 1, "bit", mlir::IntegerAttr{});
+        mlir::Value extended;
+        if (lane == 0) {
+            extended = builder.create<mlir::LLVM::SExtOp>(
+                loc, builder.getIntegerType(width), bit.getResult());
+        } else if (lane == 1) {
+            extended = builder.create<helix::mid::CastOp>(
+                loc, builder.getIntegerType(width), bit.getResult(),
+                mlir::IntegerAttr{}, helix::mid::CastKindAttr::get(
+                    &context, helix::mid::CastKind::SignExtend));
+        } else {
+            extended = builder.create<helix::high::CastOp>(
+                loc, builder.getIntegerType(width), bit.getResult(),
+                mlir::IntegerAttr{}, helix::high::CastKindAttr::get(
+                    &context, helix::high::CastKind::SignExtend));
+        }
+        builder.create<helix::high::ReturnOp>(
+            loc, extended, mlir::IntegerAttr{});
+    }
+    }
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    helix::cast::CAstBuilder astBuilder;
+    auto functions = astBuilder.buildModule(module);
+    ASSERT_EQ(functions.size(), 12u);
+    unsigned index = 0;
+    for (unsigned lane = 0; lane < 3; ++lane) {
+    for (unsigned width : {8u, 16u, 32u, 64u}) {
+        SCOPED_TRACE("lane=" + std::to_string(lane) + " width=" + std::to_string(width));
+        auto& function = functions[index++];
+        helix::cast::CAstOptimizer optimizer;
+        optimizer.simplifyExpressions(*function);
+        optimizer.eliminateRedundantCasts(*function);
+        auto* ret = llvm::dyn_cast<helix::cast::CReturnStmt>(
+            function->body.back().get());
+        ASSERT_NE(ret, nullptr);
+        auto* select = llvm::dyn_cast<helix::cast::CTernaryExpr>(ret->value.get());
+        ASSERT_NE(select, nullptr);
+        auto* set = llvm::dyn_cast<helix::cast::CIntLitExpr>(select->trueVal.get());
+        auto* clear = llvm::dyn_cast<helix::cast::CIntLitExpr>(select->falseVal.get());
+        ASSERT_NE(set, nullptr);
+        ASSERT_NE(clear, nullptr);
+        EXPECT_EQ(set->value, -1);
+        EXPECT_EQ(clear->value, 0);
+        ASSERT_NE(select->type, nullptr);
+        EXPECT_EQ(select->type->bitWidth, width);
+        EXPECT_TRUE(select->type->isSigned);
+    }
+    }
+}
+
+TEST(LowToMidSemanticsTest, CAstConsumesExactlyOneFieldAddressDereference) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    auto unsignedI64 = mlir::IntegerType::get(
+        &context, 64, mlir::IntegerType::Unsigned);
+    builder.setInsertionPointToEnd(module.getBody());
+
+    auto buildFunction = [&](llvm::StringRef name, bool loadPointedValue,
+                             bool explicitAddress = true) {
+        auto function = builder.create<helix::low::FuncOp>(
+            loc, name, /*entry_address=*/0x406000,
+            /*original_name=*/mlir::StringAttr{});
+        function->setAttr("has_return_value", builder.getUnitAttr());
+        auto* block = builder.createBlock(&function.getBody());
+        builder.setInsertionPointToStart(block);
+        auto base = builder.create<helix::high::VarRefOp>(
+            loc, builder.getI64Type(), /*var_id=*/1, "object",
+            mlir::IntegerAttr{});
+        auto field = builder.create<helix::high::FieldAccessOp>(
+            loc, builder.getI64Type(), base.getResult(),
+            builder.getStringAttr("field_0x8"),
+            mlir::IntegerAttr::get(unsignedI64, 8),
+            builder.getUnitAttr(), mlir::IntegerAttr{});
+        mlir::Value address = field.getResult();
+        if (explicitAddress) {
+            address = builder.create<helix::high::UnaryOp>(
+                loc, builder.getI64Type(), helix::high::UnaryOpKind::AddressOf,
+                field.getResult(), mlir::IntegerAttr{});
+        }
+        mlir::Value value = builder.create<helix::high::UnaryOp>(
+            loc, builder.getI64Type(), helix::high::UnaryOpKind::Deref,
+            address, mlir::IntegerAttr{});
+        if (loadPointedValue) {
+            value = builder.create<helix::high::UnaryOp>(
+                loc, builder.getI64Type(), helix::high::UnaryOpKind::Deref,
+                value, mlir::IntegerAttr{});
+        }
+        builder.create<helix::high::ReturnOp>(
+            loc, value, mlir::IntegerAttr{});
+        builder.setInsertionPointToEnd(module.getBody());
+    };
+
+    buildFunction("field_load", false);
+    buildFunction("pointed_value_load", true);
+    buildFunction("direct_field_pointer_load", false, false);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+
+    helix::cast::CAstBuilder astBuilder;
+    auto functions = astBuilder.buildModule(module);
+    ASSERT_EQ(functions.size(), 3u);
+    helix::cast::CAstPrinter printer;
+    const std::string fieldLoad = printer.print(*functions[0]);
+    const std::string pointedLoad = printer.print(*functions[1]);
+    EXPECT_NE(fieldLoad.find("return object->field_0x8;"),
+              std::string::npos) << fieldLoad;
+    EXPECT_EQ(fieldLoad.find("return *object->field_0x8;"),
+              std::string::npos) << fieldLoad;
+    // The fixture's field is integer-typed; interpreting it as an address
+    // requires an explicit pointer cast without losing the extra read.
+    EXPECT_NE(pointedLoad.find("return *(int64_t*)object->field_0x8;"),
+              std::string::npos) << pointedLoad;
+    EXPECT_NE(printer.print(*functions[2]).find("return *(int64_t*)object->field_0x8;"),
+              std::string::npos);
+}
+
+TEST(LowToMidSemanticsTest, FieldAddressSurvivesMidToHighConversion) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto function = builder.create<helix::low::FuncOp>(
+        loc, "field_address", 0x408000, mlir::StringAttr{});
+    function->setAttr("has_return_value", builder.getUnitAttr());
+    auto* block = builder.createBlock(&function.getBody());
+    builder.setInsertionPointToStart(block);
+    auto base = builder.create<helix::mid::VarRefOp>(
+        loc, builder.getI64Type(), 1, mlir::IntegerAttr{});
+    auto field = builder.create<helix::mid::FieldPtrOp>(
+        loc, builder.getI64Type(), base.getResult(), 8,
+        builder.getStringAttr("member"), mlir::IntegerAttr{});
+    builder.create<helix::high::ReturnOp>(
+        loc, field.getResult(), mlir::IntegerAttr{});
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    helix::cast::CAstBuilder ast;
+    helix::cast::CAstPrinter printer;
+    auto before = ast.buildModule(module);
+    ASSERT_EQ(before.size(), 1u);
+    EXPECT_NE(printer.print(*before[0]).find("&slot_1->member"), std::string::npos);
+    mlir::PassManager pm(&context);
+    pm.addPass(helix::createHelixMidToHighPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+    auto after = ast.buildModule(module);
+    ASSERT_EQ(after.size(), 1u);
+    auto* ret = llvm::dyn_cast<helix::cast::CReturnStmt>(after[0]->body.back().get());
+    ASSERT_NE(ret, nullptr);
+    auto* address = llvm::dyn_cast<helix::cast::CUnaryExpr>(ret->value.get());
+    ASSERT_NE(address, nullptr) << printer.print(*after[0]);
+    EXPECT_EQ(address->op, helix::cast::UnaryOp::AddressOf);
+}
+
 TEST(LowToMidSemanticsTest, MaterializesZeroAndSignFlagsFromBinaryResult) {
     mlir::MLIRContext context;
     loadDialects(context);
@@ -913,6 +1177,10 @@ TEST(LowToMidSemanticsTest, CAstPrintsExplicitOrderedComparisonSignedness) {
     const std::string signedOutput = printer.print(*functions[1]);
     EXPECT_NE(unsignedOutput.find("(uint64_t)"), std::string::npos);
     EXPECT_NE(signedOutput.find("(int64_t)"), std::string::npos);
+    helix::cast::CAstOptimizer optimizer;
+    optimizer.eliminateRedundantCasts(*functions[0]);
+    EXPECT_NE(printer.print(*functions[0]).find("(uint64_t)"), std::string::npos)
+        << "Unsigned 0 < UINT64_MAX must not become signed 0 < -1";
 }
 
 TEST(LowToMidSemanticsTest, CanonicalizesCompositeCmpFlags) {
@@ -1031,6 +1299,90 @@ TEST(LowToMidSemanticsTest, DoesNotApplyDeMorganToIntegerBitMask) {
         helix::mid::BinExprOp>();
     ASSERT_TRUE(survivingMask);
     EXPECT_EQ(survivingMask.getKind(), helix::mid::BinExprKind::BitAnd);
+}
+
+TEST(LowToMidSemanticsTest, EntrySegmentBaseIsExplicitUnknownUntilWritten) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto function = builder.create<mlir::func::FuncOp>(
+        loc, "segment_base_state",
+        builder.getFunctionType({}, {builder.getI64Type(), builder.getI64Type()}));
+    auto* block = function.addEntryBlock();
+    builder.setInsertionPointToStart(block);
+    auto entry = builder.create<helix::low::RegReadOp>(
+        loc, builder.getI64Type(), "GSBASE", 64, mlir::IntegerAttr{});
+    entry->setAttr("ssa_version", builder.getUI32IntegerAttr(0));
+    auto written = builder.create<helix::low::RegReadOp>(
+        loc, builder.getI64Type(), "GSBASE", 64, mlir::IntegerAttr{});
+    written->setAttr("ssa_version", builder.getUI32IntegerAttr(1));
+    builder.create<mlir::func::ReturnOp>(
+        loc, mlir::ValueRange{entry.getResult(), written.getResult()});
+
+    mlir::PassManager manager(&context);
+    manager.enableVerifier(true);
+    manager.addPass(helix::createHelixLowToMidPass());
+    ASSERT_TRUE(mlir::succeeded(manager.run(module)));
+
+    auto result = llvm::cast<mlir::func::ReturnOp>(block->getTerminator());
+    auto unknown = result.getOperand(0).getDefiningOp<
+        helix::mid::UnknownValueOp>();
+    ASSERT_TRUE(unknown);
+    EXPECT_EQ(unknown.getReason(), "entry register GSBASE unavailable");
+    auto known = result.getOperand(1).getDefiningOp<helix::mid::VarRefOp>();
+    ASSERT_TRUE(known);
+    EXPECT_EQ(known.getSlotId() & 0xffffu, 1u);
+}
+
+TEST(LowToMidSemanticsTest, LegalizerDeclaresDefinitionBackedRegionSlot) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto function = builder.create<helix::low::FuncOp>(
+        loc, "definition_backed_slot", 0x1000, mlir::StringAttr{});
+    auto* block = builder.createBlock(&function.getBody());
+    builder.setInsertionPointToStart(block);
+    constexpr uint32_t slot = 0xf6c20000u;
+    auto target = builder.create<helix::high::VarRefOp>(
+        loc, builder.getI64Type(), slot, builder.getStringAttr("v_gap"),
+        mlir::IntegerAttr{});
+    auto seven = builder.create<mlir::arith::ConstantIntOp>(loc, 7, 64);
+    builder.create<helix::high::AssignOp>(
+        loc, target.getResult(), seven.getResult(), mlir::IntegerAttr{});
+    auto value = builder.create<helix::high::VarRefOp>(
+        loc, builder.getI64Type(), slot, builder.getStringAttr("v_gap"),
+        mlir::IntegerAttr{});
+    value->setAttr("inferred_type", builder.getStringAttr("uint64_t"));
+    builder.create<helix::high::ReturnOp>(
+        loc, value.getResult(), mlir::IntegerAttr{});
+
+    mlir::PassManager manager(&context);
+    manager.enableVerifier(true);
+    manager.addPass(helix::createLegalizeFunctionContainersPass());
+    ASSERT_TRUE(mlir::succeeded(manager.run(module)));
+
+    helix::high::FuncOp legalized;
+    module.walk([&](helix::high::FuncOp op) { legalized = op; });
+    ASSERT_TRUE(legalized);
+    unsigned declarations = 0;
+    legalized.walk([&](helix::high::VarDeclOp declaration) {
+        if (declaration.getVarId() != slot) return;
+        ++declarations;
+        EXPECT_EQ(declaration.getVarName(), "v_gap");
+        EXPECT_TRUE(declaration->hasAttr(
+            "helix.definition_backed_slot_recovery"));
+        auto type = declaration->getAttrOfType<mlir::StringAttr>(
+            "inferred_type");
+        ASSERT_TRUE(type);
+        EXPECT_EQ(type.getValue(), "uint64_t");
+    });
+    EXPECT_EQ(declarations, 1u);
 }
 
 } // namespace

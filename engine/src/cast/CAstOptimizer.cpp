@@ -113,6 +113,11 @@ static bool isSameExpr(const CExpr* a, const CExpr* b) {
     case NodeKind::CastExpr: {
         auto& ca = static_cast<const CCastExpr&>(*a);
         auto& cb = static_cast<const CCastExpr&>(*b);
+        if (ca.targetType == cb.targetType)
+            return isSameExpr(ca.operand.get(), cb.operand.get());
+        if (!ca.targetType || !cb.targetType ||
+            *ca.targetType != *cb.targetType)
+            return false;
         return isSameExpr(ca.operand.get(), cb.operand.get());
     }
     case NodeKind::BinaryExpr: {
@@ -225,6 +230,7 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     // dispatcher-heavy functions).  Must run AFTER dissolveExitDispatchers so the
     // selector is no longer kept artificially live by a surviving switch.
     eliminateDeadSelectorStores(func);
+    foldBooleanExitSelectors(func);
     removePrologueEpilogue(func);
     eliminateInfrastructure(func);
     eliminateNullPtrStores(func);
@@ -254,6 +260,7 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     simplifyConditionPolarity(func);
     foldDegenerateCompounds(func);
     downgradeDeadAssignedCalls(func);
+    eliminateInfrastructure(func);
     declareUndeclaredVars(func);
     removeSelfAssignments(func);
     removeDanglingGotos(func);
@@ -303,6 +310,7 @@ void CAstOptimizer::optimize(CFuncDecl& func) {
     removeEmptyIfStatements(func);
     invertEmptyIfThen(func);
     simplifyConditionPolarity(func);
+    foldBooleanExitSelectors(func);
     removeEmptyIfStatements(func);
     // Drop declarations made unused by the final DCE/empty-branch cleanup.
     removeUnusedDeclarations(func);
@@ -453,6 +461,25 @@ void CAstOptimizer::foldIdenticalNestedSCFArms(CFuncDecl& func) {
 // different IDs even when they reference the same logical variable after
 // coalescing.
 
+static bool isLiteralNullDeref(const CExpr* expr) {
+    if (!expr || expr->getKind() != NodeKind::UnaryExpr)
+        return false;
+    const auto& unary = static_cast<const CUnaryExpr&>(*expr);
+    if (unary.op != UnaryOp::Deref)
+        return false;
+
+    const CExpr* address = unary.operand.get();
+    while (address && address->getKind() == NodeKind::CastExpr)
+        address = static_cast<const CCastExpr&>(*address).operand.get();
+    if (!address)
+        return false;
+    if (address->getKind() == NodeKind::IntLitExpr)
+        return static_cast<const CIntLitExpr&>(*address).value == 0;
+    if (address->getKind() == NodeKind::AddrLitExpr)
+        return static_cast<const CAddrLitExpr&>(*address).addrValue == 0;
+    return false;
+}
+
 static void removeSelfAssignsInList(std::vector<StmtPtr>& stmts) {
     // First recurse into nested scopes.
     for (auto& sp : stmts) {
@@ -500,6 +527,9 @@ static void removeSelfAssignsInList(std::vector<StmtPtr>& stmts) {
                     return false;
                 if (!a.target || !a.value)
                     return false;
+                if (isLiteralNullDeref(a.target.get()) &&
+                    isLiteralNullDeref(a.value.get()))
+                    return true;
                 if (a.target->getKind() != NodeKind::VarRefExpr ||
                     a.value->getKind() != NodeKind::VarRefExpr)
                     return false;
@@ -1982,7 +2012,14 @@ static bool isCanaryFailFunction(std::string_view name) {
 ///   - SysV/Linux: *(type)(void*)0 + 40  (gs:0x28 or fs:0x28 lifted)
 ///   - SysV/Linux: __readgsqword(0x28), __readfsqword(0x28)
 ///   - Win64:      __security_cookie  (referenced as global)
+static const CExpr* peelCanaryCasts(const CExpr* expr) {
+    while (expr && expr->getKind() == NodeKind::CastExpr)
+        expr = static_cast<const CCastExpr&>(*expr).operand.get();
+    return expr;
+}
+
 static bool isCanaryRead(const CExpr* expr) {
+    expr = peelCanaryCasts(expr);
     if (!expr) return false;
 
     // Pattern 1: deref of null + segment offset (typical kernel/SysV).
@@ -2032,6 +2069,28 @@ static bool isCanaryRead(const CExpr* expr) {
         if (var.varName == "__security_cookie" ||
             var.varName == "__stack_chk_guard")
             return true;
+    }
+
+    // A missing segment-base live-in is rendered explicitly rather than as a
+    // null pointer.  Offset 0x28 on GSBASE/FSBASE is still identifiable as the
+    // stack-canary source, but only the complete save/check/failure pattern may
+    // later elide it.
+    if (expr->getKind() == NodeKind::FieldAccessExpr) {
+        const auto& field = static_cast<const CFieldAccessExpr&>(*expr);
+        if (field.fieldOffset == 40 || field.fieldOffset == 20 ||
+            field.fieldOffset == 16 || field.fieldOffset == 8) {
+            const CExpr* base = peelCanaryCasts(field.base.get());
+            auto* call = llvm::dyn_cast_or_null<CCallExpr>(base);
+            if (call && call->targetName == "__helix_unknown" &&
+                call->args.size() == 1) {
+                const CExpr* reason = peelCanaryCasts(call->args[0].get());
+                auto* text = llvm::dyn_cast_or_null<CStringLitExpr>(reason);
+                if (text &&
+                    (llvm::StringRef(text->value).contains("GSBASE unavailable") ||
+                     llvm::StringRef(text->value).contains("FSBASE unavailable")))
+                    return true;
+            }
+        }
     }
 
     return false;
@@ -2109,7 +2168,8 @@ static bool spliceNormalCanaryArm(std::vector<StmtPtr>& stmts, size_t index) {
 /// This does not depend on recognizing the compiler-specific canary read. SCF
 /// may route the check through loop-carried tuple values, while the failure
 /// callee remains authoritative and identifies the exceptional arm directly.
-static void removeStructuredCanaryChecks(std::vector<StmtPtr>& stmts) {
+static bool removeStructuredCanaryChecks(std::vector<StmtPtr>& stmts) {
+    bool removed = false;
     for (size_t i = 0; i < stmts.size();) {
         if (!stmts[i]) {
             ++i;
@@ -2118,6 +2178,7 @@ static void removeStructuredCanaryChecks(std::vector<StmtPtr>& stmts) {
 
         if (stmts[i]->getKind() == NodeKind::IfStmt &&
             spliceNormalCanaryArm(stmts, i)) {
+            removed = true;
             // Revisit this position: the selected normal arm may itself begin
             // with another structured canary check.
             continue;
@@ -2126,28 +2187,28 @@ static void removeStructuredCanaryChecks(std::vector<StmtPtr>& stmts) {
         switch (stmts[i]->getKind()) {
         case NodeKind::IfStmt: {
             auto& branch = static_cast<CIfStmt&>(*stmts[i]);
-            removeStructuredCanaryChecks(branch.thenBody);
-            removeStructuredCanaryChecks(branch.elseBody);
+            removed |= removeStructuredCanaryChecks(branch.thenBody);
+            removed |= removeStructuredCanaryChecks(branch.elseBody);
             break;
         }
         case NodeKind::WhileStmt:
-            removeStructuredCanaryChecks(
+            removed |= removeStructuredCanaryChecks(
                 static_cast<CWhileStmt&>(*stmts[i]).body);
             break;
         case NodeKind::DoWhileStmt:
-            removeStructuredCanaryChecks(
+            removed |= removeStructuredCanaryChecks(
                 static_cast<CDoWhileStmt&>(*stmts[i]).body);
             break;
         case NodeKind::ForStmt:
-            removeStructuredCanaryChecks(
+            removed |= removeStructuredCanaryChecks(
                 static_cast<CForStmt&>(*stmts[i]).body);
             break;
         case NodeKind::SwitchStmt:
             for (auto& arm : static_cast<CSwitchStmt&>(*stmts[i]).cases)
-                removeStructuredCanaryChecks(arm.body);
+                removed |= removeStructuredCanaryChecks(arm.body);
             break;
         case NodeKind::BlockStmt:
-            removeStructuredCanaryChecks(
+            removed |= removeStructuredCanaryChecks(
                 static_cast<CBlockStmt&>(*stmts[i]).stmts);
             break;
         default:
@@ -2155,6 +2216,7 @@ static void removeStructuredCanaryChecks(std::vector<StmtPtr>& stmts) {
         }
         ++i;
     }
+    return removed;
 }
 
 /// Returns true if expr references varName.
@@ -2183,8 +2245,63 @@ static bool exprRefsVar(const CExpr* expr, const std::string& varName) {
                exprRefsVar(t.trueVal.get(), varName) ||
                exprRefsVar(t.falseVal.get(), varName);
     }
+    case NodeKind::SubscriptExpr: {
+        auto& subscript = static_cast<const CSubscriptExpr&>(*expr);
+        return exprRefsVar(subscript.base.get(), varName) ||
+               exprRefsVar(subscript.index.get(), varName);
+    }
+    case NodeKind::FieldAccessExpr:
+        return exprRefsVar(
+            static_cast<const CFieldAccessExpr&>(*expr).base.get(), varName);
     default: return false;
     }
+}
+
+static bool stmtRefsVar(const CStmt* statement,
+                        const std::string& varName);
+
+static bool stmtsRefVar(const std::vector<StmtPtr>& statements,
+                        const std::string& varName) {
+    return std::any_of(statements.begin(), statements.end(),
+        [&](const StmtPtr& statement) {
+            return stmtRefsVar(statement.get(), varName);
+        });
+}
+
+static bool stmtRefsVar(const CStmt* statement,
+                        const std::string& varName) {
+    if (!statement) return false;
+    if (auto* assign = llvm::dyn_cast<CAssignStmt>(statement))
+        return exprRefsVar(assign->target.get(), varName) ||
+               exprRefsVar(assign->value.get(), varName);
+    if (auto* expr = llvm::dyn_cast<CExprStmt>(statement))
+        return exprRefsVar(expr->expr.get(), varName);
+    if (auto* ret = llvm::dyn_cast<CReturnStmt>(statement))
+        return exprRefsVar(ret->value.get(), varName);
+    if (auto* branch = llvm::dyn_cast<CIfStmt>(statement))
+        return exprRefsVar(branch->condition.get(), varName) ||
+               stmtsRefVar(branch->thenBody, varName) ||
+               stmtsRefVar(branch->elseBody, varName);
+    if (auto* loop = llvm::dyn_cast<CWhileStmt>(statement))
+        return exprRefsVar(loop->condition.get(), varName) ||
+               stmtsRefVar(loop->body, varName);
+    if (auto* loop = llvm::dyn_cast<CDoWhileStmt>(statement))
+        return stmtsRefVar(loop->body, varName) ||
+               exprRefsVar(loop->condition.get(), varName);
+    if (auto* loop = llvm::dyn_cast<CForStmt>(statement))
+        return stmtRefsVar(loop->init.get(), varName) ||
+               exprRefsVar(loop->condition.get(), varName) ||
+               stmtRefsVar(loop->step.get(), varName) ||
+               stmtsRefVar(loop->body, varName);
+    if (auto* sw = llvm::dyn_cast<CSwitchStmt>(statement)) {
+        if (exprRefsVar(sw->selector.get(), varName)) return true;
+        for (const auto& arm : sw->cases)
+            if (stmtsRefVar(arm.body, varName)) return true;
+        return false;
+    }
+    if (auto* block = llvm::dyn_cast<CBlockStmt>(statement))
+        return stmtsRefVar(block->stmts, varName);
+    return false;
 }
 
 /// Returns true if this is a canary check: if(!(var - canary)) or if(var - canary).
@@ -2283,11 +2400,114 @@ static bool containsCanaryRead(const CExpr* expr) {
     }
 }
 
+static std::optional<std::string> canaryAliasName(
+    const CExpr* expr, const std::unordered_set<std::string>& aliases) {
+    expr = peelCanaryCasts(expr);
+    auto* var = llvm::dyn_cast_or_null<CVarRefExpr>(expr);
+    if (!var || !aliases.contains(var->varName))
+        return std::nullopt;
+    return var->varName;
+}
+
+static bool isCanaryDifference(
+    const CExpr* expr, const std::unordered_set<std::string>& aliases) {
+    expr = peelCanaryCasts(expr);
+    auto* binary = llvm::dyn_cast_or_null<CBinaryExpr>(expr);
+    if (!binary || binary->op != BinaryOp::Sub)
+        return false;
+    return (canaryAliasName(binary->lhs.get(), aliases).has_value() &&
+            isCanaryRead(binary->rhs.get())) ||
+           (isCanaryRead(binary->lhs.get()) &&
+            canaryAliasName(binary->rhs.get(), aliases).has_value());
+}
+
+/// Remove a local alias chain ending in a proven stack-canary subtraction.
+/// The caller must already have removed a branch containing a known canary
+/// failure routine. A generic surviving use of the storage is preserved.
+static bool removeResidualCanaryAliasChains(
+    std::vector<StmtPtr>& stmts, const std::string& storage) {
+    bool removed = false;
+    for (size_t i = 0; i < stmts.size();) {
+        if (!stmts[i]) {
+            ++i;
+            continue;
+        }
+
+        bool erasedChain = false;
+        auto* first = llvm::dyn_cast<CAssignStmt>(stmts[i].get());
+        auto* firstTarget = first && first->target
+            ? llvm::dyn_cast<CVarRefExpr>(first->target.get()) : nullptr;
+        if (first && firstTarget && first->value) {
+            std::unordered_set<std::string> aliases{storage};
+            if (isCanaryDifference(first->value.get(), aliases)) {
+                stmts.erase(stmts.begin() + static_cast<ptrdiff_t>(i));
+                removed = erasedChain = true;
+            } else if (canaryAliasName(first->value.get(), aliases)) {
+                aliases.insert(firstTarget->varName);
+                for (size_t j = i + 1; j < stmts.size(); ++j) {
+                    auto* next = llvm::dyn_cast<CAssignStmt>(stmts[j].get());
+                    auto* target = next && next->target
+                        ? llvm::dyn_cast<CVarRefExpr>(next->target.get())
+                        : nullptr;
+                    if (!next || !target || !next->value)
+                        break;
+                    if (isCanaryDifference(next->value.get(), aliases)) {
+                        stmts.erase(
+                            stmts.begin() + static_cast<ptrdiff_t>(i),
+                            stmts.begin() + static_cast<ptrdiff_t>(j + 1));
+                        removed = erasedChain = true;
+                        break;
+                    }
+                    if (!canaryAliasName(next->value.get(), aliases))
+                        break;
+                    aliases.insert(target->varName);
+                }
+            }
+        }
+        if (erasedChain)
+            continue;
+
+        switch (stmts[i]->getKind()) {
+        case NodeKind::IfStmt: {
+            auto& branch = static_cast<CIfStmt&>(*stmts[i]);
+            removed |= removeResidualCanaryAliasChains(branch.thenBody, storage);
+            removed |= removeResidualCanaryAliasChains(branch.elseBody, storage);
+            break;
+        }
+        case NodeKind::WhileStmt:
+            removed |= removeResidualCanaryAliasChains(
+                static_cast<CWhileStmt&>(*stmts[i]).body, storage);
+            break;
+        case NodeKind::DoWhileStmt:
+            removed |= removeResidualCanaryAliasChains(
+                static_cast<CDoWhileStmt&>(*stmts[i]).body, storage);
+            break;
+        case NodeKind::ForStmt:
+            removed |= removeResidualCanaryAliasChains(
+                static_cast<CForStmt&>(*stmts[i]).body, storage);
+            break;
+        case NodeKind::SwitchStmt:
+            for (auto& arm : static_cast<CSwitchStmt&>(*stmts[i]).cases)
+                removed |= removeResidualCanaryAliasChains(arm.body, storage);
+            break;
+        case NodeKind::BlockStmt:
+            removed |= removeResidualCanaryAliasChains(
+                static_cast<CBlockStmt&>(*stmts[i]).stmts, storage);
+            break;
+        default:
+            break;
+        }
+        ++i;
+    }
+    return removed;
+}
+
 void CAstOptimizer::recognizeStackCanary(CFuncDecl& func) {
     // FIX-134: explicit failure callees are a stronger signal than the exact
     // lifted shape of the canary read. Handle nested SCF/RVSDG checks before
     // the legacy source-variable strategies below.
-    removeStructuredCanaryChecks(func.body);
+    const bool removedStructuredCheck =
+        removeStructuredCanaryChecks(func.body);
 
     // Strategy 1: Direct canary save — var = *(type)(void*)0 + 40
     std::string canaryVar;
@@ -2346,6 +2566,56 @@ void CAstOptimizer::recognizeStackCanary(CFuncDecl& func) {
 
     if (!canaryVar.empty()) {
         const std::string canarySource = canaryVar;
+        bool residualStorageUse = false;
+        for (const auto& statement : func.body) {
+            if (!statement) continue;
+            if (getCanarySaveVar(statement.get()) == canarySource)
+                continue;
+            auto* assign = llvm::dyn_cast<CAssignStmt>(statement.get());
+            auto* target = assign && assign->target
+                ? llvm::dyn_cast<CVarRefExpr>(assign->target.get()) : nullptr;
+            auto* value = assign && assign->value
+                ? llvm::dyn_cast<CVarRefExpr>(assign->value.get()) : nullptr;
+            if (target && value && target->varName == canaryStorage &&
+                value->varName == canarySource)
+                continue;
+            if (stmtRefsVar(statement.get(), canaryStorage)) {
+                residualStorageUse = true;
+                break;
+            }
+        }
+        if (residualStorageUse && removedStructuredCheck) {
+            removeResidualCanaryAliasChains(func.body, canaryStorage);
+            residualStorageUse = false;
+            for (const auto& statement : func.body) {
+                if (!statement)
+                    continue;
+                if (getCanarySaveVar(statement.get()) == canarySource)
+                    continue;
+                auto* assign = llvm::dyn_cast<CAssignStmt>(statement.get());
+                auto* target = assign && assign->target
+                    ? llvm::dyn_cast<CVarRefExpr>(assign->target.get())
+                    : nullptr;
+                auto* value = assign && assign->value
+                    ? llvm::dyn_cast<CVarRefExpr>(assign->value.get())
+                    : nullptr;
+                if (target && value && target->varName == canaryStorage &&
+                    value->varName == canarySource)
+                    continue;
+                if (stmtRefsVar(statement.get(), canaryStorage)) {
+                    residualStorageUse = true;
+                    break;
+                }
+            }
+        }
+        if (residualStorageUse) {
+            if (std::find(func.protectedDefinitionNames.begin(),
+                          func.protectedDefinitionNames.end(),
+                          canaryStorage) == func.protectedDefinitionNames.end())
+                func.protectedDefinitionNames.push_back(canaryStorage);
+            return;
+        }
+
         removeCanaryInStmts(func.body, canaryStorage);
 
         // Remove the TLS read and its one-hop spill. Do not erase or otherwise
@@ -2424,8 +2694,27 @@ void CAstOptimizer::recognizeStackCanary(CFuncDecl& func) {
 // runs before optimization and therefore over-reports issues.
 
 void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
+    func.nativeQualityEvaluated = true;
     double deduction = 0.0;
     func.confidenceIssues.clear();
+
+    // Placeholder creation happens before the final DSE/declaration cleanup.
+    // Re-derive the surviving subset so removed orphan refs do not leave a
+    // sticky count or stale names in the final quality report.
+    std::unordered_set<std::string> survivingLocalNames;
+    for (const auto& local : func.localVars)
+        survivingLocalNames.insert(local.varName);
+    std::erase_if(func.synthesizedVarNames, [&](const std::string& name) {
+        return !survivingLocalNames.contains(name);
+    });
+    std::sort(func.synthesizedVarNames.begin(),
+              func.synthesizedVarNames.end());
+    func.synthesizedVarNames.erase(
+        std::unique(func.synthesizedVarNames.begin(),
+                    func.synthesizedVarNames.end()),
+        func.synthesizedVarNames.end());
+    func.synthesizedVarDecls =
+        static_cast<unsigned>(func.synthesizedVarNames.size());
 
     // #30 (registry-miss honest failure): this rescorer overwrites
     // confidenceScore AFTER all optimizations and is the value the user
@@ -2806,10 +3095,19 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
     if (func.synthesizedVarDecls > 0) {
         unsigned n = func.synthesizedVarDecls;
         deduction += std::min(25.0, 3.0 + 2.5 * (double)n);
+        std::string names;
+        const size_t shown = std::min<size_t>(8, func.synthesizedVarNames.size());
+        for (size_t i = 0; i < shown; ++i) {
+            if (!names.empty()) names += ", ";
+            names += func.synthesizedVarNames[i];
+        }
+        if (func.synthesizedVarNames.size() > shown)
+            names += std::format(", +{} more",
+                func.synthesizedVarNames.size() - shown);
         func.confidenceIssues.push_back(
             std::format("{} auto-declared placeholder variable(s)"
-                        " — lift-quality concern; verify against IDA",
-                        n));
+                        "{} — lift-quality concern; verify against IDA",
+                        n, names.empty() ? "" : std::format(" ({})", names)));
     }
 
     // ── Typed parameter bonus ────────────────────────────────────────
@@ -2975,10 +3273,14 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
                     (a->compoundOp == "+=" || a->compoundOp == "-=" ||
                      a->compoundOp == "|=" || a->compoundOp == "^=") &&
                     isZeroLit(a->value.get());
+                bool canonicalIncDec =
+                    a->compoundOp == "++" || a->compoundOp == "--";
                 if (plainSelf || selfOrAnd || opZero) {
                     cnt.identityNoOp++;
-                } else if (rhsRefs &&
-                           !isPureSelfWalk(a->value.get(), tn)) {
+                } else if (!canonicalIncDec && rhsRefs &&
+                           !isPureSelfWalk(a->value.get(), tn) &&
+                           !helix::cast::detail::isConditionalPreserveUpdate(
+                               a->value.get(), tn)) {
                     cnt.suspiciousSelfRef++;
                 }
             }
@@ -3018,6 +3320,7 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
             "{} null-deref of zero-initialised placeholder",
             cnt.nullDerefPlaceholder));
     }
+    func.suspiciousSelfReferences = cnt.suspiciousSelfRef;
     if (cnt.suspiciousSelfRef > 0) {
         deduction += std::min(20.0, (double)cnt.suspiciousSelfRef * 5.0);
         func.confidenceIssues.push_back(std::format(
@@ -3031,6 +3334,31 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
     }
 
     func.confidenceScore = std::max(0.0, std::min(100.0, 100.0 - deduction));
+    // A presentation bonus must never restore perfect confidence while the
+    // same report still advertises a suspicious self-reference. Keep the
+    // finding visible and cap only affected functions; clean corpora remain
+    // byte-identical.
+    if (cnt.suspiciousSelfRef > 0)
+        func.confidenceScore = std::min(func.confidenceScore, 95.0);
+    if (func.opaquePostCallReads) {
+        func.confidenceScore = std::min(func.confidenceScore, 50.0);
+        func.confidenceIssues.push_back(std::format(
+            "damning honesty defect ({} opaque post-call register read(s)) - confidence capped at 50%", func.opaquePostCallReads));
+    }
+
+    if (func.unqualifiedInstrumentationCalls) {
+        func.confidenceScore = std::min(func.confidenceScore, 50.0);
+        func.confidenceIssues.push_back(std::format(
+            "unqualified runtime instrumentation ({} call(s)); source-level register preservation only - confidence capped at 50%",
+            func.unqualifiedInstrumentationCalls));
+    }
+
+    if (func.incompleteAbiCalls) {
+        func.confidenceScore = std::min(func.confidenceScore, 50.0);
+        func.confidenceIssues.push_back(std::format(
+            "damning honesty defect ({} call(s) with incomplete ABI arguments) - confidence capped at 50%",
+            func.incompleteAbiCalls));
+    }
 
     // -- D4 (charter exit-metric 4): damning-defect hard cap (FIX-092) --
     // This rescorer overwrites confidenceScore AFTER all optimizations and is
@@ -4772,6 +5100,8 @@ bool CAstOptimizer::isInfrastructureStmt(const CStmt& stmt) const {
         // CExprStmt containing a call to infra functions.
         if (es.expr->getKind() == NodeKind::CallExpr) {
             const auto& call = static_cast<const CCallExpr&>(*es.expr);
+            if (call.targetName.starts_with("__helix_post_call_"))
+                return true;
             for (auto& name : kInfraCallNames)
                 if (call.targetName == name) return true;
         }
@@ -5195,7 +5525,11 @@ void CAstOptimizer::dseStmtList(std::vector<StmtPtr>& stmts,
 }
 
 void CAstOptimizer::eliminateDeadStores(CFuncDecl& func) {
-    dseStmtList(func.body);
+    std::unordered_set<std::string> protectedDefinitions(
+        func.protectedDefinitionNames.begin(),
+        func.protectedDefinitionNames.end());
+    dseStmtList(func.body, protectedDefinitions.empty()
+        ? nullptr : &protectedDefinitions);
 
     // FIX-095d: collect every variable READ anywhere in a loop body. Seeding the
     // loop's DSE with this set keeps loop-carried stores alive (the loop back-edge
@@ -5663,8 +5997,11 @@ ExprPtr CAstOptimizer::substituteVarRefs(
                 // Check that inlining won't exceed total depth limit.
                 unsigned defDepth = exprDepth(dit->second);
                 if (contextDepth + defDepth <= kMaxTotalDepth) {
+                    auto replacement = cloneExpr(dit->second);
+                    if (!replacement) return expr;
                     inlined.insert(v.varName);
-                    return cloneExpr(dit->second);
+                    return substituteVarRefs(std::move(replacement), defs,
+                                             refCounts, inlined, contextDepth + 1);
                 }
             }
         }
@@ -5855,12 +6192,29 @@ void CAstOptimizer::propagateCopies(CFuncDecl& func) {
         }
     }
 
+    // Rewriting assignment RHS nodes invalidates borrowed definition pointers.
+    // Keep immutable snapshots for the duration of this substitution pass.
+    std::vector<ExprPtr> definitionSnapshots;
+    definitionSnapshots.reserve(defs.size());
+    for (auto it = defs.begin(); it != defs.end();) {
+        auto snapshot = cloneExpr(it->second);
+        if (!snapshot) {
+            it = defs.erase(it);
+            continue;
+        }
+        it->second = snapshot.get();
+        definitionSnapshots.push_back(std::move(snapshot));
+        ++it;
+    }
+
     // Pass C: substitute uses of inlined variables.
     std::unordered_set<std::string> inlined;
     copyPropStmtList(func.body, defs, refCounts, inlined);
 
     // Pass D: remove the original assignment statements for inlined vars.
     if (!inlined.empty()) {
+        std::unordered_map<std::string, unsigned> remainingReferences;
+        countVarRefs(func.body, remainingReferences);
         std::erase_if(func.body, [&](const StmtPtr& sp) {
             if (!sp || sp->getKind() != NodeKind::AssignStmt) return false;
             const auto& a = static_cast<const CAssignStmt&>(*sp);
@@ -5869,7 +6223,7 @@ void CAstOptimizer::propagateCopies(CFuncDecl& func) {
                 return false;
             const std::string& name =
                 static_cast<const CVarRefExpr*>(a.target.get())->varName;
-            return inlined.count(name) > 0;
+            return inlined.count(name) > 0 && remainingReferences[name] == 0;
         });
     }
 }
@@ -6355,13 +6709,12 @@ void CAstOptimizer::simplifyExpressions(CFuncDecl& func) {
 //                                          pointer constant as a void*
 //                                          which is then immediately
 //                                          re-typed for an i64 use
-//   3. `(uint64_t)var`  where var is i64 — sign-only difference, both
-//                                          map to a 64-bit register
 //
 // We never elide a cast that changes bit width (that would change the
-// value) and we never elide pointer↔integer casts unless both sides are
-// 64 bits — narrowing to 32 bits would silently drop the upper half on
-// any real 64-bit target.
+// value). Signedness changes also remain explicit: equal register bits do not
+// imply equal C comparison, division, shift or promotion semantics.
+// Pointer/integer casts remain explicit: equal widths do not preserve C
+// pointer arithmetic, dereference legality or argument typing.
 
 namespace {
 
@@ -6373,25 +6726,8 @@ bool castIsRedundant(const CType* src, const CType* dst) {
     if (src == dst) return true;
     if (*src == *dst) return true;
 
-    auto isInt64 = [](const CType* t) {
-        return t->kind == TypeKind::Int && t->bitWidth == 64;
-    };
-    auto isPtrLike = [](const CType* t) {
-        return t->kind == TypeKind::Pointer ||
-               t->kind == TypeKind::FuncPtr;
-    };
-
-    // int64 ↔ pointer: same bit width on every supported target.
-    if ((isInt64(src) && isPtrLike(dst)) ||
-        (isPtrLike(src) && isInt64(dst)))
-        return true;
-
-    // Same kind + same width: sign-only difference.  Eliminating the
-    // cast keeps the value bits intact; the result type just reflects
-    // the new lvalue's signedness, which the printer picks up from the
-    // surrounding context.
     if (src->kind == dst->kind && src->bitWidth == dst->bitWidth &&
-        src->bitWidth != 0)
+        src->bitWidth != 0 && src->isSigned == dst->isSigned)
         return true;
 
     return false;
@@ -6442,7 +6778,19 @@ ExprPtr stripRedundantCasts(ExprPtr expr) {
     }
     case NodeKind::CastExpr: {
         auto& c = static_cast<CCastExpr&>(*expr);
-        c.operand = stripRedundantCasts(std::move(c.operand));
+        bool preserveExtensionSource = false;
+        if (c.targetType && c.targetType->kind == TypeKind::Int &&
+            c.operand && c.operand->getKind() == NodeKind::CastExpr) {
+            auto& inner = static_cast<CCastExpr&>(*c.operand);
+            preserveExtensionSource =
+                inner.targetType && inner.targetType->kind == TypeKind::Int &&
+                inner.targetType->bitWidth < c.targetType->bitWidth &&
+                inner.targetType->isSigned == c.targetType->isSigned;
+            if (preserveExtensionSource)
+                inner.operand = stripRedundantCasts(std::move(inner.operand));
+        }
+        if (!preserveExtensionSource)
+            c.operand = stripRedundantCasts(std::move(c.operand));
         if (!c.operand) return std::move(expr);
 
         const CType* srcTy = c.operand->type.get();
@@ -9787,6 +10135,202 @@ void CAstOptimizer::declareUndeclaredVars(CFuncDecl& func) {
     // can still surface this as a smell even though the output now
     // technically compiles.  See FIX-045.
     func.synthesizedVarDecls += static_cast<unsigned>(orphans.size());
+    func.synthesizedVarNames.insert(func.synthesizedVarNames.end(),
+                                    orphans.begin(), orphans.end());
+}
+
+void CAstOptimizer::foldBooleanExitSelectors(CFuncDecl& func) {
+    struct FlowState {
+        bool valid = true;
+        bool selectorDefinite = false;
+        bool targetAssigned = false;
+        unsigned zeroDefs = 0;
+        unsigned oneDefs = 0;
+    };
+
+    auto plainVar = [](const CExpr* expr) -> const CVarRefExpr* {
+        while (expr && expr->getKind() == NodeKind::CastExpr)
+            expr = static_cast<const CCastExpr&>(*expr).operand.get();
+        return llvm::dyn_cast_or_null<CVarRefExpr>(expr);
+    };
+    auto intValue = [](const CExpr* expr) -> std::optional<int64_t> {
+        while (expr && expr->getKind() == NodeKind::CastExpr)
+            expr = static_cast<const CCastExpr&>(*expr).operand.get();
+        auto* literal = llvm::dyn_cast_or_null<CIntLitExpr>(expr);
+        if (!literal)
+            return std::nullopt;
+        return literal->value;
+    };
+
+    for (size_t finalIndex = func.body.size(); finalIndex-- > 0;) {
+        auto* finalizer =
+            llvm::dyn_cast_or_null<CIfStmt>(func.body[finalIndex].get());
+        if (!finalizer || !finalizer->elseBody.empty() ||
+            finalizer->thenBody.size() != 1)
+            continue;
+        auto* negated = llvm::dyn_cast_or_null<CUnaryExpr>(
+            finalizer->condition.get());
+        if (!negated || negated->op != UnaryOp::LogNot)
+            continue;
+        auto* selectorRef = plainVar(negated->operand.get());
+        if (!selectorRef || !isSelectorVarName(selectorRef->varName))
+            continue;
+        const std::string selector = selectorRef->varName;
+
+        auto* fallback = llvm::dyn_cast_or_null<CAssignStmt>(
+            finalizer->thenBody.front().get());
+        auto* fallbackTarget = fallback && fallback->compoundOp.empty()
+            ? plainVar(fallback->target.get()) : nullptr;
+        if (!fallback || !fallbackTarget || !fallback->value ||
+            exprHasCall(fallback->value.get()))
+            continue;
+        const std::string targetName = fallbackTarget->varName;
+
+        std::vector<size_t> producers;
+        bool laterMention = false;
+        for (size_t i = 0; i < func.body.size(); ++i) {
+            if (i == finalIndex)
+                continue;
+            if (!stmtRefsVar(func.body[i].get(), selector))
+                continue;
+            if (i < finalIndex)
+                producers.push_back(i);
+            else
+                laterMention = true;
+        }
+        if (laterMention || producers.size() != 1)
+            continue;
+        const size_t producerIndex = producers.front();
+
+        std::function<FlowState(const std::vector<StmtPtr>&, bool)>
+            validateList;
+        std::function<FlowState(const CStmt*, bool)> validateStmt;
+
+        validateStmt = [&](const CStmt* stmt,
+                           bool targetAssigned) -> FlowState {
+            FlowState state;
+            state.targetAssigned = targetAssigned;
+            if (!stmt)
+                return state;
+
+            if (auto* assign = llvm::dyn_cast<CAssignStmt>(stmt)) {
+                auto* target = assign->compoundOp.empty()
+                    ? plainVar(assign->target.get()) : nullptr;
+                if (target && target->varName == selector) {
+                    auto value = intValue(assign->value.get());
+                    if (!value || (*value != 0 && *value != 1)) {
+                        state.valid = false;
+                        return state;
+                    }
+                    if (*value == 1 && !targetAssigned) {
+                        state.valid = false;
+                        return state;
+                    }
+                    state.selectorDefinite = true;
+                    state.zeroDefs = *value == 0;
+                    state.oneDefs = *value == 1;
+                    return state;
+                }
+                if (stmtRefsVar(stmt, selector)) {
+                    state.valid = false;
+                    return state;
+                }
+                if (target && target->varName == targetName)
+                    state.targetAssigned = true;
+                return state;
+            }
+
+            if (auto* branch = llvm::dyn_cast<CIfStmt>(stmt)) {
+                if (exprRefsVar(branch->condition.get(), selector)) {
+                    state.valid = false;
+                    return state;
+                }
+                auto thenState =
+                    validateList(branch->thenBody, targetAssigned);
+                auto elseState =
+                    validateList(branch->elseBody, targetAssigned);
+                state.valid = thenState.valid && elseState.valid;
+                state.selectorDefinite =
+                    thenState.selectorDefinite &&
+                    elseState.selectorDefinite;
+                state.targetAssigned =
+                    thenState.targetAssigned && elseState.targetAssigned;
+                state.zeroDefs = thenState.zeroDefs + elseState.zeroDefs;
+                state.oneDefs = thenState.oneDefs + elseState.oneDefs;
+                return state;
+            }
+
+            if (stmtRefsVar(stmt, selector))
+                state.valid = false;
+            return state;
+        };
+
+        validateList = [&](const std::vector<StmtPtr>& stmts,
+                           bool targetAssigned) -> FlowState {
+            FlowState combined;
+            combined.targetAssigned = targetAssigned;
+            for (const auto& statement : stmts) {
+                auto current =
+                    validateStmt(statement.get(), combined.targetAssigned);
+                if (!current.valid) {
+                    combined.valid = false;
+                    return combined;
+                }
+                combined.selectorDefinite |= current.selectorDefinite;
+                combined.targetAssigned = current.targetAssigned;
+                combined.zeroDefs += current.zeroDefs;
+                combined.oneDefs += current.oneDefs;
+            }
+            return combined;
+        };
+
+        auto producerState =
+            validateStmt(func.body[producerIndex].get(), false);
+        if (!producerState.valid || !producerState.selectorDefinite ||
+            producerState.zeroDefs == 0 || producerState.oneDefs == 0)
+            continue;
+
+        std::function<void(std::vector<StmtPtr>&)> rewriteList;
+        rewriteList = [&](std::vector<StmtPtr>& stmts) {
+            for (size_t i = 0; i < stmts.size();) {
+                auto* assign = llvm::dyn_cast_or_null<CAssignStmt>(
+                    stmts[i].get());
+                auto* target = assign && assign->compoundOp.empty()
+                    ? plainVar(assign->target.get()) : nullptr;
+                if (target && target->varName == selector) {
+                    auto value = intValue(assign->value.get());
+                    if (value && *value == 0) {
+                        stmts[i] = std::make_unique<CAssignStmt>(
+                            cloneExpr(fallback->target.get()),
+                            cloneExpr(fallback->value.get()), "",
+                            assign->getAddress());
+                        ++i;
+                    } else {
+                        stmts.erase(
+                            stmts.begin() + static_cast<ptrdiff_t>(i));
+                    }
+                    continue;
+                }
+                if (auto* branch = llvm::dyn_cast_or_null<CIfStmt>(
+                        stmts[i].get())) {
+                    rewriteList(branch->thenBody);
+                    rewriteList(branch->elseBody);
+                }
+                ++i;
+            }
+        };
+
+        if (auto* branch = llvm::dyn_cast<CIfStmt>(
+                func.body[producerIndex].get())) {
+            rewriteList(branch->thenBody);
+            rewriteList(branch->elseBody);
+        } else {
+            continue;
+        }
+        func.body.erase(
+            func.body.begin() + static_cast<ptrdiff_t>(finalIndex));
+        break;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
