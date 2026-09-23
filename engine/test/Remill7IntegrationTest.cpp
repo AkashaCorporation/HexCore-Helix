@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -116,10 +117,12 @@ TEST(Remill7IntegrationTest, BonePosCalc3EmitsMemoryIncAndDecForReentrancy) {
     const std::string pseudoC = decompileFile("remill-7/bone_pos_calc3.ll");
     ASSERT_FALSE(pseudoC.empty());
 
-    EXPECT_NE(pseudoC.find("field_0x100)++"), std::string::npos);
-    EXPECT_NE(pseudoC.find("field_0x100)--"), std::string::npos);
-    EXPECT_EQ(pseudoC.find("field_0x100++"), std::string::npos);
-    EXPECT_EQ(pseudoC.find("field_0x100--"), std::string::npos);
+    EXPECT_TRUE(std::regex_search(pseudoC,
+        std::regex(R"([a-zA-Z_][a-zA-Z_0-9]*->field_0x100\+\+;)")));
+    EXPECT_TRUE(std::regex_search(pseudoC,
+        std::regex(R"([a-zA-Z_][a-zA-Z_0-9]*->field_0x100--;)")));
+    EXPECT_EQ(pseudoC.find("field_0x100)++"), std::string::npos);
+    EXPECT_EQ(pseudoC.find("field_0x100)--"), std::string::npos);
 }
 
 TEST(Remill7IntegrationTest, ProjectileConstructor2RecoversDenseStackArgs) {
@@ -153,8 +156,14 @@ TEST(Remill7IntegrationTest, BonePosCalc9PropagatesCallArgumentsAcrossBlocks) {
 
     EXPECT_FALSE(findSimpleAssignmentTarget(pseudoC, "param_5").empty());
     EXPECT_NE(pseudoC.find("sub_141431250("), std::string::npos);
-    EXPECT_NE(pseudoC.find("sub_14142fe90(param_5,"),
-              std::string::npos);
+    // The call consumes the materialized ABI values. Keep the reaching
+    // assignments adjacent so a clobber cannot satisfy this regression.
+    // Parameter identities are immutable entry values. The materialized ABI
+    // values may therefore use local SSA names; require the exact reaching
+    // definitions and argument permutation instead of legacy role names.
+    EXPECT_TRUE(std::regex_search(pseudoC, std::regex(
+        R"(([a-zA-Z_][a-zA-Z_0-9]*) = param_5;\s+([a-zA-Z_][a-zA-Z_0-9]*) = v2 - 40;\s+([a-zA-Z_][a-zA-Z_0-9]*) = [^;]+;\s+([a-zA-Z_][a-zA-Z_0-9]*) = [^;]+;\s+result = sub_14142fe90\(\1, \2, \4, \3\);)")))
+        << pseudoC;
     EXPECT_EQ(pseudoC.find("sub_14142fe90();"), std::string::npos);
 }
 
@@ -185,10 +194,11 @@ TEST(Remill7IntegrationTest, BonePosCalc9RecoversStackBackedDirectCallReceiver) 
     const std::string pseudoC = decompileFile("remill-7/bone_pos_calc9.ll");
     ASSERT_FALSE(pseudoC.empty());
 
-    EXPECT_GE(
-        countCallsWithArgumentFragment(
-            pseudoC, "sub_140241c70", " - 40"),
-        2u);
+    const std::regex savedReceiver(
+        R"(([a-zA-Z_][a-zA-Z_0-9]*) = v2 - 40;\s+(?:[a-zA-Z_][a-zA-Z_0-9]* = ([a-zA-Z_][a-zA-Z_0-9]*);\s+)?var_8 = v1;\s+sub_140241c70\(\1(?:, \2)?\);)");
+    EXPECT_EQ(std::distance(
+        std::sregex_iterator(pseudoC.begin(), pseudoC.end(), savedReceiver),
+        std::sregex_iterator()), 2) << pseudoC;
     EXPECT_EQ(pseudoC.find("*(rbp - 0x28)"), std::string::npos);
 }
 

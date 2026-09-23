@@ -7,7 +7,14 @@ const { spawnSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..');
 const libraryName = process.platform === 'win32' ? 'helix_engine.lib' : 'libhelix_engine.a';
 const candidates = ['engine/deps/llvm-mlir/engine', 'engine/build/Release', 'engine/build'];
-const library = candidates.map(dir => path.join(root, dir, libraryName)).find(file => fs.existsSync(file));
+const explicitLibrary = process.env.HELIX_ENGINE_LIB_DIR
+  ? path.join(path.resolve(process.env.HELIX_ENGINE_LIB_DIR), libraryName)
+  : undefined;
+if (explicitLibrary && !fs.existsSync(explicitLibrary)) {
+  throw new Error(`HELIX_ENGINE_LIB_DIR does not contain ${libraryName}: ${explicitLibrary}`);
+}
+const library = explicitLibrary
+  ?? candidates.map(dir => path.join(root, dir, libraryName)).find(file => fs.existsSync(file));
 if (!library) throw new Error('Build the current C++ engine first; no native static library was found.');
 if (!process.env.npm_execpath) throw new Error('Run this entrypoint through npm run build or npm run build:debug.');
 

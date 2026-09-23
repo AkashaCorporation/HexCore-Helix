@@ -37,13 +37,20 @@ struct BindReturnValuesPass
         getOperation().walk([&](helix::low::FuncOp func) {
             if (!func->hasAttr("has_return_value"))
                 return;
+            if (auto type = func->getAttrOfType<StringAttr>("inferred_return_type");
+                type && type.getValue() == "void")
+                return;
 
             DenseMap<uint32_t, helix::high::VarDeclOp> resultDecls;
+            DenseMap<uint32_t, helix::high::VarDeclOp> raxDecls;
             DenseMap<uint32_t, helix::high::VarDeclOp> aapcsX0Decls;
             DenseMap<uint32_t, unsigned> referenceCounts;
             func.walk([&](helix::high::VarDeclOp decl) {
                 if (decl.getVarName() == "result")
                     resultDecls.try_emplace(decl.getVarId(), decl);
+                if (decl.getVarName() == "rax" &&
+                    decl.getStorage() == helix::high::StorageKind::Register)
+                    raxDecls.try_emplace(decl.getVarId(), decl);
                 if (decl.getVarName() == "param_1")
                     aapcsX0Decls.try_emplace(decl.getVarId(), decl);
             });
@@ -61,21 +68,31 @@ struct BindReturnValuesPass
                 return;
             } else {
                 auto cc = func->getAttrOfType<StringAttr>("calling_convention");
-                if (!cc || cc.getValue() != "aapcs64")
-                    return;
+                if (cc && (cc.getValue() == "sysv" || cc.getValue() == "win64")) {
+                    if (raxDecls.size() != 1 ||
+                        referenceCounts.lookup(raxDecls.begin()->first) == 0) {
+                        if (!raxDecls.empty()) ++NumAmbiguousFunctions;
+                        return;
+                    }
+                    resultDecl = raxDecls.begin()->second;
+                    bindingKind = "x64-live-rax-var-id";
+                } else {
+                    if (!cc || cc.getValue() != "aapcs64")
+                        return;
 
-                SmallVector<helix::high::VarDeclOp, 2> liveX0Decls;
-                for (auto [varId, decl] : aapcsX0Decls) {
-                    if (referenceCounts.lookup(varId) != 0)
-                        liveX0Decls.push_back(decl);
+                    SmallVector<helix::high::VarDeclOp, 2> liveX0Decls;
+                    for (auto [varId, decl] : aapcsX0Decls) {
+                        if (referenceCounts.lookup(varId) != 0)
+                            liveX0Decls.push_back(decl);
+                    }
+                    if (liveX0Decls.size() != 1) {
+                        if (!liveX0Decls.empty())
+                            ++NumAmbiguousFunctions;
+                        return;
+                    }
+                    resultDecl = liveX0Decls.front();
+                    bindingKind = "aapcs64-live-x0-var-id";
                 }
-                if (liveX0Decls.size() != 1) {
-                    if (!liveX0Decls.empty())
-                        ++NumAmbiguousFunctions;
-                    return;
-                }
-                resultDecl = liveX0Decls.front();
-                bindingKind = "aapcs64-live-x0-var-id";
             }
 
             if (!resultDecl) {

@@ -22,7 +22,7 @@ fn main() {
         project_root.join("engine").join("build"),
     ];
 
-    let engine_build_dir = engine_lib_search_paths
+    let default_engine_build_dir = engine_lib_search_paths
         .iter()
         .find(|p| {
             let lib_name = if cfg!(target_os = "windows") {
@@ -34,6 +34,30 @@ fn main() {
         })
         .cloned()
         .unwrap_or_else(|| project_root.join("engine").join("build"));
+
+    let engine_lib_name = if cfg!(target_os = "windows") {
+        "helix_engine.lib"
+    } else {
+        "libhelix_engine.a"
+    };
+    let engine_build_dir = match env::var_os("HELIX_ENGINE_LIB_DIR") {
+        Some(directory) => {
+            let directory = PathBuf::from(directory);
+            if !directory.join(engine_lib_name).is_file() {
+                panic!(
+                    "HELIX_ENGINE_LIB_DIR does not contain {}: {}",
+                    engine_lib_name,
+                    directory.display()
+                );
+            }
+            directory
+        }
+        None => default_engine_build_dir,
+    };
+    println!(
+        "cargo:warning=Using Helix engine from: {}",
+        engine_build_dir.display()
+    );
 
     // LLVM/MLIR lib directory — simplified detection
     let llvm_lib_dir = if let Ok(dir) = env::var("LLVM_LIB_DIR") {
@@ -269,13 +293,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LLVM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_DIR");
     println!("cargo:rerun-if-env-changed=LLVM_BUILD_DIR");
+    // The Windows build loop copies a freshly linked static engine into the
+    // vendored search path. Cargo's timestamp fingerprint can miss rapid
+    // same-path replacements, so the wrapper exports the content hash.
     println!("cargo:rerun-if-env-changed=HELIX_ENGINE_LIB_HASH");
+    println!("cargo:rerun-if-env-changed=HELIX_ENGINE_LIB_DIR");
 
-    let engine_lib_name = if cfg!(target_os = "windows") {
-        "helix_engine.lib"
-    } else {
-        "libhelix_engine.a"
-    };
     println!(
         "cargo:rerun-if-changed={}",
         engine_build_dir.join(engine_lib_name).display()

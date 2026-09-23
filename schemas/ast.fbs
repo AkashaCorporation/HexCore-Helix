@@ -178,6 +178,16 @@ table Statement {
 }
 
 /// A fully decompiled function.
+/// Native quality barriers; values are append-only, not severity scores.
+enum NativeQualityIssue : byte {
+    OpaquePostCallRegister = 0,
+    IncompleteAbiArguments = 1,
+    SynthesizedVariable = 2,
+    DamningDefect = 3,
+    RegistryMiss = 4,
+    SuspiciousSelfReference = 5,
+}
+
 table DecompiledFunction {
     name: string;
     address: Address;
@@ -187,6 +197,9 @@ table DecompiledFunction {
     body: [Statement];
     calling_convention: string;
     is_variadic: bool;
+    /// HAST 1.1: absence means native quality was not reported.
+    native_quality_reported: bool;
+    native_quality_issues: [NativeQualityIssue];
 }
 
 /// Features guaranteed by a canonical HAST producer. Values are append-only.
@@ -198,6 +211,7 @@ enum HastCapability : byte {
     DirectCallTargets = 4,
     StructFieldOffsets = 5,
     StatementChildRoles = 6,
+    NativeFunctionQuality = 7,
 }
 
 /// Top-level decompiled module.

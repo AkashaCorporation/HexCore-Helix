@@ -61,6 +61,22 @@ TEST(RemillDemanglerTest, DemangleTest) {
     EXPECT_EQ(result->semantic, RemillSemantic::TEST);
 }
 
+TEST(RemillDemanglerTest, ReadOnlyComparisonsPreserveRegisterOperandWidth) {
+    const char codes[] = {'h', 't', 'j', 'm'};
+    const unsigned widths[] = {8, 16, 32, 64};
+    for (const char* prefix : {"3CMP", "4TEST"}) {
+        for (unsigned i = 0; i < 4; ++i) {
+            const std::string symbol = std::string("_ZN12_GLOBAL__N_1") +
+                prefix + "I2RnI" + codes[i] + "Lb1EES2_EEP6MemoryS4_R5StateT_T0_";
+            auto result = demangleRemillSemantic(symbol);
+            ASSERT_TRUE(result.has_value()) << symbol;
+            EXPECT_EQ(result->src_width, widths[i]) << symbol;
+            EXPECT_FALSE(result->has_memory_src);
+            EXPECT_FALSE(result->has_memory_dst);
+        }
+    }
+}
+
 TEST(RemillDemanglerTest, DemangleCall) {
     auto result = demangleRemillSemantic(
         "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_");
@@ -133,6 +149,58 @@ TEST(RemillDemanglerTest, DemangleAnd) {
         "_ZN12_GLOBAL__N_13ANDI3MnWImE2MnImE2RnImLb1EEEEP6MemoryS8_R5StateT_T0_T1_");
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->semantic, RemillSemantic::AND);
+}
+
+TEST(RemillDemanglerTest, DemangleAarch64OrrRegisterAlias) {
+    auto result = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_13ORRI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->semantic, RemillSemantic::OR);
+    EXPECT_EQ(result->raw_name, "ORR");
+    EXPECT_EQ(result->dst_width, 64u);
+}
+
+TEST(RemillDemanglerTest, DemangleAarch64ArithmeticAndAddressAliases) {
+    auto eor = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_13EORI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_");
+    auto subs = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14SUBSI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_");
+    auto adrp = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14ADRPEP6MemoryR5State3RnWImE2InImE");
+    ASSERT_TRUE(eor.has_value());
+    ASSERT_TRUE(subs.has_value());
+    ASSERT_TRUE(adrp.has_value());
+    EXPECT_EQ(eor->semantic, RemillSemantic::XOR);
+    EXPECT_EQ(subs->semantic, RemillSemantic::SUB);
+    EXPECT_EQ(adrp->semantic, RemillSemantic::MOV);
+
+    auto madd = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14MADDI3RnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_SA_SA_");
+    ASSERT_TRUE(madd.has_value());
+    EXPECT_EQ(madd->semantic, RemillSemantic::MADD);
+}
+
+TEST(RemillDemanglerTest, DemangleAarch64BitfieldMoves) {
+    auto ubfm = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14UBFMI3RnWImE2RnIjLb1EE2InIjEEEP6MemoryS8_R5StateT_T0_T1_");
+    auto sbfm = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_14SBFMI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_SD_SD_SD_");
+    ASSERT_TRUE(ubfm.has_value());
+    ASSERT_TRUE(sbfm.has_value());
+    EXPECT_EQ(ubfm->semantic, RemillSemantic::UBFM);
+    EXPECT_EQ(sbfm->semantic, RemillSemantic::SBFM);
+    EXPECT_EQ(ubfm->dst_width, 64u);
+    EXPECT_EQ(sbfm->dst_width, 64u);
+}
+
+TEST(RemillDemanglerTest, DemangleMemoryBitTestAndSet) {
+    auto result = demangleRemillSemantic(
+        "_ZN12_GLOBAL__N_16BTSmemI3MnWImE2MnImE2RnImLb1EEEEP6MemoryS8_R5StateT_T0_T1_");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->semantic, RemillSemantic::BTS);
+    EXPECT_EQ(result->raw_name, "BTSmem");
+    EXPECT_TRUE(result->has_memory_dst);
+    EXPECT_EQ(result->dst_width, 64u);
 }
 
 TEST(RemillDemanglerTest, DemangleMovssMemoryLoadAndStore) {

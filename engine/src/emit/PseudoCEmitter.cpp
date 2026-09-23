@@ -1434,7 +1434,7 @@ bool PseudoCEmitter::isNearBlockStart(Operation* op, unsigned budget) {
 
 void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
     os << "// Decompiled by HexCore Helix\n";
-    os << "// Engine version: " << HELIX_ENGINE_VERSION << "\n";
+    os << "// Engine version: 0.8.0-nightly\n";
     os << "\n";
 }
 

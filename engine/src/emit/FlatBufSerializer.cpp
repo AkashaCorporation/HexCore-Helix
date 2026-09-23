@@ -13,6 +13,7 @@
 #include "helix/cast/CExpr.h"
 #include "helix/cast/CStmt.h"
 #include "helix/cast/CDecl.h"
+#include "helix/cast/DamningDefect.h"
 
 #ifdef HELIX_HAS_FLATBUFFERS
 #include <flatbuffers/flatbuffers.h>
@@ -75,6 +76,7 @@ enum : uint16_t {
     F_NAME = 4, F_ADDRESS = 6, F_RETURN_TYPE = 8,
     F_PARAMS = 10, F_LOCALS = 12, F_BODY = 14,
     F_CALLING_CONVENTION = 16, F_IS_VARIADIC = 18,
+    F_NATIVE_QUALITY_REPORTED = 20, F_NATIVE_QUALITY_ISSUES = 22,
 };
 
 // AstModule: legacy prefix followed by HAST 1.x negotiation fields.
@@ -95,8 +97,8 @@ enum class ChildRole : uint8_t {
 };
 
 constexpr uint16_t kHastSchemaMajor = 1;
-constexpr uint16_t kHastSchemaMinor = 0;
-constexpr std::array<uint8_t, 7> kHastCapabilities = {0, 1, 2, 3, 4, 5, 6};
+constexpr uint16_t kHastSchemaMinor = 1;
+constexpr std::array<uint8_t, 8> kHastCapabilities = {0, 1, 2, 3, 4, 5, 6, 7};
 
 // ── Alias for readability ──────────────────────────────────────────────────
 
@@ -824,6 +826,17 @@ static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func,
         ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
         : fbb.CreateVector(bodyOffs);
 
+    std::vector<uint8_t> qualityIssues;
+    if (func.opaquePostCallReads) qualityIssues.push_back(0);
+    if (func.incompleteAbiCalls) qualityIssues.push_back(1);
+    if (func.synthesizedVarDecls) qualityIssues.push_back(2);
+    if (func.hasDamningHonestyDefect ||
+        func.unqualifiedInstrumentationCalls ||
+        (func.nativeQualityEvaluated && cast::detectDamningDefects(func).any())) qualityIssues.push_back(3);
+    if (func.registryMissHonestFailure) qualityIssues.push_back(4);
+    if (func.suspiciousSelfReferences) qualityIssues.push_back(5);
+    auto qualityVec = fbb.CreateVector(qualityIssues);
+
     // 4. Build table
     auto s = fbb.StartTable();
     fbb.AddOffset(F_NAME, nameOff);
@@ -836,6 +849,9 @@ static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func,
     if (!bodyVec.IsNull())     fbb.AddOffset(F_BODY, bodyVec);
     if (!ccOff.IsNull())       fbb.AddOffset(F_CALLING_CONVENTION, ccOff);
     fbb.AddElement<uint8_t>(F_IS_VARIADIC, func.isVariadic ? uint8_t(1) : uint8_t(0), uint8_t(0));
+    fbb.AddElement<uint8_t>(F_NATIVE_QUALITY_REPORTED,
+        func.nativeQualityEvaluated || !qualityIssues.empty() ? uint8_t(1) : uint8_t(0), uint8_t(0));
+    fbb.AddOffset(F_NATIVE_QUALITY_ISSUES, qualityVec);
     return TableOff(fbb.EndTable(s));
 }
 
@@ -994,7 +1010,7 @@ bool FlatBufSerializer::verify(const uint8_t* data, size_t size) {
         !readU16(*majorLoc, schemaMajor) ||
         !readU16(*minorLoc, schemaMinor) ||
         !readU16(*pointerLoc, pointerBits) ||
-        schemaMajor != 1 || schemaMinor != 0 ||
+        schemaMajor != 1 || schemaMinor > kHastSchemaMinor ||
         data[*archLoc] > 11 || (pointerBits != 32 && pointerBits != 64)) {
         return false;
     }

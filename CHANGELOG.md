@@ -2,7 +2,19 @@
 
 All notable changes to HexCore Helix are documented here.
 
-## [0.9.4-rc.1] - Unreleased
+## [0.9.4-rc.2] - Unreleased
+
+- Reconcile the post-RC.1 semantic fixes from the validated v2 development
+  tree while retaining canonical package identity, build hardening, required
+  FlatBuffers serialization and one-pass pseudo-C/HAST production.
+- Add HAST 1.1 native quality transport, explicit entry identity, x86 floating
+  flag semantics, AArch64 bitfield/arithmetic semantics and the accepted
+  address/value, ABI, variable-recovery and SCF honesty corrections.
+- Preserve the canonical-only production files and exclude local addons,
+  dependency caches, dumps, private corpora and generated reports from the
+  migration boundary.
+
+## [0.9.4-rc.1] - 2026-09-05
 
 - Reconcile the current native implementation with the canonical release history,
   preserving published compiler, feature-gating, test-registration and CI fixes.

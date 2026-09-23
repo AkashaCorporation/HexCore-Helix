@@ -219,4 +219,38 @@ TEST(BindReturnValuesTest, LeavesAmbiguousLiveAapcsX0FallbackImplicit) {
     EXPECT_EQ(highReturns, 0u);
 }
 
+TEST(BindReturnValuesTest, X64RegisterFallbackRequiresUniqueReferencedValueAndNonVoidFunction) {
+    for (const char* cc : {"sysv", "win64"}) {
+      for (unsigned count : {0u, 1u, 2u}) {
+       for (bool referenced : {false, true}) {
+        for (bool returnsVoid : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << cc << " count=" << count << " ref=" << referenced << " void=" << returnsVoid);
+            mlir::MLIRContext ctx;
+            auto fixture = buildReturnFixture(ctx, true, count, false);
+            mlir::OpBuilder builder(&ctx);
+            fixture.func->setAttr("calling_convention", builder.getStringAttr(cc));
+            fixture.func->setAttr("inferred_return_type", builder.getStringAttr(returnsVoid ? "void" : "uint64_t"));
+            builder.setInsertionPoint(fixture.func.getBody().front().getTerminator());
+            fixture.func.walk([&](helix::high::VarDeclOp decl) {
+                decl.setVarName("rax");
+                decl->setAttr("inferred_type", builder.getStringAttr("int64_t"));
+                if (referenced)
+                    builder.create<helix::high::VarRefOp>(builder.getUnknownLoc(), builder.getI64Type(),
+                        decl.getVarId(), decl.getVarName(), mlir::IntegerAttr{});
+            });
+            runPass(ctx, *fixture.module);
+            unsigned explicitReturns = 0;
+            fixture.func.walk([&](helix::high::ReturnOp ret) {
+                ++explicitReturns;
+                auto ref = ret.getValue().getDefiningOp<helix::high::VarRefOp>();
+                ASSERT_TRUE(ref);
+                EXPECT_EQ(ref.getVarId(), 100u);
+            });
+            EXPECT_EQ(explicitReturns, !returnsVoid && referenced && count == 1 ? 1u : 0u);
+        }
+       }
+      }
+    }
+}
+
 } // namespace

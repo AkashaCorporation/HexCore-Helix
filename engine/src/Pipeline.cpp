@@ -59,6 +59,7 @@
 
 #include <cassert>
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace helix {
@@ -276,12 +277,40 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
     std::string targetTriple = llvm_module->getTargetTriple();
 
     // The LLVM importer preserves block order but drops textual block names.
-    // Remill names lifted blocks `bb_<decimal-address>`; retain that evidence
-    // so RIP-relative bookkeeping can be seeded per block after translation.
+    // Retain the existing bb_N channel for block bookkeeping. Producer versions
+    // also use ordinal labels, so it must not establish function entry identity.
     llvm::StringMap<llvm::SmallVector<int64_t>> blockAddresses;
+    llvm::StringMap<uint64_t> entryAddresses;
     for (const llvm::Function& func : *llvm_module) {
         if (func.isDeclaration())
             continue;
+        std::optional<uint64_t> encodedEntry;
+        auto functionName = func.getName();
+        unsigned radix = 0;
+        if (functionName.consume_front("lifted_")) radix = 10;
+        else if (functionName.consume_front("sub_")) radix = 16;
+        uint64_t parsedEntry = 0;
+        if (radix && !functionName.empty() &&
+            !functionName.getAsInteger(radix, parsedEntry))
+            encodedEntry = parsedEntry;
+
+        std::optional<uint64_t> explicitEntry;
+        auto attribute = func.getFnAttribute("hexcore.entry_address");
+        if (attribute.isValid()) {
+            auto value = attribute.getValueAsString();
+            const bool hex = value.consume_front("0x");
+            if (value.empty() || value.starts_with("-") || value.starts_with("+") ||
+                value.getAsInteger(hex ? 16 : 10, parsedEntry))
+                return std::unexpected("translateToMLIR: invalid hexcore.entry_address on " + func.getName().str());
+            explicitEntry = parsedEntry;
+            if (encodedEntry && *encodedEntry != *explicitEntry)
+                return std::unexpected("translateToMLIR: conflicting function entry identities on " + func.getName().str());
+        }
+
+        const auto selectedEntry = explicitEntry ? explicitEntry : encodedEntry;
+        // bb_N may be an ordinal in current Remill, not a machine address.
+        if (selectedEntry)
+            entryAddresses[func.getName()] = *selectedEntry;
         auto& addresses = blockAddresses[func.getName()];
         addresses.reserve(func.size());
         for (const llvm::BasicBlock& block : func) {
@@ -375,6 +404,9 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
 
     for (mlir::LLVM::LLVMFuncOp func :
          (*mlir_module).getOps<mlir::LLVM::LLVMFuncOp>()) {
+        if (auto entry = entryAddresses.find(func.getName()); entry != entryAddresses.end())
+            func->setAttr("helix.entry_address", mlir::IntegerAttr::get(
+                mlir::IntegerType::get(mlir_ctx_, 64), llvm::APInt(64, entry->second)));
         auto it = blockAddresses.find(func.getName());
         if (it == blockAddresses.end() || it->second.empty())
             continue;

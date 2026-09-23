@@ -22,6 +22,8 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
@@ -82,29 +84,77 @@ inferWin64RbpStackParamBaseOffset(helix::low::FuncOp func) {
     if (body.empty())
         return std::nullopt;
 
-    unsigned pushesBeforeFramePointer = 0;
-    bool sawFramePointerSetup = false;
+    int64_t stackDelta = 0;
+    llvm::DenseMap<Value, int64_t> deltas;
+    auto constant = [](Value value) -> std::optional<int64_t> {
+        auto op = value.getDefiningOp<LLVM::ConstantOp>();
+        if (!op) return std::nullopt;
+        auto attr = dyn_cast<IntegerAttr>(op.getValue());
+        if (!attr || attr.getValue().getBitWidth() > 64) return std::nullopt;
+        return attr.getValue().getSExtValue();
+    };
     for (Operation& op : body.front()) {
         if (isa<helix::low::PushOp>(op)) {
-            ++pushesBeforeFramePointer;
+            if (llvm::SubOverflow(stackDelta, int64_t{8}, stackDelta))
+                return std::nullopt;
             continue;
+        }
+        if (isa<helix::low::PopOp>(op))
+            return std::nullopt;
+
+        if (auto read = dyn_cast<helix::low::RegReadOp>(op);
+            read && read.getRegName() == "RSP" && read.getBitWidth() == 64) {
+            deltas[read.getResult()] = stackDelta;
+        }
+
+        Value lhs, rhs, result;
+        bool subtract = false;
+        if (auto add = dyn_cast<LLVM::AddOp>(op)) {
+            lhs = add.getLhs(); rhs = add.getRhs(); result = add.getResult();
+        } else if (auto sub = dyn_cast<LLVM::SubOp>(op)) {
+            lhs = sub.getLhs(); rhs = sub.getRhs(); result = sub.getResult();
+            subtract = true;
+        } else if (auto binary = dyn_cast<helix::low::BinOp>(op);
+                   binary && (binary.getKind() == helix::low::BinOpKind::Add ||
+                              binary.getKind() == helix::low::BinOpKind::Sub)) {
+            lhs = binary.getLhs(); rhs = binary.getRhs(); result = binary.getResult();
+            subtract = binary.getKind() == helix::low::BinOpKind::Sub;
+        }
+        if (result && result.getType().isInteger(64)) {
+            auto base = deltas.find(lhs);
+            auto amount = constant(rhs);
+            if (!subtract && (base == deltas.end() || !amount)) {
+                base = deltas.find(rhs);
+                amount = constant(lhs);
+            }
+            if (base != deltas.end() && amount) {
+                int64_t delta;
+                bool overflow = subtract
+                    ? llvm::SubOverflow(base->second, *amount, delta)
+                    : llvm::AddOverflow(base->second, *amount, delta);
+                if (!overflow) deltas[result] = delta;
+            }
         }
 
         auto regWrite = dyn_cast<helix::low::RegWriteOp>(op);
+        if (regWrite && (regWrite.getRegName() == "RSP" ||
+                         regWrite.getRegName() == "ESP")) {
+            auto known = deltas.find(regWrite.getValue());
+            if (regWrite.getRegName() != "RSP" || known == deltas.end())
+                return std::nullopt;
+            stackDelta = known->second;
+        }
         if (!regWrite || regWrite.getRegName() != "RBP")
             continue;
 
-        auto regRead = regWrite.getValue().getDefiningOp<helix::low::RegReadOp>();
-        if (regRead && regRead.getRegName() == "RSP") {
-            sawFramePointerSetup = true;
-            break;
+        if (auto known = deltas.find(regWrite.getValue()); known != deltas.end()) {
+            int64_t firstArgument;
+            if (llvm::SubOverflow(int64_t{0x28}, known->second, firstArgument))
+                return std::nullopt;
+            return firstArgument;
         }
     }
-
-    if (!sawFramePointerSetup)
-        return std::nullopt;
-
-    return 0x28 + static_cast<int64_t>(pushesBeforeFramePointer) * 8;
+    return std::nullopt;
 }
 
 static unsigned getWin64ParamIndex(int64_t offset, StackAccessBase base,
@@ -126,6 +176,17 @@ static unsigned getWin64ParamIndex(int64_t offset, StackAccessBase base,
     }
 
     return 0;
+}
+
+static unsigned getSysVParamIndex(int64_t offset, StackAccessBase base,
+                                  std::optional<int64_t> rbpStackParamBase) {
+    if (base == StackAccessBase::Local)
+        return 0;
+    const int64_t first = base == StackAccessBase::Rsp
+        ? 8 : rbpStackParamBase.value_or(-1);
+    if (first < 0 || offset < first || (offset - first) % 8 != 0)
+        return 0;
+    return 7u + static_cast<unsigned>((offset - first) / 8);
 }
 
 static bool hasStackPointerAdjustmentBefore(Operation* op) {
@@ -261,8 +322,31 @@ private:
         llvm::SmallVector<Operation*> unresolvedOps;
         std::set<SlotKey> nonParameterSlots;
         bool isWin64 = true;
-        if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention"))
+        bool isSysV = false;
+        if (auto ccAttr = func->getAttrOfType<StringAttr>("calling_convention")) {
             isWin64 = (ccAttr.getValue() == "win64");
+            isSysV = (ccAttr.getValue() == "sysv");
+        } else if (auto module = func->getParentOfType<ModuleOp>()) {
+            if (auto triple = module->getAttrOfType<StringAttr>("llvm.target_triple")) {
+                auto value = triple.getValue();
+                isSysV = value.starts_with("x86_64") &&
+                    (value.contains("linux") || value.contains("darwin") ||
+                     value.contains("freebsd") || value.contains("openbsd") ||
+                     value.contains("netbsd"));
+                if (isSysV)
+                    isWin64 = false;
+            }
+        }
+
+        auto sysvRbpStackParamBase = isSysV
+            ? inferWin64RbpStackParamBaseOffset(func) : std::nullopt;
+        if (sysvRbpStackParamBase) {
+            int64_t adjusted;
+            if (llvm::SubOverflow(*sysvRbpStackParamBase, int64_t{0x20}, adjusted))
+                sysvRbpStackParamBase.reset();
+            else
+                sysvRbpStackParamBase = adjusted; // SysV has no shadow space.
+        }
 
         auto win64RbpStackParamBase = isWin64
             ? inferWin64RbpStackParamBaseOffset(func)
@@ -282,9 +366,10 @@ private:
                 if (info) {
                     recordSlot(slots, *info,
                         static_cast<unsigned>(memRead.getBitWidth()));
-                    if (isWin64 && info->base == StackAccessBase::Rsp &&
+                    if ((isWin64 || isSysV) && info->base == StackAccessBase::Rsp &&
                         info->offset > 0 &&
-                        hasStackPointerAdjustmentBefore(op)) {
+                        (hasStackPointerAdjustmentBefore(op) ||
+                         (isSysV && op->getBlock() != &func.getBody().front()))) {
                         nonParameterSlots.insert(info->key());
                     }
                     resolvedAccessOps.push_back({op, info->key()});
@@ -301,9 +386,10 @@ private:
                 if (info) {
                     recordSlot(slots, *info,
                         static_cast<unsigned>(memWrite.getBitWidth()));
-                    if (isWin64 && info->base == StackAccessBase::Rsp &&
+                    if ((isWin64 || isSysV) && info->base == StackAccessBase::Rsp &&
                         info->offset > 0 &&
-                        hasStackPointerAdjustmentBefore(op)) {
+                        (hasStackPointerAdjustmentBefore(op) ||
+                         (isSysV && op->getBlock() != &func.getBody().front()))) {
                         nonParameterSlots.insert(info->key());
                     }
                     resolvedAccessOps.push_back({op, info->key()});
@@ -324,9 +410,10 @@ private:
                 if (info) {
                     recordSlot(slots, *info,
                         inferBitWidthFromType(load.getResult().getType()));
-                    if (isWin64 && info->base == StackAccessBase::Rsp &&
+                    if ((isWin64 || isSysV) && info->base == StackAccessBase::Rsp &&
                         info->offset > 0 &&
-                        hasStackPointerAdjustmentBefore(op)) {
+                        (hasStackPointerAdjustmentBefore(op) ||
+                         (isSysV && op->getBlock() != &func.getBody().front()))) {
                         nonParameterSlots.insert(info->key());
                     }
                     resolvedAccessOps.push_back({op, info->key()});
@@ -341,9 +428,10 @@ private:
                 if (info) {
                     recordSlot(slots, *info,
                         inferBitWidthFromType(store.getValue().getType()));
-                    if (isWin64 && info->base == StackAccessBase::Rsp &&
+                    if ((isWin64 || isSysV) && info->base == StackAccessBase::Rsp &&
                         info->offset > 0 &&
-                        hasStackPointerAdjustmentBefore(op)) {
+                        (hasStackPointerAdjustmentBefore(op) ||
+                         (isSysV && op->getBlock() != &func.getBody().front()))) {
                         nonParameterSlots.insert(info->key());
                     }
                     resolvedAccessOps.push_back({op, info->key()});
@@ -386,7 +474,8 @@ private:
                 unsigned paramIdx = isWin64
                     ? getWin64ParamIndex(slot.offset, slot.base,
                                          win64RbpStackParamBase)
-                    : 0;
+                    : isSysV ? getSysVParamIndex(slot.offset, slot.base,
+                                                sysvRbpStackParamBase) : 0;
                 if (slot.base == StackAccessBase::Rsp &&
                     nonParameterSlots.contains(key)) {
                     paramIdx = 0;
@@ -472,11 +561,13 @@ private:
                     builder.getUI32IntegerAttr(vid),
                     builder.getStringAttr(vname),
                     /*address=*/IntegerAttr{});
-                builder.create<helix::high::AssignOp>(
+                auto assignment = builder.create<helix::high::AssignOp>(
                     store.getLoc(),
                     varRef.getResult(),
                     store.getValue(),
                     /*address=*/IntegerAttr{});
+                if (key.first == StackAccessBase::Rsp)
+                    assignment->setAttr("helix.rsp_store_offset", builder.getI64IntegerAttr(key.second));
                 store.erase();
             } else if (auto memWrite = dyn_cast<helix::low::MemWriteOp>(op)) {
                 auto varRef = builder.create<helix::high::VarRefOp>(
@@ -485,11 +576,13 @@ private:
                     builder.getUI32IntegerAttr(vid),
                     builder.getStringAttr(vname),
                     /*address=*/IntegerAttr{});
-                builder.create<helix::high::AssignOp>(
+                auto assignment = builder.create<helix::high::AssignOp>(
                     memWrite.getLoc(),
                     varRef.getResult(),
                     memWrite.getValue(),
                     /*address=*/IntegerAttr{});
+                if (key.first == StackAccessBase::Rsp)
+                    assignment->setAttr("helix.rsp_store_offset", builder.getI64IntegerAttr(key.second));
                 memWrite.erase();
             }
         }

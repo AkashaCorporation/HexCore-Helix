@@ -100,6 +100,16 @@ public:
     /// needed synthesised placeholders usually indicates SSA-destruction
     /// gaps (bug C) or data-as-code lift artefacts (bug J).
     unsigned synthesizedVarDecls = 0;
+    std::vector<std::string> synthesizedVarNames;
+    std::vector<std::string> protectedDefinitionNames;
+
+    /// Exact supported ABI signatures with arguments missing after recovery.
+    /// Retained across AST optimization so erased syntax cannot erase the gap.
+    unsigned incompleteAbiCalls = 0;
+    unsigned opaquePostCallReads = 0;
+    unsigned unqualifiedInstrumentationCalls = 0;
+    bool nativeQualityEvaluated = false;
+    unsigned suspiciousSelfReferences = 0;
 
     /// D4 (charter exit-metric 4): set by CAstBuilder::analyzeConfidence from
     /// the builder's per-function hasDamningHonestyDefect_ member, raised on

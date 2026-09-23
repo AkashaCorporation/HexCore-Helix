@@ -24,9 +24,9 @@ enum class RemillSemantic {
     // Data movement
     MOV, MOVZX, MOVSX, CMOV, XCHG, LEA, CDQ, CDQE,
     // Arithmetic
-    ADD, SUB, MUL, IMUL, DIV, IDIV, INC, DEC, NEG,
+    ADD, SUB, MUL, IMUL, DIV, IDIV, INC, DEC, NEG, MADD,
     // Logic
-    AND, OR, XOR, NOT, SHL, SHR, SAR, ROL, ROR,
+    AND, OR, XOR, NOT, SHL, SHR, SAR, ROL, ROR, UBFM, SBFM,
     // Comparison
     CMP, TEST,
     // Stack

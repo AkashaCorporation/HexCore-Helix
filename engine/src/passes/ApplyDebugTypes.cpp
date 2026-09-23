@@ -168,6 +168,7 @@ static std::string nominalStructName(llvm::StringRef type) {
 struct ResolvedField {
     std::string path;
     std::string type;
+    uint64_t size = 0;
 };
 
 static std::optional<ResolvedField>
@@ -195,12 +196,12 @@ resolveField(const DebugDatabase& db, llvm::StringRef structName,
             continue;
         auto nested = resolveField(db, nestedName, offset - field.offset, depth + 1);
         if (nested)
-            return ResolvedField{field.name + "." + nested->path, nested->type};
+            return ResolvedField{field.name + "." + nested->path, nested->type, nested->size};
     }
 
     for (const auto& field : structIt->second.fields) {
         if (field.offset == offset)
-            return ResolvedField{field.name, field.type};
+            return ResolvedField{field.name, field.type, field.size};
     }
     return std::nullopt;
 }
@@ -296,14 +297,14 @@ static std::optional<int64_t> constantInt(Value value) {
     return attr.getValue().getSExtValue();
 }
 
-struct UnitStrideIndexedAddress {
+struct IndexedDebugAddress {
     helix::high::VarRefOp base;
     Value index;
     uint64_t offset = 0;
 };
 
-static std::optional<UnitStrideIndexedAddress>
-decomposeUnitStrideIndexedAddress(LLVM::AddOp outer) {
+static std::optional<IndexedDebugAddress>
+decomposeIndexedDebugAddress(LLVM::AddOp outer) {
     Value innerValue;
     std::optional<int64_t> offset;
     if (auto rhs = constantInt(outer.getRhs())) {
@@ -340,12 +341,12 @@ decomposeUnitStrideIndexedAddress(LLVM::AddOp outer) {
     }
     if (!base || !index)
         return std::nullopt;
-    return UnitStrideIndexedAddress{
+    return IndexedDebugAddress{
         base, index, static_cast<uint64_t>(*offset)};
 }
 
-static std::optional<std::string>
-unitStrideArrayElementType(llvm::StringRef type) {
+static std::optional<std::pair<std::string, uint64_t>>
+integerArrayElementType(llvm::StringRef type) {
     type = type.trim();
     size_t open = type.rfind('[');
     if (open == llvm::StringRef::npos || !type.ends_with("]"))
@@ -356,20 +357,37 @@ unitStrideArrayElementType(llvm::StringRef type) {
     if (element.empty() || count.getAsInteger(0, length) || length == 0)
         return std::nullopt;
 
-    // The current address shape is base + index + fieldOffset, so it proves
-    // unit stride only. Wider elements require an explicit index*stride term.
-    if (element != "u8" && element != "uint8_t" &&
-        element != "char" && element != "unsigned char" &&
-        element != "bool")
-        return std::nullopt;
-    return element.str();
+    uint64_t stride = 0;
+    if (element == "u8" || element == "uint8_t" || element == "int8_t" ||
+        element == "char" || element == "unsigned char" || element == "bool") stride = 1;
+    if (element == "u16" || element == "uint16_t" || element == "int16_t") stride = 2;
+    if (element == "u32" || element == "uint32_t" || element == "int32_t") stride = 4;
+    if (element == "u64" || element == "uint64_t" || element == "int64_t") stride = 8;
+    if (!stride) return std::nullopt;
+    return std::pair{element.str(), stride};
+}
+
+static bool hasExplicitIndexStride(Value index, uint64_t stride) {
+    if (stride == 1) return true;
+    if (auto shift = index.getDefiningOp<LLVM::ShlOp>()) {
+        auto amount = constantInt(shift.getRhs());
+        return amount && *amount >= 0 && *amount < 4 &&
+            (uint64_t{1} << *amount) == stride;
+    }
+    if (auto multiply = index.getDefiningOp<LLVM::MulOp>()) {
+        auto lhs = constantInt(multiply.getLhs());
+        auto rhs = constantInt(multiply.getRhs());
+        return (lhs && *lhs == static_cast<int64_t>(stride)) ||
+               (rhs && *rhs == static_cast<int64_t>(stride));
+    }
+    return false;
 }
 
 static void annotateIndexedDebugArrays(
     helix::low::FuncOp func, const DebugDatabase& db,
     const std::unordered_map<uint32_t, helix::high::VarDeclOp>& decls) {
     func.walk([&](LLVM::AddOp outer) {
-        auto address = decomposeUnitStrideIndexedAddress(outer);
+        auto address = decomposeIndexedDebugAddress(outer);
         if (!address)
             return;
         auto declIt = decls.find(address->base.getVarId());
@@ -388,13 +406,15 @@ static void annotateIndexedDebugArrays(
         for (const DebugField& field : structIt->second.fields) {
             if (field.offset != address->offset)
                 continue;
-            auto elementType = unitStrideArrayElementType(field.type);
-            if (!elementType)
+            auto elementType = integerArrayElementType(field.type);
+            if (!elementType || !hasExplicitIndexStride(address->index, elementType->second))
                 return;
             outer->setAttr("helix.debug_indexed_field_name",
                            StringAttr::get(outer.getContext(), field.name));
             outer->setAttr("helix.debug_indexed_element_type",
-                           StringAttr::get(outer.getContext(), *elementType));
+                           StringAttr::get(outer.getContext(), elementType->first));
+            outer->setAttr("helix.debug_indexed_element_stride",
+                IntegerAttr::get(IntegerType::get(outer.getContext(), 64), elementType->second));
             outer->setAttr(
                 "helix.debug_indexed_field_offset",
                 IntegerAttr::get(IntegerType::get(outer.getContext(), 64),
@@ -492,6 +512,18 @@ struct ApplyDebugTypesPass
                 if (callIt == db->functions.end())
                     return;
                 const DebugFunction& signature = callIt->second;
+                bool integerRegisterAbi = !signature.isVariadic;
+                for (const auto& param : signature.params) {
+                    llvm::StringRef type = llvm::StringRef(param.type).trim();
+                    integerRegisterAbi &= type.ends_with("*") ||
+                        type == "int64_t" || type == "uint64_t" ||
+                        type == "int32_t" || type == "uint32_t" ||
+                        type == "int" || type == "unsigned int";
+                }
+                if (integerRegisterAbi)
+                    call->setAttr("helix.debug_integer_abi", UnitAttr::get(call.getContext()));
+                else
+                    call->removeAttr("helix.debug_integer_abi");
                 if (!signature.returnType.empty() && call.getResult()) {
                     auto typeAttr = StringAttr::get(
                         call.getContext(), signature.returnType);
@@ -590,6 +622,40 @@ struct ApplyDebugTypesPass
                 if (!name.empty())
                     varStructs[decl.getVarId()] = std::move(name);
             });
+
+            llvm::SmallVector<helix::high::UnaryOp> zeroFieldReads;
+            func.walk([&](helix::high::UnaryOp unary) {
+                if (unary.getOp() == helix::high::UnaryOpKind::Deref &&
+                    unary.getOperand().getDefiningOp<helix::high::VarRefOp>())
+                    zeroFieldReads.push_back(unary);
+            });
+            for (auto unary : zeroFieldReads) {
+                auto base = unary.getOperand().getDefiningOp<helix::high::VarRefOp>();
+                auto typeIt = varStructs.find(base.getVarId());
+                auto width = dyn_cast<IntegerType>(unary.getResult().getType());
+                if (typeIt == varStructs.end() || !width)
+                    continue;
+                auto resolved = resolveField(*db, typeIt->second, 0);
+                if (!resolved || resolved->size == 0 ||
+                    resolved->size > 8 || resolved->size * 8 != width.getWidth() ||
+                    resolved->type.find('[') != std::string::npos)
+                    continue;
+                const llvm::StringRef fieldType(resolved->type);
+                if (!fieldType.trim().ends_with("*") &&
+                    (fieldType.trim().starts_with("struct ") ||
+                     db->structs.contains(nominalStructName(fieldType))))
+                    continue;
+                OpBuilder builder(unary);
+                auto field = builder.create<helix::high::FieldAccessOp>(
+                    unary.getLoc(), unary.getResult().getType(), base.getResult(),
+                    builder.getStringAttr(resolved->path),
+                    IntegerAttr::get(IntegerType::get(unary.getContext(), 64, IntegerType::Unsigned), 0),
+                    builder.getUnitAttr(), unary.getAddressAttr());
+                helix::applyTypeEvidence(field, resolved->type,
+                    helix::TypeEvidenceSource::DebugInfo);
+                unary.getResult().replaceAllUsesWith(field.getResult());
+                unary.erase();
+            }
 
             func.walk([&](helix::high::FieldAccessOp field) {
                 auto baseRef = field.getBase().getDefiningOp<helix::high::VarRefOp>();

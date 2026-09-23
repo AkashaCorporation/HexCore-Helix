@@ -45,7 +45,7 @@ public:
         const std::string& moduleName = "decompiled_module",
         HelixArch arch = HELIX_ARCH_X86_64);
 
-    /// Verify the HAST identifier, root bounds, and canonical 1.0 negotiation
+    /// Verify the HAST identifier, root bounds, and supported 1.x negotiation
     /// fields. Legacy identifier-only/name-only buffers are rejected.
     static bool verify(const uint8_t* data, size_t size);
 };

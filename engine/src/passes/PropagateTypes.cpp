@@ -2253,6 +2253,8 @@ private:
                     auto targetType = typeEnv[target];
                     auto targetRef =
                         target.getDefiningOp<helix::high::VarRefOp>();
+                    auto valueRef =
+                        value.getDefiningOp<helix::high::VarRefOp>();
                     const bool targetAcceptsValue =
                         !targetRef ||
                         canCarryAssignedType(targetRef.getVarId(), valueType);
@@ -2291,6 +2293,32 @@ private:
                             if (typeEnv[value].mergeFrom(varType))
                                 changed = true;
                         }
+                    }
+                    // A recovered parameter and a later register lifetime are
+                    // distinct variables. Carry pointer-ness back to the
+                    // parameter only across an exact, single-def local copy
+                    // (`local = param`). This recovers the input object's type
+                    // without merging their identities.
+                    if (valueRef && targetRef && targetType.isResolved() &&
+                            !lockedVarIds.count(valueRef.getVarId())) {
+                        const uint32_t sourceId = valueRef.getVarId();
+                        const uint32_t destinationId = targetRef.getVarId();
+                        bool provenParameterCopy = false;
+                        auto sourceStorage = storageKinds.find(sourceId);
+                        auto destinationStorage = storageKinds.find(destinationId);
+                        if (sourceStorage != storageKinds.end() &&
+                            sourceStorage->second ==
+                                helix::high::StorageKind::Parameter &&
+                            destinationStorage != storageKinds.end() &&
+                            destinationStorage->second !=
+                                helix::high::StorageKind::Parameter &&
+                            assignmentCounts.lookup(destinationId) == 1 &&
+                            targetType.kind == CTypeInfo::Pointer) {
+                            provenParameterCopy = true;
+                        }
+                        if (provenParameterCopy &&
+                            varTypes[sourceId].mergeFrom(targetType))
+                            changed = true;
                     }
                     return;
                 }

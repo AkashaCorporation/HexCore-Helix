@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-v0.9.4--rc.1-8a6d3b">
+  <img alt="version" src="https://img.shields.io/badge/version-v0.9.4--rc.2-8a6d3b">
   <img alt="engine" src="https://img.shields.io/badge/engine-C%2B%2B23%20%2F%20MLIR%2018-8a6d3b">
   <img alt="lifter" src="https://img.shields.io/badge/lifter-Remill%20(LLVM%20IR)-8a6d3b">
   <img alt="bridge" src="https://img.shields.io/badge/bridge-Rust%20%2F%20N--API-8a6d3b">
@@ -35,7 +35,7 @@
 
 ## Overview
 
-The `0.9.4-rc.1` candidate consolidates the validated native implementation into
+The `0.9.4-rc.2` candidate consolidates the validated native implementation into
 the canonical repository. It retains LLVM/MLIR 18; the upstream toolchain migration
 is a separate future release. Candidate status is not stable-release acceptance.
 

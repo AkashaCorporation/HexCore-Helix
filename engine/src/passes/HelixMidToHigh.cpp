@@ -919,7 +919,10 @@ struct MidFieldPtrToHighField : public OpConversionPattern<mid::FieldPtrOp> {
             op.getAddressAttr()
         );
 
-        rewriter.replaceOp(op, new_op.getResult());
+        auto address = rewriter.create<high::UnaryOp>(
+            op.getLoc(), op.getResult().getType(), high::UnaryOpKind::AddressOf,
+            new_op.getResult(), op.getAddressAttr());
+        rewriter.replaceOp(op, address.getResult());
         return success();
     }
 };
@@ -1408,6 +1411,49 @@ struct LegalizeFunctionContainersPass
                     }
                     reference.getResult().replaceAllUsesWith(argument);
                     reference.erase();
+                }
+
+                // Region fallback slots can be definition-backed yet lack a
+                // VarDecl when RecoverVariables had no entry snapshot for the
+                // physical register. Preserve the exact slot identity/type
+                // instead of forcing the C-AST to invent an int64_t orphan.
+                DenseSet<uint32_t> declaredIds;
+                DenseSet<uint32_t> definedIds;
+                DenseMap<uint32_t, high::VarRefOp> representativeRefs;
+                replacement.walk([&](high::VarDeclOp declaration) {
+                    declaredIds.insert(declaration.getVarId());
+                });
+                replacement.walk([&](high::VarRefOp reference) {
+                    auto [it, inserted] = representativeRefs.try_emplace(
+                        reference.getVarId(), reference);
+                    if (!inserted && reference->hasAttr("inferred_type") &&
+                        !it->second->hasAttr("inferred_type"))
+                        it->second = reference;
+                });
+                replacement.walk([&](high::AssignOp assignment) {
+                    if (auto target = assignment.getTarget().getDefiningOp<
+                            high::VarRefOp>())
+                        definedIds.insert(target.getVarId());
+                });
+                SmallVector<uint32_t, 8> missingDeclarations;
+                for (uint32_t id : definedIds)
+                    if (!declaredIds.contains(id) &&
+                        representativeRefs.contains(id))
+                        missingDeclarations.push_back(id);
+                llvm::sort(missingDeclarations);
+                OpBuilder declarations(&entry, entry.begin());
+                for (uint32_t id : missingDeclarations) {
+                    high::VarRefOp reference = representativeRefs.lookup(id);
+                    auto declaration = declarations.create<high::VarDeclOp>(
+                        reference.getLoc(), declarations.getUI32IntegerAttr(id),
+                        reference.getVarNameAttr(),
+                        high::StorageKindAttr::get(
+                            &getContext(), high::StorageKind::Register),
+                        IntegerAttr{}, Value{}, reference.getAddressAttr());
+                    copyRecoveryAttrs(reference, declaration);
+                    declaration->setAttr(
+                        "helix.definition_backed_slot_recovery",
+                        declarations.getUnitAttr());
                 }
             }
             replacement->setAttr(
