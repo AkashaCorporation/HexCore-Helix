@@ -50,12 +50,14 @@ with SHA-256
 - Smoke pseudo-C and HAST were non-empty and deterministic across fresh engine
   instances.
 - Windows x64 addon SHA-256:
-  `D2E2F000D7B8EB74044FFF34A1E2A67F1859392E2B8C7760AA5AA0B9649F4DC0`.
+  `D7023EC230C1ADE03E5E28ECBD3F997B89190F9BE6E8301ACD2EDE6C8B2733AB`.
 - Clean-build engine tree:
-  `427602F3919C655ECF480BD1E756796FE6716A30`; static library SHA-256:
-  `8C7DCCC9F69EBCE0EAB0A59D37DEA5E831520269A73F8ED38586DD924952ADF5`.
+  `4E2FFF953A65D6CD58D724D26B89718EBC8385F6`; static library SHA-256:
+  `408FB8724A3087091117440DF2F2E55EE0E2B46A41A84753558928DE41BEADDE`.
 - The addon was loaded and exercised from an isolated artifact directory,
   outside both source trees.
+- PR #18 passes Rust/Clippy, the C++ Linux verifier lane and the Linux N-API
+  build. npm publication remains intentionally skipped for the pull request.
 
 ## Remaining Release Gates
 
