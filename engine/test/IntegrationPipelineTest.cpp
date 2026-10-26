@@ -766,6 +766,32 @@ TEST(IntegrationPipelineRegressionTest,
 }
 
 TEST(IntegrationPipelineRegressionTest,
+     RemillStateByteOffsetsRemainRegisterSlices) {
+    constexpr const char* ir = R"(
+        target triple = "x86_64-pc-windows-msvc"
+
+        define ptr @lifted_4096(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %xmm0.high = getelementptr inbounds i8, ptr %state, i64 24
+          %old = load i64, ptr %xmm0.high
+          %updated = add i64 %old, 1
+          store i64 %updated, ptr %xmm0.high
+          ret ptr %memory
+        }
+    )";
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_X86_64);
+    auto output = pipeline.decompile(ir);
+
+    ASSERT_TRUE(output.has_value()) << output.error();
+    EXPECT_EQ(output->pseudo_c.find("(void*)0"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("literal null memory access"),
+              std::string::npos) << output->pseudo_c;
+}
+
+TEST(IntegrationPipelineRegressionTest,
      Win64ScalarFpArgumentsAndReturnSurviveStructuredBranches) {
     constexpr const char* ir = R"(
         target triple = "x86_64-pc-windows-msvc"

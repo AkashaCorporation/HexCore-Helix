@@ -173,8 +173,18 @@ static bool isLiteralZero(Value v) {
 /// Built during the initial scan of the LLVM Dialect module by recognizing
 /// getelementptr operations that carry !remill_register metadata.
 struct RegisterTracker {
+    struct RegisterSlice {
+        std::string name;
+        unsigned bitOffset = 0;
+        unsigned storageWidth = 0;
+    };
+
     /// Maps SSA values (GEP results) to their register name.
     llvm::DenseMap<Value, std::string> gep_to_reg;
+
+    /// Byte-offset GEPs into the imported Remill State lose their typed path
+    /// and metadata during LLVM import. Preserve the affected XMM lane here.
+    llvm::DenseMap<Value, RegisterSlice> register_slices;
 
     /// Maps register names to their bit width (derived from access patterns).
     llvm::StringMap<unsigned> reg_widths;
@@ -293,6 +303,15 @@ struct RegisterTracker {
 
     /// Scan a function body and build the register map.
     void scan(LLVM::LLVMFuncOp func) {
+        bool usesX86_64StateLayout = false;
+        if (auto module = func->getParentOfType<ModuleOp>()) {
+            if (auto triple =
+                    module->getAttrOfType<StringAttr>("llvm.target_triple")) {
+                usesX86_64StateLayout =
+                    triple.getValue().contains("x86_64") ||
+                    triple.getValue().contains("amd64");
+            }
+        }
         func.walk([&](LLVM::GEPOp gep) {
             // Strategy 1: Check for !remill_register metadata as an MLIR attribute.
             if (auto regAttr = gep->getAttrOfType<StringAttr>("remill_register")) {
@@ -519,6 +538,47 @@ struct RegisterTracker {
                 reg_widths[baseName] = reg_widths.count(baseName)
                     ? reg_widths[baseName] : 128;
             }
+        });
+
+        // SROA commonly rewrites typed XMM lane pointers to
+        // `getelementptr i8, %state, <byte-offset>`. The Remill x86 State has a
+        // 16-byte ArchState prefix followed by 32 vector slots of 64 bytes.
+        // Only classify the architectural low 128 bits of XMM0-XMM15 here;
+        // wider lanes retain their conservative memory fallback until the
+        // register model carries explicit YMM/ZMM slice identities.
+        if (usesX86_64StateLayout) func.walk([&](LLVM::GEPOp gep) {
+            if (gep_to_reg.count(gep.getResult()) ||
+                register_slices.count(gep.getResult()))
+                return;
+
+            Value base = stripPointerAliases(gep.getBase());
+            auto argument = dyn_cast<BlockArgument>(base);
+            if (!argument || argument.getOwner() != &func.getBody().front() ||
+                argument.getArgNumber() != 0)
+                return;
+
+            auto indices = extractConstantGEPIndices(gep);
+            if (!indices || indices->size() != 1)
+                return;
+
+            constexpr int64_t kVectorBase = 16;
+            constexpr int64_t kVectorStride = 64;
+            const int64_t byteOffset = (*indices)[0];
+            if (byteOffset < kVectorBase)
+                return;
+            const int64_t relative = byteOffset - kVectorBase;
+            const int64_t registerIndex = relative / kVectorStride;
+            const int64_t laneByteOffset = relative % kVectorStride;
+            if (registerIndex < 0 || registerIndex >= 16 ||
+                laneByteOffset < 0 || laneByteOffset >= 16)
+                return;
+
+            register_slices.try_emplace(
+                gep.getResult(),
+                RegisterSlice{
+                    "XMM" + std::to_string(registerIndex),
+                    static_cast<unsigned>(laneByteOffset * 8),
+                    128});
         });
 
         // Also track alloca-based bookkeeping values (NEXT_PC, RETURN_PC,
@@ -875,6 +935,15 @@ struct RegisterTracker {
         }
 
         return candidate;
+    }
+
+    /// Get a byte-addressed register slice identity, if known.
+    std::optional<RegisterSlice> getRegisterSlice(Value val) const {
+        val = stripPointerAliases(val);
+        auto it = register_slices.find(val);
+        if (it == register_slices.end())
+            return std::nullopt;
+        return it->second;
     }
 
     /// Get the register name for a GEP result, if known.
@@ -1937,6 +2006,27 @@ private:
 
         // ─── Pattern: Load from register pointer ─────────────────────────
         if (auto load = dyn_cast<LLVM::LoadOp>(op)) {
+            if (auto slice = regs.getRegisterSlice(load.getAddr())) {
+                Type resultType = load.getResult().getType();
+                unsigned accessWidth = vectorTotalBits(resultType);
+                if (auto integer = dyn_cast<IntegerType>(resultType))
+                    accessWidth = integer.getWidth();
+                else if (auto floating = dyn_cast<FloatType>(resultType))
+                    accessWidth = floating.getWidth();
+
+                if (Value bits = readRegisterSlice(
+                        *slice, accessWidth, builder, loc, addrAttr)) {
+                    Value replacement = bits;
+                    if (!isa<IntegerType>(resultType)) {
+                        replacement = builder.create<LLVM::BitcastOp>(
+                            loc, resultType, bits).getResult();
+                    }
+                    load.getResult().replaceAllUsesWith(replacement);
+                    opsToErase.push_back(op);
+                    return;
+                }
+            }
+
             if (auto regName = regs.getRegName(load.getAddr())) {
                 // Fold tracked bookkeeping slots directly to constants so
                 // they don't become orphan temporaries like v0/v1/v7.
@@ -2130,6 +2220,14 @@ private:
             // `*((int64_t)(&__local)) = ...` noise in the C output.
             if (store.getAddr().getDefiningOp<LLVM::AllocaOp>())
                 return;
+
+            if (auto slice = regs.getRegisterSlice(store.getAddr())) {
+                if (writeRegisterSlice(
+                        *slice, store.getValue(), builder, loc, addrAttr)) {
+                    opsToErase.push_back(op);
+                    return;
+                }
+            }
 
             if (auto regName = regs.getRegName(store.getAddr())) {
                 // Skip PC/NEXT_PC updates — these are bookkeeping
@@ -3124,6 +3222,85 @@ private:
             loc, integer, builder.getIntegerAttr(integer, 0));
         return builder.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::ne, value, zero).getResult();
+    }
+
+    static Value readRegisterSlice(
+        const RegisterTracker::RegisterSlice& slice,
+        unsigned accessWidth,
+        OpBuilder& builder,
+        Location loc,
+        IntegerAttr addrAttr) {
+        if (accessWidth == 0 ||
+            slice.bitOffset + accessWidth > slice.storageWidth)
+            return nullptr;
+
+        auto storageType = builder.getIntegerType(slice.storageWidth);
+        Value storage = builder.create<helix::low::RegReadOp>(
+            loc, storageType, builder.getStringAttr(slice.name),
+            builder.getUI32IntegerAttr(slice.storageWidth), addrAttr).getResult();
+        if (accessWidth == slice.storageWidth && slice.bitOffset == 0)
+            return storage;
+        if (slice.storageWidth % accessWidth != 0 ||
+            slice.bitOffset % accessWidth != 0)
+            return nullptr;
+
+        auto elementType = builder.getIntegerType(accessWidth);
+        auto vectorType = VectorType::get(
+            {static_cast<int64_t>(slice.storageWidth / accessWidth)},
+            elementType);
+        Value vector = builder.create<LLVM::BitcastOp>(
+            loc, vectorType, storage).getResult();
+        auto indexType = builder.getI64Type();
+        auto index = builder.create<LLVM::ConstantOp>(
+            loc, indexType,
+            builder.getI64IntegerAttr(slice.bitOffset / accessWidth));
+        return builder.create<LLVM::ExtractElementOp>(
+            loc, elementType, vector, index.getResult()).getResult();
+    }
+
+    static bool writeRegisterSlice(
+        const RegisterTracker::RegisterSlice& slice,
+        Value storedValue,
+        OpBuilder& builder,
+        Location loc,
+        IntegerAttr addrAttr) {
+        storedValue = coerceRegValueToInt(storedValue, builder, loc);
+        auto storedType = dyn_cast<IntegerType>(storedValue.getType());
+        if (!storedType)
+            return false;
+        const unsigned accessWidth = storedType.getWidth();
+        if (accessWidth == 0 ||
+            slice.bitOffset + accessWidth > slice.storageWidth)
+            return false;
+
+        auto storageType = builder.getIntegerType(slice.storageWidth);
+        Value merged = storedValue;
+        if (accessWidth != slice.storageWidth || slice.bitOffset != 0) {
+            if (slice.storageWidth % accessWidth != 0 ||
+                slice.bitOffset % accessWidth != 0)
+                return false;
+            auto vectorType = VectorType::get(
+                {static_cast<int64_t>(slice.storageWidth / accessWidth)},
+                storedType);
+            Value current = builder.create<helix::low::RegReadOp>(
+                loc, storageType, builder.getStringAttr(slice.name),
+                builder.getUI32IntegerAttr(slice.storageWidth), addrAttr).getResult();
+            Value vector = builder.create<LLVM::BitcastOp>(
+                loc, vectorType, current).getResult();
+            auto indexType = builder.getI64Type();
+            auto index = builder.create<LLVM::ConstantOp>(
+                loc, indexType,
+                builder.getI64IntegerAttr(slice.bitOffset / accessWidth));
+            Value inserted = builder.create<LLVM::InsertElementOp>(
+                loc, vectorType, vector, storedValue,
+                index.getResult()).getResult();
+            merged = builder.create<LLVM::BitcastOp>(
+                loc, storageType, inserted).getResult();
+        }
+        builder.create<helix::low::RegWriteOp>(
+            loc, merged, builder.getStringAttr(slice.name),
+            builder.getUI32IntegerAttr(slice.storageWidth), addrAttr);
+        return true;
     }
 
     /// Find the most recent flag-producing operation (CmpOp, BinOp, TestOp)
