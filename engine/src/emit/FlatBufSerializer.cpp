@@ -1,16 +1,11 @@
 /// @file FlatBufSerializer.cpp
-/// @brief FlatBuffer serializer: C AST / HelixHigh MLIR → ast.fbs binary.
+/// @brief Canonical C AST to HAST FlatBuffer serializer.
 ///
-/// Two paths:
-///   1. serialize(ModuleOp)           — stub/legacy MLIR walker
-///   2. serialize(vector<CFuncDecl>)  — full C AST → HAST  [NEW]
-///
-/// The C AST path requires HELIX_HAS_FLATBUFFERS (flatbuffers::FlatBufferBuilder).
-/// When the library is absent, a minimal stub HAST is produced instead.
+/// Successful serialization always produces the append-only HAST 1.x
+/// contract. There is deliberately no partial MLIR or name-only fallback.
 
 #include "helix/emit/FlatBufSerializer.h"
-#include "helix/dialects/HelixHighOps.h"
-#include "helix/dialects/HelixLowOps.h"
+#include "helix/Engine.h"
 
 // C AST headers
 #include "helix/cast/CAstNode.h"
@@ -18,153 +13,24 @@
 #include "helix/cast/CExpr.h"
 #include "helix/cast/CStmt.h"
 #include "helix/cast/CDecl.h"
-
-#include "mlir/IR/BuiltinOps.h"
+#include "helix/cast/DamningDefect.h"
 
 #ifdef HELIX_HAS_FLATBUFFERS
 #include <flatbuffers/flatbuffers.h>
 #endif
 
+#include <array>
+#include <algorithm>
 #include <cstring>
 #include <format>
+#include <limits>
+#include <optional>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
-using namespace mlir;
 using namespace helix;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MiniFlatBufBuilder — manual builder for the stub MLIR path
-// ═══════════════════════════════════════════════════════════════════════════════
-
-namespace {
-
-class MiniFlatBufBuilder {
-public:
-    void writeU8(uint8_t val) { buf_.push_back(val); }
-
-    void writeU16(uint16_t val) {
-        buf_.push_back(val & 0xFF);
-        buf_.push_back((val >> 8) & 0xFF);
-    }
-
-    void writeU32(uint32_t val) {
-        buf_.push_back(val & 0xFF);
-        buf_.push_back((val >> 8) & 0xFF);
-        buf_.push_back((val >> 16) & 0xFF);
-        buf_.push_back((val >> 24) & 0xFF);
-    }
-
-    void writeI32(int32_t val) { writeU32(static_cast<uint32_t>(val)); }
-
-    void writeU64(uint64_t val) {
-        writeU32(static_cast<uint32_t>(val));
-        writeU32(static_cast<uint32_t>(val >> 32));
-    }
-
-    uint32_t writeString(const std::string& str) {
-        align(4);
-        uint32_t offset = static_cast<uint32_t>(buf_.size());
-        writeU32(static_cast<uint32_t>(str.size()));
-        for (char c : str)
-            buf_.push_back(static_cast<uint8_t>(c));
-        buf_.push_back(0);
-        while (buf_.size() % 4 != 0)
-            buf_.push_back(0);
-        return offset;
-    }
-
-    void align(size_t alignment) {
-        while (buf_.size() % alignment != 0)
-            buf_.push_back(0);
-    }
-
-    uint32_t pos() const { return static_cast<uint32_t>(buf_.size()); }
-    std::vector<uint8_t>& buffer() { return buf_; }
-
-private:
-    std::vector<uint8_t> buf_;
-};
-
-} // anonymous namespace
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MLIR Path (stub) — serialize(ModuleOp)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-std::vector<uint8_t> FlatBufSerializer::serialize(ModuleOp module) {
-    MiniFlatBufBuilder builder;
-
-    struct FuncInfo {
-        std::string name;
-        uint64_t address;
-        std::vector<std::string> params;
-        std::vector<std::string> locals;
-    };
-    std::vector<FuncInfo> functions;
-
-    module.walk([&](Operation* op) {
-        if (auto func = dyn_cast<helix::high::FuncOp>(op)) {
-            FuncInfo info;
-            info.name = func.getSymName().str();
-            info.address = func.getEntryAddress();
-            func.walk([&](helix::high::VarDeclOp decl) {
-                auto name = decl.getVarName().str();
-                if (decl.getStorage() == helix::high::StorageKind::Parameter)
-                    info.params.push_back(name);
-                else
-                    info.locals.push_back(name);
-            });
-            functions.push_back(std::move(info));
-        }
-    });
-
-    builder.writeU32(0); // root offset placeholder
-    builder.writeU8('H');
-    builder.writeU8('A');
-    builder.writeU8('S');
-    builder.writeU8('T');
-    builder.align(4);
-
-    std::string moduleName = "decompiled_module";
-    uint32_t moduleNameOff = builder.writeString(moduleName);
-
-    std::vector<uint32_t> funcNameOffsets;
-    for (auto& func : functions)
-        funcNameOffsets.push_back(builder.writeString(func.name));
-
-    builder.align(4);
-    uint32_t vtablePos = builder.pos();
-    builder.writeU16(10);
-    builder.writeU16(12);
-    builder.writeU16(4);
-    builder.writeU16(8);
-    builder.writeU16(0);
-
-    builder.align(4);
-    uint32_t rootTablePos = builder.pos();
-    builder.writeI32(static_cast<int32_t>(rootTablePos - vtablePos));
-    builder.writeU32(moduleNameOff > rootTablePos + 4
-        ? moduleNameOff - (rootTablePos + 4)
-        : (rootTablePos + 4) - moduleNameOff);
-    builder.writeU32(0);
-
-    auto& buf = builder.buffer();
-    uint32_t rootOff = rootTablePos;
-    buf[0] = rootOff & 0xFF;
-    buf[1] = (rootOff >> 8) & 0xFF;
-    buf[2] = (rootOff >> 16) & 0xFF;
-    buf[3] = (rootOff >> 24) & 0xFF;
-
-    return buf;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// C AST Path — serialize(vector<CFuncDecl>)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Full serialization of the C AST tree into the HAST FlatBuffer schema.
-// Requires the FlatBuffers library (HELIX_HAS_FLATBUFFERS).
 
 #ifdef HELIX_HAS_FLATBUFFERS
 
@@ -181,23 +47,39 @@ enum : uint16_t {
     DT_FIELDS = 16, DT_RETURN_TYPE = 18, DT_PARAM_TYPES = 20,
 };
 
-// Variable: name, type, storage, stack_offset
+// Variable: legacy prefix followed by HAST 1.x append-only fields.
 enum : uint16_t {
     V_NAME = 4, V_TYPE = 6, V_STORAGE = 8, V_STACK_OFFSET = 10,
+    V_IDENTITY_ID = 12, V_PARAMETER_INDEX = 14, V_TYPE_EVIDENCE = 16,
 };
 
-// Expression: kind, int_value, float_value, string_value, operator_,
-//             cast_type, children, variable, address
+// EvidenceOrigin: producer, generation, target_identity, snapshot_hash.
+enum : uint16_t {
+    EO_PRODUCER = 4, EO_GENERATION = 6,
+    EO_TARGET_IDENTITY = 8, EO_SNAPSHOT_HASH = 10,
+};
+
+// TypeEvidence: source, state, authority, strength, rejected_spelling,
+//               origin_id.
+enum : uint16_t {
+    TE_SOURCE = 4, TE_STATE = 6, TE_AUTHORITY = 8, TE_STRENGTH = 10,
+    TE_REJECTED_SPELLING = 12, TE_ORIGIN_ID = 14,
+};
+
+// Expression: legacy prefix followed by HAST 1.x append-only fields.
 enum : uint16_t {
     E_KIND = 4, E_INT_VALUE = 6, E_FLOAT_VALUE = 8,
     E_STRING_VALUE = 10, E_OPERATOR = 12, E_CAST_TYPE = 14,
     E_CHILDREN = 16, E_VARIABLE = 18, E_ADDRESS = 20,
+    E_RESULT_TYPE = 22, E_NODE_ID = 24, E_SOURCE_ADDRESS = 26,
+    E_CALL_TARGET = 28, E_FIELD_OFFSET = 30,
 };
 
-// Statement: kind, variable, expressions, children, cases, text
+// Statement: legacy prefix followed by HAST 1.x append-only fields.
 enum : uint16_t {
     S_KIND = 4, S_VARIABLE = 6, S_EXPRESSIONS = 8,
     S_CHILDREN = 10, S_CASES = 12, S_TEXT = 14,
+    S_NODE_ID = 16, S_SOURCE_ADDRESS = 18, S_CHILD_ROLES = 20,
 };
 
 // SwitchCase: values, body
@@ -209,18 +91,154 @@ enum : uint16_t {
     F_NAME = 4, F_ADDRESS = 6, F_RETURN_TYPE = 8,
     F_PARAMS = 10, F_LOCALS = 12, F_BODY = 14,
     F_CALLING_CONVENTION = 16, F_IS_VARIADIC = 18,
+    F_NATIVE_QUALITY_REPORTED = 20, F_NATIVE_QUALITY_ISSUES = 22,
+    F_RETURN_TYPE_EVIDENCE = 24,
 };
 
-// AstModule: name, functions, global_vars, type_defs
+// AstModule: legacy prefix followed by HAST 1.x negotiation fields.
 enum : uint16_t {
     M_NAME = 4, M_FUNCTIONS = 6, M_GLOBAL_VARS = 8, M_TYPE_DEFS = 10,
+    M_SCHEMA_MAJOR = 12, M_SCHEMA_MINOR = 14, M_CAPABILITIES = 16,
+    M_PRODUCER = 18, M_VERSION = 20, M_ARCH = 22, M_POINTER_BITS = 24,
+    M_EVIDENCE_ORIGINS = 26,
 };
+
+enum class ChildRole : uint8_t {
+    Unknown = 0,
+    Then = 1,
+    Else = 2,
+    Body = 3,
+    Init = 4,
+    Step = 5,
+    BlockItem = 6,
+};
+
+constexpr uint16_t kHastSchemaMajor = 1;
+constexpr uint16_t kHastSchemaMinor = 2;
+constexpr std::array<uint8_t, 9> kHastCapabilities = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 
 // ── Alias for readability ──────────────────────────────────────────────────
 
 using FBB = flatbuffers::FlatBufferBuilder;
 using TableOff = flatbuffers::Offset<flatbuffers::Table>;
 using StringOff = flatbuffers::Offset<flatbuffers::String>;
+
+static bool appendIfPresent(std::vector<TableOff>& offsets, TableOff offset) {
+    if (!offset.IsNull()) {
+        offsets.push_back(offset);
+        return true;
+    }
+    return false;
+}
+
+/// Assign IDs in logical preorder even though FlatBuffers writes children
+/// before parents. Object identity guards against accidental re-serialization.
+class NodeIdState {
+public:
+    uint64_t get(const cast::CAstNode* node) {
+        auto [it, inserted] = ids_.try_emplace(node, 0);
+        if (inserted)
+            it->second = next_++;
+        return it->second;
+    }
+
+private:
+    uint64_t next_ = 1; // zero is reserved by the HAST contract
+    std::unordered_map<const cast::CAstNode*, uint64_t> ids_;
+};
+
+static std::string originKey(const cast::CTypeEvidenceOrigin& origin) {
+    return std::format("{}\x1f{}\x1f{}\x1f{}",
+        origin.producer,
+        origin.generation ? std::to_string(*origin.generation) : std::string{},
+        origin.targetIdentity, origin.snapshotHash);
+}
+
+class EvidenceRegistry {
+public:
+    explicit EvidenceRegistry(
+            const std::vector<std::unique_ptr<cast::CFuncDecl>>& functions) {
+        auto collect = [&](const std::optional<cast::CTypeEvidence>& evidence) {
+            if (evidence && evidence->origin)
+                origins_.push_back(*evidence->origin);
+        };
+        for (const auto& function : functions) {
+            collect(function->returnTypeEvidence);
+            for (const auto& parameter : function->params)
+                collect(parameter.typeEvidence);
+            for (const auto& local : function->localVars)
+                collect(local.typeEvidence);
+        }
+        std::sort(origins_.begin(), origins_.end(),
+            [](const auto& left, const auto& right) {
+                return std::tie(left.producer, left.generation,
+                                left.targetIdentity, left.snapshotHash) <
+                       std::tie(right.producer, right.generation,
+                                right.targetIdentity, right.snapshotHash);
+            });
+        origins_.erase(std::unique(origins_.begin(), origins_.end()),
+                       origins_.end());
+        for (uint32_t index = 0; index < origins_.size(); ++index)
+            indices_.emplace(originKey(origins_[index]), index);
+    }
+
+    std::optional<uint32_t> idFor(
+            const std::optional<cast::CTypeEvidence>& evidence) const {
+        if (!evidence || !evidence->origin)
+            return std::nullopt;
+        auto iterator = indices_.find(originKey(*evidence->origin));
+        if (iterator == indices_.end())
+            return std::nullopt;
+        return iterator->second;
+    }
+
+    const std::vector<cast::CTypeEvidenceOrigin>& origins() const {
+        return origins_;
+    }
+
+private:
+    std::vector<cast::CTypeEvidenceOrigin> origins_;
+    std::unordered_map<std::string, uint32_t> indices_;
+};
+
+static uint8_t archToFB(HelixArch arch) {
+    switch (arch) {
+    case HELIX_ARCH_X86:       return 0;
+    case HELIX_ARCH_X86_64:    return 1;
+    case HELIX_ARCH_ARM:       return 2;
+    case HELIX_ARCH_AARCH64:   return 3;
+    case HELIX_ARCH_MIPS:      return 4;
+    case HELIX_ARCH_MIPS64:    return 5;
+    case HELIX_ARCH_POWERPC:   return 6;
+    case HELIX_ARCH_POWERPC64: return 7;
+    case HELIX_ARCH_SPARC:     return 8;
+    case HELIX_ARCH_SPARC64:   return 9;
+    case HELIX_ARCH_RISCV32:   return 10;
+    case HELIX_ARCH_RISCV64:   return 11;
+    }
+    return 255;
+}
+
+static uint16_t pointerBitsForArch(HelixArch arch) {
+    switch (arch) {
+    case HELIX_ARCH_X86:
+    case HELIX_ARCH_ARM:
+    case HELIX_ARCH_MIPS:
+    case HELIX_ARCH_RISCV32:
+        return 32;
+    case HELIX_ARCH_X86_64:
+    case HELIX_ARCH_AARCH64:
+    case HELIX_ARCH_MIPS64:
+    case HELIX_ARCH_POWERPC64:
+    case HELIX_ARCH_SPARC64:
+    case HELIX_ARCH_RISCV64:
+        return 64;
+    case HELIX_ARCH_POWERPC:
+    case HELIX_ARCH_SPARC:
+        return 32;
+    }
+    return 0;
+}
 
 // ── Enum mappings ──────────────────────────────────────────────────────────
 
@@ -246,7 +264,7 @@ static uint8_t storageKindToFB(cast::StorageKind k) {
     case cast::StorageKind::Register:  return 1;
     case cast::StorageKind::Global:    return 2;
     case cast::StorageKind::Parameter: return 3;
-    case cast::StorageKind::Temporary: return 0; // no Temporary in schema
+    case cast::StorageKind::Temporary: return 4;
     }
     return 0;
 }
@@ -322,6 +340,7 @@ static uint8_t stmtKindFromNode(cast::NodeKind k) {
     case cast::NodeKind::LabelStmt:    return 12;
     case cast::NodeKind::AsmStmt:      return 13;
     case cast::NodeKind::CommentStmt:  return 14;
+    case cast::NodeKind::BlockStmt:    return 15;
     default:                           return 255;
     }
 }
@@ -329,9 +348,13 @@ static uint8_t stmtKindFromNode(cast::NodeKind k) {
 // ── Forward declarations ───────────────────────────────────────────────────
 
 static TableOff emitDataType(FBB& fbb, const cast::CType* type);
-static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr);
-static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt);
-static std::vector<TableOff> emitStmtList(FBB& fbb, const std::vector<cast::StmtPtr>& stmts);
+static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr,
+                               NodeIdState& nodeIds);
+static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt,
+                              NodeIdState& nodeIds);
+static std::vector<TableOff> emitStmtList(
+    FBB& fbb, const std::vector<cast::StmtPtr>& stmts,
+    NodeIdState& nodeIds);
 
 // ── DataType ───────────────────────────────────────────────────────────────
 
@@ -381,35 +404,109 @@ static TableOff emitDataType(FBB& fbb, const cast::CType* type) {
 
 // ── Variable ───────────────────────────────────────────────────────────────
 
+static TableOff emitEvidenceOrigin(
+        FBB& fbb, const cast::CTypeEvidenceOrigin& origin) {
+    auto producer = origin.producer.empty()
+        ? StringOff{} : fbb.CreateString(origin.producer);
+    auto target = origin.targetIdentity.empty()
+        ? StringOff{} : fbb.CreateString(origin.targetIdentity);
+    auto snapshot = origin.snapshotHash.empty()
+        ? StringOff{} : fbb.CreateString(origin.snapshotHash);
+    auto table = fbb.StartTable();
+    if (!producer.IsNull()) fbb.AddOffset(EO_PRODUCER, producer);
+    if (origin.generation) {
+        fbb.AddElement<uint64_t>(EO_GENERATION, *origin.generation,
+                                 std::numeric_limits<uint64_t>::max());
+    }
+    if (!target.IsNull()) fbb.AddOffset(EO_TARGET_IDENTITY, target);
+    if (!snapshot.IsNull()) fbb.AddOffset(EO_SNAPSHOT_HASH, snapshot);
+    return TableOff(fbb.EndTable(table));
+}
+
+static TableOff emitTypeEvidence(
+        FBB& fbb, const std::optional<cast::CTypeEvidence>& evidence,
+        const EvidenceRegistry* registry) {
+    const auto source = evidence
+        ? static_cast<uint8_t>(evidence->source) : uint8_t(0);
+    const auto state = evidence
+        ? static_cast<uint8_t>(evidence->state) : uint8_t(0);
+    const auto authority = evidence
+        ? static_cast<uint8_t>(evidence->authority) : uint8_t(0);
+    const auto strength = evidence ? evidence->strength : uint16_t(0);
+    auto rejected = evidence && !evidence->rejectedSpelling.empty()
+        ? fbb.CreateString(evidence->rejectedSpelling) : StringOff{};
+    const auto originId = registry
+        ? registry->idFor(evidence) : std::optional<uint32_t>{};
+    auto table = fbb.StartTable();
+    fbb.AddElement<uint8_t>(TE_SOURCE, source, uint8_t(0));
+    fbb.AddElement<uint8_t>(TE_STATE, state, uint8_t(0));
+    fbb.AddElement<uint8_t>(TE_AUTHORITY, authority, uint8_t(0));
+    fbb.AddElement<uint16_t>(TE_STRENGTH, strength, uint16_t(0));
+    if (!rejected.IsNull()) fbb.AddOffset(TE_REJECTED_SPELLING, rejected);
+    if (originId) {
+        fbb.AddElement<uint32_t>(TE_ORIGIN_ID, *originId,
+                                 std::numeric_limits<uint32_t>::max());
+    }
+    return TableOff(fbb.EndTable(table));
+}
+
 static TableOff emitVariable(FBB& fbb, const std::string& name,
-                              const cast::CType* type,
-                              cast::StorageKind storage,
-                              int64_t stackOffset) {
+                               const cast::CType* type,
+                               cast::StorageKind storage,
+                               int64_t stackOffset,
+                               std::optional<uint64_t> identityId,
+                               std::optional<uint32_t> parameterIndex,
+                               const std::optional<cast::CTypeEvidence>& evidence,
+                               const EvidenceRegistry* registry) {
     auto typeOff = emitDataType(fbb, type);
     auto nameOff = fbb.CreateString(name);
+    auto evidenceOff = emitTypeEvidence(fbb, evidence, registry);
 
     auto s = fbb.StartTable();
     fbb.AddOffset(V_NAME, nameOff);
     if (!typeOff.IsNull()) fbb.AddOffset(V_TYPE, typeOff);
     fbb.AddElement<uint8_t>(V_STORAGE, storageKindToFB(storage), uint8_t(0));
     fbb.AddElement<int64_t>(V_STACK_OFFSET, stackOffset, int64_t(0));
+    // Optional scalars use vtable presence. A deliberately impossible builder
+    // default forces present zero values onto the wire without ForceDefaults.
+    if (identityId) {
+        fbb.AddElement<uint64_t>(V_IDENTITY_ID, *identityId,
+                                 std::numeric_limits<uint64_t>::max());
+    }
+    if (parameterIndex) {
+        fbb.AddElement<uint32_t>(V_PARAMETER_INDEX, *parameterIndex,
+                                 std::numeric_limits<uint32_t>::max());
+    }
+    fbb.AddOffset(V_TYPE_EVIDENCE, evidenceOff);
     return TableOff(fbb.EndTable(s));
 }
 
-static TableOff emitVarDecl(FBB& fbb, const cast::CVarDecl& v) {
+static TableOff emitVarDecl(FBB& fbb, const cast::CVarDecl& v,
+                            const EvidenceRegistry& registry) {
     return emitVariable(fbb, v.varName, v.type.get(), v.storage,
-                        v.stackOffset.value_or(0));
+                        v.stackOffset.value_or(0), uint64_t(v.varId),
+                        std::nullopt, v.typeEvidence, &registry);
 }
 
-static TableOff emitParamAsVar(FBB& fbb, const cast::CParamDecl& p) {
+static TableOff emitParamAsVar(FBB& fbb, const cast::CParamDecl& p,
+                               const EvidenceRegistry& registry) {
+    std::optional<uint64_t> identityId;
+    if (p.varId)
+        identityId = uint64_t(*p.varId);
     return emitVariable(fbb, p.name, p.type.get(),
-                        cast::StorageKind::Parameter, 0);
+                        cast::StorageKind::Parameter, 0, identityId,
+                        uint32_t(p.index), p.typeEvidence, &registry);
 }
 
 // ── Expression ─────────────────────────────────────────────────────────────
 
-static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
+static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr,
+                               NodeIdState& nodeIds) {
     if (!expr) return TableOff{0};
+
+    // Allocate before descending so IDs describe the logical AST preorder,
+    // independent of FlatBuffers' bottom-up object construction.
+    const uint64_t nodeId = nodeIds.get(expr);
 
     // Determine ExprKind
     uint8_t kind = exprKindFromNode(expr->getKind());
@@ -419,12 +516,15 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
     StringOff opStr{0};
     TableOff castType{0};
     TableOff varRef{0};
+    TableOff resultType = emitDataType(fbb, expr->type.get());
     flatbuffers::Offset<flatbuffers::Vector<TableOff>> childrenVec{0};
 
     // Values for scalars
     int64_t intVal = 0;
     double floatVal = 0.0;
-    uint64_t addrVal = 0;
+    std::optional<uint64_t> addrVal;
+    std::optional<uint64_t> callTarget;
+    std::optional<uint64_t> fieldOffset;
 
     switch (expr->getKind()) {
     case cast::NodeKind::IntLitExpr: {
@@ -451,32 +551,34 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
         auto* ref = static_cast<const cast::CVarRefExpr*>(expr);
         strVal = fbb.CreateString(ref->varName);
         varRef = emitVariable(fbb, ref->varName, ref->type.get(),
-                              cast::StorageKind::Stack, 0);
+                              cast::StorageKind::Stack, 0,
+                              uint64_t(ref->varId), std::nullopt,
+                              std::nullopt, nullptr);
         break;
     }
     case cast::NodeKind::BinaryExpr: {
         auto* bin = static_cast<const cast::CBinaryExpr*>(expr);
         // Children first (recursion happens before StartTable)
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, bin->lhs.get()));
-        ch.push_back(emitExpression(fbb, bin->rhs.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, bin->lhs.get(), nodeIds));
+        appendIfPresent(ch, emitExpression(fbb, bin->rhs.get(), nodeIds));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         opStr = fbb.CreateString(binaryOpStr(bin->op));
         break;
     }
     case cast::NodeKind::UnaryExpr: {
         auto* un = static_cast<const cast::CUnaryExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, un->operand.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, un->operand.get(), nodeIds));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         opStr = fbb.CreateString(unaryOpStr(un->op));
         break;
     }
     case cast::NodeKind::CastExpr: {
         auto* ce = static_cast<const cast::CCastExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, ce->operand.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, ce->operand.get(), nodeIds));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         castType = emitDataType(fbb, ce->targetType.get());
         break;
     }
@@ -484,34 +586,37 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
         auto* call = static_cast<const cast::CCallExpr*>(expr);
         std::vector<TableOff> ch;
         for (auto& arg : call->args)
-            ch.push_back(emitExpression(fbb, arg.get()));
+            appendIfPresent(ch, emitExpression(fbb, arg.get(), nodeIds));
         if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         strVal = fbb.CreateString(call->targetName);
+        if (call->targetAddr != 0)
+            callTarget = call->targetAddr;
         break;
     }
     case cast::NodeKind::TernaryExpr: {
         auto* te = static_cast<const cast::CTernaryExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, te->cond.get()));
-        ch.push_back(emitExpression(fbb, te->trueVal.get()));
-        ch.push_back(emitExpression(fbb, te->falseVal.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, te->cond.get(), nodeIds));
+        appendIfPresent(ch, emitExpression(fbb, te->trueVal.get(), nodeIds));
+        appendIfPresent(ch, emitExpression(fbb, te->falseVal.get(), nodeIds));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         break;
     }
     case cast::NodeKind::SubscriptExpr: {
         auto* sub = static_cast<const cast::CSubscriptExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, sub->base.get()));
-        ch.push_back(emitExpression(fbb, sub->index.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, sub->base.get(), nodeIds));
+        appendIfPresent(ch, emitExpression(fbb, sub->index.get(), nodeIds));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         break;
     }
     case cast::NodeKind::FieldAccessExpr: {
         auto* fa = static_cast<const cast::CFieldAccessExpr*>(expr);
         std::vector<TableOff> ch;
-        ch.push_back(emitExpression(fbb, fa->base.get()));
-        childrenVec = fbb.CreateVector(ch);
+        appendIfPresent(ch, emitExpression(fbb, fa->base.get(), nodeIds));
+        if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         strVal = fbb.CreateString(fa->fieldName);
+        fieldOffset = fa->fieldOffset;
         // Override kind: Member (9) or DerefMember (10)
         kind = fa->isPointer ? uint8_t(10) : uint8_t(9);
         break;
@@ -530,34 +635,53 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr) {
     if (!castType.IsNull())         fbb.AddOffset(E_CAST_TYPE, castType);
     if (!childrenVec.IsNull())      fbb.AddOffset(E_CHILDREN, childrenVec);
     if (!varRef.IsNull())           fbb.AddOffset(E_VARIABLE, varRef);
-    // Address field: struct Address { value: uint64 } — binary-identical to uint64 scalar
-    if (addrVal != 0)               fbb.AddElement<uint64_t>(E_ADDRESS, addrVal, uint64_t(0));
+    // Address fields use the inline Address struct, binary-identical to u64.
+    if (addrVal) {
+        fbb.AddElement<uint64_t>(E_ADDRESS, *addrVal,
+                                 std::numeric_limits<uint64_t>::max());
+    }
+    if (!resultType.IsNull())       fbb.AddOffset(E_RESULT_TYPE, resultType);
+    fbb.AddElement<uint64_t>(E_NODE_ID, nodeId, uint64_t(0));
+    if (expr->getAddress() != 0) {
+        fbb.AddElement<uint64_t>(E_SOURCE_ADDRESS, expr->getAddress(),
+                                 uint64_t(0));
+    }
+    if (callTarget) {
+        fbb.AddElement<uint64_t>(E_CALL_TARGET, *callTarget, uint64_t(0));
+    }
+    if (fieldOffset) {
+        fbb.AddElement<uint64_t>(E_FIELD_OFFSET, *fieldOffset,
+                                 std::numeric_limits<uint64_t>::max());
+    }
     return TableOff(fbb.EndTable(s));
 }
 
 // ── Statement ──────────────────────────────────────────────────────────────
 
 /// Flatten BlockStmt children into a single list of Statement offsets.
-static std::vector<TableOff> emitStmtList(FBB& fbb,
-                                           const std::vector<cast::StmtPtr>& stmts) {
+static std::vector<TableOff> emitStmtList(
+    FBB& fbb, const std::vector<cast::StmtPtr>& stmts,
+    NodeIdState& nodeIds) {
     std::vector<TableOff> result;
     for (auto& stmt : stmts) {
         if (!stmt) continue;
         if (auto* block = dynamic_cast<cast::CBlockStmt*>(stmt.get())) {
             // Flatten: inline the block's children
-            auto inner = emitStmtList(fbb, block->stmts);
+            auto inner = emitStmtList(fbb, block->stmts, nodeIds);
             result.insert(result.end(), inner.begin(), inner.end());
         } else {
-            auto off = emitStatement(fbb, stmt.get());
+            auto off = emitStatement(fbb, stmt.get(), nodeIds);
             if (!off.IsNull()) result.push_back(off);
         }
     }
     return result;
 }
 
-static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
+static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt,
+                              NodeIdState& nodeIds) {
     if (!stmt) return TableOff{0};
 
+    const uint64_t nodeId = nodeIds.get(stmt);
     uint8_t kind = stmtKindFromNode(stmt->getKind());
 
     // Pre-create everything before StartTable
@@ -566,6 +690,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     flatbuffers::Offset<flatbuffers::Vector<TableOff>> exprsVec{0};
     flatbuffers::Offset<flatbuffers::Vector<TableOff>> childrenVec{0};
     flatbuffers::Offset<flatbuffers::Vector<TableOff>> casesVec{0};
+    flatbuffers::Offset<flatbuffers::Vector<uint8_t>> childRolesVec{0};
+    std::vector<uint8_t> childRoles;
 
     switch (stmt->getKind()) {
 
@@ -583,9 +709,11 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::AssignStmt: {
         auto* a = static_cast<const cast::CAssignStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, a->target.get()));
-        exprs.push_back(emitExpression(fbb, a->value.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs,
+                        emitExpression(fbb, a->target.get(), nodeIds));
+        appendIfPresent(exprs,
+                        emitExpression(fbb, a->value.get(), nodeIds));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         if (!a->compoundOp.empty())
             text = fbb.CreateString(a->compoundOp);
         break;
@@ -594,8 +722,9 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::ExprStmt: {
         auto* e = static_cast<const cast::CExprStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, e->expr.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs,
+                        emitExpression(fbb, e->expr.get(), nodeIds));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         break;
     }
 
@@ -603,7 +732,8 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         auto* r = static_cast<const cast::CReturnStmt*>(stmt);
         if (r->value) {
             std::vector<TableOff> exprs;
-            exprs.push_back(emitExpression(fbb, r->value.get()));
+            appendIfPresent(exprs,
+                            emitExpression(fbb, r->value.get(), nodeIds));
             exprsVec = fbb.CreateVector(exprs);
         }
         break;
@@ -613,14 +743,19 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         auto* ifs = static_cast<const cast::CIfStmt*>(stmt);
         // expressions[0] = condition
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, ifs->condition.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs,
+                        emitExpression(fbb, ifs->condition.get(), nodeIds));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         // children = then_body ++ else_body
-        auto thenOffs = emitStmtList(fbb, ifs->thenBody);
-        auto elseOffs = emitStmtList(fbb, ifs->elseBody);
+        auto thenOffs = emitStmtList(fbb, ifs->thenBody, nodeIds);
+        auto elseOffs = emitStmtList(fbb, ifs->elseBody, nodeIds);
         std::vector<TableOff> allChildren;
         allChildren.insert(allChildren.end(), thenOffs.begin(), thenOffs.end());
         allChildren.insert(allChildren.end(), elseOffs.begin(), elseOffs.end());
+        childRoles.insert(childRoles.end(), thenOffs.size(),
+                          uint8_t(ChildRole::Then));
+        childRoles.insert(childRoles.end(), elseOffs.size(),
+                          uint8_t(ChildRole::Else));
         if (!allChildren.empty()) childrenVec = fbb.CreateVector(allChildren);
         // text = number of then-body statements (for adapter to split)
         text = fbb.CreateString(std::to_string(thenOffs.size()));
@@ -630,20 +765,26 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     case cast::NodeKind::WhileStmt: {
         auto* w = static_cast<const cast::CWhileStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, w->condition.get()));
-        exprsVec = fbb.CreateVector(exprs);
-        auto bodyOffs = emitStmtList(fbb, w->body);
+        appendIfPresent(exprs,
+                        emitExpression(fbb, w->condition.get(), nodeIds));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
+        auto bodyOffs = emitStmtList(fbb, w->body, nodeIds);
         if (!bodyOffs.empty()) childrenVec = fbb.CreateVector(bodyOffs);
+        childRoles.insert(childRoles.end(), bodyOffs.size(),
+                          uint8_t(ChildRole::Body));
         break;
     }
 
     case cast::NodeKind::DoWhileStmt: {
         auto* dw = static_cast<const cast::CDoWhileStmt*>(stmt);
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, dw->condition.get()));
-        exprsVec = fbb.CreateVector(exprs);
-        auto bodyOffs = emitStmtList(fbb, dw->body);
+        appendIfPresent(exprs,
+                        emitExpression(fbb, dw->condition.get(), nodeIds));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
+        auto bodyOffs = emitStmtList(fbb, dw->body, nodeIds);
         if (!bodyOffs.empty()) childrenVec = fbb.CreateVector(bodyOffs);
+        childRoles.insert(childRoles.end(), bodyOffs.size(),
+                          uint8_t(ChildRole::Body));
         break;
     }
 
@@ -652,17 +793,26 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         // expressions = [condition] (may be empty if no condition)
         if (f->condition) {
             std::vector<TableOff> exprs;
-            exprs.push_back(emitExpression(fbb, f->condition.get()));
+            appendIfPresent(exprs,
+                            emitExpression(fbb, f->condition.get(), nodeIds));
             exprsVec = fbb.CreateVector(exprs);
         }
         // children = [init?, step?, ...body]
         std::vector<TableOff> ch;
         bool hasInit = f->init != nullptr;
         bool hasStep = f->step != nullptr;
-        if (hasInit) ch.push_back(emitStatement(fbb, f->init.get()));
-        if (hasStep) ch.push_back(emitStatement(fbb, f->step.get()));
-        auto bodyOffs = emitStmtList(fbb, f->body);
+        if (hasInit && appendIfPresent(
+                ch, emitStatement(fbb, f->init.get(), nodeIds))) {
+            childRoles.push_back(uint8_t(ChildRole::Init));
+        }
+        if (hasStep && appendIfPresent(
+                ch, emitStatement(fbb, f->step.get(), nodeIds))) {
+            childRoles.push_back(uint8_t(ChildRole::Step));
+        }
+        auto bodyOffs = emitStmtList(fbb, f->body, nodeIds);
         ch.insert(ch.end(), bodyOffs.begin(), bodyOffs.end());
+        childRoles.insert(childRoles.end(), bodyOffs.size(),
+                          uint8_t(ChildRole::Body));
         if (!ch.empty()) childrenVec = fbb.CreateVector(ch);
         // text = "has_init,has_step" so the adapter knows the layout
         text = fbb.CreateString(std::format("{},{}", hasInit ? 1 : 0,
@@ -674,8 +824,9 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         auto* sw = static_cast<const cast::CSwitchStmt*>(stmt);
         // expressions = [selector]
         std::vector<TableOff> exprs;
-        exprs.push_back(emitExpression(fbb, sw->selector.get()));
-        exprsVec = fbb.CreateVector(exprs);
+        appendIfPresent(exprs,
+                        emitExpression(fbb, sw->selector.get(), nodeIds));
+        if (!exprs.empty()) exprsVec = fbb.CreateVector(exprs);
         // cases = [SwitchCase, ...]
         std::vector<TableOff> caseOffs;
         for (auto& sc : sw->cases) {
@@ -685,7 +836,7 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
             if (!sc.isDefault)
                 vals.push_back(sc.value);
             auto valsVec = fbb.CreateVector(vals);
-            auto bodyOffs = emitStmtList(fbb, sc.body);
+            auto bodyOffs = emitStmtList(fbb, sc.body, nodeIds);
             auto bodyVec = bodyOffs.empty()
                 ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
                 : fbb.CreateVector(bodyOffs);
@@ -732,15 +883,20 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
         // Shouldn't reach here (emitStmtList flattens BlockStmt),
         // but handle it defensively.
         auto* b = static_cast<const cast::CBlockStmt*>(stmt);
-        auto inner = emitStmtList(fbb, b->stmts);
+        auto inner = emitStmtList(fbb, b->stmts, nodeIds);
         if (!inner.empty()) childrenVec = fbb.CreateVector(inner);
-        kind = 255; // no BlockStmt kind in schema; fallback
+        childRoles.insert(childRoles.end(), inner.size(),
+                          uint8_t(ChildRole::BlockItem));
+        kind = 15;
         break;
     }
 
     default:
         break;
     }
+
+    if (!childRoles.empty())
+        childRolesVec = fbb.CreateVector(childRoles);
 
     // Build the Statement table
     auto s = fbb.StartTable();
@@ -750,24 +906,35 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt) {
     if (!childrenVec.IsNull())  fbb.AddOffset(S_CHILDREN, childrenVec);
     if (!casesVec.IsNull())     fbb.AddOffset(S_CASES, casesVec);
     if (!text.IsNull())         fbb.AddOffset(S_TEXT, text);
+    fbb.AddElement<uint64_t>(S_NODE_ID, nodeId, uint64_t(0));
+    if (stmt->getAddress() != 0) {
+        fbb.AddElement<uint64_t>(S_SOURCE_ADDRESS, stmt->getAddress(),
+                                 uint64_t(0));
+    }
+    if (!childRolesVec.IsNull())
+        fbb.AddOffset(S_CHILD_ROLES, childRolesVec);
     return TableOff(fbb.EndTable(s));
 }
 
 // ── DecompiledFunction ─────────────────────────────────────────────────────
 
-static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func) {
+static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func,
+                             NodeIdState& nodeIds,
+                             const EvidenceRegistry& registry) {
     // 1. Recursively create all child objects
     auto retTypeOff = emitDataType(fbb, func.returnType.get());
 
     std::vector<TableOff> paramOffs;
     for (auto& p : func.params)
-        paramOffs.push_back(emitParamAsVar(fbb, p));
+        paramOffs.push_back(emitParamAsVar(fbb, p, registry));
 
     std::vector<TableOff> localOffs;
     for (auto& lv : func.localVars)
-        localOffs.push_back(emitVarDecl(fbb, lv));
+        localOffs.push_back(emitVarDecl(fbb, lv, registry));
 
-    auto bodyOffs = emitStmtList(fbb, func.body);
+    auto bodyOffs = emitStmtList(fbb, func.body, nodeIds);
+    auto returnEvidence = emitTypeEvidence(
+        fbb, func.returnTypeEvidence, &registry);
 
     // 2. Create strings
     auto nameOff = fbb.CreateString(func.name);
@@ -786,17 +953,33 @@ static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func) {
         ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
         : fbb.CreateVector(bodyOffs);
 
+    std::vector<uint8_t> qualityIssues;
+    if (func.opaquePostCallReads) qualityIssues.push_back(0);
+    if (func.incompleteAbiCalls) qualityIssues.push_back(1);
+    if (func.synthesizedVarDecls) qualityIssues.push_back(2);
+    if (func.hasDamningHonestyDefect ||
+        func.unqualifiedInstrumentationCalls ||
+        (func.nativeQualityEvaluated && cast::detectDamningDefects(func).any())) qualityIssues.push_back(3);
+    if (func.registryMissHonestFailure) qualityIssues.push_back(4);
+    if (func.suspiciousSelfReferences) qualityIssues.push_back(5);
+    auto qualityVec = fbb.CreateVector(qualityIssues);
+
     // 4. Build table
     auto s = fbb.StartTable();
     fbb.AddOffset(F_NAME, nameOff);
     // Address struct { value: uint64 } — binary-identical to a uint64 scalar
-    fbb.AddElement<uint64_t>(F_ADDRESS, func.entryAddr, uint64_t(0));
+    fbb.AddElement<uint64_t>(F_ADDRESS, func.entryAddr,
+                             std::numeric_limits<uint64_t>::max());
     if (!retTypeOff.IsNull())  fbb.AddOffset(F_RETURN_TYPE, retTypeOff);
     if (!paramsVec.IsNull())   fbb.AddOffset(F_PARAMS, paramsVec);
     if (!localsVec.IsNull())   fbb.AddOffset(F_LOCALS, localsVec);
     if (!bodyVec.IsNull())     fbb.AddOffset(F_BODY, bodyVec);
     if (!ccOff.IsNull())       fbb.AddOffset(F_CALLING_CONVENTION, ccOff);
     fbb.AddElement<uint8_t>(F_IS_VARIADIC, func.isVariadic ? uint8_t(1) : uint8_t(0), uint8_t(0));
+    fbb.AddElement<uint8_t>(F_NATIVE_QUALITY_REPORTED,
+        func.nativeQualityEvaluated || !qualityIssues.empty() ? uint8_t(1) : uint8_t(0), uint8_t(0));
+    fbb.AddOffset(F_NATIVE_QUALITY_ISSUES, qualityVec);
+    fbb.AddOffset(F_RETURN_TYPE_EVIDENCE, returnEvidence);
     return TableOff(fbb.EndTable(s));
 }
 
@@ -806,24 +989,50 @@ static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func) {
 
 std::vector<uint8_t> FlatBufSerializer::serialize(
     const std::vector<std::unique_ptr<cast::CFuncDecl>>& funcs,
-    const std::string& moduleName)
+    const std::string& moduleName,
+    HelixArch arch)
 {
     flatbuffers::FlatBufferBuilder fbb(8192);
+    NodeIdState nodeIds;
+    EvidenceRegistry evidenceRegistry(funcs);
 
     // Serialize all functions
     std::vector<TableOff> funcOffs;
     for (auto& func : funcs)
-        funcOffs.push_back(emitFunction(fbb, *func));
+        funcOffs.push_back(emitFunction(
+            fbb, *func, nodeIds, evidenceRegistry));
 
-    // Create AstModule
+    std::vector<TableOff> originOffs;
+    for (const auto& origin : evidenceRegistry.origins())
+        originOffs.push_back(emitEvidenceOrigin(fbb, origin));
+
+    // Pre-create every root child before starting the AstModule table.
     auto modNameOff = fbb.CreateString(moduleName);
+    auto producerOff = fbb.CreateString("hexcore-helix");
+    auto versionOff = fbb.CreateString(Engine::version());
+    auto capabilitiesVec = fbb.CreateVector(
+        kHastCapabilities.data(), kHastCapabilities.size());
     auto funcsVec = funcOffs.empty()
         ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
         : fbb.CreateVector(funcOffs);
+    auto originsVec = originOffs.empty()
+        ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
+        : fbb.CreateVector(originOffs);
 
     auto root = fbb.StartTable();
     fbb.AddOffset(M_NAME, modNameOff);
     if (!funcsVec.IsNull()) fbb.AddOffset(M_FUNCTIONS, funcsVec);
+    fbb.AddElement<uint16_t>(M_SCHEMA_MAJOR, kHastSchemaMajor, uint16_t(0));
+    // Minor zero must still be present: absence means legacy/non-canonical.
+    fbb.AddElement<uint16_t>(M_SCHEMA_MINOR, kHastSchemaMinor,
+                             std::numeric_limits<uint16_t>::max());
+    fbb.AddOffset(M_CAPABILITIES, capabilitiesVec);
+    fbb.AddOffset(M_PRODUCER, producerOff);
+    fbb.AddOffset(M_VERSION, versionOff);
+    fbb.AddElement<uint8_t>(M_ARCH, archToFB(arch), uint8_t(255));
+    fbb.AddElement<uint16_t>(M_POINTER_BITS, pointerBitsForArch(arch),
+                             uint16_t(0));
+    if (!originsVec.IsNull()) fbb.AddOffset(M_EVIDENCE_ORIGINS, originsVec);
     auto rootOff = fbb.EndTable(root);
 
     fbb.Finish(flatbuffers::Offset<flatbuffers::Table>(rootOff), "HAST");
@@ -836,40 +1045,13 @@ std::vector<uint8_t> FlatBufSerializer::serialize(
 #else // !HELIX_HAS_FLATBUFFERS
 
 std::vector<uint8_t> FlatBufSerializer::serialize(
-    const std::vector<std::unique_ptr<cast::CFuncDecl>>& funcs,
-    const std::string& moduleName)
+    const std::vector<std::unique_ptr<cast::CFuncDecl>>&,
+    const std::string&,
+    HelixArch)
 {
-    // FlatBuffers library not linked — produce a minimal stub HAST
-    // containing only the module name. Full serialization requires
-    // building with -DHELIX_HAS_FLATBUFFERS.
-    MiniFlatBufBuilder builder;
-    builder.writeU32(0);
-    builder.writeU8('H'); builder.writeU8('A');
-    builder.writeU8('S'); builder.writeU8('T');
-    builder.align(4);
-
-    uint32_t nameOff = builder.writeString(moduleName);
-
-    builder.align(4);
-    uint32_t vtPos = builder.pos();
-    builder.writeU16(8);  // vtable size
-    builder.writeU16(12); // table size
-    builder.writeU16(4);  // name offset
-    builder.writeU16(0);  // functions (absent)
-
-    builder.align(4);
-    uint32_t rootPos = builder.pos();
-    builder.writeI32(static_cast<int32_t>(rootPos - vtPos));
-    builder.writeU32(nameOff > rootPos + 4
-        ? nameOff - (rootPos + 4) : (rootPos + 4) - nameOff);
-    builder.writeU32(0);
-
-    auto& buf = builder.buffer();
-    buf[0] = rootPos & 0xFF;
-    buf[1] = (rootPos >> 8) & 0xFF;
-    buf[2] = (rootPos >> 16) & 0xFF;
-    buf[3] = (rootPos >> 24) & 0xFF;
-    return buf;
+    // A name-only buffer is syntactically HAST-shaped but semantically false.
+    // Fail closed; Pipeline turns this into an explicit emit error.
+    return {};
 }
 
 #endif // HELIX_HAS_FLATBUFFERS
@@ -879,12 +1061,116 @@ std::vector<uint8_t> FlatBufSerializer::serialize(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bool FlatBufSerializer::verify(const uint8_t* data, size_t size) {
-    if (size < 8)
+    if (!data || size < 8)
         return false;
-    if (data[4] != 'H' || data[5] != 'A' || data[6] != 'S' || data[7] != 'T')
+    if (data[4] != 'H' || data[5] != 'A' ||
+        data[6] != 'S' || data[7] != 'T') {
         return false;
-    uint32_t rootOffset = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
-    if (rootOffset >= size)
+    }
+
+    auto readU16 = [&](size_t pos, uint16_t& value) {
+        if (pos > size || size - pos < sizeof(value))
+            return false;
+        std::memcpy(&value, data + pos, sizeof(value));
+        return true;
+    };
+    auto readU32 = [&](size_t pos, uint32_t& value) {
+        if (pos > size || size - pos < sizeof(value))
+            return false;
+        std::memcpy(&value, data + pos, sizeof(value));
+        return true;
+    };
+    auto readI32 = [&](size_t pos, int32_t& value) {
+        if (pos > size || size - pos < sizeof(value))
+            return false;
+        std::memcpy(&value, data + pos, sizeof(value));
+        return true;
+    };
+
+    uint32_t rootOffset = 0;
+    if (!readU32(0, rootOffset) || rootOffset > size ||
+        size - rootOffset < sizeof(uint32_t)) {
         return false;
+    }
+
+    int32_t vtableDistance = 0;
+    if (!readI32(rootOffset, vtableDistance)) {
+        return false;
+    }
+    const int64_t vtableSigned =
+        int64_t(rootOffset) - int64_t(vtableDistance);
+    if (vtableSigned < 0 || uint64_t(vtableSigned) >= size)
+        return false;
+    const size_t vtable = size_t(vtableSigned);
+
+    uint16_t vtableSize = 0;
+    uint16_t objectSize = 0;
+    if (!readU16(vtable, vtableSize) ||
+        !readU16(vtable + sizeof(uint16_t), objectSize) ||
+        vtableSize < 4 || vtable > size || size - vtable < vtableSize ||
+        objectSize < sizeof(uint32_t) || objectSize > size - rootOffset) {
+        return false;
+    }
+
+    auto fieldLocation = [&](uint16_t slot, size_t width)
+            -> std::optional<size_t> {
+        if (slot > vtableSize || vtableSize - slot < sizeof(uint16_t))
+            return std::nullopt;
+        uint16_t objectOffset = 0;
+        if (!readU16(vtable + slot, objectOffset) || objectOffset == 0 ||
+            objectOffset > objectSize || objectSize - objectOffset < width ||
+            rootOffset > size || size - rootOffset < objectOffset + width) {
+            return std::nullopt;
+        }
+        return rootOffset + objectOffset;
+    };
+
+    auto offsetTarget = [&](uint16_t slot) -> std::optional<size_t> {
+        auto location = fieldLocation(slot, sizeof(uint32_t));
+        if (!location)
+            return std::nullopt;
+        uint32_t relative = 0;
+        if (!readU32(*location, relative) || relative == 0 ||
+            relative > size - *location) {
+            return std::nullopt;
+        }
+        return *location + relative;
+    };
+
+    uint16_t schemaMajor = 0;
+    uint16_t schemaMinor = 0;
+    uint16_t pointerBits = 0;
+    auto majorLoc = fieldLocation(12, sizeof(uint16_t));
+    auto minorLoc = fieldLocation(14, sizeof(uint16_t));
+    auto archLoc = fieldLocation(22, sizeof(uint8_t));
+    auto pointerLoc = fieldLocation(24, sizeof(uint16_t));
+    if (!majorLoc || !minorLoc || !archLoc || !pointerLoc ||
+        !readU16(*majorLoc, schemaMajor) ||
+        !readU16(*minorLoc, schemaMinor) ||
+        !readU16(*pointerLoc, pointerBits) ||
+        schemaMajor != 1 || schemaMinor > kHastSchemaMinor ||
+        data[*archLoc] > 11 || (pointerBits != 32 && pointerBits != 64)) {
+        return false;
+    }
+
+    // Canonical negotiation also requires a non-empty capability vector and
+    // non-empty producer/version strings. Merely carrying the HAST identifier
+    // is no longer sufficient to pass verification.
+    auto capabilities = offsetTarget(16);
+    auto producer = offsetTarget(18);
+    auto version = offsetTarget(20);
+    uint32_t capabilityCount = 0;
+    uint32_t producerLength = 0;
+    uint32_t versionLength = 0;
+    if (!capabilities || !producer || !version ||
+        !readU32(*capabilities, capabilityCount) || capabilityCount == 0 ||
+        capabilityCount > size - *capabilities - sizeof(uint32_t) ||
+        !readU32(*producer, producerLength) || producerLength == 0 ||
+        producerLength > size - *producer - sizeof(uint32_t) ||
+        !readU32(*version, versionLength) || versionLength == 0 ||
+        versionLength > size - *version - sizeof(uint32_t)) {
+        return false;
+    }
+
     return true;
 }

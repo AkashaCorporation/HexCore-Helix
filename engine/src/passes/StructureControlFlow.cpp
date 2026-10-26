@@ -31,7 +31,9 @@
 
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixLowOps.h"
+#include "helix/dialects/HelixMidOps.h"
 #include "helix/dialects/HelixHighOps.h"
+#include "helix/utils/Debug.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -46,6 +48,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Region.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -102,6 +105,9 @@ namespace {
 // adapted so createUnreachableTerminator works on a helix_low.func.
 class HelixSCFInterface : public mlir::CFGToSCFInterface {
 public:
+    explicit HelixSCFInterface(bool forceStructuredTerminatorFailure = false)
+        : forceStructuredTerminatorFailure_(forceStructuredTerminatorFailure) {}
+
     mlir::FailureOr<mlir::Operation*> createStructuredBranchRegionOp(
         mlir::OpBuilder& builder, mlir::Operation* controlFlowCondOp,
         mlir::TypeRange resultTypes,
@@ -140,6 +146,12 @@ public:
     mlir::LogicalResult createStructuredBranchRegionTerminatorOp(
         mlir::Location loc, mlir::OpBuilder& builder, mlir::Operation*,
         mlir::Operation*, mlir::ValueRange results) override {
+        // Deterministic negative control for CORE-09. Fail after the upstream
+        // transform has moved the conditional regions into their structured
+        // owner, so the caller observes a real partial-mutation failure while
+        // avoiding malformed input or a destructor assert inside MLIR itself.
+        if (forceStructuredTerminatorFailure_)
+            return mlir::failure();
         builder.create<mlir::scf::YieldOp>(loc, results);
         return mlir::success();
     }
@@ -200,6 +212,9 @@ public:
         return builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{})
             .getOperation();
     }
+
+private:
+    bool forceStructuredTerminatorFailure_ = false;
 };
 
 // [M1] Bridge scf.* -> helix_high.*, de-SSA'ing region results into variables so
@@ -215,21 +230,97 @@ static unsigned g_scfBridgeVarId = 900000;  // high base to avoid colliding w/ r
 static unsigned g_irrLabelCounter = 100;
 static unsigned g_gotoLabelCounter = 0;
 
+// An SCF result does not need synthetic storage when every region proves that
+// the corresponding tuple component is unchanged. Keep this deliberately
+// narrow: either every yield forwards the same value defined outside the
+// structured op, or every yield produces the same arith constant. In
+// particular, ub.poison is missing evidence rather than an invariant value.
+struct ForwardedSCFResult {
+    mlir::Value existingValue;
+    mlir::Type type;
+    mlir::TypedAttr constantValue;
+};
+
+static std::optional<ForwardedSCFResult> findForwardedSCFResult(
+    mlir::Operation* structuredOp, mlir::ArrayRef<mlir::Region*> regions,
+    unsigned resultIndex) {
+    llvm::SmallVector<mlir::Value> yieldedValues;
+    for (mlir::Region* region : regions) {
+        if (!region || region->empty())
+            return std::nullopt;
+        for (mlir::Block& block : *region) {
+            auto yield = mlir::dyn_cast_or_null<mlir::scf::YieldOp>(
+                block.getTerminator());
+            if (!yield || resultIndex >= yield.getNumOperands())
+                return std::nullopt;
+            yieldedValues.push_back(yield.getOperand(resultIndex));
+        }
+    }
+    if (yieldedValues.empty())
+        return std::nullopt;
+
+    for (mlir::Value value : yieldedValues) {
+        if (value.getDefiningOp<mlir::ub::PoisonOp>())
+            return std::nullopt;
+    }
+
+    mlir::Value first = yieldedValues.front();
+    if (llvm::all_of(yieldedValues,
+                     [&](mlir::Value value) { return value == first; })) {
+        mlir::Operation* definingOp = first.getDefiningOp();
+        if (!definingOp || !structuredOp->isAncestor(definingOp))
+            return ForwardedSCFResult{first, first.getType(), {}};
+    }
+
+    auto firstConstant = first.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!firstConstant)
+        return std::nullopt;
+    for (mlir::Value value : llvm::drop_begin(yieldedValues)) {
+        auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
+        if (!constant || constant.getType() != firstConstant.getType() ||
+            constant.getValue() != firstConstant.getValue())
+            return std::nullopt;
+    }
+    return ForwardedSCFResult{
+        {}, firstConstant.getType(),
+        mlir::cast<mlir::TypedAttr>(firstConstant.getValue())};
+}
+
+static mlir::Value materializeForwardedSCFResult(
+    mlir::OpBuilder& builder, mlir::Location loc,
+    const ForwardedSCFResult& forwarded) {
+    if (forwarded.existingValue)
+        return forwarded.existingValue;
+    return builder.create<mlir::arith::ConstantOp>(loc,
+                                                    forwarded.constantValue);
+}
+
 static void bridgeSCFIfToHelixHigh(mlir::scf::IfOp ifOp) {
     mlir::OpBuilder b(ifOp);
     mlir::Location loc = ifOp.getLoc();
     unsigned n = ifOp.getNumResults();
 
-    // 1) one temp var per result.
-    llvm::SmallVector<std::pair<uint32_t, std::string>> vars;
+    llvm::SmallVector<mlir::Region*> regions{
+        &ifOp.getThenRegion(), &ifOp.getElseRegion()};
+    llvm::SmallVector<std::optional<ForwardedSCFResult>> forwarded;
+    llvm::SmallVector<std::optional<std::pair<uint32_t, std::string>>> vars;
+    forwarded.reserve(n);
+    vars.reserve(n);
+
+    // 1) one temp var per result that genuinely differs across the arms.
     for (unsigned i = 0; i < n; ++i) {
+        forwarded.push_back(findForwardedSCFResult(ifOp, regions, i));
+        if (forwarded.back()) {
+            vars.push_back(std::nullopt);
+            continue;
+        }
         uint32_t id = g_scfBridgeVarId++;
         std::string name = std::format("scf_r{}", id);
         b.setInsertionPoint(ifOp);
         b.create<helix::high::VarDeclOp>(
             loc, id, name, helix::high::StorageKind::Temporary,
             mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
-        vars.emplace_back(id, name);
+        vars.emplace_back(std::pair{id, name});
     }
 
     // 2) in each region, replace scf.yield(vals) with per-result assigns + a
@@ -243,9 +334,11 @@ static void bridgeSCFIfToHelixHigh(mlir::scf::IfOp ifOp) {
                 continue;
             mlir::OpBuilder yb(y);
             for (unsigned i = 0; i < n; ++i) {
+                if (forwarded[i])
+                    continue;
                 auto vref = yb.create<helix::high::VarRefOp>(
-                    loc, y.getOperand(i).getType(), vars[i].first,
-                    vars[i].second, mlir::IntegerAttr{});
+                    loc, y.getOperand(i).getType(), vars[i]->first,
+                    vars[i]->second, mlir::IntegerAttr{});
                 yb.create<helix::high::AssignOp>(
                     loc, vref.getResult(), y.getOperand(i), mlir::IntegerAttr{});
             }
@@ -264,8 +357,13 @@ static void bridgeSCFIfToHelixHigh(mlir::scf::IfOp ifOp) {
     // 4) replace result uses with var reads placed after the if.
     b.setInsertionPointAfter(hif);
     for (unsigned i = 0; i < n; ++i) {
+        if (forwarded[i]) {
+            ifOp.getResult(i).replaceAllUsesWith(
+                materializeForwardedSCFResult(b, loc, *forwarded[i]));
+            continue;
+        }
         auto vref = b.create<helix::high::VarRefOp>(
-            loc, ifOp.getResult(i).getType(), vars[i].first, vars[i].second,
+            loc, ifOp.getResult(i).getType(), vars[i]->first, vars[i]->second,
             mlir::IntegerAttr{});
         ifOp.getResult(i).replaceAllUsesWith(vref.getResult());
     }
@@ -286,16 +384,29 @@ static void bridgeSCFIndexSwitchToHelixHigh(mlir::scf::IndexSwitchOp sw) {
     mlir::Location loc = sw.getLoc();
     unsigned n = sw.getNumResults();
 
-    // 1) one temp var per result (value routing across the switch).
-    llvm::SmallVector<std::pair<uint32_t, std::string>> vars;
+    llvm::SmallVector<mlir::Region*> regions;
+    for (mlir::Region& caseRegion : sw.getCaseRegions())
+        regions.push_back(&caseRegion);
+    regions.push_back(&sw.getDefaultRegion());
+    llvm::SmallVector<std::optional<ForwardedSCFResult>> forwarded;
+    llvm::SmallVector<std::optional<std::pair<uint32_t, std::string>>> vars;
+    forwarded.reserve(n);
+    vars.reserve(n);
+
+    // 1) one temp var per result that genuinely differs across the cases.
     b.setInsertionPoint(sw);
     for (unsigned i = 0; i < n; ++i) {
+        forwarded.push_back(findForwardedSCFResult(sw, regions, i));
+        if (forwarded.back()) {
+            vars.push_back(std::nullopt);
+            continue;
+        }
         uint32_t id = g_scfBridgeVarId++;
         std::string name = std::format("scf_r{}", id);
         b.create<helix::high::VarDeclOp>(
             loc, id, name, helix::high::StorageKind::Temporary,
             mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
-        vars.emplace_back(id, name);
+        vars.emplace_back(std::pair{id, name});
     }
 
     // 2) selector: trace the index_castui back to the original integer.
@@ -324,9 +435,11 @@ static void bridgeSCFIndexSwitchToHelixHigh(mlir::scf::IndexSwitchOp sw) {
                 continue;
             mlir::OpBuilder yb(y);
             for (unsigned i = 0; i < n; ++i) {
+                if (forwarded[i])
+                    continue;
                 auto vref = yb.create<helix::high::VarRefOp>(
-                    loc, y.getOperand(i).getType(), vars[i].first,
-                    vars[i].second, mlir::IntegerAttr{});
+                    loc, y.getOperand(i).getType(), vars[i]->first,
+                    vars[i]->second, mlir::IntegerAttr{});
                 yb.create<helix::high::AssignOp>(
                     loc, vref.getResult(), y.getOperand(i), mlir::IntegerAttr{});
             }
@@ -345,8 +458,13 @@ static void bridgeSCFIndexSwitchToHelixHigh(mlir::scf::IndexSwitchOp sw) {
     // 4) route the switch results to the temp vars (reads placed after).
     b.setInsertionPointAfter(hsw);
     for (unsigned i = 0; i < n; ++i) {
+        if (forwarded[i]) {
+            sw.getResult(i).replaceAllUsesWith(
+                materializeForwardedSCFResult(b, loc, *forwarded[i]));
+            continue;
+        }
         auto vref = b.create<helix::high::VarRefOp>(
-            loc, sw.getResult(i).getType(), vars[i].first, vars[i].second,
+            loc, sw.getResult(i).getType(), vars[i]->first, vars[i]->second,
             mlir::IntegerAttr{});
         sw.getResult(i).replaceAllUsesWith(vref.getResult());
     }
@@ -369,9 +487,11 @@ static void bridgeSCFIndexSwitchToHelixHigh(mlir::scf::IndexSwitchOp sw) {
 // handled; a multi-block BEFORE is left untouched and logged.
 static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
     if (!wh.getBefore().hasOneBlock()) {
-        std::fprintf(stderr,
-                     "[SCF-SPIKE] scf.while with multi-block before region "
-                     "left un-bridged (unsupported in M1)\n");
+        if (helix::scfDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[SCF-SPIKE] scf.while with multi-block before region "
+                         "left un-bridged (unsupported in M1)\n");
+        }
         return;
     }
     mlir::OpBuilder b(wh);
@@ -379,18 +499,182 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
     mlir::Block& beforeBlk = wh.getBefore().front();
     auto cond = mlir::cast<mlir::scf::ConditionOp>(beforeBlk.getTerminator());
     mlir::Type condTy = cond.getCondition().getType();
-    unsigned n = wh.getNumOperands();  // loop-carried count
+    unsigned n = wh.getNumOperands();  // before-region carried count
+
+    // Canonicalization may legitimately produce an asymmetric scf.while:
+    // the before region has N inputs, scf.condition forwards M values to the
+    // after region / final results, and the after yield maps those M values
+    // back to N inputs. The original bridge assumed N == M and left results
+    // live when N was zero (e.g. `scf.while : () -> i32`), then erased the
+    // still-used operation. Handle the canonical trivial-after form exactly.
+    if (n != wh.getNumResults()) {
+        if (!wh.getAfter().hasOneBlock()) {
+            if (helix::scfDebugEnabled())
+                llvm::errs() << "[SCF-BRIDGE] asymmetric while has "
+                             << "multi-block after region; left intact\n";
+            return;
+        }
+        mlir::Block& afterBlk = wh.getAfter().front();
+        auto afterYield = mlir::dyn_cast_or_null<mlir::scf::YieldOp>(
+            afterBlk.getTerminator());
+        if (!afterYield ||
+            afterBlk.getOperations().size() != 1 ||
+            cond.getArgs().size() != wh.getNumResults() ||
+            afterYield.getNumOperands() != n) {
+            if (helix::scfDebugEnabled())
+                llvm::errs() << "[SCF-BRIDGE] unsupported asymmetric while "
+                             << "after-region shape; left intact\n";
+            return;
+        }
+
+        llvm::SmallVector<unsigned> nextInputFromResult;
+        nextInputFromResult.reserve(n);
+        for (mlir::Value value : afterYield.getOperands()) {
+            auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+            if (!argument || argument.getOwner() != &afterBlk) {
+                if (helix::scfDebugEnabled())
+                    llvm::errs() << "[SCF-BRIDGE] asymmetric while after "
+                                 << "yield is not a block-argument mapping\n";
+                return;
+            }
+            nextInputFromResult.push_back(argument.getArgNumber());
+        }
+
+        llvm::SmallVector<std::pair<uint32_t, std::string>> inputVars;
+        llvm::SmallVector<std::pair<uint32_t, std::string>> resultVars;
+        inputVars.reserve(n);
+        resultVars.reserve(wh.getNumResults());
+        b.setInsertionPoint(wh);
+        auto createTemp = [&](mlir::Type type, llvm::StringRef prefix) {
+            uint32_t id = g_scfBridgeVarId++;
+            std::string name = std::format("{}{}", prefix.str(), id);
+            b.create<helix::high::VarDeclOp>(
+                loc, id, name, helix::high::StorageKind::Temporary,
+                mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+            return std::pair{id, std::move(name)};
+        };
+        for (mlir::Value operand : wh.getOperands())
+            inputVars.push_back(createTemp(operand.getType(), "scf_w"));
+        for (mlir::Type type : wh.getResultTypes())
+            resultVars.push_back(createTemp(type, "scf_r"));
+        auto conditionVar = createTemp(condTy, "scf_w");
+
+        for (unsigned i = 0; i < n; ++i) {
+            auto target = b.create<helix::high::VarRefOp>(
+                loc, wh.getOperand(i).getType(), inputVars[i].first,
+                inputVars[i].second, mlir::IntegerAttr{});
+            b.create<helix::high::AssignOp>(
+                loc, target.getResult(), wh.getOperand(i),
+                mlir::IntegerAttr{});
+        }
+
+        {
+            mlir::OpBuilder entryBuilder(&beforeBlk, beforeBlk.begin());
+            for (unsigned i = 0; i < n; ++i) {
+                mlir::BlockArgument argument = beforeBlk.getArgument(i);
+                auto read = entryBuilder.create<helix::high::VarRefOp>(
+                    loc, argument.getType(), inputVars[i].first,
+                    inputVars[i].second, mlir::IntegerAttr{});
+                argument.replaceAllUsesWith(read.getResult());
+            }
+        }
+
+        {
+            mlir::OpBuilder condBuilder(cond);
+            for (unsigned i = 0; i < wh.getNumResults(); ++i) {
+                auto target = condBuilder.create<helix::high::VarRefOp>(
+                    loc, cond.getArgs()[i].getType(), resultVars[i].first,
+                    resultVars[i].second, mlir::IntegerAttr{});
+                condBuilder.create<helix::high::AssignOp>(
+                    loc, target.getResult(), cond.getArgs()[i],
+                    mlir::IntegerAttr{});
+            }
+            auto conditionTarget = condBuilder.create<helix::high::VarRefOp>(
+                loc, condTy, conditionVar.first, conditionVar.second,
+                mlir::IntegerAttr{});
+            condBuilder.create<helix::high::AssignOp>(
+                loc, conditionTarget.getResult(), cond.getCondition(),
+                mlir::IntegerAttr{});
+
+            // Result temporaries are a parallel snapshot of cond.getArgs(),
+            // so routing next inputs from them cannot clobber another source.
+            for (unsigned i = 0; i < n; ++i) {
+                unsigned sourceIndex = nextInputFromResult[i];
+                auto target = condBuilder.create<helix::high::VarRefOp>(
+                    loc, beforeBlk.getArgument(i).getType(),
+                    inputVars[i].first, inputVars[i].second,
+                    mlir::IntegerAttr{});
+                auto source = condBuilder.create<helix::high::VarRefOp>(
+                    loc, wh.getResult(sourceIndex).getType(),
+                    resultVars[sourceIndex].first,
+                    resultVars[sourceIndex].second, mlir::IntegerAttr{});
+                condBuilder.create<helix::high::AssignOp>(
+                    loc, target.getResult(), source.getResult(),
+                    mlir::IntegerAttr{});
+            }
+            condBuilder.create<helix::high::YieldOp>(loc, mlir::Value{});
+            cond.erase();
+        }
+        beforeBlk.eraseArguments(0, n);
+
+        auto loop = b.create<helix::high::DoWhileOp>(
+            loc, mlir::IntegerAttr{});
+        loop.getBodyRegion().takeBody(wh.getBefore());
+        {
+            auto* conditionBlock = new mlir::Block();
+            loop.getCondRegion().push_back(conditionBlock);
+            mlir::OpBuilder conditionBuilder(
+                conditionBlock, conditionBlock->begin());
+            auto read = conditionBuilder.create<helix::high::VarRefOp>(
+                loc, condTy, conditionVar.first, conditionVar.second,
+                mlir::IntegerAttr{});
+            conditionBuilder.create<helix::high::YieldOp>(
+                loc, read.getResult());
+        }
+
+        b.setInsertionPointAfter(loop);
+        for (unsigned i = 0; i < wh.getNumResults(); ++i) {
+            auto read = b.create<helix::high::VarRefOp>(
+                loc, wh.getResult(i).getType(), resultVars[i].first,
+                resultVars[i].second, mlir::IntegerAttr{});
+            wh.getResult(i).replaceAllUsesWith(read.getResult());
+        }
+
+        // The after region is proven to contain only its yield. Remove the
+        // consumer before its block arguments, then erase the now-empty while.
+        afterYield.erase();
+        afterBlk.erase();
+        wh.erase();
+        return;
+    }
+
+    // A component forwarded as the exact before-block argument is invariant
+    // across every iteration. Its initial operand already dominates both the
+    // loop body and all result uses, so routing it through a carried var plus a
+    // parallel-copy shadow only creates scf_w aliases. Poison initializers are
+    // deliberately kept on the normal evidence-preserving path.
+    llvm::SmallVector<bool> forwarded(n, false);
+    for (unsigned i = 0; i < n; ++i) {
+        forwarded[i] =
+            cond.getArgs()[i] == beforeBlk.getArgument(i) &&
+            !wh.getOperand(i).getDefiningOp<mlir::ub::PoisonOp>();
+    }
 
     // 1) temp var per carried value + one for the loop condition.
-    llvm::SmallVector<std::pair<uint32_t, std::string>> vars;
+    llvm::SmallVector<std::optional<std::pair<uint32_t, std::string>>> vars;
+    vars.reserve(n);
     b.setInsertionPoint(wh);
     for (unsigned i = 0; i < n; ++i) {
+        if (forwarded[i]) {
+            vars.push_back(std::nullopt);
+            continue;
+        }
         uint32_t id = g_scfBridgeVarId++;
         std::string name = std::format("scf_w{}", id);
         b.create<helix::high::VarDeclOp>(
             loc, id, name, helix::high::StorageKind::Temporary,
             mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
-        vars.emplace_back(id, name);
+        vars.emplace_back(std::pair{id, name});
     }
     uint32_t condId = g_scfBridgeVarId++;
     std::string condName = std::format("scf_w{}", condId);
@@ -399,20 +683,27 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
         mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
     // shadow temps used to lower the scf.condition's PARALLEL carried-value
     // forward as a true parallel copy (see step 4).
-    llvm::SmallVector<std::pair<uint32_t, std::string>> shadows;
+    llvm::SmallVector<std::optional<std::pair<uint32_t, std::string>>> shadows;
+    shadows.reserve(n);
     for (unsigned i = 0; i < n; ++i) {
+        if (forwarded[i]) {
+            shadows.push_back(std::nullopt);
+            continue;
+        }
         uint32_t id = g_scfBridgeVarId++;
         std::string name = std::format("scf_w{}", id);
         b.create<helix::high::VarDeclOp>(
             loc, id, name, helix::high::StorageKind::Temporary,
             mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
-        shadows.emplace_back(id, name);
+        shadows.emplace_back(std::pair{id, name});
     }
 
     // 2) init the carried vars before the loop: var[i] = init[i].
     for (unsigned i = 0; i < n; ++i) {
+        if (forwarded[i])
+            continue;
         auto vref = b.create<helix::high::VarRefOp>(
-            loc, wh.getOperand(i).getType(), vars[i].first, vars[i].second,
+            loc, wh.getOperand(i).getType(), vars[i]->first, vars[i]->second,
             mlir::IntegerAttr{});
         b.create<helix::high::AssignOp>(loc, vref.getResult(),
                                         wh.getOperand(i), mlir::IntegerAttr{});
@@ -423,8 +714,12 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
         mlir::OpBuilder rb(&beforeBlk, beforeBlk.begin());
         for (unsigned i = 0; i < n; ++i) {
             mlir::BlockArgument arg = beforeBlk.getArgument(i);
+            if (forwarded[i]) {
+                arg.replaceAllUsesWith(wh.getOperand(i));
+                continue;
+            }
             auto vref = rb.create<helix::high::VarRefOp>(
-                loc, arg.getType(), vars[i].first, vars[i].second,
+                loc, arg.getType(), vars[i]->first, vars[i]->second,
                 mlir::IntegerAttr{});
             arg.replaceAllUsesWith(vref.getResult());
         }
@@ -449,19 +744,25 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
                                          mlir::IntegerAttr{});
         // snapshot the next-iteration carried values into shadow temps.
         for (unsigned i = 0; i < n; ++i) {
+            if (forwarded[i])
+                continue;
             auto sref = cb.create<helix::high::VarRefOp>(
-                loc, nextVals[i].getType(), shadows[i].first, shadows[i].second,
+                loc, nextVals[i].getType(), shadows[i]->first,
+                shadows[i]->second,
                 mlir::IntegerAttr{});
             cb.create<helix::high::AssignOp>(loc, sref.getResult(), nextVals[i],
                                              mlir::IntegerAttr{});
         }
         // commit: var[i] = shadow[i] (every carried-var read already happened).
         for (unsigned i = 0; i < n; ++i) {
+            if (forwarded[i])
+                continue;
             auto vref = cb.create<helix::high::VarRefOp>(
-                loc, nextVals[i].getType(), vars[i].first, vars[i].second,
+                loc, nextVals[i].getType(), vars[i]->first, vars[i]->second,
                 mlir::IntegerAttr{});
             auto sread = cb.create<helix::high::VarRefOp>(
-                loc, nextVals[i].getType(), shadows[i].first, shadows[i].second,
+                loc, nextVals[i].getType(), shadows[i]->first,
+                shadows[i]->second,
                 mlir::IntegerAttr{});
             cb.create<helix::high::AssignOp>(loc, vref.getResult(),
                                              sread.getResult(),
@@ -490,35 +791,140 @@ static void bridgeSCFWhileToHelixHigh(mlir::scf::WhileOp wh) {
     // 6) route results to the carried vars (reads placed after the loop).
     b.setInsertionPointAfter(dw);
     for (unsigned i = 0; i < n; ++i) {
+        if (forwarded[i]) {
+            wh.getResult(i).replaceAllUsesWith(wh.getOperand(i));
+            continue;
+        }
         auto vref = b.create<helix::high::VarRefOp>(
-            loc, wh.getResult(i).getType(), vars[i].first, vars[i].second,
+            loc, wh.getResult(i).getType(), vars[i]->first, vars[i]->second,
             mlir::IntegerAttr{});
         wh.getResult(i).replaceAllUsesWith(vref.getResult());
     }
     wh.erase();  // drops the trivial AFTER region too
 }
 
-static void bridgeSCFToHelixHigh(helix::low::FuncOp func) {
+static void bridgeSCFToHelixHigh(Operation* func) {
     // Collect innermost-first so a child scf op is bridged before its parent
     // (the parent then just takes a region already full of helix_high ops).
     llvm::SmallVector<mlir::Operation*> worklist;
-    func.walk<mlir::WalkOrder::PostOrder>([&](mlir::Operation* op) {
+    func->walk<mlir::WalkOrder::PostOrder>([&](mlir::Operation* op) {
         if (mlir::isa<mlir::scf::IfOp, mlir::scf::IndexSwitchOp,
                       mlir::scf::WhileOp>(op))
             worklist.push_back(op);
     });
     for (mlir::Operation* op : worklist) {
+        if (helix::scfDebugEnabled()) {
+            llvm::errs() << "[SCF-BRIDGE] begin " << op->getName()
+                         << " results=" << op->getNumResults()
+                         << " regions=" << op->getNumRegions() << "\n";
+        }
         if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op))
             bridgeSCFIfToHelixHigh(ifOp);
         else if (auto sw = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(op))
             bridgeSCFIndexSwitchToHelixHigh(sw);
         else if (auto wh = mlir::dyn_cast<mlir::scf::WhileOp>(op))
             bridgeSCFWhileToHelixHigh(wh);
+        if (helix::scfDebugEnabled())
+            llvm::errs() << "[SCF-BRIDGE] done\n";
     }
 }
 
+static LogicalResult eraseUnreachableBlocksSafely(
+        ArrayRef<Block*> deadBlocks, Operation* owner) {
+    if (deadBlocks.empty())
+        return success();
+
+    llvm::SmallPtrSet<Block*, 32> deadSet(
+        deadBlocks.begin(), deadBlocks.end());
+
+    auto isExternalUser = [&](Operation* user) {
+        return !user || !deadSet.contains(user->getBlock());
+    };
+    for (Block* block : deadBlocks) {
+        for (Block* predecessor : block->getPredecessors()) {
+            if (!deadSet.contains(predecessor)) {
+                owner->emitError(
+                    "unreachable-block deletion found a live predecessor");
+                return failure();
+            }
+        }
+        for (BlockArgument argument : block->getArguments()) {
+            for (Operation* user : argument.getUsers()) {
+                if (isExternalUser(user)) {
+                    owner->emitError(
+                        "unreachable block argument has a live external user");
+                    return failure();
+                }
+            }
+        }
+        for (Operation& operation : *block) {
+            for (Value result : operation.getResults()) {
+                for (Operation* user : result.getUsers()) {
+                    if (isExternalUser(user)) {
+                        owner->emitError(
+                            "unreachable operation result has a live external user");
+                        return failure();
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove terminators first. This destroys successor references normally
+    // and breaks cycles among unreachable blocks without `dropAllReferences`.
+    for (Block* block : deadBlocks) {
+        if (block->empty())
+            continue;
+        Operation& last = block->back();
+        if (last.hasTrait<OpTrait::IsTerminator>())
+            last.erase();
+    }
+
+    SmallVector<Operation*, 64> pending;
+    for (Block* block : deadBlocks)
+        for (Operation& operation : *block)
+            pending.push_back(&operation);
+
+    while (!pending.empty()) {
+        bool erasedAny = false;
+        for (size_t index = 0; index < pending.size();) {
+            Operation* operation = pending[index];
+            bool useEmpty = llvm::all_of(
+                operation->getResults(), [](Value value) {
+                    return value.use_empty();
+                });
+            if (!useEmpty) {
+                ++index;
+                continue;
+            }
+            operation->erase();
+            pending[index] = pending.back();
+            pending.pop_back();
+            erasedAny = true;
+        }
+        if (!erasedAny) {
+            owner->emitError(
+                "unreachable-block deletion found a cyclic/live SSA use");
+            return failure();
+        }
+    }
+
+    for (Block* block : deadBlocks) {
+        if (llvm::any_of(block->getArguments(), [](BlockArgument argument) {
+                return !argument.use_empty();
+            })) {
+            owner->emitError(
+                "unreachable block argument remained live after cleanup");
+            return failure();
+        }
+        block->erase();
+    }
+    return success();
+}
+
 // Run the spike on one HelixLow function: convert jmp/jcc -> cf, then lift to scf.
-static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
+static mlir::LogicalResult runSCFSpikeInPlace(helix::low::FuncOp func,
+                                             bool bridgeToHigh) {
     if (func.getBody().empty())
         return mlir::success();
 
@@ -540,11 +946,8 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
         for (auto& blk : func.getBody())
             if (!reachable.contains(&blk))
                 dead.push_back(&blk);
-        for (auto* blk : dead) {
-            blk->dropAllDefinedValueUses();
-            blk->dropAllReferences();
-            blk->erase();
-        }
+        if (failed(eraseUnreachableBlocksSafely(dead, func)))
+            return failure();
     }
 
     // 1) Collect every non-cf block terminator with successors (helix_low.jmp/jcc
@@ -558,86 +961,159 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
                        mlir::cf::SwitchOp>(term))
             branches.push_back(term);
     }
-    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-unreachable-removal blocks=%u\n",
-                 func.getSymName().str().c_str(),
-                 (unsigned)std::distance(func.getBody().begin(), func.getBody().end()));
-    std::fflush(stderr);
+    if (helix::scfDebugEnabled()) {
+        std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-unreachable-removal blocks=%u\n",
+                     func.getSymName().str().c_str(),
+                     (unsigned)std::distance(func.getBody().begin(), func.getBody().end()));
+        std::fflush(stderr);
+    }
 
     mlir::OpBuilder b(func.getContext());
 
-    // 0.5) Strip block arguments. HelixLow carries lift-artifact block-arg phis
-    //      that are inconsistently forwarded (an llvm.br sets them, a helix_low.jcc
-    //      edge to the same block does not), which makes successor-operand counts
-    //      mismatch and crashes transformCFGToSCF's BranchOpInterface access.
-    //      Replace each arg with poison and drop it; ALL branches are then
-    //      rewritten operand-less below. (M1 routes these properly as variables;
-    //      the spike only needs to prove control-flow structuring.)
-    unsigned strippedArgs = 0;
-    for (mlir::Block& blk : func.getBody()) {
-        if (blk.getNumArguments() == 0)
-            continue;
-        b.setInsertionPointToStart(&blk);
-        for (mlir::BlockArgument arg : blk.getArguments()) {
-            auto poison = b.create<mlir::ub::PoisonOp>(
-                arg.getLoc(), arg.getType(), nullptr);
-            arg.replaceAllUsesWith(poison);
-            ++strippedArgs;
-        }
-        blk.eraseArguments(0, blk.getNumArguments());
-    }
-
     // Convert ALL branch terminators (helix_low.jmp/jcc + llvm.br/cond_br) to
-    // operand-less cf.br/cf.cond_br so every CFG op implements BranchOpInterface
-    // uniformly with no forwarded successor operands.
+    // cf.br/cf.cond_br so every CFG op implements BranchOpInterface uniformly.
+    // Preserve existing forwarded operands: LLVM PHIs are imported as block
+    // arguments, and dropping these values here silently turned live float/int
+    // paths into zero in RecoverVariables. Some HelixLow branches genuinely do
+    // lack successor operands because the earlier semantic conversion discarded
+    // them. Pad only those missing edge arguments with poison; CFGToSCF can then
+    // route all surviving evidence through native SCF results.
     unsigned converted = 0;
+    unsigned preservedArgs = 0;
+    unsigned paddedArgs = 0;
     for (mlir::Operation* op : branches) {
         b.setInsertionPoint(op);
         mlir::Location loc = op->getLoc();
+
+        auto getEdgeArguments = [&](unsigned successorIndex) {
+            llvm::SmallVector<mlir::Value> args;
+            mlir::Block* dest = op->getSuccessor(successorIndex);
+            mlir::SuccessorOperands successorOperands(
+                mlir::MutableOperandRange(op, 0, 0));
+            bool hasInterface = false;
+            if (auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(op)) {
+                successorOperands = branch.getSuccessorOperands(successorIndex);
+                hasInterface = true;
+            }
+
+            mlir::OperandRange forwarded =
+                successorOperands.getForwardedOperands();
+            unsigned produced = successorOperands.getProducedOperandCount();
+            args.reserve(dest->getNumArguments());
+            for (unsigned i = 0; i < dest->getNumArguments(); ++i) {
+                mlir::Value incoming;
+                if (hasInterface && i >= produced) {
+                    unsigned forwardedIndex = i - produced;
+                    if (forwardedIndex < forwarded.size())
+                        incoming = forwarded[forwardedIndex];
+                }
+
+                mlir::Type expectedType = dest->getArgument(i).getType();
+                if (incoming && incoming.getType() == expectedType) {
+                    args.push_back(incoming);
+                    ++preservedArgs;
+                } else {
+                    args.push_back(b.create<mlir::ub::PoisonOp>(
+                        loc, expectedType, nullptr));
+                    ++paddedArgs;
+                }
+            }
+            return args;
+        };
+
         if (op->getNumSuccessors() == 1) {
+            auto args = getEdgeArguments(0);
             b.create<mlir::cf::BranchOp>(loc, op->getSuccessor(0),
-                                         mlir::ValueRange{});
+                                         mlir::ValueRange(args));
         } else if (op->getNumSuccessors() == 2) {
             mlir::Value cond;
             if (auto jcc = mlir::dyn_cast<helix::low::JccOp>(op))
                 cond = jcc.getFlagValue();
             else if (op->getNumOperands() >= 1)
                 cond = op->getOperand(0);
-            if (cond)
-                b.create<mlir::cf::CondBranchOp>(
-                    loc, cond, op->getSuccessor(0), mlir::ValueRange{},
-                    op->getSuccessor(1), mlir::ValueRange{});
+            if (!cond) {
+                op->emitOpError("cannot preserve a two-way CFG edge without a condition");
+                return mlir::failure();
+            }
+            auto trueArgs = getEdgeArguments(0);
+            auto falseArgs = getEdgeArguments(1);
+            b.create<mlir::cf::CondBranchOp>(
+                loc, cond, op->getSuccessor(0), mlir::ValueRange(trueArgs),
+                op->getSuccessor(1), mlir::ValueRange(falseArgs));
         }
         op->erase();
         ++converted;
     }
-    std::fprintf(stderr,
-                 "[SCF-SPIKE] %s: stage=after-cf-conversion (converted %u, stripped %u args)\n",
-                 func.getSymName().str().c_str(), converted, strippedArgs);
-    std::fflush(stderr);
+    if (helix::scfDebugEnabled()) {
+        std::fprintf(stderr,
+                     "[SCF-SPIKE] %s: stage=after-cf-conversion "
+                     "(converted %u, preserved %u args, padded %u args)\n",
+                     func.getSymName().str().c_str(), converted,
+                     preservedArgs, paddedArgs);
+        std::fflush(stderr);
+    }
+
+    // 0.6) Normalize helix_low.ret so CFGToSCF's ReturnLikeExitCombiner sees
+    //      ONE return-like kind. MLIR's transformCFGToSCF (CFGToSCF.cpp) groups
+    //      return-like terminators by OperationEquivalence — same op kind AND
+    //      same attributes. HelixLow RetOp carries a per-site `address` attr
+    //      (the Remill RET PC). Two RETs at different PCs therefore become two
+    //      inequivalent return-like kinds; multi-kind exits force CFGToSCF to
+    //      leave a residual top-level cf.cond_br dispatcher (documented
+    //      contract: full SCF lift is only guaranteed for a single return-like
+    //      kind). Empirically that residual is the outer guard-clause branch
+    //      on calc_a/calc_c main (`__helix_unhandled_cf_cond_br`), while the
+    //      same guard in isolation (one structured region) works. Stripping
+    //      the address attr is structure-preserving: both paths still return
+    //      via helix_low.ret; only the site-PC metadata is dropped for SCF.
+    //      (Maya Bug 1 — return-value-binding / CFG cascade.)
+    unsigned normalizedRets = 0;
+    func.walk([&](helix::low::RetOp ret) {
+        if (ret->hasAttr("address")) {
+            ret->removeAttr("address");
+            ++normalizedRets;
+        }
+    });
+    if (normalizedRets > 0 && helix::scfDebugEnabled()) {
+        std::fprintf(stderr,
+                     "[SCF-SPIKE] %s: stage=after-ret-normalize (stripped address on %u rets)\n",
+                     func.getSymName().str().c_str(), normalizedRets);
+        std::fflush(stderr);
+    }
 
     // 2) lift to scf via the upstream correct-by-construction algorithm.
     mlir::DominanceInfo domInfo(func);
-    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-DominanceInfo\n",
-                 func.getSymName().str().c_str());
-    std::fflush(stderr);
-    HelixSCFInterface iface;
+    if (helix::scfDebugEnabled()) {
+        std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-DominanceInfo\n",
+                     func.getSymName().str().c_str());
+        std::fflush(stderr);
+    }
+    HelixSCFInterface iface(
+        func->hasAttr("helix.scf.force_transform_failure"));
     auto changed = mlir::transformCFGToSCF(func.getBody(), iface, domInfo);
-    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-transformCFGToSCF\n",
-                 func.getSymName().str().c_str());
-    std::fflush(stderr);
+    if (helix::scfDebugEnabled()) {
+        std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-transformCFGToSCF\n",
+                     func.getSymName().str().c_str());
+        std::fflush(stderr);
+    }
 
-    // [M1] bridge scf.if -> helix_high.if (switch/while still TODO).
-    bridgeSCFToHelixHigh(func);
-    std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-bridge\n",
-                 func.getSymName().str().c_str());
-    std::fflush(stderr);
     if (mlir::failed(changed)) {
         std::fprintf(stderr, "[SCF-SPIKE] transformCFGToSCF FAILED on %s\n",
                      func.getSymName().str().c_str());
         return mlir::failure();
     }
-    std::fprintf(stderr, "[SCF-SPIKE] OK on %s (changed=%d)\n",
-                 func.getSymName().str().c_str(), (int)*changed);
+    if (bridgeToHigh) {
+        bridgeSCFToHelixHigh(func);
+        if (helix::scfDebugEnabled()) {
+            std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-bridge\n",
+                         func.getSymName().str().c_str());
+            std::fflush(stderr);
+        }
+    }
+    if (helix::scfDebugEnabled()) {
+        std::fprintf(stderr, "[SCF-SPIKE] OK on %s (changed=%d)\n",
+                     func.getSymName().str().c_str(), (int)*changed);
+    }
     // Dump the lifted scf IR for inspection.
     if (const char* dir = std::getenv("HELIX_SCF_SPIKE_DUMP")) {
         std::string fname =
@@ -647,6 +1123,34 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func) {
         if (!ec)
             func.print(os);
     }
+    return mlir::success();
+}
+
+// transformCFGToSCF documents the input region as unspecified after failure.
+// Run the complete normalization/transform/bridge attempt on a detached clone
+// and commit only a successful result. This keeps the original function valid
+// and byte-stable on every failure path, including callbacks that fail after
+// the upstream transform has already mutated part of the trial region.
+static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
+                                      bool bridgeToHigh) {
+    mlir::Operation* trialOperation = func->clone();
+    auto trial = mlir::cast<helix::low::FuncOp>(trialOperation);
+    auto destroyDetachedTrial = [](mlir::Operation* operation) {
+        // A failed CFGToSCF attempt may leave cyclic or dangling SSA uses in
+        // the unspecified trial IR. Break both value and CFG references before
+        // invoking normal MLIR destruction, which asserts that uses are empty.
+        operation->dropAllDefinedValueUses();
+        operation->dropAllReferences();
+        operation->destroy();
+    };
+    if (mlir::failed(runSCFSpikeInPlace(trial, bridgeToHigh))) {
+        destroyDetachedTrial(trialOperation);
+        return mlir::failure();
+    }
+
+    func->setAttrs(trialOperation->getAttrs());
+    func.getBody().takeBody(trial.getBody());
+    destroyDetachedTrial(trialOperation);
     return mlir::success();
 }
 
@@ -1931,6 +2435,10 @@ struct StructureControlFlowPass
 
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StructureControlFlowPass)
 
+    StructureControlFlowPass(bool preserveCfg = false,
+                             bool bridgeToHigh = true)
+        : preserveCfg_(preserveCfg), bridgeToHigh_(bridgeToHigh) {}
+
     StringRef getArgument() const final { return "structure-control-flow"; }
     StringRef getDescription() const final {
         return "Transform flat basic blocks into structured control flow "
@@ -1939,9 +2447,12 @@ struct StructureControlFlowPass
 
     void getDependentDialects(DialectRegistry& registry) const override {
         registry.insert<helix::low::HelixLowDialect>();
+        registry.insert<helix::mid::HelixMidDialect>();
         registry.insert<helix::high::HelixHighDialect>();
         registry.insert<mlir::arith::ArithDialect>();
         registry.insert<mlir::cf::ControlFlowDialect>();
+        registry.insert<mlir::scf::SCFDialect>();
+        registry.insert<mlir::ub::UBDialect>();
     }
 
     // CFG-topology-preserving mode (callfuscation-deflatten path).  When true,
@@ -1950,6 +2461,7 @@ struct StructureControlFlowPass
     // loop with one latch per opcode handler).  Default false → normal lifts
     // keep the conservative guard and are byte-for-byte unchanged.
     bool preserveCfg_ = false;
+    bool bridgeToHigh_ = true;
 
     void runOnOperation() override {
         auto module = getOperation();
@@ -1966,6 +2478,13 @@ struct StructureControlFlowPass
             g_scfBridgeVarId = 900000;
             g_irrLabelCounter = 100;
             g_gotoLabelCounter = 0;
+            // FIX (non-determinism, residual -- Maya R. review): promotedVarCounter
+            // (HELIX_SCF_LEGACY path only) is the same file-static-accumulates-
+            // across-decompiles class as the three counters above -- its own
+            // comment says "within a function" but nothing ever reset it. Reset
+            // here too so the legacy structurer's `_promoted_N` names are stable
+            // regardless of decompile order, matching the default-path fix.
+            promotedVarCounter = 0;
             if (failed(structureFunction(func)))
                 return WalkResult::interrupt();
             return WalkResult::advance();
@@ -2082,7 +2601,7 @@ private:
         // regressions). Set HELIX_SCF_LEGACY=1 to force the old block-moving
         // structurer. (HELIX_SCF_SPIKE still forces it on too, for back-compat.)
         if (std::getenv("HELIX_SCF_SPIKE") || !std::getenv("HELIX_SCF_LEGACY"))
-            return runSCFSpike(func);
+            return runSCFSpike(func, bridgeToHigh_);
 
         OpBuilder builder(func->getContext());
 
@@ -2130,11 +2649,8 @@ private:
                     toErase.push_back(&blk);
             }
 
-            for (auto* blk : toErase) {
-                blk->dropAllDefinedValueUses();
-                blk->dropAllReferences();
-                blk->erase();
-            }
+            if (failed(eraseUnreachableBlocksSafely(toErase, func)))
+                return failure();
         }
 
         // After removing unreachable blocks, re-check single-block.
@@ -2762,7 +3278,8 @@ private:
                         tb.clone(*exitTerm);
                     } else {
                         tb.create<helix::low::JmpOp>(
-                            termLoc, /*target_addr=*/IntegerAttr{},
+                            termLoc, /*destOperands=*/ValueRange{},
+                            /*target_addr=*/IntegerAttr{},
                             /*address=*/IntegerAttr{}, /*dest=*/exitTarget);
                     }
                 }
@@ -3132,7 +3649,9 @@ private:
             auto retAddr = mergeRet->getAttrOfType<IntegerAttr>("address");
             builder.create<helix::low::RetOp>(loc, retAddr);
         } else if (ifRegion.mergeBlock) {
-            builder.create<helix::low::JmpOp>(loc, IntegerAttr{}, IntegerAttr{}, ifRegion.mergeBlock);
+            builder.create<helix::low::JmpOp>(
+                loc, ValueRange{}, IntegerAttr{}, IntegerAttr{},
+                ifRegion.mergeBlock);
         } else {
             // If there's no merge block, both paths diverge (e.g. return).
             builder.create<helix::low::RetOp>(loc, IntegerAttr{});
@@ -3442,14 +3961,48 @@ private:
     }
 };
 
+struct BridgeStructuredControlFlowPass
+    : public PassWrapper<BridgeStructuredControlFlowPass,
+                         OperationPass<ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+        BridgeStructuredControlFlowPass)
+
+    StringRef getArgument() const final {
+        return "bridge-structured-control-flow";
+    }
+    StringRef getDescription() const final {
+        return "Legalize native SCF SSA into HelixHigh source constructs";
+    }
+
+    void getDependentDialects(DialectRegistry& registry) const override {
+        registry.insert<helix::low::HelixLowDialect>();
+        registry.insert<helix::high::HelixHighDialect>();
+        registry.insert<mlir::arith::ArithDialect>();
+        registry.insert<mlir::scf::SCFDialect>();
+    }
+
+    void runOnOperation() override {
+        getOperation().walk([&](Operation* func) {
+            if (!isa<helix::low::FuncOp, helix::mid::FuncOp>(func))
+                return;
+            g_scfBridgeVarId = 900000;
+            bridgeSCFToHelixHigh(func);
+        });
+    }
+};
+
 } // anonymous namespace
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pass Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<mlir::Pass> helix::createStructureControlFlowPass(bool preserveCfg) {
-    auto pass = std::make_unique<StructureControlFlowPass>();
-    pass->preserveCfg_ = preserveCfg;
-    return pass;
+std::unique_ptr<mlir::Pass> helix::createStructureControlFlowPass(
+        bool preserveCfg, bool bridgeToHigh) {
+    return std::make_unique<StructureControlFlowPass>(
+        preserveCfg, bridgeToHigh);
+}
+
+std::unique_ptr<mlir::Pass> helix::createBridgeStructuredControlFlowPass() {
+    return std::make_unique<BridgeStructuredControlFlowPass>();
 }

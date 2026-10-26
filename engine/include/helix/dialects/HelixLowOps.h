@@ -11,9 +11,12 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "helix/dialects/HelixLowDialect.h"
 #include "helix/dialects/HelixLowTypes.h"
+#include "helix/dialects/HelixEffects.h"
+#include "helix/Interfaces.h"
 
 // Include the auto-generated enum declarations
 #include "helix/dialects/HelixLowEnums.h.inc"

@@ -6,6 +6,7 @@
 /// helix_core::ffi.
 
 #include "helix/Engine.h"
+#include <cstring>
 #include <new>
 
 // ─── Handle Casting ─────────────────────────────────────────────────────────────
@@ -104,6 +105,61 @@ int helix_engine_decompile_ir_text(
     ));
 }
 
+void helix_engine_free_decompile_output(
+    HelixCombinedDecompileOutput* output)
+{
+    if (!output)
+        return;
+    delete[] output->pseudo_c;
+    delete[] output->flatbuffer;
+    *output = {};
+}
+
+int helix_engine_decompile_ir_combined(
+    HelixEngineHandle* handle,
+    const char* ir_text,
+    size_t ir_len,
+    HelixCombinedDecompileOutput* output)
+{
+    if (!handle)
+        return HELIX_ERROR_ENGINE_NOT_READY;
+    if (!output)
+        return HELIX_ERROR_INVALID_INPUT;
+
+    *output = {};
+    helix::DecompileOutput result;
+    auto* engine = to_engine(handle);
+    HelixStatus status = engine->decompileIRCombined(ir_text, ir_len, result);
+    if (status != HELIX_OK)
+        return static_cast<int>(status);
+
+    char* pseudoC = new (std::nothrow) char[result.pseudo_c.size() + 1];
+    uint8_t* flatbuffer = result.flatbuffer.empty()
+        ? nullptr
+        : new (std::nothrow) uint8_t[result.flatbuffer.size()];
+    if (!pseudoC || (!result.flatbuffer.empty() && !flatbuffer)) {
+        delete[] pseudoC;
+        delete[] flatbuffer;
+        return HELIX_ERROR_OUT_OF_MEMORY;
+    }
+
+    std::memcpy(pseudoC, result.pseudo_c.data(), result.pseudo_c.size());
+    pseudoC[result.pseudo_c.size()] = '\0';
+    if (!result.flatbuffer.empty()) {
+        std::memcpy(
+            flatbuffer, result.flatbuffer.data(), result.flatbuffer.size());
+    }
+
+    output->pseudo_c = pseudoC;
+    output->pseudo_c_len = result.pseudo_c.size();
+    output->flatbuffer = flatbuffer;
+    output->flatbuffer_len = result.flatbuffer.size();
+    output->function_count = result.function_count;
+    output->block_count = result.block_count;
+    output->instruction_count = result.instruction_count;
+    return HELIX_OK;
+}
+
 void helix_engine_set_skip_optimization(HelixEngineHandle* handle, int skip) {
     if (handle) {
         to_engine(handle)->setSkipOptimization(skip != 0);
@@ -154,6 +210,14 @@ void helix_engine_set_function_starts(HelixEngineHandle* handle,
                                        size_t len) {
     if (handle && starts && len > 0) {
         to_engine(handle)->setFunctionStarts(starts, len);
+    }
+}
+
+void helix_engine_set_debug_type_info_json(HelixEngineHandle* handle,
+                                           const char* json,
+                                           size_t len) {
+    if (handle) {
+        to_engine(handle)->setDebugTypeInfoJson(json, len);
     }
 }
 

@@ -17,12 +17,18 @@
 #include "helix/dialects/HelixLowDialect.h"
 #include "helix/dialects/HelixMidDialect.h"
 #include "helix/dialects/HelixHighDialect.h"
+#include "helix/diagnostics/VerifyAudit.h"
 
 // MLIR includes
 #include "mlir/Target/LLVMIR/Import.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -48,9 +54,12 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Metadata.h"   // FIX-089: NamedMDNode / MDNode / ConstantAsMetadata
 #include "llvm/IR/Constants.h"  // FIX-089: ConstantInt
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <cassert>
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace helix {
@@ -165,7 +174,13 @@ Pipeline::Pipeline(mlir::MLIRContext* mlir_ctx, HelixArch arch,
     {
         mlir::DialectRegistry registry;
         mlir::registerAllFromLLVMIRTranslations(registry);
-        registry.insert<mlir::DLTIDialect>();
+        registry.insert<
+            mlir::DLTIDialect,
+            mlir::arith::ArithDialect,
+            mlir::cf::ControlFlowDialect,
+            mlir::func::FuncDialect,
+            mlir::scf::SCFDialect,
+            mlir::ub::UBDialect>();
         mlir_ctx_->appendDialectRegistry(registry);
     }
 
@@ -261,6 +276,52 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
     // Capture the target triple before the LLVM module is moved.
     std::string targetTriple = llvm_module->getTargetTriple();
 
+    // The LLVM importer preserves block order but drops textual block names.
+    // Retain the existing bb_N channel for block bookkeeping. Producer versions
+    // also use ordinal labels, so it must not establish function entry identity.
+    llvm::StringMap<llvm::SmallVector<int64_t>> blockAddresses;
+    llvm::StringMap<uint64_t> entryAddresses;
+    for (const llvm::Function& func : *llvm_module) {
+        if (func.isDeclaration())
+            continue;
+        std::optional<uint64_t> encodedEntry;
+        auto functionName = func.getName();
+        unsigned radix = 0;
+        if (functionName.consume_front("lifted_")) radix = 10;
+        else if (functionName.consume_front("sub_")) radix = 16;
+        uint64_t parsedEntry = 0;
+        if (radix && !functionName.empty() &&
+            !functionName.getAsInteger(radix, parsedEntry))
+            encodedEntry = parsedEntry;
+
+        std::optional<uint64_t> explicitEntry;
+        auto attribute = func.getFnAttribute("hexcore.entry_address");
+        if (attribute.isValid()) {
+            auto value = attribute.getValueAsString();
+            const bool hex = value.consume_front("0x");
+            if (value.empty() || value.starts_with("-") || value.starts_with("+") ||
+                value.getAsInteger(hex ? 16 : 10, parsedEntry))
+                return std::unexpected("translateToMLIR: invalid hexcore.entry_address on " + func.getName().str());
+            explicitEntry = parsedEntry;
+            if (encodedEntry && *encodedEntry != *explicitEntry)
+                return std::unexpected("translateToMLIR: conflicting function entry identities on " + func.getName().str());
+        }
+
+        const auto selectedEntry = explicitEntry ? explicitEntry : encodedEntry;
+        // bb_N may be an ordinal in current Remill, not a machine address.
+        if (selectedEntry)
+            entryAddresses[func.getName()] = *selectedEntry;
+        auto& addresses = blockAddresses[func.getName()];
+        addresses.reserve(func.size());
+        for (const llvm::BasicBlock& block : func) {
+            uint64_t address = 0;
+            llvm::StringRef name = block.getName();
+            if (name.consume_front("bb_"))
+                (void)name.getAsInteger(10, address);
+            addresses.push_back(static_cast<int64_t>(address));
+        }
+    }
+
     // FIX-089: capture the Pathfinder function-start table BEFORE the LLVM
     // module is moved.  The MLIR LLVM-IR importer drops named metadata, so —
     // exactly like the target triple below — we lift it out by hand and
@@ -339,6 +400,28 @@ Pipeline::translateToMLIR(std::unique_ptr<llvm::Module> llvm_module) {
         (*mlir_module)->setAttr(
             "helix.function_starts",
             mlir::ArrayAttr::get(mlir_ctx_, starts));
+    }
+
+    for (mlir::LLVM::LLVMFuncOp func :
+         (*mlir_module).getOps<mlir::LLVM::LLVMFuncOp>()) {
+        if (auto entry = entryAddresses.find(func.getName()); entry != entryAddresses.end())
+            func->setAttr("helix.entry_address", mlir::IntegerAttr::get(
+                mlir::IntegerType::get(mlir_ctx_, 64), llvm::APInt(64, entry->second)));
+        auto it = blockAddresses.find(func.getName());
+        if (it == blockAddresses.end() || it->second.empty())
+            continue;
+        func->setAttr(
+            "helix.block_addresses",
+            mlir::DenseI64ArrayAttr::get(mlir_ctx_, it->second));
+    }
+
+    // FIX-121: nominal debug types are supplied by the IDE after DWARF/BTF/PDB
+    // parsing. The LLVM importer cannot carry this external database, so keep
+    // the versioned JSON as a module attribute for ApplyDebugTypes.
+    if (!debug_type_info_json_.empty()) {
+        (*mlir_module)->setAttr(
+            "helix.debug_type_info_json",
+            mlir::StringAttr::get(mlir_ctx_, debug_type_info_json_));
     }
 
     // Run the MLIR verifier to catch structural problems early (invalid
@@ -466,6 +549,14 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    machine-level HelixLow operations (registers, flags, raw memory).
     pm.addPass(createRemillToHelixLowPass(preserve_cfg_));
 
+    // FIX-138: seed authoritative debug function signatures before ABI
+    // inference. The full nominal-type pass still runs in Tier 3.5, after
+    // variables and fields exist, but return types must be visible before
+    // RecoverCallingConvention decides whether an RAX write means that the
+    // source function returns a value. This matters for large void functions
+    // that use RAX heavily as scratch storage.
+    pm.addPass(createApplyDebugTypesPass());
+
     // ── Tier 1 Analysis: HelixLow-level passes ──────────────────────────
     //    These passes operate on machine-level IR to recover high-level
     //    information while register/flag semantics are still explicit.
@@ -507,10 +598,36 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     // ── Tier 1.7: Control Flow Structuring ───────────────────────────────
     //    [Nightly: enhanced with else detection (P0.3), break/continue
     //    recovery (P0.4), and switch op consumption from P0.2]
-    pm.addPass(createStructureControlFlowPass(preserve_cfg_));
+    auto environmentFlagEnabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value && value[0] != '\0' && std::string_view(value) != "0";
+    };
+    bool deferScfBridge = !environmentFlagEnabled("HELIX_EARLY_SCF_BRIDGE");
+    // Backwards-compatible explicit override for existing A/B harnesses.
+    if (std::getenv("HELIX_DEFER_SCF_BRIDGE"))
+        deferScfBridge = environmentFlagEnabled("HELIX_DEFER_SCF_BRIDGE");
+    // The C-AST path now consumes the exact SCF family produced above
+    // (if/index_switch/while) and performs de-SSA only at source legalization.
+    // Keep the old High synthetic-variable bridge for the legacy emitter and
+    // as an explicit compatibility A/B lane.
+    bool directScfToCast = use_cast_layer_;
+    if (std::getenv("HELIX_DIRECT_SCF_TO_CAST")) {
+        directScfToCast = use_cast_layer_ &&
+            environmentFlagEnabled("HELIX_DIRECT_SCF_TO_CAST");
+    }
+    if (environmentFlagEnabled("HELIX_LEGACY_SCF_BRIDGE"))
+        directScfToCast = false;
+    pm.addPass(createStructureControlFlowPass(
+        preserve_cfg_, /*bridgeToHigh=*/!deferScfBridge));
 
     pm.addPass(createRecoverVariablesPass());
-    pm.addPass(createEliminateDeadCodePass());          // [Nightly: +liveness-driven DCE]
+    // FIX-144: make the recovered return identity a real SSA use before DCE.
+    // This replaces an implicit low-level RET only when RecoverVariables has
+    // produced exactly one canonical `result` identity for a non-void
+    // function. Ambiguous functions retain the existing implicit fallback.
+    pm.addPass(createBindReturnValuesPass());
+    if (!deferScfBridge)
+        pm.addPass(createEliminateDeadCodePass());      // [Nightly: +liveness-driven DCE]
 
     // ── FIX-087 (2026-05-20): per-function SSA renaming of register reads/
     //    writes.  Stamps `ssa_version` discardable attrs that the next pass
@@ -522,7 +639,9 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     //    Converts remaining machine-level ops to ISA-agnostic typed SSA:
     //    registers → abstract variables, flags → comparisons,
     //    raw memory → typed loads/stores, CMOV → select.
-    pm.addPass(createHelixLowToMidPass());
+    const bool strictTierClosure =
+        environmentFlagEnabled("HELIX_STRICT_TIER_CLOSURE");
+    pm.addPass(createHelixLowToMidPass(strictTierClosure));
 
     // ── Tier 2.5: HelixMid Analysis & Optimization ──────────────────────
     if (shouldRun(enable_helix_mid_simplify_)) {
@@ -531,8 +650,24 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
     if (shouldRun(enable_constant_folding_)) {
         pm.addPass(createConstantFoldingPass());
     }
-    if (shouldRun(enable_escape_analysis_)) {
+    if (shouldRun(enable_escape_analysis_) &&
+        environmentFlagEnabled("HELIX_ESCAPE_ANALYSIS_V2")) {
         pm.addPass(createEscapeAnalysisPass());
+    }
+    if (environmentFlagEnabled("HELIX_MEMORY_SLOT_PILOT")) {
+        pm.addPass(createMemorySlotPilotPass());
+    }
+    const bool allGenericMidGates =
+        environmentFlagEnabled("HELIX_GENERIC_MID_GATES");
+    if (allGenericMidGates ||
+        environmentFlagEnabled("HELIX_GENERIC_CANONICALIZER_GATE")) {
+        // Audit-only maturity gate. Keep disabled in production until the
+        // full corpus is clean under verifier + semantic differential checks.
+        pm.addPass(mlir::createCanonicalizerPass());
+    }
+    if (allGenericMidGates ||
+        environmentFlagEnabled("HELIX_GENERIC_CSE_GATE")) {
+        pm.addPass(mlir::createCSEPass());
     }
     if (shouldRun(enable_struct_recovery_)) {
         pm.addPass(createRecoverStructTypesPass());
@@ -543,10 +678,32 @@ void Pipeline::buildPassPipeline(mlir::PassManager& pm) {
         pm.addPass(createDevirtualizeIndirectCallsPass());
     }
 
+    if (deferScfBridge && !directScfToCast) {
+        pm.addPass(createBridgeStructuredControlFlowPass());
+        // The custom multi-tier DCE reasons about HelixHigh structured
+        // regions, not native scf.* RegionBranch semantics. Running it before
+        // the deferred bridge deletes values that are live through SCF yields.
+        // Keep it at source legalization until generic SSA/effect-driven DCE
+        // replaces this compatibility pass.
+        pm.addPass(createEliminateDeadCodePass());
+    }
+
     // ── Tier 3: HelixMid → HelixHigh (v1.0) ───────────────────────────
     //    Applies variable naming, finalizes type annotations, converts
     //    abstract slots to named C variables.
-    pm.addPass(createHelixMidToHighPass());
+    pm.addPass(createHelixMidToHighPass(strictTierClosure));
+
+    // ── Tier 3.5: Nominal debug types (FIX-121) ─────────────────────────
+    // DWARF/BTF/PDB lives outside the lifted LLVM IR, so the IDE supplies a
+    // scoped JSON database through `helix.debug_type_info_json`. Seed params,
+    // call results and fields only after every op is in High, then run the
+    // existing lattice to propagate those authoritative seeds through aliases.
+    // A second seed resolves fields whose base type became known in that first
+    // propagation; the final propagation carries recovered field types onward.
+    pm.addPass(createApplyDebugTypesPass());
+    pm.addPass(createPropagateTypesHighPass());
+    pm.addPass(createApplyDebugTypesPass());
+    pm.addPass(createLegalizeFunctionContainersPass());
 
 }
 
@@ -556,10 +713,11 @@ void Pipeline::ensurePipelineBuilt() {
 
     pass_manager_ = std::make_unique<mlir::PassManager>(mlir_ctx_);
 
-    // Disable inter-pass verification to allow the pipeline to complete
-    // even when intermediate IR has minor issues (e.g., unreachable blocks
-    // without terminators).  The final output is validated by the emitter.
-    pass_manager_->enableVerifier(/*verifyPasses=*/false);
+    // Production compatibility remains unchanged by default. In VerifyAudit
+    // mode, the instrumentation records the invalid producer and MLIR's native
+    // verifier pass stops execution before the next semantic pass runs.
+    const bool verifyEachPass = verifyAuditEnabledFromEnvironment();
+    pass_manager_->enableVerifier(/*verifyPasses=*/verifyEachPass);
 
     // Disable multithreading for deterministic pass execution.
     mlir_ctx_->disableMultithreading();
@@ -572,6 +730,20 @@ void Pipeline::ensurePipelineBuilt() {
         pass_manager_->addInstrumentation(
             std::make_unique<CallOpCountInstrumentation>());
 
+    // Per-pass IR dump (only passes that actually change the IR) -- a
+    // standard MLIR PassManager utility, kept as a permanent debug switch
+    // alongside HELIX_PIPELINE_DEBUG above rather than stripped, since it's
+    // proven broadly useful for bisecting which pass introduces/loses a
+    // given IR shape.
+    if (std::getenv("HELIX_IR_PRINT"))
+        pass_manager_->enableIRPrinting();
+
+    if (verifyEachPass) {
+        verify_audit_state_ = std::make_shared<VerifyAuditState>();
+        pass_manager_->addInstrumentation(
+            createVerifyAuditInstrumentation(verify_audit_state_));
+    }
+
     buildPassPipeline(*pass_manager_);
     pipeline_built_ = true;
 }
@@ -582,6 +754,9 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
     }
 
     ensurePipelineBuilt();
+
+    if (verify_audit_state_)
+        verify_audit_state_->beginRun(verifyAuditRootFromEnvironment());
 
     // Capture diagnostics so that pass failures produce actionable messages.
     DiagnosticCapture capture(mlir_ctx_);
@@ -604,9 +779,32 @@ PipelineResult<void> Pipeline::runPasses(mlir::ModuleOp module) {
         std::string detail = capture.take();
         if (detail.empty())
             detail = "(no diagnostic details available)";
+        if (verify_audit_state_) {
+            if (auto failure = verify_audit_state_->firstFailure()) {
+                return std::unexpected(std::format(
+                    "runPasses: first invalid IR after pass '{}' ({}) "
+                    "before='{}' after='{}': {}",
+                    failure->pass_name,
+                    failure->reason,
+                    failure->before_path.string(),
+                    failure->after_path.string(),
+                    detail));
+            }
+        }
         return std::unexpected(
             std::format("runPasses: MLIR pass pipeline failed: {}", detail)
         );
+    }
+
+    // Production always refuses to emit from invalid final IR. The more
+    // expensive per-pass verifier remains an audit/CI lane that identifies
+    // the first producer; this final gate is unconditional and cheap enough
+    // for every decompile.
+    if (mlir::failed(mlir::verify(module))) {
+        std::string detail = capture.take();
+        return std::unexpected(std::format(
+            "runPasses: final MLIR verification failed: {}",
+            detail.empty() ? "(no diagnostic details available)" : detail));
     }
     // ── Post-pipeline IR dump: HelixHigh after all passes ────────────────
     if (pipelineDebug) {
@@ -688,26 +886,22 @@ Pipeline::emitFlatBuffer(mlir::ModuleOp module) {
         FlatBufSerializer serializer;
         std::vector<uint8_t> buf;
 
-        if (use_cast_layer_) {
-            // C AST path: build the C AST tree and serialize it directly.
-            // This produces a complete HAST with all node types.
-            cast::CAstBuilder builder;
-            auto funcs = builder.buildModule(module);
+        // HAST has one canonical representation regardless of which text
+        // emitter renders pseudo-C. The old MLIR/name-only buffer was a second,
+        // lossy dialect that could still pass the HAST identifier check.
+        cast::CAstBuilder builder;
+        auto funcs = builder.buildModule(module);
 
-            cast::CAstOptimizer optimizer;
-            for (auto& func : funcs) {
-                optimizer.optimize(*func);
-                // Apply user-defined variable renames (P3: hydrateHAST).
-                if (!variable_renames_.empty()) {
-                    optimizer.applyVariableRenames(*func, variable_renames_);
-                }
+        cast::CAstOptimizer optimizer;
+        for (auto& func : funcs) {
+            optimizer.optimize(*func);
+            // Apply user-defined variable renames (P3: hydrateHAST).
+            if (!variable_renames_.empty()) {
+                optimizer.applyVariableRenames(*func, variable_renames_);
             }
-
-            buf = serializer.serialize(funcs);
-        } else {
-            // MLIR path: stub serializer (walks HelixHigh ops)
-            buf = serializer.serialize(module);
         }
+
+        buf = serializer.serialize(funcs, "decompiled_module", arch_);
 
         if (buf.empty()) {
             return std::unexpected(
@@ -796,9 +990,31 @@ PipelineResult<DecompileOutput> Pipeline::decompile(llvm::StringRef ir_text) {
         );
     }
 
+    uint32_t functionCount = 0;
+    uint32_t blockCount = 0;
+    llvm::DenseSet<uint64_t> sourceAddresses;
+    mod_op.walk([&](high::FuncOp func) {
+        ++functionCount;
+        func->walk([&](mlir::Operation* op) {
+            for (mlir::Region& region : op->getRegions())
+                blockCount += static_cast<uint32_t>(region.getBlocks().size());
+
+            if (op == func.getOperation())
+                return;
+            if (auto address = op->getAttrOfType<mlir::IntegerAttr>("address")) {
+                uint64_t value = address.getValue().getLimitedValue();
+                if (value != 0)
+                    sourceAddresses.insert(value);
+            }
+        });
+    });
+
     return DecompileOutput{
-        .pseudo_c   = std::move(*pseudo_c),
-        .flatbuffer = std::move(*flatbuf),
+        .pseudo_c          = std::move(*pseudo_c),
+        .flatbuffer        = std::move(*flatbuf),
+        .function_count    = functionCount,
+        .block_count       = blockCount,
+        .instruction_count = static_cast<uint32_t>(sourceAddresses.size()),
     };
 }
 

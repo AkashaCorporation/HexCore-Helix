@@ -11,4 +11,6 @@ pub mod cfg;
 pub const CFG_FILE_IDENTIFIER: &str = "HCFG";
 
 /// File identifier para AST FlatBuffers
-pub const AST_FILE_IDENTIFIER: &str = "HAST";
+/// Legacy Rust pseudo-AST transport. This layout is not schemas/ast.fbs and
+/// must never share the canonical HAST identifier.
+pub const AST_FILE_IDENTIFIER: &str = "HRST";

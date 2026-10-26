@@ -207,6 +207,8 @@ set(HELIX_SOURCES
     src/Engine.cpp
     src/CApi.cpp
     src/Pipeline.cpp
+    src/Interfaces.cpp
+    src/diagnostics/VerifyAudit.cpp
 
     # Dialects — 3-tier architecture (Low → Mid → High)
     src/dialects/HelixLowDialect.cpp
@@ -223,6 +225,7 @@ set(HELIX_SOURCES
 
     # Analysis — Helix-Nightly
     src/analysis/TypeLattice.cpp               # P1.5 Type lattice
+    src/analysis/TypeEvidence.cpp              # provenance-aware type evidence
     src/analysis/JumpTableAnalysis.cpp         # P0.2 Jump table detection
     src/analysis/DataSectionProvider.cpp       # P0.2 Binary data access
     src/analysis/StructRecovery.cpp            # P1.6 Struct recovery
@@ -237,10 +240,13 @@ set(HELIX_SOURCES
     src/passes/RecoverStackLayout.cpp
     src/passes/RecoverCallingConvention.cpp
     src/passes/PropagateTypes.cpp
+    src/passes/ApplyDebugTypes.cpp
     src/passes/StructureControlFlow.cpp
     src/passes/RecoverVariables.cpp
     src/passes/RecoverVariablesFactory.cpp
+    src/passes/BindReturnValues.cpp
     src/passes/EliminateDeadCode.cpp
+    src/passes/MemorySlotPilot.cpp
     src/passes/RegisterSSARename.cpp          # FIX-087: per-fn SSA versioning
 
     # Passes — v3.8.0 optimization passes
@@ -304,6 +310,7 @@ set(HELIX_HEADERS
     # Helix-Nightly headers
     include/helix/passes/Patterns.h
     include/helix/analysis/TypeLattice.h
+    include/helix/analysis/TypeEvidence.h
     include/helix/analysis/JumpTableAnalysis.h
     include/helix/analysis/DataSectionProvider.h
     include/helix/analysis/CallingConventionDb.h
@@ -426,7 +433,7 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include/flatbuffers/
     target_include_directories(helix_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include")
     target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
 else()
-    message(STATUS "FlatBuffers not found -- stub HAST serialization (HQL gets module name only).")
+    message(WARNING "FlatBuffers not found -- canonical HAST serialization is unavailable and fails closed.")
     message(STATUS "  To enable: run  bash engine/vendor_flatbuffers.sh  then reconfigure.")
 endif()
 

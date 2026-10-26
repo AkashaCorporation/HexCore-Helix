@@ -17,6 +17,9 @@ enum Arch : byte {
     Sparc64 = 9,
     Riscv32 = 10,
     Riscv64 = 11,
+    /// Producer could not determine a supported target architecture.
+    /// Kept at 255 so every existing architecture value remains stable.
+    Unknown = -1,
 }
 
 /// A virtual memory address.

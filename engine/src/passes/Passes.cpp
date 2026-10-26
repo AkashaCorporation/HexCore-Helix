@@ -20,13 +20,49 @@ void registerHelixPasses() {
         return createPropagateTypesPass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createPropagateTypesHighPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createApplyDebugTypesPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createStructureControlFlowPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createBridgeStructuredControlFlowPass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createRecoverVariablesPass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createBindReturnValuesPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createEliminateDeadCodePass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createMemorySlotPilotPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createRegisterSSARenamePass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createHelixLowSimplifyPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createHelixMidSimplifyPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createConstantFoldingPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createEscapeAnalysisPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createRecoverStructTypesPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createRecoverSwitchTablesPass();
     });
 
     // v3.8.0 optimization passes
@@ -46,6 +82,9 @@ void registerHelixPasses() {
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
         return createHelixMidToHighPass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return createLegalizeFunctionContainersPass();
     });
 }
 

@@ -29,6 +29,8 @@
 
 namespace helix {
 
+class VerifyAuditState;
+
 /// Result type for pipeline operations.
 template <typename T>
 using PipelineResult = std::expected<T, std::string>;
@@ -39,6 +41,14 @@ struct DecompileOutput {
     std::string pseudo_c;
     /// FlatBuffer-serialized AST (file identifier "HAST").
     std::vector<uint8_t> flatbuffer;
+    /// Number of source-level function containers in the legalized IR.
+    uint32_t function_count = 0;
+    /// Number of MLIR blocks across those functions and their structured
+    /// regions. This is a structural metric, not the pre-structuring CFG.
+    uint32_t block_count = 0;
+    /// Number of distinct non-zero binary instruction addresses that survive
+    /// source legalization. Padding and address-less synthetic ops are absent.
+    uint32_t instruction_count = 0;
 };
 
 /// The MLIR decompilation pipeline.
@@ -69,7 +79,15 @@ public:
     /// Enable the C AST layer for emission (Phase 4d).
     /// When true, uses CAstBuilder → CAstOptimizer → CAstPrinter
     /// instead of PseudoCEmitter.
-    void setUseCastLayer(bool use) { use_cast_layer_ = use; }
+    void setUseCastLayer(bool use) {
+        use_cast_layer_ = use;
+        // Emission and pass construction both depend on this flag: the C-AST
+        // path keeps native SCF until source legalization, while the legacy
+        // emitter requires the compatibility High bridge. Always invalidate:
+        // callers may set the same value after another option recreated or
+        // eagerly built the pass manager.
+        pipeline_built_ = false;
+    }
 
     /// Enable CFG-topology-preserving lowering (callfuscation-deflatten path).
     /// When true, RemillToHelixLow honours intra-function `br` edges for
@@ -106,6 +124,13 @@ public:
     /// translateToMLIR's attribute stamping).
     [[nodiscard]] const std::vector<uint64_t>&
     functionStarts() const { return function_starts_; }
+
+    /// Provide function signatures and nominal struct layouts extracted from
+    /// DWARF/BTF/PDB. The JSON is stamped on the ModuleOp and consumed by the
+    /// late debug-type seed pass. Empty clears the side channel.
+    void setDebugTypeInfoJson(std::string json) {
+        debug_type_info_json_ = std::move(json);
+    }
 
     // ─── Stage 1: LLVM IR Parsing ────────────────────────────────────────
 
@@ -185,6 +210,7 @@ private:
 
     /// MLIR pass manager (lazily built on first use).
     std::unique_ptr<mlir::PassManager> pass_manager_;
+    std::shared_ptr<VerifyAuditState> verify_audit_state_;
     bool pipeline_built_ = false;
 
     /// When true, skip optimization passes (Tier 2.5 optimizations).
@@ -219,6 +245,10 @@ private:
     /// vector in translateToMLIR before the `helix.function_starts` attribute
     /// is stamped.  Empty by default -> behaviour identical to today.
     std::vector<uint64_t> function_starts_;
+
+    /// Versioned StructInfoJson side channel from the IDE. Kept as JSON at
+    /// this boundary so Rust/NAPI do not duplicate the C++ type schema.
+    std::string debug_type_info_json_;
 
     /// Build the pass manager if not already built.
     void ensurePipelineBuilt();

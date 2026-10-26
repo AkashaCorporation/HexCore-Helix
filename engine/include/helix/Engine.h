@@ -90,6 +90,15 @@ public:
         size_t* out_len
     );
 
+    /// Decompile LLVM IR once and return both emission products plus metrics.
+    /// This is the canonical integration entry point; the two buffer-oriented
+    /// methods above remain for ABI compatibility.
+    HelixStatus decompileIRCombined(
+        const char* ir_text,
+        size_t ir_len,
+        DecompileOutput& output
+    );
+
     /// Set whether to skip optimization passes in the pipeline.
     /// Must be called BEFORE the first decompile call (pipeline is lazily built).
     /// Controls Tier 2.5 passes (magic division, devirtualization).
@@ -127,6 +136,10 @@ public:
     /// honesty path fire instead of the regression-safe non-gating fallback.
     /// Call before decompile.  Replaces the full set on each call.
     void setFunctionStarts(const int64_t* starts, size_t len);
+
+    /// Provide versioned DWARF/BTF/PDB type metadata as UTF-8 JSON.
+    /// The engine copies the bytes; an empty payload clears prior metadata.
+    void setDebugTypeInfoJson(const char* json, size_t len);
 
     /// Register raw bytes for a virtual-address range so passes can read from
     /// the original binary (jump tables, vtables, string literals, etc.).
@@ -168,6 +181,7 @@ private:
     // Data sections owned by this engine instance.  Lazily wrapped into a
     // DataSectionProvider for the active thread before each pipeline run.
     std::vector<DataSection> data_sections_;
+    std::string debug_type_info_json_;
 
     // FIX-097: scan the input IR text for `!helix.strings` named metadata
     // emitted by the HexCore disassembler (relocated .rodata bytes for ET_REL
@@ -239,6 +253,22 @@ int helix_engine_decompile_ir_text(
     size_t* out_len
 );
 
+/// Decompile LLVM IR exactly once and return both pseudo-C and HAST.
+/// Buffers in `output` are engine-allocated and must be released with
+/// `helix_engine_free_decompile_output`, including after partial failure.
+int helix_engine_decompile_ir_combined(
+    HelixEngineHandle* engine,
+    const char* ir_text,
+    size_t ir_len,
+    HelixCombinedDecompileOutput* output
+);
+
+/// Release buffers returned by `helix_engine_decompile_ir_combined` and reset
+/// every field to zero/null. Safe to call on an empty output.
+void helix_engine_free_decompile_output(
+    HelixCombinedDecompileOutput* output
+);
+
 /// Set whether to skip optimization passes. Call before first decompile.
 void helix_engine_set_skip_optimization(HelixEngineHandle* engine, int skip);
 
@@ -281,6 +311,13 @@ void helix_engine_clear_variable_renames(HelixEngineHandle* engine);
 void helix_engine_set_function_starts(
     HelixEngineHandle* engine,
     const int64_t* starts,
+    size_t len
+);
+
+/// Provide versioned DWARF/BTF/PDB type metadata as UTF-8 JSON.
+void helix_engine_set_debug_type_info_json(
+    HelixEngineHandle* engine,
+    const char* json,
     size_t len
 );
 

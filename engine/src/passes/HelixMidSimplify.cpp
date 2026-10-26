@@ -16,6 +16,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "helix-mid-simplify"
@@ -24,6 +25,12 @@ using namespace mlir;
 using namespace helix;
 
 namespace {
+
+static IntegerAttr getSI64Attr(Builder& rewriter, int64_t value) {
+    auto type = IntegerType::get(
+        rewriter.getContext(), 64, IntegerType::Signed);
+    return IntegerAttr::get(type, llvm::APInt(64, value, true));
+}
 
 // ── Inline pattern implementations for safe manual application ──────────
 // These duplicate the logic from ArithPatterns/CastPatterns/ConstantFoldPatterns
@@ -49,7 +56,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
     if (kind == mid::BinExprKind::Sub && lhs == rhs) {
         rewriter.setInsertionPoint(op);
         auto zero = rewriter.create<mid::ConstantOp>(
-            loc, resultType, rewriter.getIntegerAttr(resultType, 0), IntegerAttr{});
+            loc, resultType, getSI64Attr(rewriter, 0), IntegerAttr{});
         rewriter.replaceOp(op, zero.getResult());
         return true;
     }
@@ -94,49 +101,86 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
         return true;
     }
 
+    const bool isMul = kind == mid::BinExprKind::Mul ||
+                       kind == mid::BinExprKind::UMul ||
+                       kind == mid::BinExprKind::SMul;
+
     // MUL x, 1 → x
-    if (kind == mid::BinExprKind::Mul && rhsConst && *rhsConst == 1) {
+    if (isMul && rhsConst && *rhsConst == 1) {
         rewriter.replaceOp(op, lhs);
         return true;
     }
 
     // MUL x, 0 → 0
-    if (kind == mid::BinExprKind::Mul && rhsConst && *rhsConst == 0) {
+    if (isMul && rhsConst && *rhsConst == 0) {
         rewriter.setInsertionPoint(op);
         auto zero = rewriter.create<mid::ConstantOp>(
-            loc, resultType, rewriter.getIntegerAttr(resultType, 0), IntegerAttr{});
+            loc, resultType, getSI64Attr(rewriter, 0), IntegerAttr{});
         rewriter.replaceOp(op, zero.getResult());
         return true;
     }
 
     // Constant fold: both operands constant
     if (lhsConst && rhsConst) {
-        int64_t l = *lhsConst, r = *rhsConst, result;
+        int64_t l = *lhsConst, r = *rhsConst;
+        unsigned operandWidth =
+            cast<IntegerType>(lhs.getType()).getWidth();
+        if (operandWidth > 64)
+            return false;
+        llvm::APInt lhsBits(operandWidth, static_cast<uint64_t>(l));
+        llvm::APInt rhsBits(operandWidth, static_cast<uint64_t>(r));
+        llvm::APInt resultBits(operandWidth, 0);
         using K = mid::BinExprKind;
         switch (kind) {
-        case K::Add:    result = l + r; break;
-        case K::Sub:    result = l - r; break;
-        case K::Mul:    result = l * r; break;
-        case K::Div:    if (r == 0) return false; result = l / r; break;
-        case K::Mod:    if (r == 0) return false; result = l % r; break;
-        case K::Shl:    if (r < 0 || r >= 64) return false; result = l << r; break;
-        case K::Shr:    if (r < 0 || r >= 64) return false;
-                        result = static_cast<int64_t>(static_cast<uint64_t>(l) >> r); break;
-        case K::Sar:    if (r < 0 || r >= 64) return false; result = l >> r; break;
-        case K::BitAnd: result = l & r; break;
-        case K::BitOr:  result = l | r; break;
-        case K::BitXor: result = l ^ r; break;
-        case K::Eq:     result = (l == r) ? 1 : 0; break;
-        case K::Ne:     result = (l != r) ? 1 : 0; break;
-        case K::Lt:     result = (l < r)  ? 1 : 0; break;
-        case K::Le:     result = (l <= r) ? 1 : 0; break;
-        case K::Gt:     result = (l > r)  ? 1 : 0; break;
-        case K::Ge:     result = (l >= r) ? 1 : 0; break;
+        case K::Add:    resultBits = lhsBits + rhsBits; break;
+        case K::Sub:    resultBits = lhsBits - rhsBits; break;
+        case K::Mul:
+        case K::UMul:
+        case K::SMul:   resultBits = lhsBits * rhsBits; break;
+        case K::Div:
+        case K::SDiv: {
+            if (rhsBits.isZero()) return false;
+            bool overflow = false;
+            resultBits = lhsBits.sdiv_ov(rhsBits, overflow);
+            if (overflow) return false;
+            break;
+        }
+        case K::UDiv:
+            if (rhsBits.isZero()) return false;
+            resultBits = lhsBits.udiv(rhsBits);
+            break;
+        case K::Mod:
+            if (rhsBits.isZero()) return false;
+            resultBits = lhsBits.srem(rhsBits);
+            break;
+        case K::Shl:    if (r < 0 || static_cast<uint64_t>(r) >= operandWidth) return false;
+                        resultBits = lhsBits.shl(static_cast<unsigned>(r)); break;
+        case K::Shr:    if (r < 0 || static_cast<uint64_t>(r) >= operandWidth) return false;
+                        resultBits = lhsBits.lshr(static_cast<unsigned>(r)); break;
+        case K::Sar:    if (r < 0 || static_cast<uint64_t>(r) >= operandWidth) return false;
+                        resultBits = lhsBits.ashr(static_cast<unsigned>(r)); break;
+        case K::BitAnd: resultBits = lhsBits & rhsBits; break;
+        case K::BitOr:  resultBits = lhsBits | rhsBits; break;
+        case K::BitXor: resultBits = lhsBits ^ rhsBits; break;
+        case K::Eq:     resultBits = llvm::APInt(operandWidth, lhsBits == rhsBits); break;
+        case K::Ne:     resultBits = llvm::APInt(operandWidth, lhsBits != rhsBits); break;
+        case K::Lt:     resultBits = llvm::APInt(operandWidth, lhsBits.slt(rhsBits)); break;
+        case K::Le:     resultBits = llvm::APInt(operandWidth, lhsBits.sle(rhsBits)); break;
+        case K::Gt:     resultBits = llvm::APInt(operandWidth, lhsBits.sgt(rhsBits)); break;
+        case K::Ge:     resultBits = llvm::APInt(operandWidth, lhsBits.sge(rhsBits)); break;
+        case K::Ult:    resultBits = llvm::APInt(operandWidth, lhsBits.ult(rhsBits)); break;
+        case K::Ule:    resultBits = llvm::APInt(operandWidth, lhsBits.ule(rhsBits)); break;
+        case K::Ugt:    resultBits = llvm::APInt(operandWidth, lhsBits.ugt(rhsBits)); break;
+        case K::Uge:    resultBits = llvm::APInt(operandWidth, lhsBits.uge(rhsBits)); break;
+        case K::LogAnd: resultBits = llvm::APInt(operandWidth, l != 0 && r != 0); break;
+        case K::LogOr:  resultBits = llvm::APInt(operandWidth, l != 0 || r != 0); break;
         default: return false;
         }
         rewriter.setInsertionPoint(op);
+        unsigned resultWidth = cast<IntegerType>(resultType).getWidth();
+        resultBits = resultBits.sextOrTrunc(resultWidth);
         auto c = rewriter.create<arith::ConstantOp>(
-            loc, rewriter.getIntegerAttr(resultType, result));
+            loc, rewriter.getIntegerAttr(resultType, resultBits));
         rewriter.replaceOp(op, c.getResult());
         return true;
     }
@@ -152,6 +196,10 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
         case K::Le:  result = 1; break;
         case K::Gt:  result = 0; break;
         case K::Ge:  result = 1; break;
+        case K::Ult: result = 0; break;
+        case K::Ule: result = 1; break;
+        case K::Ugt: result = 0; break;
+        case K::Uge: result = 1; break;
         default: return false;
         }
         rewriter.setInsertionPoint(op);
@@ -176,7 +224,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
                             rewriter.setInsertionPoint(op);
                             auto combined = rewriter.create<mid::ConstantOp>(
                                 loc, resultType,
-                                rewriter.getIntegerAttr(resultType, sum),
+                                getSI64Attr(rewriter, sum),
                                 IntegerAttr{});
                             auto newShift = rewriter.create<mid::BinExprOp>(
                                 loc, resultType,
@@ -280,7 +328,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
         rewriter.setInsertionPoint(op);
         auto shamt = rewriter.create<mid::ConstantOp>(
             loc, lhs.getType(),
-            rewriter.getIntegerAttr(lhs.getType(), bitWidth - 1),
+            getSI64Attr(rewriter, bitWidth - 1),
             IntegerAttr{});
         auto shr = rewriter.create<mid::BinExprOp>(
             loc, lhs.getType(),
@@ -292,7 +340,8 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
         Value result = shr.getResult();
         if (result.getType() != resultType)
             result = rewriter.create<mid::CastOp>(
-                loc, resultType, result, IntegerAttr{}).getResult();
+                loc, resultType, result, IntegerAttr{},
+                mid::CastKindAttr{}).getResult();
         rewriter.replaceOp(op, result);
         return true;
     }
@@ -321,7 +370,8 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
                 rewriter.replaceOp(op, lhs);
             } else {
                 auto boolCast = rewriter.create<mid::CastOp>(
-                    loc, resultType, lhs, IntegerAttr{});
+                    loc, resultType, lhs, IntegerAttr{},
+                    mid::CastKindAttr{});
                 rewriter.replaceOp(op, boolCast.getResult());
             }
             return true;
@@ -355,7 +405,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
                         // mask >> n (folded constant)
                         auto newMaskOp = rewriter.create<mid::ConstantOp>(
                             loc, resultType,
-                            rewriter.getIntegerAttr(resultType, newMask),
+                            getSI64Attr(rewriter, newMask),
                             IntegerAttr{});
                         // (x >> n) & (mask >> n)
                         auto newAnd = rewriter.create<mid::BinExprOp>(
@@ -399,7 +449,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
                     // (a + b) * n
                     auto nOp = rewriter.create<mid::ConstantOp>(
                         loc, resultType,
-                        rewriter.getIntegerAttr(resultType, *lhsMulConst),
+                        getSI64Attr(rewriter, *lhsMulConst),
                         IntegerAttr{});
                     auto mulOp = rewriter.create<mid::BinExprOp>(
                         loc, resultType,
@@ -460,8 +510,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
                                 auto maskOp =
                                     rewriter.create<mid::ConstantOp>(
                                         loc, x.getType(),
-                                        rewriter.getIntegerAttr(
-                                            x.getType(), mask),
+                                        getSI64Attr(rewriter, mask),
                                         IntegerAttr{});
                                 // x & (1 << n)
                                 auto bitTest =
@@ -479,7 +528,8 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
                                         rewriter
                                             .create<mid::CastOp>(
                                                 loc, resultType,
-                                                bitTestVal, IntegerAttr{})
+                                                bitTestVal, IntegerAttr{},
+                                                mid::CastKindAttr{})
                                             .getResult();
                                 auto logNot =
                                     rewriter.create<mid::UnExprOp>(
@@ -503,7 +553,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
     // ── RuleMulNegOne: x * -1 → -x (Neg) ───────────────────────────────
     // Replace multiplication by -1 with unary negation, which is cheaper
     // and more readable in decompiled output.
-    if (kind == mid::BinExprKind::Mul && rhsConst && *rhsConst == -1) {
+    if (isMul && rhsConst && *rhsConst == -1) {
         if (!isa<IntegerType>(lhs.getType()))
             return false;
         rewriter.setInsertionPoint(op);
@@ -527,7 +577,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
         rewriter.setInsertionPoint(op);
         auto mulConst = rewriter.create<mid::ConstantOp>(
             loc, resultType,
-            rewriter.getIntegerAttr(resultType, multiplier),
+            getSI64Attr(rewriter, multiplier),
             IntegerAttr{});
         auto mulOp = rewriter.create<mid::BinExprOp>(
             loc, resultType,
@@ -564,7 +614,7 @@ static bool trySimplifyBinExpr(mid::BinExprOp op, IRRewriter &rewriter) {
 }
 
 /// Try to simplify a mid::UnExprOp in-place. Returns true if changed.
-/// Handles double negation, De Morgan's laws for LogNot over BitAnd / BitOr.
+/// Handles double negation and De Morgan's laws for logical conjunctions.
 static bool trySimplifyUnExpr(mid::UnExprOp op, IRRewriter &rewriter) {
     auto resultType = op.getResult().getType();
     if (!isa<IntegerType>(resultType))
@@ -584,7 +634,8 @@ static bool trySimplifyUnExpr(mid::UnExprOp op, IRRewriter &rewriter) {
                 } else {
                     rewriter.setInsertionPoint(op);
                     auto cast = rewriter.create<mid::CastOp>(
-                        op.getLoc(), resultType, innerVal, IntegerAttr{});
+                        op.getLoc(), resultType, innerVal, IntegerAttr{},
+                        mid::CastKindAttr{});
                     rewriter.replaceOp(op, cast.getResult());
                 }
                 return true;
@@ -592,19 +643,23 @@ static bool trySimplifyUnExpr(mid::UnExprOp op, IRRewriter &rewriter) {
         }
     }
 
-    // ── NotDistribute (De Morgan): !(a & b) → !a | !b
-    //                                !(a | b) → !a & !b ─────────────────
+    // ── NotDistribute (De Morgan): !(a && b) → !a || !b
+    //                                !(a || b) → !a && !b ───────────────
+    // Never apply this to BitAnd/BitOr: `!(x & 8)` is a bit-mask test and is
+    // not equivalent to `!x | !8` for multi-bit integers.
     if (op.getKind() == mid::UnExprKind::LogNot) {
+        if (!resultType.isInteger(1))
+            return false;
         auto inner = op.getOperand().getDefiningOp<mid::BinExprOp>();
         if (!inner)
             return false;
 
         auto innerKind = inner.getKind();
         mid::BinExprKind newBinKind;
-        if (innerKind == mid::BinExprKind::BitAnd)
-            newBinKind = mid::BinExprKind::BitOr;
-        else if (innerKind == mid::BinExprKind::BitOr)
-            newBinKind = mid::BinExprKind::BitAnd;
+        if (innerKind == mid::BinExprKind::LogAnd)
+            newBinKind = mid::BinExprKind::LogOr;
+        else if (innerKind == mid::BinExprKind::LogOr)
+            newBinKind = mid::BinExprKind::LogAnd;
         else
             return false;
 
@@ -652,7 +707,11 @@ static bool trySimplifyCast(mid::CastOp op, IRRewriter &rewriter) {
     }
     // Double cast: cast(cast(x)) where outer restores original type
     if (auto inner = op.getOperand().getDefiningOp<mid::CastOp>()) {
-        if (inner.getOperand().getType() == op.getResult().getType()) {
+        const bool explicitBitcasts =
+            op.getCastKind() == mid::CastKind::Bitcast &&
+            inner.getCastKind() == mid::CastKind::Bitcast;
+        if (explicitBitcasts &&
+            inner.getOperand().getType() == op.getResult().getType()) {
             rewriter.replaceOp(op, inner.getOperand());
             return true;
         }
@@ -765,14 +824,20 @@ static std::optional<CSEKey> computeCSEKey(Operation *op) {
 
     if (auto binExpr = dyn_cast<mid::BinExprOp>(op)) {
         auto kind = static_cast<int64_t>(binExpr.getKind());
+        int64_t semanticMode = 0;
+        if (binExpr->hasAttr("helix.fixed_width_unsigned"))
+            semanticMode |= 1;
+        if (binExpr->hasAttr("helix.fixed_width_compare"))
+            semanticMode |= 2;
         // Use the SSA Value's opaque pointer as identity for operands.
         // Two Values that are the same SSA def will have the same pointer.
         auto lhsId = static_cast<int64_t>(
             reinterpret_cast<uintptr_t>(binExpr.getLhs().getAsOpaquePointer()));
         auto rhsId = static_cast<int64_t>(
             reinterpret_cast<uintptr_t>(binExpr.getRhs().getAsOpaquePointer()));
-        key.signature = {kind, lhsId, rhsId};
-        key.hash = size_t(llvm::hash_combine(key.opName, kind, lhsId, rhsId));
+        key.signature = {kind, lhsId, rhsId, semanticMode};
+        key.hash = size_t(llvm::hash_combine(
+            key.opName, kind, lhsId, rhsId, semanticMode));
         return key;
     }
 

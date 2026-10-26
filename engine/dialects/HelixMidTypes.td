@@ -157,6 +157,14 @@ def HelixMid_BundleType : HelixMid_Type<"Bundle", "bundle"> {
   }];
 }
 
+// Opaque handle used only by the MemorySlot promotion pilot. The element type
+// is carried structurally so MLIR mem2reg can verify whole-value accesses.
+def HelixMid_SlotType : HelixMid_Type<"Slot", "slot"> {
+  let summary = "Promotable recovered-variable storage slot";
+  let parameters = (ins "mlir::Type":$valueType);
+  let assemblyFormat = "`<` $valueType `>`";
+}
+
 // ─── Variable Slot Kind ──────────────────────────────────────────────────────
 
 def HelixMid_SlotKind : I32EnumAttr<

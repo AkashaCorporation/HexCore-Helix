@@ -14,6 +14,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/APInt.h"
+
 using namespace mlir;
 using namespace helix;
 
@@ -66,33 +68,66 @@ struct ConstantFoldingPass
                 if (!lhsConst || !rhsConst)
                     continue;
 
-                int64_t l = *lhsConst, r = *rhsConst, result;
+                int64_t l = *lhsConst, r = *rhsConst;
+                unsigned operandWidth =
+                    cast<IntegerType>(op.getLhs().getType()).getWidth();
+                llvm::APInt lhsBits(operandWidth, static_cast<uint64_t>(l));
+                llvm::APInt rhsBits(operandWidth, static_cast<uint64_t>(r));
+                llvm::APInt resultBits(operandWidth, 0);
                 using K = mid::BinExprKind;
                 switch (op.getKind()) {
-                case K::Add: result = l + r; break;
-                case K::Sub: result = l - r; break;
-                case K::Mul: result = l * r; break;
-                case K::Div: if (r == 0) continue; result = l / r; break;
-                case K::Mod: if (r == 0) continue; result = l % r; break;
-                case K::Shl: if (r < 0 || r >= 64) continue; result = l << r; break;
-                case K::Shr: if (r < 0 || r >= 64) continue;
-                    result = static_cast<int64_t>(static_cast<uint64_t>(l) >> r); break;
-                case K::Sar: if (r < 0 || r >= 64) continue; result = l >> r; break;
-                case K::BitAnd: result = l & r; break;
-                case K::BitOr:  result = l | r; break;
-                case K::BitXor: result = l ^ r; break;
-                case K::Eq:  result = (l == r) ? 1 : 0; break;
-                case K::Ne:  result = (l != r) ? 1 : 0; break;
-                case K::Lt:  result = (l < r)  ? 1 : 0; break;
-                case K::Le:  result = (l <= r) ? 1 : 0; break;
-                case K::Gt:  result = (l > r)  ? 1 : 0; break;
-                case K::Ge:  result = (l >= r) ? 1 : 0; break;
+                case K::Add: resultBits = lhsBits + rhsBits; break;
+                case K::Sub: resultBits = lhsBits - rhsBits; break;
+                case K::Mul:
+                case K::UMul:
+                case K::SMul:
+                    resultBits = lhsBits * rhsBits;
+                    break;
+                case K::Div:
+                case K::SDiv: {
+                    if (rhsBits.isZero()) continue;
+                    bool overflow = false;
+                    resultBits = lhsBits.sdiv_ov(rhsBits, overflow);
+                    if (overflow) continue;
+                    break;
+                }
+                case K::UDiv:
+                    if (rhsBits.isZero()) continue;
+                    resultBits = lhsBits.udiv(rhsBits);
+                    break;
+                case K::Mod:
+                    if (rhsBits.isZero()) continue;
+                    resultBits = lhsBits.srem(rhsBits);
+                    break;
+                case K::Shl: if (r < 0 || static_cast<uint64_t>(r) >= operandWidth) continue;
+                    resultBits = lhsBits.shl(static_cast<unsigned>(r)); break;
+                case K::Shr: if (r < 0 || static_cast<uint64_t>(r) >= operandWidth) continue;
+                    resultBits = lhsBits.lshr(static_cast<unsigned>(r)); break;
+                case K::Sar: if (r < 0 || static_cast<uint64_t>(r) >= operandWidth) continue;
+                    resultBits = lhsBits.ashr(static_cast<unsigned>(r)); break;
+                case K::BitAnd: resultBits = lhsBits & rhsBits; break;
+                case K::BitOr:  resultBits = lhsBits | rhsBits; break;
+                case K::BitXor: resultBits = lhsBits ^ rhsBits; break;
+                case K::Eq:  resultBits = llvm::APInt(operandWidth, lhsBits == rhsBits); break;
+                case K::Ne:  resultBits = llvm::APInt(operandWidth, lhsBits != rhsBits); break;
+                case K::Lt:  resultBits = llvm::APInt(operandWidth, lhsBits.slt(rhsBits)); break;
+                case K::Le:  resultBits = llvm::APInt(operandWidth, lhsBits.sle(rhsBits)); break;
+                case K::Gt:  resultBits = llvm::APInt(operandWidth, lhsBits.sgt(rhsBits)); break;
+                case K::Ge:  resultBits = llvm::APInt(operandWidth, lhsBits.sge(rhsBits)); break;
+                case K::Ult: resultBits = llvm::APInt(operandWidth, lhsBits.ult(rhsBits)); break;
+                case K::Ule: resultBits = llvm::APInt(operandWidth, lhsBits.ule(rhsBits)); break;
+                case K::Ugt: resultBits = llvm::APInt(operandWidth, lhsBits.ugt(rhsBits)); break;
+                case K::Uge: resultBits = llvm::APInt(operandWidth, lhsBits.uge(rhsBits)); break;
+                case K::LogAnd: resultBits = llvm::APInt(operandWidth, l != 0 && r != 0); break;
+                case K::LogOr:  resultBits = llvm::APInt(operandWidth, l != 0 || r != 0); break;
                 default: continue;
                 }
 
                 rewriter.setInsertionPoint(op);
+                unsigned resultWidth = cast<IntegerType>(resultType).getWidth();
+                resultBits = resultBits.sextOrTrunc(resultWidth);
                 auto c = rewriter.create<arith::ConstantOp>(
-                    op.getLoc(), rewriter.getIntegerAttr(resultType, result));
+                    op.getLoc(), rewriter.getIntegerAttr(resultType, resultBits));
                 rewriter.replaceOp(op, c.getResult());
                 changed = true;
             }

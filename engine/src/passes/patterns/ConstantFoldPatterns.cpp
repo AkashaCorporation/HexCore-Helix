@@ -23,6 +23,7 @@
 #include "mlir/IR/PatternMatch.h"
 
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/APInt.h"
 
 #define DEBUG_TYPE "helix-constant-fold"
 
@@ -74,45 +75,73 @@ struct BinExprConstantFold
         int64_t rhs = *rhsConst;
         int64_t result;
         bool isComparison = false;
+        unsigned operandWidth =
+            cast<IntegerType>(op.getLhs().getType()).getWidth();
+        if (operandWidth > 64)
+            return failure();
+        llvm::APInt lhsBits(operandWidth, static_cast<uint64_t>(lhs));
+        llvm::APInt rhsBits(operandWidth, static_cast<uint64_t>(rhs));
 
         auto kind = op.getKind();
         using K = helix::mid::BinExprKind;
 
         switch (kind) {
-        case K::Add:    result = lhs + rhs; break;
-        case K::Sub:    result = lhs - rhs; break;
-        case K::Mul:    result = lhs * rhs; break;
+        case K::Add:    result = (lhsBits + rhsBits).getSExtValue(); break;
+        case K::Sub:    result = (lhsBits - rhsBits).getSExtValue(); break;
+        case K::Mul:
+        case K::UMul:
+        case K::SMul:
+            result = (lhsBits * rhsBits).getSExtValue();
+            break;
         case K::Div:
-            if (rhs == 0) return failure(); // Don't fold div by zero
-            result = lhs / rhs;
+        case K::SDiv: {
+            if (rhsBits.isZero()) return failure();
+            bool overflow = false;
+            auto quotient = lhsBits.sdiv_ov(rhsBits, overflow);
+            if (overflow) return failure();
+            result = quotient.getSExtValue();
+            break;
+        }
+        case K::UDiv:
+            if (rhsBits.isZero()) return failure();
+            result = lhsBits.udiv(rhsBits).getSExtValue();
             break;
         case K::Mod:
-            if (rhs == 0) return failure();
-            result = lhs % rhs;
+            if (rhsBits.isZero()) return failure();
+            result = lhsBits.srem(rhsBits).getSExtValue();
             break;
         case K::Shl:
         case K::Shr:
         case K::Sar:
-            if (rhs < 0 || rhs >= 64) return failure();
-            if (kind == K::Shl) result = lhs << rhs;
-            else if (kind == K::Shr) result = static_cast<int64_t>(
-                            static_cast<uint64_t>(lhs) >> rhs);
-            else result = lhs >> rhs;
+            if (rhs < 0 || static_cast<uint64_t>(rhs) >= operandWidth)
+                return failure();
+            if (kind == K::Shl)
+                result = lhsBits.shl(static_cast<unsigned>(rhs)).getSExtValue();
+            else if (kind == K::Shr)
+                result = lhsBits.lshr(static_cast<unsigned>(rhs)).getSExtValue();
+            else
+                result = lhsBits.ashr(static_cast<unsigned>(rhs)).getSExtValue();
             break;
-        case K::BitAnd: result = lhs & rhs; break;
-        case K::BitOr:  result = lhs | rhs; break;
-        case K::BitXor: result = lhs ^ rhs; break;
+        case K::BitAnd: result = (lhsBits & rhsBits).getSExtValue(); break;
+        case K::BitOr:  result = (lhsBits | rhsBits).getSExtValue(); break;
+        case K::BitXor: result = (lhsBits ^ rhsBits).getSExtValue(); break;
 
         // Comparison operators → bool (0 or 1)
-        case K::Eq:  result = (lhs == rhs) ? 1 : 0; isComparison = true; break;
-        case K::Ne:  result = (lhs != rhs) ? 1 : 0; isComparison = true; break;
-        case K::Lt:  result = (lhs < rhs)  ? 1 : 0; isComparison = true; break;
-        case K::Le:  result = (lhs <= rhs) ? 1 : 0; isComparison = true; break;
-        case K::Gt:  result = (lhs > rhs)  ? 1 : 0; isComparison = true; break;
-        case K::Ge:  result = (lhs >= rhs) ? 1 : 0; isComparison = true; break;
+        case K::Eq:  result = (lhsBits == rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Ne:  result = (lhsBits != rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Lt:  result = lhsBits.slt(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Le:  result = lhsBits.sle(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Gt:  result = lhsBits.sgt(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Ge:  result = lhsBits.sge(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Ult: result = lhsBits.ult(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Ule: result = lhsBits.ule(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Ugt: result = lhsBits.ugt(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::Uge: result = lhsBits.uge(rhsBits) ? 1 : 0; isComparison = true; break;
+        case K::LogAnd: result = (lhs != 0 && rhs != 0) ? 1 : 0; break;
+        case K::LogOr:  result = (lhs != 0 || rhs != 0) ? 1 : 0; break;
 
         default:
-            return failure(); // LogAnd, LogOr: need short-circuit semantics
+            return failure();
         }
 
         // Replace the binexpr with a constant
@@ -164,6 +193,10 @@ struct SelfComparisonFold
         case K::Le:  result = 1; break; // x <= x → true
         case K::Gt:  result = 0; break; // x > x → false
         case K::Ge:  result = 1; break; // x >= x → true
+        case K::Ult: result = 0; break;
+        case K::Ule: result = 1; break;
+        case K::Ugt: result = 0; break;
+        case K::Uge: result = 1; break;
         default: return failure();
         }
 

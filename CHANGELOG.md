@@ -5,6 +5,1132 @@ All notable changes to HexCore Helix are documented here.
 
 ## [Unreleased]
 
+**HAST 1.1 native quality transport.** Function records now include an explicit
+native-quality report and typed issue codes, independent of confidence scores.
+The legacy table prefix is preserved. Semantic consumers must support the new
+quality capability; older readers do not enforce these barriers. Paired HQL
+consumer migration and package qualification remain required before deployment.
+
+**Opaque post-call register state.** x64 calling-convention recovery tracks
+potentially clobbered GPR bits across CFG predecessors and backedges. Reads
+not resolved by subsequent writes use explicit state-provider expressions,
+not the original parameter value. The output remains partial with an opaque
+state diagnostic; this does not assume tracing callbacks are no-ops.
+
+**Stable copy-propagation definitions.** C-AST copy propagation snapshots its
+definitions before rewriting RHS nodes, resolves bounded copy chains, and
+retains assignments still referenced after expansion. This prevents dangling
+definition pointers and empty variable names in emitted returns.
+
+**Register lifetime and return binding.** SSA declarations use a stable
+declaration anchor instead of a potentially erased instruction. Void call
+types are not propagated into register storage. Non-void x64 returns may bind
+to a unique referenced RAX identity when no canonical result variable exists;
+ambiguous and unreferenced identities remain unbound.
+
+**Raw byte-address semantics.** LLVM integer add/sub address expressions retain
+explicit pointer-to-integer conversions and memory accesses retain the loaded
+or stored type. Same-width pointer/integer casts are no longer removed merely
+because their register widths match. Pointer declaration IDs, including
+retained parameter declarations, inform address emission after legalization.
+
+**Scaled nominal arrays.** Integer array fields can recover explicit
+shift/multiply index scales matching their element width. C-AST emission
+checks scale and memory-access width before replacing byte-address arithmetic
+with a named subscript; mismatched accesses are not promoted.
+
+**Nominal fields at offset zero.** Direct dereferences of a known record
+pointer can now resolve to its first leaf field when debug layout size
+exactly matches the accessed width. Unknown-size and width-mismatched accesses
+are not promoted to whole-field accesses.
+
+**Scalar pointer types.** Canonical type spelling recovery now parses pointees
+recursively instead of turning scalar pointers such as `uint64_t*` into
+`struct uint64_t*`. Nested scalar/void pointers preserve their pointer levels;
+existing nominal-struct fallback behavior remains unchanged.
+
+**Incomplete ABI call diagnostics.** Calls with a supported authoritative
+integer/pointer signature retain explicit missing-argument counts when ABI
+recovery cannot bind all arguments. A function-level diagnostic survives
+C-AST optimization and caps the existing confidence score at 50%, so the
+current HexCore quality consumer reports partial output instead of a clean
+result. Unknown signatures are not treated as proven argument mismatches.
+
+**Win64 outgoing integer stack slots.** Stack recovery retains explicit
+RSP-relative store offsets. For supported exact integer/pointer signatures,
+call recovery binds full-width slots starting at RSP+32 after the four register
+arguments. Captured values retain snapshot identity; intervening RSP changes
+or unresolved effects reject the association.
+Intervening register reads no longer incorrectly block recovery of these slots.
+
+**Outgoing argument snapshots.** Captured push values retain a snapshot
+identity through variable merging and single-use inlining. This prevents the
+capture from reverting to a read of a register overwritten before the call.
+
+**SysV pushed call arguments.** For supported non-variadic integer/pointer
+signatures, call recovery binds an intact same-block sequence of 64-bit pushes
+after the six register arguments. Values are materialized at each push point
+and appended in ABI order; consumed pushes are removed during lowering.
+Unknown signatures, saved-register pushes and intervening memory/stack barriers
+remain outside this recovery path.
+
+**Exact arity for unnamed callees.** Calling-convention recovery now honors
+`helix.debug_param_count` before applying callee-name heuristics. A `sub_...`
+name no longer causes an authoritative zero- or three-argument signature to
+be ignored in favor of extra prepared registers.
+
+**Constant frame displacement recovery.** Frame inference now tracks RSP
+snapshots and constant add/subtract operations before RBP establishment.
+Recognized adjustments shift the incoming argument base correctly; dynamic
+adjustments and arithmetic overflow remain unresolved.
+
+**Unknown frame displacement.** Frame-base inference now rejects unmodeled
+RSP/ESP writes or pops before RBP establishment. Counting pushes alone could
+otherwise classify the wrong stack slot as an incoming parameter.
+
+**SysV integer stack parameters.** Stack layout recovery recognizes the
+seventh and subsequent SysV integer parameters at entry RSP+8 onward, using
+the target triple when calling-convention recovery has not run yet. Adjusted
+or unproven incoming RSP contexts are excluded from this inference. A fresh
+0-10 argument sum matrix for SysV and Win64 passes 88 executable C checks.
+
+**Field address preservation.** Mid-to-High conversion now lowers
+`field.ptr` to `AddressOf(FieldAccess)`. Returning or forwarding a field
+address therefore retains the address operation instead of becoming a field
+value. A direct-Mid versus converted-High regression covers the distinction.
+C-AST load emission cancels only an explicit field AddressOf; dereferencing
+a pointer stored in the field remains a real memory access.
+
+**CMP/TEST register operand widths.** The Remill demangler now extracts the
+width of the first read-register accessor for CMP and TEST instead of retaining
+the 64-bit default. Widened semantic-call arguments no longer cause signed byte
+comparisons to use the wrong sign bit. Fresh Remill byte-comparison controls
+pass all 65,536 operand pairs for each of signed and unsigned less-than.
+
+**Preserve signedness-changing C casts.** Redundant-cast elimination now
+requires equal signedness as well as equal integer width. Otherwise an
+unsigned comparison can silently become signed after correct C-AST lowering.
+The comparison regression now exercises cleanup too: unsigned zero less than
+UINT64_MAX must retain its unsigned interpretation.
+
+**Call-clobber barrier in argument recovery.** Backward register-write lookup
+now stops at real ABI calls and distinguishes a blocked lookup from missing
+local state. Predecessor fallback cannot cross that barrier. This prevents
+argument stabilization from replacing a saved SSA value with a caller-saved
+register read after an intervening call.
+Marked machine intrinsics are excluded from ABI argument inference and
+stabilization, preserving their explicit instruction operands.
+
+**Typed access through void pointers.** High memory dereferences with a
+void-pointer operand now use an explicit pointer cast matching the operation's
+value type. This avoids invalid C such as `*param_1` when `param_1` is `void*`.
+A fresh Remill load/clear/return control compiles and preserves six original
+64-bit values while clearing their storage.
+
+**One-bit sign extension.** C-AST emission now preserves `sext i1` as
+`bit ? -1 : 0`, including 8/16/32/64-bit destinations. Widening a C boolean
+directly incorrectly produced positive one. A focused LLVM-to-C-AST regression
+checks both result arms and destination types after simplification. The same
+helper handles direct Mid and High extension operations; all three input forms
+are covered at four destination widths.
+
+**Helix 0.9.4 F02 (cast-aware algebraic identity).** C-AST structural
+equality now requires `CCastExpr` destination types to match recursively,
+including integer width and signedness, before applying identities such as
+`x - (x - y) -> y`. This prevents a narrow cast from being treated as the
+same value as a wider cast. Matching-cast and mismatched-width controls pass;
+the complete native suite passes with one optional fixture skipped.
+
+**Helix 0.9.4 ABI forwarding and extension semantics.** The calling-convention
+pass now reconstructs a bounded first-call ABI prefix when an exact signature
+or a prepared later argument proves its length. Untouched leading registers
+become explicit live-in reads, while any earlier call barrier disables the
+heuristic. `kbase_csf_queue_register` now retains two inputs and emits
+`csf_queue_register_internal(param_1, param_2, 0)`. Integer extensions retain
+both sides of the C conversion: zero extension prints a narrow unsigned cast
+before the wider unsigned cast, while sign extension preserves signed types.
+The recovered unsigned range accepts 4096 through 2^31 and rejects tested
+values outside that interval.
+
+**Helix 0.9.4 F04 (single-evaluation call arguments).** Memory-derived values
+already saved into an ABI register are read from that register at a later call
+instead of recursively rebuilding the load expression. The rewrite requires
+an exact latest register-write/value match. In `kbase_mem_free`, clearing the
+pending slot no longer changes the later free operand: the saved region is
+passed to `kbase_free_alloced_region`. The BTS storage/index reconstruction is
+still open and is not covered by this fix. The complete native suite now passes
+321/321 with one optional fresh-producer fixture skipped; both Mali controls
+are byte-deterministic across 5/5 engine-direct and 5/5 N-API runs. The isolated
+candidate is `hexcore-helix.094-f02-abi-f04.node`, SHA-256
+`90AC0A1440DB9CBC55096A649D17B9BB69EBAF71EAC93EFE25692C9EADB6C7A9`;
+it has not been installed into the open IDE.
+
+**Helix 0.9.4 BTS memory semantics.** Remill `BT/BTS/BTR/BTC` memory/register/
+immediate name variants are now classified explicitly. The `BTSmem` path is a
+machine intrinsic with program-memory read/write effects, explicit storage and
+bit-index operands, and a CF result; it no longer falls through ABI call
+recovery or acts as a real-call clobber barrier. The Mali control now emits
+`atomic_test_and_set(v5 + 0xA4F8, result)` instead of using the pending-region
+pointer. Native validation passes 322/322 with one optional fixture skipped.
+Isolated candidate `hexcore-helix.094-wave2-bts1.node`, SHA-256
+`45DEE4EBC8544B1798B31E4A433B1655FF33645488D8649B10A93FCAE64F620B`,
+is deterministic across 5/5 N-API runs for both current Mali controls and has
+not been installed into the open IDE.
+
+**Explicit lifted-entry identity.** Preserve LLVM function attribute
+`"hexcore.entry_address"="0x..."` through import and consume it before PC
+lowering. Legacy encoded function names remain supported; missing identities
+are errors instead of fabricated zero addresses. Block labels are not used as
+entry identities because current Remill can emit ordinal names such as `bb_0`.
+Invalid attributes and conflicts with an encoded function entry are rejected.
+Source/C ABI tests pass, including zero and high-bit addresses. Addon relinking
+and packaged integration qualification remain pending.
+
+The N-API wrapper now reads the canonical HAST identity for single-function
+results instead of returning `functionName:"mlir_decompiled"` and an empty
+entry address. Multi-function results keep both scalar identity fields empty.
+The minimal reader rejects legacy HRST/truncated buffers and preserves valid
+zero/high-bit addresses. Candidate `.node` `75EC02F4...7309BC7` passes isolated
+A/B tests; the IDE addon remains unchanged pending a closed-process swap.
+
+**FIX-154 (preserve scalar floating-point register loads through Low
+lowering).** A complete ROTTR `receive-damage` lift exposed a final verifier
+failure where valid LLVM `fptrunc double -> float` consumed `i128` after
+`RemillToHelixLow`. Scalar `load double` from an XMM-backed pointer fell through
+the generic physical-register path, which replaced it with a full-width i128
+`RegReadOp`. Scalar f32/f64 register and memory loads now read their logical
+bit width and bitcast back to the original float type, matching the existing
+vector-preservation contract.
+
+The retained 236,135-byte IR is SHA-256
+`8CCB0E00630072A23961B80B3C8560F45A6EE6DF66B6F8248743D6E118053CFD`.
+The previously installed addon (`F4736ED6...445776`) reproduces the verifier
+failure; candidate `hexcore-helix.rottr-fptrunc1.node`
+(`ACEED38E3173EA4CE7803E0357A2A15F13CB835CCDD7845F25AB53C0719F13F9`)
+emits 493 lines at an honest 29.1% confidence. The exact output is stable over
+10/10 same-process runs, and the NUCLEO oracle is 10/10 functions stable at
+K=5. The complete native suite passes 309/309. The remaining
+`MULrax`/`MAXPS` operations stay visible as unsupported semantics instead of
+invalidating the MLIR module.
+
+**MLIR function/SCF/source-legalization closure.** Final `high.func` now
+implements `FunctionOpInterface` as well as `CallableOpInterface`, accepts real
+multi-block function bodies, and carries recovered argument metadata plus entry
+block arguments. Read-only recovered parameters are real SSA arguments; mutable
+parameters remain explicit storage. Low, Mid, and High call families implement
+`CallOpInterface`, while complete High signatures verify return arity and type.
+
+The C-AST path now consumes native `scf.if`, `scf.index_switch`, and canonical
+`scf.while` directly and performs de-SSA only at source legalization. This lane
+is default for the C-AST emitter. `HELIX_LEGACY_SCF_BRIDGE=1` keeps the former
+High synthetic-variable bridge for controlled A/B. Residual irreducible
+`cf.br`/`cf.cond_br`/`cf.switch` tails emit explicit labels and gotos, with
+snapshotted block-argument transfers preserving simultaneous PHI semantics.
+Index casts introduced solely for SCF selectors no longer become unhandled
+helpers.
+
+This exposed and fixed two hidden closure defects: `high.func` had accidentally
+retained a one-block region constraint, and strict dialect conversion rejected
+legal CF/SCF infrastructure. On the focused Mali JIT lift, the direct lane
+removes an undefined bridge temporary that made the final branch constant-like;
+output moves from 51 lines / 86.3% to 64 lines / 88.8% with routed yields
+preserved. Seven Mali lifts, WWZ, and the large CSF fixture complete under
+strict tier closure and per-pass verification without SCF/CF or block-argument
+leaks. The legacy opt-out remains byte-identical to its prior output.
+
+The opt-in MemorySlot pilot now materializes a real safe single-block stack
+local family before official Mem2Reg; `kbase_mem_import` provides one accepted
+candidate while no-candidate targets remain byte-identical. Native tests pass
+**306/306** normally and with per-pass verification. Final isolated addon (not
+installed): `hexcore-helix.mlir-foundation-final-20260822.node`, SHA-256
+`7284A673FCA9C36ECB70953569243F02FD3D2C3335AC509ECB96DA359EE625E4`.
+Strict/verifier K=10 hashes are WWZ `594CC315...AB209`, Mali JIT
+`759F66EB...E38B0`, and Mali CSF `DD96B3C3...DE0A`.
+
+**Third MLIR re-audit and closed-tier wave.** Recovered High operations are
+normalized back to Mid by default, and strict Low-to-Mid now closes across the
+seven current Mali lifts. Rotate, bit-scan, XCHG, non-prologue push/pop, and
+variadic bundles have exact or explicit Mid/High carriage rather than residual
+Low whitelists. Default and strict outputs are hash-identical for all seven
+targets with zero stderr.
+
+The re-audit fixed three verifier-exposed correctness bugs: DCE no longer keeps
+stale VarRef handles after mutation; canonicalized asymmetric `scf.while`
+results are routed before erasure; and CMP/TEST plus memory stores are
+normalized to their machine width. Twelve Low op verifiers now reject width
+and operand-contract violations. Scalar vector-register updates carry an
+explicit `helix.partial_write_width` marker.
+
+`HelixMidSimplify` no longer applies De Morgan to integer BitAnd/BitOr. This
+restores material flag-mask conditions such as `flags & 0x1000` and
+`!(value & 0xFFF)` that the old pipeline reduced incorrectly to truthiness.
+Canonicalizer and CSE complete the seven-target structural gate, but remain
+audit-only because their semantic deltas need an executable oracle.
+
+The Addressable interface is now common to all three dialect bases, the pass
+registry covers 25/25 factories, final MLIR verification is unconditional,
+and HAST preserves Temporary and Block categories without enum downgrade.
+Native tests pass **297/297** normally and with per-pass verification. Final
+isolated addon (not installed):
+`hexcore-helix.mlir-reaudit-20260822.node`, SHA-256
+`D3631148F26F775FE5EB4A2344EC2008DD947652FA26BEA124E943FD56C83F08`.
+N-API strict/verifier K=10 is stable on WWZ, Mali JIT, and Mali CSF.
+
+**P0.3 lossless-semantics wave.** INT3 is now a first-class observable
+`debug_break` through Mid/High; MOVZX/MOVSX carry distinct structural cast
+kinds; machine MUL/IMUL/DIV/IDIV preserve signedness; and APInt folding refuses
+signed division overflow. Mid/High CastOps now have local direction/width
+verifiers. Missing Remill operands, undefined values, unavailable flags,
+unresolved CMOV/SETcc/Jcc conditions, and null-based unresolved loads become a
+located `__helix_unknown(...)`, never zero/false/always-taken. Surviving unknown
+is a damning honesty defect and caps confidence at 50%.
+
+Register XCHG uses real RegisterTracker identities and emits one observable
+swap helper; memory XCHG emits one atomic exchange returning the old value.
+HandleUnsupported and flag-state instructions are visible unhandled operations,
+not NOPs. Non-self PXOR/XORPS/XORPD preserves both 128-bit operands instead of
+copying operand one or degenerating to `0 ^ 0`. CMOV conditions recover from
+predecessor flags when evidence exists. Release telemetry is silent by default.
+The node build fingerprints `helix_engine.lib` by SHA-256 so C++-only changes
+force Cargo to relink rather than shipping a stale addon.
+
+Validation passes **289/289** normally and with per-pass verification. WWZ,
+Mali JIT, and Mali CSF are deterministic at K=10 with zero stderr. JIT keeps
+74.5% and identical control/call/store counts; WWZ/CSF retain additional paths
+behind explicit unknowns and honestly cap at 50%. Final candidate (not installed
+in the IDE): `hexcore-helix.p03-lossless-final-20260822.node`. See
+`P03_LOSSLESS_SEMANTICS_20260822.md`.
+
+**Second MLIR audit reconciliation.** The N-API integration now calls one
+combined C ABI that returns pseudo-C, verified HAST, and final-IR metrics from
+a single pipeline execution. `blockCount` is the number of legalized
+structural blocks; `instructionCount` is the number of distinct non-zero
+source addresses surviving legalization. Owned C buffers have an explicit
+free API. A release `.node` exercised the path successfully with non-zero
+metrics instead of the former unconditional zeros.
+
+The re-audit also fixed four hidden contract regressions: physical stack-slot
+width is legacy type evidence and no longer blocks stronger recovered struct
+types; infrastructure DCE erases consumers before producers instead of using
+`dropAllUses()`; annotated callee-save push/pop artifacts are removed in the
+late lane; and Mid `Deref` is a program-memory read rather than `Pure`.
+C-AST annihilator folds (`x * 0`, `x & 0`) now preserve calls and memory
+evaluation. The GitHub engine job builds and runs the native verifier lane.
+Native tests pass **275/275** both normally and with
+`HELIX_VERIFY_EACH_PASS=1`. WWZ, Mali JIT, and Mali CSF remain byte-identical
+to their accepted promoted-SCF baselines. Canonicalizer remains audit-only and
+still exposes the late bridge use-list abort; CSE alone completes on WWZ.
+
+**Race-worker semantic correctness and tier-closure lane.** Fixed two
+controlled false-high defects: memory increments now print a parenthesized
+deref lvalue (`(*p)++`), and Add/Sub result plus derived flags share one SSA
+definition through source legalization, preventing `result--; if (result - 1)`
+double evaluation. Definite-assignment honesty now traverses nested loop bodies
+without crediting loop-local writes at loop exit, so the still-uncertain
+non-void signature is honestly capped at 50% instead of 97.5%.
+
+Low-to-Mid and Mid-to-High now publish residual/tier-contamination metrics and
+support `HELIX_STRICT_TIER_CLOSURE=1`. Native SCF now remains SSA through Mid
+analysis by default and is bridged only at source legalization;
+`HELIX_EARLY_SCF_BRIDGE=1` retains the old lane for A/B. This reduces early
+High contamination on the controlled worker from 32 to four parameter ops.
+Native-SCF return recovery and cross-tier DCE preserve values through SCF and
+Mid stores.
+
+Scalar SSE memory moves now decode `MVnI/MVnW` direction and lower to real
+load/store effects; `MOVxPS` models packed register copies and 128-bit memory
+moves; `UNPCKLPS/HPS` interleave lanes instead of treating Remill's `Memory*`
+return token as scalar data. Final source legalization replaces the temporary
+`low.func` compatibility wrapper with `high.func`, publishes final container
+metrics, and removes the ordinary CallOp manual-conversion fallbacks. WWZ,
+Mali JIT and Mali CSF promoted-default outputs are byte-identical to the
+accepted deferred baselines; the early lane is byte-identical to its previous
+baseline.
+
+Final `high.func` now carries an MLIR `FunctionType` derived from recovered
+parameter/result evidence and implements `CallableOpInterface`; High call and
+variadic-call ops implement `CallOpInterface`; Low/Mid/High returns carry
+`ReturnLike`. The previously generated-but-unlinked Helix interface
+definitions now compile in `Interfaces.cpp`, and all three function tiers
+implement `HelixDecompilableOpInterface`. Signature provenance/completeness is
+explicit (`helix.signature_source`, `helix.signature_complete`); orphan
+parameter refs make the signature incomplete rather than silently authoritative.
+Native suite **264/264**. See
+`RACE_WORKER_SEMANTIC_CLOSURE_20260822.md`.
+
+**MLIR reusable-infrastructure pilots.** Added a provenance-aware type-evidence
+arbiter and routed every `inferred_type` writer through it. Debug, signature,
+interprocedural, structural, dataflow and legacy facts now have explicit
+authority; weaker facts cannot overwrite stronger facts, equal disagreement
+is recorded, and the existing dataflow pointer-over-scalar refinement remains
+preserved. Added explicit Mid slot alloc/load/store operations implementing
+MLIR MemorySlot interfaces, an opt-in official Mem2Reg pilot with `undef`
+defaults, and DataFlowSolver constant/uninitialized telemetry. Fixed
+EscapeAnalysis container selection, gated behind
+`HELIX_ESCAPE_ANALYSIS_V2=1` pending corpus acceptance. CSE and Canonicalizer
+have separate audit gates; CSE completes on WWZ but changes structure, while
+Canonicalizer still exposes a late bridge RAUW/use-list abort. Production
+defaults remain unchanged. See `MLIR_INFRASTRUCTURE_PILOTS_20260822.md`.
+
+**AAPCS64 live-X0 return binding wave.** `BindReturnValues` now preserves the
+normal unique `result` rule and, only for `aapcs64`, falls back to exactly one
+live recovered `param_1` storage when no canonical result exists. Zero or
+multiple candidates remain implicit. This closes a real Low-to-High identity
+loss where Remill had correctly written X0 but the C-AST returned a new,
+uninitialized local.
+
+On the exact CZG3 Samsung graphics library, six bounded getters move from 50%
+with an uninitialized return to 85-89.5% with offsets/index scales matching the
+IDA 9.3 oracle. The other three functions remain unchanged and honestly expose
+their AArch64 opcode/control-flow debt. The full native suite passes **251/251**,
+the current Mali JIT/CSF/WWZ lane produces 144 verifier dumps with zero failure,
+and NUCLEO is 10/10 stable at K=10. The installed development addon SHA-256 is
+`CFD4E5F2BDFD49FEE5BC8EBA3348BD94F9134BB3965EF6F95B1B9F7F597E9F46`.
+See `AAPCS_RETURN_BINDING_20260822.md`.
+
+**Effect resources and address/load separation wave.** Low register state, Mid
+and High recovered-variable state, and program memory now use distinct MLIR
+resources. High Unary effects are kind-dependent: only Deref reads program
+memory, while Neg/Not/AddressOf are effect-free. FieldAccess and Subscript are
+again Pure address/lvalue computations, matching their Mid FieldPtr/IndexPtr
+producers; the actual load remains an explicit Deref. High Assign dynamically
+classifies variable targets versus program-memory targets. Push/pop/XCHG and
+REP operations now declare their hidden register/program-memory effects without
+claiming that POP writes program memory.
+
+Nine focused contracts cover resource identity, dynamic effects, safe positive
+CSE and write barriers. The native suite passes **249/249**. Current Mali JIT,
+Mali CSF, and WWZ complete 144 verifier dumps with zero failure and emit output
+byte-identical to the accepted CF/OF wave; Mali JIT remains deterministic at
+K=10. MLIR 18 generic CSE still treats any intervening write as a barrier even
+across distinct resources, so it remains disabled in production. See
+`EFFECT_RESOURCES_20260822.md`.
+
+**Fixed-width CF/OF and ordered signedness wave.** Mid and High now distinguish
+`Ult/Ule/Ugt/Uge` from signed `Lt/Le/Gt/Ge`, and the C-AST emits explicit
+width-aware casts for ordered comparisons. CMP, ADD, and SUB recover live carry
+and overflow from fixed-width semantics; constant folding uses `llvm::APInt`
+instead of host signed arithmetic. Composite x86 conditions canonicalize
+`SF xor OF`, `ZF or (SF xor OF)`, and `CF or ZF` into direct signed/unsigned
+comparisons while isolated JO/JS-style flag consumers retain exact formulas.
+
+Eight boundary contracts cover 8-bit borrow, wrap and signed overflow plus
+C-AST signedness, Jcc canonicalization, and fixed-width CSE identity. The native
+suite passes **244/244**.
+Mali JIT, Mali CSF, and current WWZ complete 144 verifier dumps with zero
+failure in roughly 10.1 seconds; Mali JIT is deterministic at K=10. Mali CSF
+is byte-identical, while WWZ replaces redundant negated comparison chains with
+direct `>` conditions. A rejected eager version that exposed flag algebra and
+took roughly 56 seconds was not retained. See `CF_OF_SIGNEDNESS_20260821.md`.
+
+**Lossless Low-to-Mid operation and result-flag wave.** `ROL`/`ROR` are no
+longer changed into shifts, and `BSWAP`/`BSF`/`BSR` no longer fall through to
+negation. Until Mid has first-class forms, these operations remain explicit Low
+ops and the C-AST emits width-specific rotate or existing bit-operation
+builtins. Binary and supported unary arithmetic now derive live zero/sign flags
+from the actual result instead of replacing both with false.
+
+This restores an IDA-confirmed branch in the current Mali JIT lift:
+`(timeline_flags & 4) != 0` once again guards `_kbase_tlstream_jit_alloc`
+instead of executing it unconditionally. The current Mali CSF and WWZ outputs
+remain byte-identical, all three complete 144 verifier dumps with zero failure,
+Mali JIT is deterministic at K=10, and the native suite passes **239/239**.
+Carry/overflow recovery remains explicitly deferred to opcode-specific,
+fixed-width contracts. See `LOW_TO_MID_SEMANTICS_20260821.md`.
+
+**MLIR effects truthfulness and current-lift verifier wave.** Register reads,
+variable references, stack exchanges, pop, memcpy, memset, and conservative
+High-level address expressions now declare the state they actually read or
+write instead of exposing false `Pure` contracts. Four adversarial optimizer
+tests prove that reads do not cross intervening writes while still allowing
+equivalent reads to coalesce when the state is unchanged. Generic CSE remains
+disabled in the production pipeline.
+
+Current Mali JIT/CSF and WWZ lifts also exposed and closed width/ODS defects in
+register-load replacement, CMOV lowering, post-variable-recovery identity
+casts, Mid constant attributes, and 128-bit XMM parent storage. All three
+current fixtures cross the complete per-pass verifier lane and emit C. The
+native suite passes **236/236**. Historical Remill-7 lifts remain compatibility
+fixtures only; they are not used as the current quality oracle. Unsupported
+`BTSmem`, `UNPCKLPS`, and `MOVSD_MEM` evidence remains visible as coverage debt.
+See `EFFECTS_TRUTHFULNESS_20260821.md` for the exact fixtures and artifacts.
+
+**Verify-audit lane (semantic-consolidation PR 1).** `HELIX_VERIFY_EACH_PASS=1`
+now enables MLIR's native verifier between every pass and installs a dedicated
+instrumentation that records the first invalid producer, stops before the next
+semantic pass, and writes per-pass before/after IR plus `first_failure.txt` to
+an isolated run directory. Production compatibility remains unchanged when the
+environment variable is absent.
+
+Direct contracts prove that valid IR produces paired dumps and that a pass
+which removes a required terminator is named, dumped, and stops the following
+pass. The lane then found and closed five existing contract violations in
+sequence: 22 identity LLVM integer casts after register-value replacement,
+signless `stack_offset` where High requires `si64`, signless Mid/High call
+addresses where ODS requires `ui64`, signless Mid constant values where ODS
+requires `si64`, and signless High field offsets where ODS requires `ui64`.
+
+The normal native suite passes **232/232**. Both the real Remill-6 integration
+fixture and the complex Remill-7 BonePosCalc9 SCF fixture now cross every pass
+with the verifier active. The Remill-6 audit emits 24 before/after pairs (48
+MLIR files) and no `first_failure.txt`. Historical failing reproducers remain
+under `C:\tmp\helix-verify-audit-*-20260821` as evidence of the progression.
+
+**Foreigner semantic-boundary hardening (sandbox package 0.1.9).** Function
+ownership, calling-convention recovery, debug-type application, and the
+Disassembler-to-Helix analysis context now remain bound to the requested
+target. The Remill lowering recognizes 128-bit SIMD zero idioms and emits the
+complete zero store. The C-AST optimizer removes synthetic `scf_w*` do/while
+wrappers only when straight-line assignments prove that the first condition
+is false; unknown or real loop guards remain intact. On the retained raw
+Foreigner lift this narrow SCF rule reduces output from 362 to 350 lines,
+from four to two do/while loops, and from 97 to 85 `scf_*` references while
+retaining the honest 50% confidence result.
+
+The native suite passes 224/224. The retained raw lift is byte-identical over
+K=10 separate-process runs (SHA-256
+`6B0A427EC4ED9C1C2848C51DD13E2C7F1D76AAE4BE7B0A7616F9DAC544853D65`),
+and the NUCLEO same-process oracle is 10/10 functions stable at K=10. The
+installed candidate is SHA-256
+`4BD498CF03E0F0A866BC8DA400D22CE7050D5B9747898B987CD41A5C61603553`.
+
+The package remains the v2 development sandbox for the public Helix 0.9.3 RC
+line; this internal version bump does not promote Helix to a final release.
+
+**FIX-153 (preserve constant-comparison ownership in C-AST).** A retained
+live-memory lift from HTB `ffmodule` exposed a native access violation after
+all MLIR passes had completed. `flattenZeroComparison` moved one operand out
+of a binary expression before discovering that both operands were integer
+literals. It then returned the original expression with a null child, and the
+C-AST printer dereferenced the malformed tree. The optimizer now identifies
+constant-vs-constant comparisons before transferring ownership, leaving
+expressions such as `1 == 0` intact for the existing constant-folding stages.
+
+A focused ownership regression verifies that both operands survive condition
+polarity simplification and that the expression remains printable. The native
+suite passes **220/220**. The exact 116,688-byte retained IR that previously
+crashed now completes both directly and through the isolated decompilation
+path. Its output is deterministic across **K=10** same-process runs (one
+SHA-256), and the standard NUCLEO oracle is **10/10 stable at K=10**. Final
+standalone candidate (installed in the development IDE):
+`target/release/hexcore-helix.fix153-constant-zero-ownership.node`, SHA-256
+`A7BA046D6F87DDDD4FE1683EBECB394D03C9DBE6E39F83FF441122BF06E69871`.
+The displaced addon is retained as
+`hexcore-helix.win32-x64-msvc.node.bak-20260809-pre-fix153-D49D7441`.
+The full IDE acceptance job completes all nine steps without a native error or
+timeout: eight are `ok`, and live-memory decompilation is honestly `partial`
+at 50% because the function still contains nine placeholders, seven
+self-references, and one unrecovered `cf.switch`. It emits 289,415 bytes of C,
+retains the byte-identical source IR (SHA-256
+`D9014135AD3BE14613136F5B83E171B33EF4DB7AEC44F4CB48FAB5025AAC953E`),
+disposes the Debugger session, and leaves the runner queue empty.
+
+**FIX-148 through FIX-152 (ROTTR hash correctness wave).** A direct comparison
+of ROTTR `sub_14000e620` against IDA exposed a false-High decompilation that
+shifted and dereferenced the string pointer while reporting 94.5% confidence.
+The Remill LLVM IR was correct; four independent losses occurred downstream:
+register renaming could collide with an undeclared body-only `vN`, register
+forms of `MOVSX`/`MOVZX` consumed the destination pointer and omitted their
+writeback, C-AST pre-build DSE erased definitions consumed by loop self-updates,
+and C-AST copy propagation rewrote assignment lvalues through their rvalue
+aliases. Register renaming now reserves every referenced identifier, extension
+instructions use operand 3 as the source and explicitly write operand 2's
+destination register, pre-build DSE is block-local with self-read-aware
+liveness, and direct variable lvalues retain their storage identity.
+
+The corrected output implements the same string-hash recurrence as IDA:
+`v0 = result; v0 <<= 5; v1 = result; v1 >>= 2; ... result ^= v0`, while the
+pointer advances independently and the previous/current characters remain
+distinct. Three focused C-AST regressions cover name collision, loop-carried
+setup and lvalue identity. The native suite passes **219/219** and the fresh
+ROTTR lift is deterministic at **K=10** (one output SHA-256). Final standalone
+candidate: `target/release/hexcore-helix.fix152-lvalue-identity.node`, SHA-256
+`24B3CB2522B20680B9566C55911454242BB6B9FDEA91ED06A11733E18548FF29`.
+
+The current-lift harness now records Remill wrapper/upstream versions and addon
+SHA-256, and selects the same `amd64_avx` semantics family as the IDE instead
+of silently falling back to plain `amd64`. The March WWZ `bone_pos_calc3.ll`
+remains a frozen Remill-7 compatibility fixture. A Remill 6.0.1 candidate was
+generated from the current corpus at `0x14142fef0`, but it is not promoted as a
+replacement: the historical entry is `0x14142fe90`, so binary/function identity
+must be established before comparing quality claims.
+
+**FIX-147 (interference-safe SCF copy coalescing and late cleanup).** The
+C-AST selector coalescer no longer unions every connected `scf_r*` copy class.
+It now requires one-destination routing and a structured backward-liveness
+proof that source and destination live ranges do not interfere. Loop
+back-edges reach a bounded fixed point, goto sources seed all selectors live,
+and the complete union-find classes are checked for transitive interference.
+This preserves independently consumed tuple components, sources redefined
+while a copied destination remains live, destinations live before a copy, and
+the `A-B-C` case where pairwise-safe edges would form an unsafe transitive
+class. Three adversarial no-coalesce contracts plus the positive routing
+contract cover those boundaries.
+
+The late optimizer now repeats the guarded coalescer after earlier DSE,
+removes globally dead pure stores to a bounded fixed point, and closes the
+resulting identical-arm/empty-branch cleanup cycle. The native suite passes
+**216/216**. Fresh NUCLEO completes **80/80**: 27 outputs are byte-identical,
+53 change, total output falls by 2,364 lines, and every confidence,
+placeholder, and suspicious-self-reference metric stays flat. A separate
+adversarial text audit finds no delta in calls, memory stores, returns, gotos,
+or labels and no new code-address leak; no empty `if` shell remains. The
+largest positive delta (`sub_140088400`, +66 lines) is intentional correctness:
+distinct structured results remain distinct instead of being collapsed into
+one `scf_r900002` identity. On the Mali CSF target, the same policy keeps
+79.5%, one placeholder, and 60 suspicious self-references while final C grows
+from 2,119 to 2,176 physical lines relative to FIX-146; the extra routing is
+the cost of refusing unproven aliases. Determinism is **10/10 functions stable
+at K=10**. Final locally rebuilt addon (installed in the development IDE):
+`target/release/hexcore-helix.fix147-scf-interference-final.node`, SHA-256
+`408A676712765FD379709609CF141034606ED0AFA7156FC6B34FFB5A37AA5CCC`.
+The rebuild passes **216/216** and reproduces the accepted Mali C byte for
+byte against RC9 (output SHA-256
+`11D807072FDB5D035877ED42E2F6431E88FBCEF64F718E97CC0420A463333230`).
+The displaced FIX-142 binary is retained only as the explicitly named local
+backup `hexcore-helix.win32-x64-msvc.node.bak-20260802-fix142`.
+An additional 12-lift cross-corpus gate (five Lara functions, Lies of P,
+Mali, vgk, three Malwarebytes drivers, and the controlled `malware.ko`)
+completes 12/12 with seven changed outputs, flat confidence throughout, no
+call/store/return/goto/label anomaly, and a net +60 lines from the same
+interference-preservation policy. A normalized sweep over every usable kernel
+lift currently present in the local corpus completes **30/30** across six
+binaries. Versus FIX-146, 18 outputs are byte-identical and 12 change for a
+net +74 lines; confidence stays flat and the same side-effect audit is clean.
+The installed addon also passes the final IDE lanes: Mali CSF 3/3 at 79.5%
+with the source signature intact, and ROTTR 2/2 with output byte-identical to
+the accepted post-disassembler-1.4.25 baseline. On HTB Funkynator, the current
+pipeline expands the historical 20-line false-100% stub to 162 lines, restores
+the menu loop and all five paths, and honestly caps the remaining PIE/dataflow
+debt at 50%.
+
+**FIX-146 (elide invariant native-SCF tuple storage).** The native
+SCF-to-HelixHigh bridge now avoids synthesizing `scf_r*` storage for an
+`scf.if`/`scf.index_switch` result when every region either forwards the same
+outside SSA value or yields the same typed `arith.constant`. Loop-carried
+`scf_w*` storage and its parallel-copy shadow are likewise omitted when the
+`scf.condition` forwards the exact before-block argument unchanged. Direct
+`ub.poison` is never treated as invariant evidence, and changing components,
+swaps, rotations, and partial PHIs retain the full FIX-132/FIX-145 routing.
+
+Three focused contracts cover changing PHI operands, invariant if-tuple
+components, and a loop tuple with one pass-through plus one changing
+component. The native suite passes **210/210**. On the fresh IDE-produced Mali
+lift, the post-bridge IR loses 23 `scf_r` declarations and 46 assignments; the
+final C drops from 2,139 to 2,120 harness lines while confidence (79.5%), the
+single placeholder, and 60 suspicious self-references remain flat. The fresh
+NUCLEO 80-function gate completes 80/80 with zero failures: 54 outputs are
+byte-identical, 26 remove a total of 71 `scf_*` assignments and 77 lines, and
+all confidence/placeholder/self-reference metrics remain flat. No corpus case
+exercised the loop pass-through optimization; that policy is validated by its
+focused IR contract rather than claimed as an empirical corpus improvement.
+The ten-function determinism oracle is stable at K=10. Candidate addon (not
+installed in the IDE):
+`target/release/hexcore-helix.fix146-invariant-scf-rw.node`, SHA-256
+`97A3E8E7549779C54F3D01A9F2E82E048F328C36E0040562A26833596273A0DD`.
+
+**FIX-145 (preserve CFG/PHI values through native SCF lowering).**
+`helix_low.jmp` and `helix_low.jcc` now implement MLIR's
+`BranchOpInterface` and retain the operands forwarded to each successor.
+`StructureControlFlow` no longer destroys every block argument before
+`transformCFGToSCF`; it forwards type-compatible edge values and inserts
+`ub.poison` only when an edge genuinely lacks required evidence. Operand
+capture is deliberately delayed until the replacement terminator is emitted,
+after Remill bookkeeping RAUW has completed. This avoids retaining stale SSA
+handles or resurrecting Remill `MEMORY` tokens.
+
+The focused Low-dialect diamond regression routes constants from both arms to
+one merge argument with zero poison. The native suite passes **208/208**.
+Direct A/B on the IDE-produced
+`mali-csf-fix142-single-20260730/.../kbase_csf_kcpu_queue_process.fix142.ll`
+is byte-identical to FIX-144 at 79.5% / 2,139 harness lines: the Mali PHIs in
+that lift are Remill memory-state tokens and remain correctly absent from C.
+`BattleConductor-inner` instead preserves 16 real scalar edge operands with
+zero padding, removing the old unconditional-PHI substitution behavior.
+PlayerAwareness, IsInfiniteAmmo, and the Lies of P health xref remain
+byte-identical with flat confidence.
+
+The fresh 80-function NUCLEO gate completes with zero failures: 42 outputs are
+byte-identical and 38 expose newly routed values. Confidence is flat in 79
+cases. `sub_1400788b0` falls from 47.0% to 39.5% because the honesty gate sees
+four explicit placeholders instead of one, while the output eliminates all
+16 synthetic `(int32_t)0.0f` PHI substitutions and restores the corresponding
+`max` branches. This is increased visible debt, not semantic loss. The
+ten-function determinism oracle is stable at K=10. Candidate addon (not
+installed in the IDE):
+`target/release/hexcore-helix.fix145-preserve-phi.node`, SHA-256
+`EA6B9EF942390DF32C88C75E8C488225C111196C22FCDB85F073256FAE3EFDC1`.
+
+**FIX-144 (explicit return binding at structured exits).** A new
+`BindReturnValues` pass runs after variable recovery and before DCE. For a
+non-void function with exactly one canonical `result` declaration, every
+remaining Low return is replaced by a High return whose value is a `VarRef`
+to that declaration's `var_id`. Void, missing-evidence, and ambiguous-result
+functions retain the conservative implicit-return fallback. Four focused
+tests cover all policies; the native suite passed **207/207**. Targeted
+Lara/Lies/Mali A/B and a fresh 80-function NUCLEO gate were byte-identical to
+FIX-143, and the NUCLEO K=10 oracle was stable. Candidate addon:
+`target/release/hexcore-helix.fix144-explicit-return.node`, SHA-256
+`96309166444A3273796016A6F384425BF8B477110DADBE91457E2B4D2196DC77`.
+
+**FIX-143 (single ABI return identity across structured regions).**
+`RecoverVariables` Phase 2.5 now reuses the exact `result` SSA identity
+created by the top-level walk when nested `if`/loop regions also write RAX.
+The old fallback probed the non-existent key `RAX__result`; the SSA path did
+not register that key, so the fallback always synthesized a second VarDecl
+with the same C identifier. The fix resolves the existing return value by
+`var_id` from the RAX version set and creates a new return slot only when the
+nested region is genuinely the first producer. This is an IR identity fix,
+not a printer-side declaration deduplication, so assignments and uses in both
+regions remain attached to one storage object.
+
+A focused regression covers a top-level return-register write plus a nested
+structured write and requires one declaration, one referenced `var_id`, and
+two assignments. The native suite passes **203/203**. A/B decompilation against
+FIX-142 on `PlayerAwareness-sub2`, `BattleConductor-inner`, `IsInfiniteAmmo`,
+and the Lies of P health xref removes exactly one duplicate declaration from
+each output; every function body and confidence score is otherwise
+byte-identical (68.7%, 50.0%, 82.0%, and 46.6%). All four targets are stable at
+K=10 in-process. A fresh same-frontend NUCLEO A/B completes **80/80** with
+zero confidence regressions: 67 outputs are byte-identical and 13 change.
+Eight changes only remove the duplicate declaration. The other five preserve
+CFG, calls, and memory stores while exposing the real RAX-to-result copy that
+the split identities previously hid; one also propagates the surviving
+pointer type to two dependent locals. Candidate addon:
+`target/release/hexcore-helix.fix143-result-identity.node`, SHA-256
+`ED44A5364EBE7DC3D8B482DDB2E711FB0BAA244278CE04F3BD2CE8BE3E1E49D2`.
+
+**FIX-142 (identical SCF yield-arm folding).** The C-AST optimizer now folds
+the exact structured shape
+`if (A) { tuple } else if (B) { tuple } else { other }` into
+`if (A || B) { tuple } else { other }` when both successful arms contain the
+same ordered list of plain assignments to the same engine-reserved `scf_r*` or
+`scf_w*` variables. Target names, expression structure, and C types must all
+match. Logical OR preserves the original short-circuit evaluation of `B`.
+The fold runs once during normal expression cleanup and once after global DSE,
+which can expose identical arms only at the end of optimization. It does not
+coalesce loop-carried storage, remove tuple components, or weaken FIX-132.
+
+On current scoped-debug `kbase_csf_kcpu_queue_process`, the output drops from
+2,188 to 2,140 counted lines and from 123,202 to 119,734 bytes. Six nested
+branches and 30 duplicate `scf_*` writes disappear; confidence remains 79.5%,
+the exact `queue`/`drain_queue` signature remains intact, and both parameters
+still have zero assignments. Final output SHA-256:
+`523E66DB8083720C9D46FBD2DDA1091B0545A3253E426208F282AEA57E4857E6`.
+
+The native suite passes **202/202**. The debug-aware target and the standard
+ten-function NUCLEO oracle are deterministic at K=10. A fresh FIX-141/FIX-142
+NUCLEO A/B completes **80/80** with 80 flat / 0 confidence regressions:
+52 outputs become smaller, 28 are byte-identical, and the changed set loses
+1,759 lines. A normalized adversarial diff audit finds zero additions outside
+new `||` conditions and zero removals outside old branch structure or duplicate
+`scf_*` assignments. Installed addon:
+`target/release/hexcore-helix.fix142-identical-scf-arms.node`, SHA-256
+`874876C864E61A89E8CA333A126A97CB7E0C6D58FC6C39D713D5CFC23E69BA07`.
+The same hash is installed at
+`vscode-main/extensions/hexcore-helix/hexcore-helix.win32-x64-msvc.node`;
+the final isolated three-step IDE job passes 3/3. Its debug-aware output is
+132,483 bytes / 2,389 lines / 79.5% confidence, SHA-256
+`FA388BA8D6ECE138D0A172C0F838F5624700A587F00CCF0D39A609555AC739D8`,
+with the exact source signature and zero assignments to `queue` or
+`drain_queue`. A normalized IDE diff contains only the six combined `||`
+conditions and removal of 30 duplicate SCF assignments plus obsolete branch
+structure.
+
+**FIX-141 (structured-region parameter shadowing).** `RecoverVariables`
+preserves a fixed DWARF/BTF/PDB source parameter when its ABI register is
+reused inside a structured High-IR region. Phase 2.5 Strategy B previously
+bound every nested register read/write to the containing top-level block exit
+snapshot. On x86-64 SysV this made nested RDI/RSI writes mutate
+`queue`/`drain_queue` themselves. The pass now creates one mutable shadow per
+top-level block and fixed parameter register, initializes it from the source
+parameter immediately before the structured operation, and binds nested
+machine-register traffic to that shadow. Flat post-entry register versions
+also remain distinct from certified source parameters.
+
+The native suite passes **199/199**. On the current
+`kbase_csf_kcpu_queue_process` lift with scoped real debug metadata, the
+signature is exactly
+`void kbase_csf_kcpu_queue_process(struct kbase_kcpu_command_queue* queue, bool drain_queue)`;
+assignments to either source parameter fall to zero, confidence remains
+79.5%, and the output is stable across ten in-process runs. The no-debug A/B
+against FIX-139 is byte-identical. The full three-step IDE job passes 3/3 and
+produces SHA-256
+`7EE036E827CE53EA6C46793A7A30AF575C089F5E76234C0C1A69F34FA16DEFB9`.
+Candidate and installed addon:
+`target/release/hexcore-helix.fix141-region-param-shadow.node`, SHA-256
+`DE90BDE813C5AF8ACE80C7BE96692A2301A9E780AB47DB69D907CF78D1B1A7E4`.
+The full IDE artifact still contains 67 `scf_r*` region-result values and 34
+`scf_w*` loop-carried values (781 writes, 101 reads); those are the next
+structured-output quality target and are not part of the parameter-identity
+fix.
+
+**FIX-140 (prefer complete duplicate debug signatures).** The HexCore
+disassembler's DWARF/BTF loaders now select the better duplicate signature
+instead of accepting the first equal-arity declaration. More parameters win;
+at equal arity, real source names win over synthesized `param_N` names. This
+fixes kernel DWARF where an early declaration of
+`kbase_csf_kcpu_queue_process` had unnamed parameters and the later definition
+carried `queue` and `drain_queue`. The shared selector is covered by three
+focused policies inside the **11/11** BTF/debug-loader suite. A direct load of
+the real Mali module now returns the source names and types. This is a
+disassembler metadata fix shipped as disassembler 1.4.24; the interim
+`fix140-debug-param-identity` Helix probe is superseded by FIX-141.
+
+**FIX-139 (authoritative source parameter count and AAPCS64 mapping).**
+Non-variadic debug signatures now publish an exact source-level parameter
+count, and calling-convention recovery intersects ABI register candidates with
+that certified set. AAPCS64 parameter indices are derived from X0-X7 rather
+than accidentally using the x86 register lookup. Variadic metadata is carried
+from DWARF/BTF so open-ended signatures retain legacy ABI discovery instead of
+being truncated. The native suite passes **198/198**. Candidate addon:
+`target/release/hexcore-helix.fix139-aapcs-debug-params.node`, SHA-256
+`4F1E6B9C99B78D2ECF9479FA7A4EA3624AE05C58E670582FA54D72D58759E142`.
+
+**FIX-138 (debug signatures before ABI inference).** The pipeline seeds
+authoritative debug function signatures before calling-convention recovery,
+then runs the full nominal type application at Tier 3.5. A debug-proven `void`
+return now overrides the RAX return heuristic, so scratch writes in a void
+function do not invent a source result. Nominal propagation is guarded to
+prevent a recovered struct/pointer type from contaminating incompatible
+storage. Experimental region-SSA probes were rejected after semantic
+regressions; the guarded signature implementation is the retained result. The
+native suite passes **196/196**. Candidate addon:
+`target/release/hexcore-helix.fix138-debug-signatures-guarded.node`, SHA-256
+`D8D44EC8CAC3F606970212C4F0A9401EC45E317FE2DFB7282EF2E512E533A891`.
+
+**FIX-136/137 (per-block PC evidence and x86-64 PC32 data relocations).**
+Before LLVM-to-MLIR import, the pipeline now preserves Remill
+`bb_<decimal-address>` evidence and stamps it on the imported function.
+`RemillToHelixLow` seeds PC/NEXT_PC at each block boundary, preventing a linear
+walk from reusing bookkeeping from an unrelated layout neighbour. In the
+disassembler, `R_X86_64_PC32` against a non-executable named object is routed
+as RIP-relative data rather than call/jump relocation and encoded using
+`S + A - (P + 4)`. This restores readonly kernel data references without
+misclassifying executable or undefined symbols. Retained probes:
+`hexcore-helix.fix136-block-address-evidence.node` (SHA-256
+`F2F671C830CEC79D05BC4CC54E7C122E1E74ECE9FA4CB71A5113B844ADF7631A`)
+and `hexcore-helix.fix137-pc32-rodata.node` (SHA-256
+`2459C0CF7B236042A57D28CC10B862197D7365493805D3EBB446025D04115D29`).
+
+**FIX-135 (explicit High-IR type propagation dispatch).** The second
+`PropagateTypes` invocation no longer chooses its analysis tier from the
+function container dialect. `HelixMidToHigh` intentionally retains
+`helix_low.func` as the container while replacing its body with High
+operations, so the former dispatch ran Low propagation over a High body and
+made the High implementation effectively dead in the standard pipeline. A
+dedicated `createPropagateTypesHighPass()` now visits High operations through
+the retained Low container, while the original factory remains Low-only.
+
+The mismatch was reproduced on a freshly lifted Mali
+`__SCT__tp_func_mali_pm_status` function as an LLVM `dyn_cast` assertion on a
+non-existent value during the second propagation pass. The corrected target
+decompiles deterministically in two runs at 62.0% confidence, and a regression
+covers High operations nested in a Low function container. The native suite
+passes **192/192**. A boundary-normalized cross-kernel gate freshly lifted and
+decompiled **128/128** selected functions across two ELF modules and four
+Windows drivers with zero lift, Helix, or assertion failures. IDA 9.3 produced
+pseudocode for 26 of 30 selected references; all 26 shared references resolve
+to exact function starts after translating ET_REL section-relative addresses.
+Candidate addon:
+`target/release/hexcore-helix.fix135-high-type-dispatch.node`, SHA-256
+`87B586B47E5C0FECF09F5140C5B36FA9DF77CC41FE59CAF3F4BC51CF615E50CD`.
+The same binary is installed in the IDE runtime. The final
+debug-metadata-aware IDE gate passed 3/3 in 141.655 seconds. The fresh
+`kbase_jit_allocate` output is 33,477 bytes / 699 lines / 79.5% confidence,
+SHA-256
+`1CF83FCD7C0D6B7AB72B78BD1B9F11428920772AE941EF4980F18361B4FEBFC2`.
+It retains the debug-proven signature and named array accesses, both stack
+cleanup calls, distinct SCF terminal values, and emits no stack-canary call or
+unhandled-control-flow marker. One placeholder and five suspicious
+self-referencing assignments remain as honest quality debt.
+
+**FIX-134 (structured stack-canary polarity and SCF loop exit).** Stack-canary
+elision now selects the normal arm by locating a direct
+`__stack_chk_fail`/toolchain-equivalent call in exactly one arm instead of
+assuming the `then` arm is normal. The search recurses through structured
+control flow to reach the check but deliberately classifies only direct arm
+contents, so an outer `if` that contains an entire cleanup dispatcher is not
+mistaken for the failure branch. Generic `abort()` calls are no longer treated
+as proof of a stack-canary check.
+
+The full IDE gate exposed this after FIX-132 preserved the loop tuple:
+`kbase_jit_allocate` reached state 6 with distinct storage, but C-AST constant
+branch cleanup retained the failure tuple (`next_state = 5`, `continue = 1`)
+and discarded the normal termination tuple. The emitted cleanup could cycle
+forever through `6 -> 5 -> 4 -> 3 -> 2 -> 1 -> 0 -> 6`. FIX-134 keeps
+`next_state = 0`, `continue = 0` at the terminal arm. The final debug-aware
+Mali output is 26,058 bytes / 570 printer-counted lines / 79.5% confidence,
+SHA-256
+`DF6745006A8E25DB66E7879A2AA1358C69A44CD630E8075900AFED6F81B85B6B`.
+The native suite passes **191/191**. A fresh NUCLEO 80-function A/B is
+**80/80 byte-identical** to FIX-133 with 80 flat / 0 confidence regressions;
+the standard ten-function set and ten debug-aware Mali runs are deterministic.
+The fresh three-step IDE automation gate also passes: its debug-layout-enriched
+artifact is 33,218 bytes / 698 lines / 79.5% confidence, SHA-256
+`3E440AF32E75FF9E9E299286C657338FF299E6983C60B886E7F37A76FAF3A99F`,
+with the same terminal `next_state = 0`, `continue = 0` behavior.
+Installed addon SHA-256:
+`7B5EE472C5C3CED506910764667D232B9800141A5CA62E722326E8C4AF3DE447`.
+
+**FIX-132 (preserve SCF tuple and loop storage identities).** Phase 4 of
+`RecoverVariables` no longer applies generic cover-based storage reuse to
+`scf_r*`/`scf_w*` variables created by `StructureControlFlow`. Those variables
+represent region-result tuple components, loop-carried state, continuation
+conditions, and parallel-copy shadows. Their lexical block covers can look
+disjoint even though the values are simultaneously live across a region join
+or loop backedge. On `kbase_jit_allocate`, the former merge collapsed
+`next_state`, an auxiliary result, and `continue` into one scalar. Sequential
+tuple assignments then overwrote every next state with `1`, and emitted a
+cleanup `do...while` whose terminal state could never stop. The corrected
+output retains the real `5 -> 4 -> 3 -> 2 -> 1 -> 0 -> 6 -> exit` cleanup
+chain. A regression covers three disjoint SCF bridge identities, including two
+same-width `i32` components, so a width-only guard cannot reintroduce the bug.
+
+**FIX-133 (post-DSE empty-branch cleanup).** The final post-order empty-if
+sweep now runs after `removeGloballyDeadStores`. Preserving SCF identities
+exposed many dead selector stores inside nested dispatcher arms; the global
+DSE correctly removed those stores but previously left empty `if/else` shells
+because it ran after the last branch cleanup. This ordering fix removed 905
+lines of empty shells from the FIX-132 NUCLEO output without changing the
+corrected Mali result.
+
+**FIX-132/133 validation.** The debug-aware `kbase_jit_allocate` output is
+26,094 bytes / 571 lines / 79.5% confidence. It retains the FIX-130 named
+`jit_current_allocations_per_bin[index]` accesses and FIX-131 void-call
+statements while preserving distinct cleanup states and continuation storage.
+The native suite passes **189/189**. A fresh NUCLEO 80-function A/B against
+FIX-131 completes **80/80**: confidence improves in 41 functions, stays flat
+in 39, and falls in none; 73 outputs change because the old generic merge had
+affected SCF storage broadly. The standard ten-function set is stable for
+10/10 in-process repetitions, and Mali with real debug metadata produces one
+SHA-256 across ten runs:
+`0225A9F4576F368DE7CBF3412911FE7C0E26424B237333EC6562190C3EA1BD82`.
+Installed addon SHA-256:
+`B67078EA1B697653C51E73CC758576F6AF01CE137413194A3410CB587145A37D`.
+
+**FIX-131 (debug-proven void-call statements).** A lifted ABI result-register
+binding no longer forces an assignment when the call's recovered debug
+signature proves its return type is `void`. The C-AST builder preserves the
+call as an expression statement and clears copy-equivalence caches, producing
+valid C without a callee-name allowlist. On `kbase_jit_allocate`, ten false
+assignments were removed for DWARF-void functions including `mutex_lock`,
+`mutex_unlock`, `up_read`, `_dev_err`, `trace_jit_stats`, `kfree`, spinlock,
+and page-release helpers. Both cleanup calls now emit as
+`kfree(var_40);` / `kfree(var_38);`. Confidence remains 73.5%, suspicious
+self-references fall from 8 to 5, the complete native suite passes
+**187/187**, Mali is byte-stable across 10 debug-aware runs, and a fresh
+NUCLEO 80-function run remains **80/80 byte-identical** without debug
+metadata. Installed addon SHA-256:
+`DF5D0A488FF824302BCAF16509BECE26481BF9A16D79574C9D0A14117FC892BC`.
+
+**FIX-130 (debug-proven nominal aliases and indexed arrays).** Direct copies
+from a debug-typed nominal pointer can now replace only a synthetic
+`auto_struct_N*` destination type. The rule requires a direct
+`VarRef -> VarRef` assignment and a pointee present in the supplied debug
+database; it does not perform general dataflow or retag scalar storage.
+`ApplyDebugTypes` also recognizes the exact unit-stride address form
+`base + index + fieldOffset` when the nominal struct has a matching
+`u8`/byte/bool array field. It annotates that address for the C-AST builder,
+which emits a named subscript without reinterpreting unproven pointer
+arithmetic.
+
+**FIX-130 validation.** On the relocation- and debug-aware
+`kbase_jit_allocate` artifact, `v5` is now declared
+`struct kbase_context*` and both raw `*(v5 + result + 0xC5EA)` expressions
+become `v5->jit_current_allocations_per_bin[result]`; the second is
+canonicalized to `++`. Those are the only two C changes versus the
+nominal-alias stage. Confidence remains 73.5%, issues do not increase, both
+stack-local `kfree` arguments remain intact, and no stack-canary call returns.
+The complete native suite passes **187/187**. A fresh NUCLEO 80-function A/B
+produced **80/80 byte-identical** outputs without debug metadata. Determinism
+is **10/10 stable** at K=10 on NUCLEO and 10/10 byte-identical on Mali with
+the real debug JSON. Installed addon SHA-256:
+`3574497D851F01445B19C92B96BA92F04176C9B65E5535012CF5CCA3934E61F5`.
+
+**FIX-129 (addressable stack-local alias safety).** Global C-AST copy
+propagation no longer inlines variables with a known stack offset. Their
+address may still be represented as frame-pointer arithmetic and recovered as
+`&var_X` only by the later `resolveFramePointerLeaks` pass, so treating an
+initializer as immutable before that recovery is unsound. On
+`kbase_jit_allocate`, the old ordering changed the real
+`kfree(prealloc_sas[0])` cleanup into `kfree(0)` even though
+`&prealloc_sas[0]` escaped to an allocator helper. The corrected output keeps
+`kfree(var_40)` and `kfree(var_38)`, matching the IDA/source cleanup.
+
+**FIX-129 validation.** The focused alias regression and complete native suite
+pass (**186/186**). A fresh NUCLEO 80-function A/B completed **80/80**:
+69 outputs are byte-identical, 11 retain potentially aliased stack stores,
+average confidence rises 58.783% -> 58.820%, one function gains 3.0 points,
+and none regress. The corpus grows by 67 lines in exchange for removing the
+unsound propagation. Determinism remains **10/10 stable** at K=10. Final
+isolated and installed addon SHA-256:
+`47CE752C7C5DD5D735C7765634D68EA6DE5CF19D29F0F74348054C0D572710AC`.
+The definitive debug-info-aware IDE gate passed 3/3 in 62.891 seconds from a
+fresh isolated workspace. Its lift is unchanged after timestamp
+normalization, and two independent final-addon runs produced identical C
+(SHA-256
+`8965AB4CCF4F4743872CAC925FD959D4A0AD52B0AC35A3BE4B0C725B569482DC`):
+33,821 bytes / 685 lines / 73.5%, with `v5 = kctx`, both stack-local cleanup
+arguments preserved, and no residual `__stack_chk_fail`.
+
+**FIX-128 (C-AST parameter identity, stack-canary register reuse, and
+structured liveness).** C-AST prologue removal no longer treats every copy
+to or from a callee-saved register as disposable ABI noise; it removes only
+demonstrable frame setup/teardown forms. Stack-canary recognition follows a
+one-hop register-to-stack spill and owns the spill slot rather than a transfer
+register that may immediately be reused for a semantic parameter. Assigned
+forms of `__stack_chk_fail` are removed with expression-statement forms.
+Backward DSE now computes structured live-in sets across nested branches and
+loops, respecting intervening definitions instead of either missing deep uses
+or conservatively retaining every nested read.
+
+**FIX-128 validation.** Fresh per-pass tracing of the current
+`kbase_jit_allocate` lift proved that `param_1 -> rbx` and every later field
+base survived Low, Mid, High, and Mid-to-High; identity was lost only in the
+C-AST optimizer. The corrected standalone output replaces the fabricated
+null base with `v5 = this`, retains all later `v5->field_*` accesses, and
+removes the residual assigned `__stack_chk_fail` call at unchanged 73.5%
+confidence. The first recursive-read prototype was rejected after a fresh
+80-function NUCLEO A/B showed avoidable output growth. The refined
+definition-aware transfer completed **80/80** without a crash; versus the
+preceding stage, average confidence is unchanged (two +3.0, two -3.0/-2.5
+honesty deltas) and the two decreases expose real definitions previously
+replaced by zero. The complete native suite passes **185/185**, and the fixed
+ten-function set is **10/10 stable** over K=10 in one process. Installed IDE
+addon SHA-256:
+`DC5EF26683EE62C5BE8EF051F6B5268C2FE6D28313B75225086B1FACEE439643`
+(superseded by FIX-129);
+rollback addon SHA-256:
+`78195F87EA787173EC563B7822A4E270B5C5946BD7E6A817860DB07822730148`.
+The isolated debug-info-aware IDE job passed 3/3 in 58.069 seconds. Its fresh
+lift is byte-identical to the preceding lift after normalizing the generation
+timestamp. Typed C remains at 73.5% and now contains `v5 = kctx`, with no
+fabricated null base or residual `__stack_chk_fail`.
+
+**FIX-127 (x86 signed division semantics).** The common Remill
+`CQO_RAX -> IDIVrdxrax` sequence is now lowered as a proven same-block pair:
+the current RAX SSA value is divided by the incoming divisor, quotient is
+written to RAX, and remainder to RDX. The transient CQO RDX write is removed
+for the pair so it cannot overwrite or alias the live divisor; standalone CQO
+still sign-extends RAX into RDX. Pairing state is reset for every function and
+unpaired/general 128-bit IDIV remains on the conservative helper path. Added
+an end-to-end regression that checks signed remainder recovery, divisor
+preservation, and removal of raw CQO/IDIV helpers.
+
+**FIX-125/FIX-126 (leaf return identity and NEG writeback).** Call-free x86
+functions now preserve the final return-register definition as the exact
+`result` identity consumed implicitly by DCE and the C emitter. Remill machine
+helper `CQO_RAX` does not count as a source-level program call. The policy is
+intentionally restricted to call-free x86 functions; AAPCS64 retains its
+existing return handling and call-heavy x86 code keeps the established
+coalescing policy. `NEG` lowering now negates the source value and writes it
+back to the register or memory destination instead of treating the destination
+pointer as the operand and dropping the result. Focused regressions cover
+exact RAX return preservation, CQO classification, and NEG writeback.
+
+**FIX-125 through FIX-127 validation and de-obfuscation audit.** The native
+suite passes **179/179**. The current `HelixCalcBench` binary corpus was lifted
+fresh: clean floating-point calculator A and polymorphic/vtable calculator B
+are byte-identical to FIX-126; obfuscated calculator C now recovers MBA
+addition/subtraction, multiplication, XOR, guarded signed division and modulo,
+and both opaque-predicate helper results without the prior lost-input,
+self-referential quotient, or divisor-alias failures. The full flattened
+dispatcher and indirect operation table are still present, so this is a
+semantic-lifting improvement, not a claim of generic de-obfuscation. A fresh
+NUCLEO 80-function sweep produced **80/80** outputs byte-identical to FIX-126,
+and the ten-function determinism set is **10/10 stable** at K=10
+(`unstable=0`). Final isolated addon:
+`C:\tmp\hexcore-helix.fix127-cqo-idiv.node`, SHA-256
+`0FF9A1D755B8F430190B2DD716FB4FAB6B30B2A0A333293A5FA5773F6943F7C8`.
+The IDE addon was not replaced.
+
+**FIX-124 (issue #15 C2, explicit floating-call preservation).** Direct
+LLVM calls with floating-point operands or results now remain in authoritative
+SSA form through `RemillToHelixLow`. Previously the pass discarded their
+explicit operands, reconstructed only integer ABI registers, synthesized an
+integer return, and replaced the real floating result with `undef`; this
+produced malformed output such as `sqrtf()`. The preserved call retains its
+XMM-derived arguments and floating return dataflow for the C-AST. Unrecognized
+mangled calls still report a warning. Added a minimal end-to-end regression
+that fails on an empty `sqrtf()` call.
+
+**FIX-124 validation.** The complete native suite passes **175/175**. On the
+frozen issue #15 `UpdatePosition` compatibility fixture, all three `sqrtf`
+calls remain present while empty calls fall **2 -> 0**; output stays at 310
+lines and 50% confidence because the unrelated honesty defects remain.
+The output is byte-stable across ten in-process runs. A fresh 80-function
+NUCLEO binary-to-IR-to-C sweep completed **80/80** and was byte-identical to
+the FIX-123 candidate for every function, with no missing or extra output.
+The standard ten-function determinism set is **10/10** stable at K=10.
+Final isolated addon:
+`C:\tmp\hexcore-helix.fix124-fp-call-final.node`, SHA-256
+`B9D4EB25531F94491427FC3DE97F360B1EDC81F29B353096E2E31283776A9769`.
+It has not been installed, committed, or published.
+
+**FIX-123 (issue #31 residual honesty and address-shape recovery).**
+Remill `Do<MNEMONIC>` wrappers are now decomposed conservatively, with
+`DoINT_IMMb` rendered as the semantic `software_interrupt` call instead of a
+fabricated binary callee. Field recovery now accepts only a direct pointer
+base plus a positive signed displacement: indexed/global address expressions
+and negative displacements remain explicit pointer arithmetic instead of
+inventing fields such as `field_0x18b30` or
+`field_0xffffffffffffffb0`. The confidence gate now detects returned locals
+that are assigned on only some structured paths and caps them at 50%, while
+excluding address-taken locals that a call may initialize indirectly. Added
+focused regressions for all three bug classes and the alias-safety exclusion.
+
+**FIX-123 fresh validation.** Both original issue repros were lifted again
+from their PE binaries with the current Remill addon; no historical `.ll`
+entered the test. `partialencryption:0x140001C30` keeps the same IR hash,
+eliminates `DoINT_IMMb`, and changes 90% High to an honest 50% Low because
+`result` is conditionally initialized. `ffmodule:0x14000A340` keeps the same
+IR/confidence (62%) while all six false `field_0x18b30` accesses disappear.
+A 20-function NUCLEO back-edge A/B completed with 20/20 identical IRs, zero
+lift/Helix failures and zero missing branch targets; false negative-offset
+fields were removed. Two real conditionally initialized returns moved to the
+50% cap, and two small score decreases (-1.0/-1.7) reflect newly visible raw
+pointer placeholders instead of false struct evidence. A separate fresh
+80-function NUCLEO sweep produced C for 80/80 functions: suspicious large
+fields dropped **373 -> 3**, negative/zero-extended fields dropped
+**310 -> 0**, and generic Remill `Do*` wrappers dropped **2 -> 0**. Eight
+outputs previously above 50% now cap at 50%; manual review confirmed that
+each emitted body returns an uninitialized `result` on at least one path
+(including five GL loaders whose real signatures are void, but were emitted
+as returning a conditional call result). The complete native suite is
+**174/174 passing**, and ten fixed NUCLEO functions are byte-stable across
+ten in-process repetitions each. Candidate addon SHA-256:
+`D03B22697EA9A8F86FF09CB13D6EC647C34E70CF1C14A9E41C558310E874E62B`;
+it is isolated in `C:\tmp` and has not been installed or published.
+
+**Native pipeline API and HAST serialization hardening.** `Pipeline` now
+registers the standard DLTI, arith, cf, func, scf and ub dialects it consumes,
+so direct library users no longer depend on `Engine` having initialized an
+MLIR context first. FlatBuffer serialization now filters absent expression and
+statement children instead of inserting `Offset(0)` into vectors, which
+violates the real FlatBuffers builder contract and aborted the native test
+path. Added a null-child serializer regression. The complete CMake suite is
+**174/174 passing**.
+
+**Fixture provenance and release evidence.** Remill 6/7 `.ll` files under
+`tests/` are explicitly frozen compatibility fixtures, not evidence for the
+current lifter, IDA parity or release quality. Fresh release probes now record
+binary/addon/IR hashes and avoid persisting IR unless a current CMake-vs-addon
+comparison requires it. On current binaries, the x86/x64 CFG gate passed 8/8
+back-edge functions with zero missing branch targets. AArch64 was deterministic
+for 120/120 runs on the SP-disabled path, but high-confidence output still
+contains raw branch/address/store helpers; AArch64 remains experimental.
+
+**Release hardening - temporary P0/SCF diagnostics are opt-in.** Call-conversion, DCE, calling-convention, lift-coverage, and SCF stage telemetry no longer writes to the host terminal during normal decompilation. `HELIX_PIPELINE_DEBUG=1` enables the shared pipeline diagnostics, while `HELIX_SCF_SPIKE_DEBUG=1` enables only the SCF progress trace; genuine pass failures remain visible unconditionally. The release addon rebuilt successfully. On the fixed NUCLEO determinism set, all 10 functions remained stable across 10 in-process repetitions, with zero `[P0-DEBUG]` and `[SCF-SPIKE]` records; the final silence check also produced zero `[LIFT-STATS]` and `[CC-FIX]` records.
+
+**FIX-122 (issue #56 stub-confidence honesty) - empty/bare-return output can no longer report Medium or High.** Added final-AST `emptyStubBody` as a damning defect in both confidence scorers, with a located reason and a hard cap at 50%. A call-return wrapper is not blindly capped in the engine because it can be a legitimate thunk; the IDE supplies the missing authoritative evidence (`bytesConsumed`, known function size, emitted line count) and caps measured under-lifts or large functions collapsed to only call/return. The original HTB `ransom_unpacked` 389-byte fixture now rewrites 85% High to 50% Low, while a genuine 12-byte wrapper stays unchanged. Registry-miss tests are 3/3 passing; packaging honesty tests are 12/12 passing.
+
+**FIX-121 (DWARF/BTF/PDB nominal type bridge) - carry debug signatures and layouts into the MLIR pipeline instead of limiting them to a text post-processor.** Added a versioned JSON transport across N-API/C API/Engine/Pipeline and a scoped `ApplyDebugTypes` pass after Mid-to-High. Function parameters and returns now use debug names/types; typed call returns are bound through the local ABI sequence (`call -> result/RAX -> destination`) without poisoning the globally reused result register; nominal debug structs outrank only synthetic `auto_struct_N` evidence; and embedded fields resolve recursively without following pointer-member cycles. `CAstBuilder` now parses the same canonical C type spellings for parameters, returns, calls, and locals. **Mali validation:** `kbase_jit_allocate` now emits `struct kbase_va_region* kbase_jit_allocate(struct kbase_context* kctx, struct base_jit_alloc_info* info, bool ignore_pressure_limit)`, `v4` is `kbase_va_region*`, and offsets `0x70/0x78` become `jit_node.next/prev`. Confidence remains 73.5%; no-metadata output remains 73.5%/463 lines; 5/5 DWARF runs are byte-identical.
+
+**FIX-119 (C AST scalarized vector lane zero) - stop emitting non-compilable scalar subscripts for `llvm.extractelement ..., 0`.** `CAstBuilder::convertType` deliberately flattens LLVM/MLIR vectors to their element CType, but `ExtractElementOp` still emitted a `CSubscriptExpr`, producing invalid C such as `float v; v[0]`. Under the existing scalarized representation the expression already denotes lane zero, so constant lane-zero extracts now return the scalar expression directly; non-zero lanes remain explicit until the C AST gains a sized vector type. Added `VectorLaneTest.LaneZeroOfScalarizedVectorIsNotSubscripted`. **Validated:** engine Release build passes; focused vector + Phase-3.5 variable guard tests pass; SOTTR HealthData full IR keeps 306 lines/61 conditions/11 calls while scalar subscripts drop **63 -> 0** and the scalar-float honesty defect disappears; 10/10 engine-direct outputs are byte-identical. Confidence remains honestly capped at 50% for the separate surviving code-address leak at `0x140253B21`. **Packaged 2026-07-11:** tagged as `target/release/hexcore-helix.fix119-lane0.node`, installed into the IDE extension, and load-tested through `decompile_ll.cjs` with zero numeric subscripts.
+
+**FIX-118 (issue #31 D3 honesty) - surviving post-return statements hard-cap confidence at 50%.** Soft penalty alone (`unreachableAfterReturn * 5`, cap 40) still allowed Medium/High on bodies that print statements after `return`. Category (6) `postReturnUnreachable` in `detectDamningDefects` (`DamningDefect.h`) counts same-scope post-return siblings (nested independently, matching the soft scorer) and trips the damning cap with a located reason. Packaging safety net in disassembler mirrors FIX-110/D1 text patterns until the next `.node` ships. Does **not** close #31 fully (bare `var=0xBLOCK` D1 residual, registry D2 opt-in, full CFG-reachability D3 remain).
+
 **FIX-117 (output determinism) - the same byte-identical engine produced different C across runs (var numbering, bool/int labels, some DSE, +/-few% confidence).** Two root causes, both fixed. (1) `PropagateTypes` iterated `llvm::DenseMap<Value, CTypeInfo> typeEnv` in POINTER-address order (varies per decompile: each call allocates ops at fresh addresses) to write the `inferred_type` attr on `val.getDefiningOp()`; multiple results of one op (a `helix.low.BinOp`'s value + carry/zero/sign flags) share a defining op, so the per-Value last-write "winner" was non-deterministic (the observed inferred_type bool vs int64 flip, cascading into DSE / variable merging / var counts). FIX (PropagateTypes.cpp low ~1975 + high ~2989) = pick a deterministic winner per op, the resolved result with the LOWEST result number (the op's primary value), via a `DenseMap<Operation*, {resultNo, type}>` keeping the min, then write once per op (inter-op write order is irrelevant, each targets a distinct op). (2) `StructureControlFlow.cpp:210 g_scfBridgeVarId` (and the irreducible-CFG `loc_irr_N` label counters) were file-static and NEVER reset, so they ACCUMULATED across every function/decompile in the process -> a function's `scf_r9000NN` selector ids depended on how many functions were decompiled before it (batch-position-dependent). FIX = reset all three to their bases at the top of the per-function `module.walk` in `StructureControlFlowPass::runOnOperation` (scf/label ids live in the per-function id space, so per-function reset is safe). **Validated** (oracle: decompile the same lifted IR K times in one process -> a deterministic engine gives all K byte-identical): in-process 28/28 across a whole-binary sample (was 0/10), two SEPARATE batch processes over 80 NUCLEO funcs -> 80/80 byte-identical; semantic quality FLAT/better (avg confidence +0.15%, issues -1); crash/sret/shortlist fixes intact. Note: textual A/B diffs were INVALID before this fix (dominated by the non-determinism) - validation used semantic metrics.
 
 **FIX-116 (audit shortlist, low-risk guards) - a batch of independently-verified fixes from an external source audit.** (11.1) `CAstOptimizer::canonicalizeXorExpr` dereferenced `b.lhs->type`/`b.rhs->type` with no null guard (crash on a lowered XOR node whose operand has no attached CType) -> a null-safe `isBooleanOperand` helper. (11.2) `x ^ 1` was rewritten to `!x` UNCONDITIONALLY, wrong for a wider non-boolean integer where it toggles bit 0 (neither `!x` nor `~x`) -> gate the LogNot rewrite on the operand actually being boolean/1-bit, else leave `x ^ 1`. (7.3) `ValueRange::forSignedBits(0)` was UB (`1LL << (bits-1)` underflows the shift count at bits==0) -> guard bits==0 -> {0,0}. (13.3) the out-of-table indirect call rendered `(*(code *)0xADDR)()` where `code` is not a valid C type -> emit `(*(void (*)())0xADDR)()` (compilable K&R form). (8.1/8.2) the `CallOpCountInstrumentation` (an O(N*P) before/after-every-pass module walk + stderr spam) and the three fixed-name `helix_dump_*.mlir` CWD dumps ran unconditionally -> gate both behind `HELIX_PIPELINE_DEBUG`. **Validated:** semantic quality flat over 150 NUCLEO funcs (confidence +0.02%, issues +1), zero regression; debug noise + CWD dumps gone by default.

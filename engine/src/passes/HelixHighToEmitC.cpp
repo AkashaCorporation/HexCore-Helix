@@ -233,6 +233,10 @@ struct BinaryAddToEmitC : public OpConversionPattern<high::BinaryOp> {
             case high::BinaryOpKind::Sar:    op_name = "HELIX_SAR"; break;
             case high::BinaryOpKind::LogAnd: op_name = "HELIX_LOGAND"; break;
             case high::BinaryOpKind::LogOr:  op_name = "HELIX_LOGOR"; break;
+            case high::BinaryOpKind::Ult:    op_name = "HELIX_ULT"; break;
+            case high::BinaryOpKind::Ule:    op_name = "HELIX_ULE"; break;
+            case high::BinaryOpKind::Ugt:    op_name = "HELIX_UGT"; break;
+            case high::BinaryOpKind::Uge:    op_name = "HELIX_UGE"; break;
             default:                          op_name = "HELIX_BINOP"; break;
             }
 

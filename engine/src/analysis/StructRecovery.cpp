@@ -71,6 +71,7 @@ RecoveredStruct StructRecoveryAnalyzer::buildStruct(
     result.total_size = 0;
     result.alignment = 1;
     result.has_overlaps = false;
+    result.base_var_id = base_var;
 
     // Group accesses by offset to merge into fields.
     std::map<int64_t, std::vector<const AccessPattern*>> byOffset;

@@ -66,3 +66,9 @@ Thumbs.db
 
 # v2 judge scratch
 /tools/helix-validate/_judge/
+# HexCore session files
+.hexcore_session.db
+.hexcore_session.db-shm
+.hexcore_session.db-wal
+.hexcore_session.db.migration-backup-*
+.hexcore_session.db.target-mismatch-*

@@ -73,10 +73,15 @@ jobs:
           sudo apt-get install -y llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 lld-18 ninja-build
 
       - name: Configure CMake
-        run: cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR"
+        run: cmake -B engine/build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DMLIR_DIR="$MLIR_DIR" -DHELIX_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build engine/build --config Release
+
+      - name: Run native verifier lane
+        env:
+          HELIX_VERIFY_EACH_PASS: "1"
+        run: ctest --test-dir engine/build --output-on-failure
 
   # ─── NAPI-RS Build (Multi-Platform) ─────────────────────────────────────────
   napi-build:

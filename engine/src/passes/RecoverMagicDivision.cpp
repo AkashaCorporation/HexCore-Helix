@@ -46,6 +46,12 @@ STATISTIC(NumMagicModRecovered, "Number of magic modulos recovered");
 
 namespace {
 
+static bool isMultiplyKind(mid::BinExprKind kind) {
+    return kind == mid::BinExprKind::Mul ||
+           kind == mid::BinExprKind::UMul ||
+           kind == mid::BinExprKind::SMul;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Magic Number Reversal Algorithm
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -242,7 +248,7 @@ struct RecoverMagicDivisionPass
 
             // ── Pattern 1: Direct chain Shr(Mul(x, magic), shift) ───────
             if (auto mulOp = outerShr.getLhs().getDefiningOp<mid::BinExprOp>()) {
-                if (mulOp.getKind() == mid::BinExprKind::Mul) {
+                if (isMultiplyKind(mulOp.getKind())) {
                     auto magicConst = extractConstant(mulOp.getRhs());
                     if (magicConst && *magicConst > 1) {
                         mulLhs = mulOp.getLhs();
@@ -259,7 +265,7 @@ struct RecoverMagicDivisionPass
                     auto innerShift = extractConstant(mulOp.getRhs());
                     if (innerShift && (*innerShift == 32 || *innerShift == 64)) {
                         if (auto innerMul = mulOp.getLhs().getDefiningOp<mid::BinExprOp>()) {
-                            if (innerMul.getKind() == mid::BinExprKind::Mul) {
+                            if (isMultiplyKind(innerMul.getKind())) {
                                 auto magicConst = extractConstant(innerMul.getRhs());
                                 if (magicConst && *magicConst > 1) {
                                     mulLhs = innerMul.getLhs();
@@ -286,7 +292,7 @@ struct RecoverMagicDivisionPass
                             if (innerShift && (*innerShift == 32 || *innerShift == 64)) {
                                 // Check if the inner Shr's LHS is a Mul
                                 if (auto innerMul = innerShr.getLhs().getDefiningOp<mid::BinExprOp>()) {
-                                    if (innerMul.getKind() == mid::BinExprKind::Mul) {
+                                    if (isMultiplyKind(innerMul.getKind())) {
                                         auto magicConst = extractConstant(innerMul.getRhs());
                                         if (magicConst && *magicConst > 1) {
                                             mulLhs = innerMul.getLhs();
@@ -300,7 +306,7 @@ struct RecoverMagicDivisionPass
                         }
                         // Also handle: VarRef → Assign from Mul directly
                         // (for patterns where the Shr-by-32 is folded differently)
-                        if (!mulLhs && innerShr.getKind() == mid::BinExprKind::Mul) {
+                        if (!mulLhs && isMultiplyKind(innerShr.getKind())) {
                             auto magicConst = extractConstant(innerShr.getRhs());
                             if (magicConst && *magicConst > 1) {
                                 mulLhs = innerShr.getLhs();
@@ -359,7 +365,9 @@ struct RecoverMagicDivisionPass
             );
 
             // Create the division.
-            auto divKind = is_signed ? mid::BinExprKind::Div : mid::BinExprKind::Div;
+            auto divKind = is_signed
+                ? mid::BinExprKind::SDiv
+                : mid::BinExprKind::UDiv;
             auto divOp = builder.create<mid::BinExprOp>(
                 loc, resultType,
                 mid::BinExprKindAttr::get(builder.getContext(), divKind),
@@ -382,11 +390,14 @@ struct RecoverMagicDivisionPass
 
             // RHS should be Mul(Div(x, d), d)
             auto mulOp = subOp.getRhs().getDefiningOp<mid::BinExprOp>();
-            if (!mulOp || mulOp.getKind() != mid::BinExprKind::Mul)
+            if (!mulOp || !isMultiplyKind(mulOp.getKind()))
                 return;
 
             auto divOp = mulOp.getLhs().getDefiningOp<mid::BinExprOp>();
-            if (!divOp || divOp.getKind() != mid::BinExprKind::Div)
+            if (!divOp ||
+                (divOp.getKind() != mid::BinExprKind::Div &&
+                 divOp.getKind() != mid::BinExprKind::SDiv &&
+                 divOp.getKind() != mid::BinExprKind::UDiv))
                 return;
 
             // Check: sub.lhs == div.lhs (same dividend x)

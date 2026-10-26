@@ -24,9 +24,9 @@ enum class RemillSemantic {
     // Data movement
     MOV, MOVZX, MOVSX, CMOV, XCHG, LEA, CDQ, CDQE,
     // Arithmetic
-    ADD, SUB, MUL, IMUL, DIV, IDIV, INC, DEC, NEG,
+    ADD, SUB, MUL, IMUL, DIV, IDIV, INC, DEC, NEG, MADD,
     // Logic
-    AND, OR, XOR, NOT, SHL, SHR, SAR, ROL, ROR,
+    AND, OR, XOR, NOT, SHL, SHR, SAR, ROL, ROR, UBFM, SBFM,
     // Comparison
     CMP, TEST,
     // Stack
@@ -50,8 +50,8 @@ enum class RemillSemantic {
     MULSS, MULSD, SUBSS, SUBSD, DIVSS, DIVSD,
     XORPS, XORPD, PXOR,
     // SSE/AVX packed & misc
-    MOVxPS, MOVSS_MEM, SHUFPS, SUBPS, ADDPS, MULPS,
-    COMISS, UNPCKHPS,
+    MOVxPS, MOVSS_MEM, MOVSD_MEM, SHUFPS, SUBPS, ADDPS, MULPS,
+    COMISS, UNPCKLPS, UNPCKHPS,
     // SETcc (conditional byte set)
     SETcc,
     // CMPXCHG
@@ -83,6 +83,8 @@ struct RemillSemanticInfo {
     /// Width of the source operand in bits (inferred from type suffix).
     /// e.g., MnIjE → 32-bit (j=uint32), MnImE → 64-bit (m=uint64).
     unsigned src_width = 64;
+	/// Width of the destination register/memory operand in bits.
+	unsigned dst_width = 64;
 };
 
 /// Attempt to demangle a Remill semantic function name.

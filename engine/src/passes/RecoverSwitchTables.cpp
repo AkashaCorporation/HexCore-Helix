@@ -291,6 +291,8 @@ static bool emitSwitchCascade(
             loc,
             builder.getStringAttr("z"),
             cmpOp.getZeroFlag(),
+            /*trueDestOperands=*/ValueRange{},
+            /*falseDestOperands=*/ValueRange{},
             /*address=*/IntegerAttr{},
             caseBlocks[i],
             falseTarget);

@@ -21,6 +21,8 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Region.h"
 
+#include "llvm/ADT/DenseMap.h"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -131,6 +133,13 @@ private:
     /// Build an expression AST node from an MLIR Value.
     ExprPtr buildExpression(mlir::Value val);
 
+    /// Recover a debug-proven unit-stride struct array element from an
+    /// annotated address expression. Returns null when the address is not the
+    /// exact `base + index + fieldOffset` shape.
+    ExprPtr buildDebugIndexedField(mlir::Value address, mlir::Type accessType);
+    ExprPtr preserveIntegerAddressOperand(ExprPtr value, CTypePtr integerType,
+                                         uint64_t address);
+
     // ── Filtering ───────────────────────────────────────────────────────
 
     /// Return true if this operation should be skipped during AST building.
@@ -222,6 +231,8 @@ private:
 
     /// Per-variable use count for single-use temporary elimination.
     std::unordered_map<std::string, unsigned> varUseCount_;
+    std::unordered_map<uint32_t, CTypePtr> declaredVarTypes_;
+    std::unordered_map<uint32_t, CTypePtr> declaredPointerTypes_;
 
     /// Set of operations identified as dead stores.
     std::unordered_set<mlir::Operation*> deadStoreOps_;
@@ -237,6 +248,27 @@ private:
 
     /// Reverse map: expression string -> best variable name.
     std::unordered_map<std::string, std::string> exprToBestName_;
+
+    struct MaterializedValue {
+        uint32_t varId = 0;
+        std::string varName;
+        CTypePtr type;
+    };
+
+    /// SSA values already emitted into a concrete C lvalue. Reusing the
+    /// lvalue preserves single-evaluation semantics when later users consume
+    /// the same MLIR value after the recovered variable has been mutated.
+    llvm::DenseMap<mlir::Value, MaterializedValue> materializedValues_;
+
+    /// Final high.func block arguments with recovered source identities.
+    /// Unlike per-block materializations, these remain valid across every
+    /// structured region in the function.
+    llvm::DenseMap<mlir::Value, MaterializedValue> functionArguments_;
+
+    /// Native SCF results legalized directly at the C-AST boundary.
+    llvm::DenseMap<mlir::Value, MaterializedValue> sourceLegalizedValues_;
+    std::vector<CVarDecl> lateLocalVars_;
+    uint32_t nextSourceLegalizedVarId_ = 950000;
 
     /// Learnt base addresses for synthetic call-target temporaries.
     std::unordered_map<std::string, int64_t> syntheticCallBaseAddrs_;

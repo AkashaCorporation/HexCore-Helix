@@ -42,6 +42,11 @@ public:
     void recoverStructFieldAccess(CFuncDecl& func);
     void canonicalizeXorPatterns(CFuncDecl& func);
     void eliminateConstantBranches(CFuncDecl& func);
+    /// Fold nested SCF arms that yield the exact same synthetic tuple:
+    /// `if (A) { S } else if (B) { S } else { T }` becomes
+    /// `if (A || B) { S } else { T }`. The logical OR preserves the original
+    /// short-circuit evaluation of B.
+    void foldIdenticalNestedSCFArms(CFuncDecl& func);
     void removeEmptyIfStatements(CFuncDecl& func);
     void eliminateNullPtrStores(CFuncDecl& func);
     void cleanupFloatZeros(CFuncDecl& func);
@@ -110,12 +115,13 @@ public:
     /// M4 P2 (DREAM++ congruence coalescing): collapse the scf_r* selector
     /// ROUTING chains.  After dissolveExitDispatchers the dispatcher is an
     /// `if (scf_rK)` but the selector value is still routed up through a tree of
-    /// pure copies (`scf_rB = scf_rA; scf_rC = scf_rB; ...`).  These form a
-    /// copy tree (no interference -- each routing selector's value flows only to
-    /// its parent), so coalescing every copy-connected scf_r* to one
-    /// representative is sound; the copies become `rep = rep` self-assigns that
-    /// the existing removeSelfAssignments + removeUnusedDeclarations then erase,
-    /// leaving each branch assigning the consumed selector directly.
+    /// pure copies (`scf_rB = scf_rA; scf_rC = scf_rB; ...`). A copy edge is
+    /// coalesced only when the source routes to exactly one destination and
+    /// structured backward liveness proves that their live ranges do not
+    /// interfere. Loop back-edges are solved to a fixed point and gotos seed all
+    /// selectors live conservatively. The complete union-find classes are also
+    /// checked for transitive interference. Accepted copies become `rep = rep`
+    /// self-assigns that the existing cleanup then erases.
     void coalesceSelectorChains(CFuncDecl& func);
 
     /// M4 P5 (selector DCE): after P3/P4 dissolve every `switch(scf_r)` into an
@@ -129,14 +135,20 @@ public:
     /// while it was consumed by a `switch`, and the flat backward scan there
     /// under-counts liveness across structured scopes.  This pass replaces that
     /// blunt guard with a PROPER recursive backward liveness restricted to scf_r*
-    /// selectors (sound because they are pointerless, non-aliased, never
-    /// address-taken, and never read by a call): a `scf_rK = const` is erased when
-    /// scf_rK is not live on the join after it.  This is the line-count lever --
+    /// region-result storage. These variables may carry pointer values, but the
+    /// synthetic storage identity itself is never address-taken, aliased, or read
+    /// implicitly by a call. A `scf_rK = const` is erased when scf_rK is not live
+    /// on the join after it. This is the line-count lever --
     /// the dead selector writes are ~36% of the dispatcher-heavy functions.  Runs
     /// AFTER dissolveExitDispatchers so the switch is already an if-chain (no
     /// switch selector to keep artificially live).  Loops and goto/label scopes
     /// are handled conservatively (every selector kept live across them).
     void eliminateDeadSelectorStores(CFuncDecl& func);
+
+    /// Fold a synthetic boolean exit selector consumed only by a final
+    /// `if (!selector) target = fallback`. Every path in one structured
+    /// producer must define 0/1; success leaves must define target locally.
+    void foldBooleanExitSelectors(CFuncDecl& func);
 
     // ── Public expression utilities (used by free-function AST helpers) ───────
 

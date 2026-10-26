@@ -7,6 +7,7 @@
 
 #include "helix/analysis/SignatureDb.h"
 #include "helix/dialects/HelixLowOps.h"
+#include "helix/utils/Debug.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -198,7 +199,7 @@ void helix::resolveCallTargets(mlir::ModuleOp module) {
         relocMap[instrAddr] = symPart.str();
     });
 
-    if (!relocMap.empty()) {
+    if (!relocMap.empty() && helix::pipelineDebugEnabled()) {
         llvm::errs() << "[Helix] resolveCallTargets: loaded " << relocMap.size()
                      << " relocation entries from __hxreloc__ declarations\n";
     }

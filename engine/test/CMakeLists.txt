@@ -21,6 +21,7 @@ set(HELIX_TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
 # ─── Test Executable ─────────────────────────────────────────────────────────────
 
 add_executable(helix_tests
+    EntryIdentityTest.cpp
     RemillDemanglerTest.cpp
     Remill6DemanglerTest.cpp
     Remill6IntegrationTest.cpp
@@ -28,6 +29,14 @@ add_executable(helix_tests
     IntegrationPipelineTest.cpp
     EmitterTest.cpp
     RegistryMissTest.cpp
+    RecoverVariablesTest.cpp
+    BindReturnValuesTest.cpp
+    StructureControlFlowTest.cpp
+    ApplyDebugTypesTest.cpp
+    VectorLaneTest.cpp
+    VerifyAuditTest.cpp
+    EffectsContractTest.cpp
+    LowToMidSemanticsTest.cpp
 )
 
 target_include_directories(helix_tests PRIVATE

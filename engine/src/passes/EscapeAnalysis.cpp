@@ -25,6 +25,7 @@
 
 #include "helix/passes/Passes.h"
 #include "helix/dialects/HelixMidOps.h"
+#include "helix/dialects/HelixLowOps.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Builders.h"
@@ -129,26 +130,30 @@ struct EscapeAnalysisPass
     }
 
     void getDependentDialects(DialectRegistry& registry) const override {
-        registry.insert<mid::HelixMidDialect>();
+        registry.insert<helix::low::HelixLowDialect,
+                        mid::HelixMidDialect>();
     }
 
     void runOnOperation() override {
         auto module = getOperation();
 
-        module.walk([&](mid::FuncOp func) {
-            analyzeFunction(func);
+        module.walk([&](Operation* operation) {
+            if (auto func = dyn_cast<helix::low::FuncOp>(operation)) {
+                analyzeFunction(func.getBody(), func.getSymName());
+            } else if (auto func = dyn_cast<mid::FuncOp>(operation)) {
+                analyzeFunction(func.getBody(), func.getSymName());
+            }
         });
     }
 
 private:
     /// Run escape analysis on a single function.
-    void analyzeFunction(mid::FuncOp func) {
-        auto& body = func.getBody();
+    void analyzeFunction(Region& body, StringRef functionName) {
         if (body.empty())
             return;
 
         LLVM_DEBUG(llvm::dbgs() << "EscapeAnalysis: processing '"
-                                << func.getSymName() << "'\n");
+                                << functionName << "'\n");
 
         // Set of variable slot IDs that escape.
         llvm::DenseSet<uint32_t> escapingSlots;

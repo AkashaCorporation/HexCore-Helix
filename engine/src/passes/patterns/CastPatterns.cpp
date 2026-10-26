@@ -80,12 +80,17 @@ struct RedundantCast : public OpRewritePattern<mid::CastOp> {
         if (!innerCast)
             return failure();
 
+        if (op.getCastKind() != mid::CastKind::Bitcast ||
+            innerCast.getCastKind() != mid::CastKind::Bitcast)
+            return failure();
+
         // Replace cast(cast(x, T1), T2) with cast(x, T2).
         auto newCast = rewriter.create<mid::CastOp>(
             op.getLoc(),
             op.getResult().getType(),
             innerCast.getInput(),
-            op.getAddressAttr());
+            op.getAddressAttr(),
+            op.getCastKindAttr());
 
         rewriter.replaceOp(op, newCast.getResult());
         return success();

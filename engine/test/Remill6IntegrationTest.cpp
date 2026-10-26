@@ -9,6 +9,7 @@
 #include <fstream>
 #include <string>
 #include <regex>
+#include <set>
 #include <sstream>
 
 #ifndef HELIX_TEST_DATA_DIR
@@ -25,18 +26,6 @@ static std::string readFileToString(const std::string &path) {
     std::ostringstream oss;
     oss << ifs.rdbuf();
     return oss.str();
-}
-
-/// Helper: count non-overlapping occurrences of `needle` in `haystack`.
-static size_t countOccurrences(const std::string &haystack,
-                               const std::string &needle) {
-    size_t count = 0;
-    size_t pos = 0;
-    while ((pos = haystack.find(needle, pos)) != std::string::npos) {
-        ++count;
-        pos += needle.size();
-    }
-    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,138 +132,36 @@ TEST_F(Remill6IntegrationTest, MetadataNodeRCXIsNode18) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Semantic call counting
+// 3. Semantic compatibility
 // ---------------------------------------------------------------------------
 
-TEST_F(Remill6IntegrationTest, CountCALLSemantics) {
-    // CALL may appear in two variants; count all of them.
-    size_t count = countOccurrences(llContents, "CALL");
-    EXPECT_GE(count, 13u) << "Expected ~15 CALL semantics (got " << count << ")";
-    EXPECT_LE(count, 17u) << "Expected ~15 CALL semantics (got " << count << ")";
-}
+TEST_F(Remill6IntegrationTest, MangledSemanticsRemainRecognizable) {
+    std::regex symbolRe(R"(@(_ZN12_GLOBAL__N_1[A-Za-z0-9_]+)\()");
+    std::set<std::string> symbols;
+    std::set<helix::RemillSemantic> semantics;
 
-TEST_F(Remill6IntegrationTest, CountMOVSemantics) {
-    size_t count = countOccurrences(llContents, "MOV");
-    // MOV also matches MOVZX so we count pure MOV via regex
-    std::regex movRe(R"(\bMOV\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), movRe);
-    auto end = std::sregex_iterator();
-    size_t regexCount = std::distance(begin, end);
-    EXPECT_GE(regexCount, 13u)
-        << "Expected ~15 MOV semantics (got " << regexCount << ")";
-    EXPECT_LE(regexCount, 17u)
-        << "Expected ~15 MOV semantics (got " << regexCount << ")";
-}
+    for (auto it = std::sregex_iterator(
+             llContents.begin(), llContents.end(), symbolRe);
+         it != std::sregex_iterator(); ++it) {
+        symbols.insert((*it)[1].str());
+    }
 
-TEST_F(Remill6IntegrationTest, CountJZSemantics) {
-    std::regex jzRe(R"(\bJZ\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), jzRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 4u) << "Expected 4 JZ semantics";
-}
+    ASSERT_FALSE(symbols.empty());
+    for (const std::string& symbol : symbols) {
+        auto info = helix::demangleRemillSemantic(symbol);
+        ASSERT_TRUE(info.has_value()) << "Unrecognized semantic: " << symbol;
+        if (!info->is_helper)
+            semantics.insert(info->semantic);
+    }
 
-TEST_F(Remill6IntegrationTest, CountJNZSemantics) {
-    std::regex jnzRe(R"(\bJNZ\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), jnzRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 2u) << "Expected 2 JNZ semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountTESTSemantics) {
-    std::regex testRe(R"(\bTEST\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), testRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 4u) << "Expected 4 TEST semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountCMPSemantics) {
-    std::regex cmpRe(R"(\bCMP\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), cmpRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 2u) << "Expected 2 CMP semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountNOP_IMPLSemantics) {
-    size_t count = countOccurrences(llContents, "NOP_IMPL");
-    EXPECT_EQ(count, 3u) << "Expected 3 NOP_IMPL semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountDoINT3Semantics) {
-    size_t count = countOccurrences(llContents, "DoINT3");
-    EXPECT_EQ(count, 6u) << "Expected 6 DoINT3 semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountPUSHSemantics) {
-    std::regex pushRe(R"(\bPUSH\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), pushRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 1u) << "Expected 1 PUSH semantic";
-}
-
-TEST_F(Remill6IntegrationTest, CountPOPSemantics) {
-    std::regex popRe(R"(\bPOP\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), popRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 2u) << "Expected 2 POP semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountRETSemantics) {
-    std::regex retRe(R"(\bRET\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), retRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 1u) << "Expected 1 RET semantic";
-}
-
-TEST_F(Remill6IntegrationTest, CountJMPSemantics) {
-    std::regex jmpRe(R"(\bJMP\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), jmpRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 3u) << "Expected 3 JMP semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountADDSemantics) {
-    std::regex addRe(R"(\bADD\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), addRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 3u) << "Expected 3 ADD semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountSUBSemantics) {
-    std::regex subRe(R"(\bSUB\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), subRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 2u) << "Expected 2 SUB semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountXORSemantics) {
-    std::regex xorRe(R"(\bXOR\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), xorRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 3u) << "Expected 3 XOR semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountLEASemantics) {
-    std::regex leaRe(R"(\bLEA\b)");
-    auto begin = std::sregex_iterator(llContents.begin(), llContents.end(), leaRe);
-    auto end = std::sregex_iterator();
-    size_t count = std::distance(begin, end);
-    EXPECT_EQ(count, 2u) << "Expected 2 LEA semantics";
-}
-
-TEST_F(Remill6IntegrationTest, CountMOVZXSemantics) {
-    size_t count = countOccurrences(llContents, "MOVZX");
-    EXPECT_EQ(count, 2u) << "Expected 2 MOVZX semantics";
+    for (helix::RemillSemantic required : {
+             helix::RemillSemantic::MOV, helix::RemillSemantic::CALL,
+             helix::RemillSemantic::CMP, helix::RemillSemantic::TEST,
+             helix::RemillSemantic::JMP, helix::RemillSemantic::RET}) {
+        EXPECT_TRUE(semantics.contains(required))
+            << "Missing semantic category "
+            << helix::semanticToString(required).str();
+    }
 }
 
 // ---------------------------------------------------------------------------

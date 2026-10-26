@@ -51,12 +51,14 @@
 #include <vector>
 
 #include "helix/passes/Passes.h"
+#include "helix/analysis/TypeEvidence.h"
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixHighOps.h"
 #include "helix/analysis/X86RegisterInfo.h"
 #include "helix/utils/CallOpHelpers.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
@@ -151,6 +153,15 @@ static std::optional<SubRegInfo> getSubRegInfo(llvm::StringRef reg) {
     return helix::analysis::getX86SubRegInfo(reg);
 }
 
+static unsigned getParentRegisterWidth(const SubRegInfo& info,
+                                       bool isX86Cdecl32 = false) {
+    if (info.parent.starts_with("XMM"))
+        return 128u;
+    if (isX86Cdecl32 && info.parent.starts_with("R"))
+        return 32u;
+    return 64u;
+}
+
 /// Convert a canonical 64-bit register name to its lowercase variable name.
 ///
 /// RAX -> rax, RBX -> rbx, R8 -> r8, etc.
@@ -168,6 +179,52 @@ static uint32_t getNextAvailableVarId(helix::low::FuncOp func) {
         nextId = std::max(nextId, decl.getVarId() + 1);
     });
     return nextId;
+}
+
+/// FIX (Maya R. review, Phase 3.5/4 usage-classifier gap): returns true if
+/// `addOp` is the address-forming `llvm.add(base, const)` shape that
+/// HelixLowToMid's `tryDecomposeAddrAsField` (HelixLowToMid.cpp ~L202) will
+/// later lift into a `mid.field.ptr`. Mirrors that function's own
+/// const/zero-offset checks so the two stay in lockstep, then additionally
+/// confirms the add's RESULT actually feeds a MemRead/MemWrite address
+/// operand -- narrowing to the specific shape that becomes an address, not
+/// every add with one constant operand.
+///
+/// RecoverVariables' Phase 3.5/4 usage classifier runs BEFORE HelixLowToMid
+/// (Pipeline.cpp: RecoverVariables ~L512, HelixLowToMid ~L525), so at
+/// classification time the address is still this raw LLVM::AddOp -- neither
+/// `mid::FieldPtrOp` nor `high::FieldAccessOp` exist yet in the IR. A
+/// classifier branch checking for either op (as originally proposed) is
+/// dead code at this pipeline stage; this helper checks the actual shape
+/// present here instead.
+static bool isAddressFormingAdd(LLVM::AddOp addOp) {
+    if (!addOp) return false;
+    auto lhs = addOp.getLhs();
+    auto rhs = addOp.getRhs();
+    if (!lhs || !rhs) return false;
+
+    auto extractConst = [](Value v) -> std::optional<uint64_t> {
+        auto cst = v.getDefiningOp<LLVM::ConstantOp>();
+        if (!cst) return std::nullopt;
+        auto intAttr = dyn_cast<IntegerAttr>(cst.getValue());
+        if (!intAttr) return std::nullopt;
+        return intAttr.getValue().getZExtValue();
+    };
+
+    auto lhsConst = extractConst(lhs);
+    auto rhsConst = extractConst(rhs);
+    if (lhsConst && rhsConst) return false;   // fully-foldable, no provenance
+    if (!lhsConst && !rhsConst) return false; // neither side is a constant offset
+    if (rhsConst && *rhsConst == 0) return false;
+    if (lhsConst && *lhsConst == 0) return false;
+
+    for (auto& use : addOp.getResult().getUses()) {
+        Operation* user = use.getOwner();
+        unsigned idx = use.getOperandNumber();
+        if (isa<helix::low::MemReadOp>(user) && idx == 0) return true;
+        if (isa<helix::low::MemWriteOp>(user) && idx == 0) return true;
+    }
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -201,11 +258,16 @@ struct VariableTracker {
     /// Whether the function has a return value (set by RecoverCallingConvention).
     bool hasReturnValue = false;
 
-    /// Whether the current function uses the AArch64 AAPCS64 ABI.  Gates the
-    /// AArch64-specific return-register (X0) and "result" naming/coalescing
-    /// behaviour so x86 (SysV/Win64/cdecl) output stays byte-for-byte
-    /// unchanged.
+    /// Whether the current function uses the AArch64 AAPCS64 ABI.  Gates
+    /// AArch64-specific X0 argument/return-register handling.
     bool isAapcs64 = false;
+
+    /// Keep the implicit return-register definition as an exact, separate
+    /// `result` variable. On x86 this is restricted to call-free functions:
+    /// unknown calls conservatively materialize RAX and complex call-heavy
+    /// functions rely on the established coalescing policy. AAPCS64 keeps
+    /// the pre-existing exact-X0 behavior.
+    bool preserveExactReturnIdentity = false;
 
     /// Initialize the argument register position map based on calling convention.
     ///
@@ -217,6 +279,13 @@ struct VariableTracker {
             argRegPositions["RDX"] = 2;
             argRegPositions["R8"]  = 3;
             argRegPositions["R9"]  = 4;
+            // Win64 uses one positional slot per argument. Floating-point
+            // values occupy XMM0..XMM3 in the same positions as the integer
+            // RCX/RDX/R8/R9 lane.
+            argRegPositions["XMM0"] = 1;
+            argRegPositions["XMM1"] = 2;
+            argRegPositions["XMM2"] = 3;
+            argRegPositions["XMM3"] = 4;
         } else {
             argRegPositions["RDI"] = 1;
             argRegPositions["RSI"] = 2;
@@ -247,23 +316,21 @@ struct VariableTracker {
         argRegPositions["RCX"] = 1;   // __thiscall `this` only; EDX/fastcall over-binds (deferred)
     }
 
-    /// Check if an operation is in a return context — i.e., the register
-    /// value flows into a helix_low.ret or helix_high.return operation.
+    /// Same-block forward scan used by isReturnContext, factored out so it
+    /// can be re-entered on the target block of an unconditional jmp chain
+    /// (see isReturnContext's comment for why that's needed).
     ///
-    /// Scans forward from the given operation within the same block to find
-    /// if a RetOp follows without an intervening write to the same register.
-    ///
-    /// @param op       The operation to check (typically a reg.write to RAX).
-    /// @param regName  The register being written (checked for intervening writes).
-    /// @return         true if this write feeds a return.
-    static bool isReturnContext(Operation* op, llvm::StringRef regName) {
-        auto* block = op->getBlock();
-        if (!block)
+    /// @param visited  Blocks already scanned in this query -- guards
+    ///                 against infinite recursion on a jmp cycle (which
+    ///                 shouldn't occur in practice for a jmp chain that's
+    ///                 actually converging on a return, but a malformed or
+    ///                 adversarial CFG must not hang the pass).
+    static bool isReturnContextScan(Block* block, Block::iterator it,
+                                    llvm::StringRef regName,
+                                    llvm::SmallPtrSetImpl<Block*>& visited) {
+        if (!visited.insert(block).second)
             return false;
 
-        // Scan forward from op to the end of the block.
-        auto it = Block::iterator(op);
-        ++it; // skip the current op
         for (auto end = block->end(); it != end; ++it) {
             // If we hit a return, this is a return context.
             if (isa<helix::low::RetOp>(&*it))
@@ -275,13 +342,64 @@ struct VariableTracker {
                     return false;
             }
 
-            // If we hit a call or branch, stop scanning.
-            if (helix::isAnyCallOp(&*it) ||
-                isa<helix::low::JmpOp, helix::low::JccOp>(&*it))
+            if (helix::isAnyCallOp(&*it))
+                return false;
+
+            // FIX (return-context-through-jmp-chain): an unconditional jmp
+            // to another block does NOT by itself disqualify return
+            // context -- follow it and keep scanning there. This is the
+            // common shape for an early-return guard clause: the compiler
+            // merges multiple `return` sites into one shared exit block,
+            // so the register write that logically IS `return 1` sits in
+            // a predecessor block that reaches the real helix_low.ret only
+            // via an intervening jmp. Before this fix, hitting that jmp
+            // unconditionally returned false, so none of the predecessor
+            // writes were ever recognized as return context -- the write
+            // got named as a plain register variable, EliminateDeadCode
+            // then correctly-per-its-own-logic removed it as unread (since
+            // the operand-less helix_low.ret doesn't reference it either),
+            // and CAstBuilder's return-statement construction fell back to
+            // an unbound placeholder ("int64_t result;" declared but never
+            // assigned). A conditional branch (JccOp) is intentionally NOT
+            // followed here -- that's a genuine fork where the write may
+            // or may not reach a return depending on which edge is taken,
+            // a materially different and harder question this narrow fix
+            // doesn't attempt to answer.
+            if (auto jmp = dyn_cast<helix::low::JmpOp>(&*it)) {
+                Block* dest = jmp.getDest();
+                if (!dest)
+                    return false;
+                return isReturnContextScan(dest, dest->begin(), regName,
+                                           visited);
+            }
+
+            if (isa<helix::low::JccOp>(&*it))
                 return false;
         }
 
         return false;
+    }
+
+    /// Check if an operation is in a return context — i.e., the register
+    /// value flows into a helix_low.ret or helix_high.return operation.
+    ///
+    /// Scans forward from the given operation, following unconditional
+    /// jmp chains into their target blocks, to find if a RetOp follows
+    /// without an intervening write to the same register or a conditional
+    /// branch (see isReturnContextScan for why Jcc stops the scan but Jmp
+    /// doesn't).
+    ///
+    /// @param op       The operation to check (typically a reg.write to RAX).
+    /// @param regName  The register being written (checked for intervening writes).
+    /// @return         true if this write feeds a return.
+    static bool isReturnContext(Operation* op, llvm::StringRef regName) {
+        auto* block = op->getBlock();
+        if (!block)
+            return false;
+        auto it = Block::iterator(op);
+        ++it; // skip the current op
+        llvm::SmallPtrSet<Block*, 8> visited;
+        return isReturnContextScan(block, it, regName, visited);
     }
 
     /// Determine the semantic variable name for a canonical register.
@@ -293,10 +411,10 @@ struct VariableTracker {
     /// @param canonicalReg  The canonical 64-bit register name (e.g., "RAX").
     /// @param contextOp     The operation context (for return detection).
     /// @return              The semantic variable name and storage kind.
-    /// True if `reg` is the integer return register for the active ABI:
-    /// RAX on x86, X0 on AArch64 AAPCS64.
-    static bool isIntegerReturnRegister(llvm::StringRef reg) {
-        return reg == "RAX" || reg == "X0";
+    /// True if `reg` is an integer or floating-point ABI return register.
+    static bool isReturnRegister(llvm::StringRef reg) {
+        return reg == "RAX" || reg == "X0" ||
+               reg == "XMM0" || reg == "V0";
     }
 
     std::pair<std::string, helix::high::StorageKind>
@@ -306,7 +424,7 @@ struct VariableTracker {
         // argument register AND the integer return register: a write to X0
         // in return context is the return value ("result"), not param_1.
         // (On x86 RAX is never an argument register, so order is moot there.)
-        if (isIntegerReturnRegister(canonicalReg) && hasReturnValue && contextOp &&
+        if (isReturnRegister(canonicalReg) && hasReturnValue && contextOp &&
             isReturnContext(contextOp, canonicalReg)) {
             return {"result", helix::high::StorageKind::Register};
         }
@@ -339,7 +457,7 @@ struct VariableTracker {
         // For the integer return register (RAX / X0), check return context to
         // decide between "result" and the plain register name.  We use a
         // separate key for the return-context variant.
-        bool isRetCtx = (isIntegerReturnRegister(canonicalReg) && hasReturnValue &&
+        bool isRetCtx = (isReturnRegister(canonicalReg) && hasReturnValue &&
                          contextOp && isReturnContext(contextOp, canonicalReg));
         llvm::StringRef lookupKey = isRetCtx ? "__ret_result" : canonicalReg;
 
@@ -469,6 +587,7 @@ struct SSAVersionTracker {
 
     /// Counter for creating unique names per register (rax→0, rax→1, ...).
     llvm::StringMap<unsigned> versionCounters;
+    Operation* lastVersionDeclaration = nullptr;
 
     /// Reference to the shared var_id counter (owned by VariableTracker).
     uint32_t& varIdCounter;
@@ -494,19 +613,36 @@ struct SSAVersionTracker {
         unsigned ver = versionCounters[canonReg]++;
         auto [baseName, storage] = tracker.getSemanticName(canonReg, contextOp);
 
+        // A parameter denotes the entry value, regardless of whether its
+        // identity came from debug info or ABI live-in recovery. Later writes
+        // to the physical register are distinct local lifetimes. If the ABI
+        // inference was speculative and the entry value is unused, normal DCE
+        // may remove version zero; mutating it is never sound.
+        if (ver > 0 &&
+            storage == helix::high::StorageKind::Parameter) {
+            baseName = regToVarName(canonReg);
+            storage = helix::high::StorageKind::Register;
+        }
+
         std::string varName;
-        // On AArch64, X0's param-init version 0 ("param_1") is followed by a
-        // return-context write that must still be named exactly "result" (no
-        // SSA suffix) so the C emitter / DCE preservation recognise it. This
-        // is gated to AAPCS64 so x86 version naming (rax_1, etc.) is byte-for
-        // -byte unchanged.
+        // Selected return-context writes must be named exactly "result"
+        // (without an SSA suffix). DCE and CAstBuilder model the implicit
+        // consumer of the return register through this semantic name; the
+        // tracker flag keeps the x86 policy narrow for call-heavy functions.
         if (ver == 0 ||
-            (tracker.isAapcs64 && baseName == "result")) {
+            (tracker.preserveExactReturnIdentity &&
+             baseName == "result")) {
             varName = baseName;
         } else {
             varName = llvm::formatv("{0}_{1}", baseName, ver).str();
         }
 
+        // Instruction anchors can be erased during SSA rewriting. Version
+        // declarations survive this phase and preserve declaration order.
+        if (lastVersionDeclaration)
+            declBuilder.setInsertionPointAfter(lastVersionDeclaration);
+        else
+            declBuilder.setInsertionPointToStart(declBuilder.getInsertionBlock());
         auto declOp = declBuilder.create<helix::high::VarDeclOp>(
             loc,
             /*var_id=*/varIdCounter++,
@@ -515,8 +651,14 @@ struct SSAVersionTracker {
             /*stack_offset=*/IntegerAttr{},
             /*init=*/Value{},
             /*address=*/IntegerAttr{});
+        if (storage == helix::high::StorageKind::Parameter &&
+            canonReg.starts_with_insensitive("XMM")) {
+            helix::applyTypeEvidence(
+                declOp, "double", helix::TypeEvidenceSource::Structural);
+        }
 
         uint32_t newId = declOp.getVarId();
+        lastVersionDeclaration = declOp;
         current[canonReg] = {declOp, newId, varName};
         allVersions[canonReg].push_back({declOp, newId, varName});
 
@@ -573,7 +715,8 @@ static Value emitTruncation(Value fullValue, unsigned targetWidth,
         return fullValue;
 
     return builder.create<helix::high::CastOp>(
-        loc, targetTy, fullValue);
+        loc, targetTy, fullValue, mlir::IntegerAttr{},
+        helix::high::CastKindAttr{});
 }
 
 /// Emit a right-shift + truncation for high-byte registers (AH, BH, CH, DH).
@@ -590,11 +733,15 @@ static Value emitTruncation(Value fullValue, unsigned targetWidth,
 static Value emitHighByteExtract(Value fullValue, unsigned bitOffset,
                                  unsigned targetWidth,
                                  OpBuilder& builder, Location loc) {
-    auto i64Ty = builder.getIntegerType(64);
+	auto parentTy = dyn_cast<IntegerType>(fullValue.getType());
+	if (!parentTy)
+		parentTy = builder.getIntegerType(64);
 
     // Shift right by the bit offset.
-    auto shiftAmount = builder.create<arith::ConstantOp>(
-        loc, i64Ty, builder.getI64IntegerAttr(bitOffset));
+	auto shiftAmount = builder.create<arith::ConstantOp>(
+		loc, parentTy,
+		IntegerAttr::get(parentTy,
+			llvm::APInt(parentTy.getWidth(), bitOffset)));
     auto shifted = builder.create<arith::ShRUIOp>(
         loc, fullValue, shiftAmount);
 
@@ -618,35 +765,47 @@ static Value emitHighByteExtract(Value fullValue, unsigned bitOffset,
 static Value emitSubRegInsert(Value parentVar, Value newValue,
                               const SubRegInfo& info,
                               OpBuilder& builder, Location loc) {
-    auto i64Ty = builder.getIntegerType(64);
+	auto parentTy = dyn_cast<IntegerType>(parentVar.getType());
+	if (!parentTy)
+		parentTy = builder.getIntegerType(64);
+	const unsigned parentWidth = parentTy.getWidth();
 
-    if (info.width == 64) {
+    if (info.width >= parentWidth) {
         // Full-width write — no insertion needed.
-        return newValue;
+		return emitTruncation(newValue, parentWidth, builder, loc);
     }
 
-    if (info.width == 32 && info.bitOffset == 0) {
+    if (info.width == 32 && info.bitOffset == 0 && parentWidth == 64) {
         // x86-64: writing a 32-bit register zero-extends to 64 bits.
         // This is a simple zero-extension cast.
-        return builder.create<helix::high::CastOp>(loc, i64Ty, newValue);
+        return builder.create<helix::high::CastOp>(
+			loc, parentTy, newValue, mlir::IntegerAttr{},
+            helix::high::CastKindAttr{});
     }
 
     // For 16-bit and 8-bit writes, we need a read-modify-write pattern:
     //   new_full = (old_full & ~mask) | ((new_value & value_mask) << offset)
 
-    // Build the mask to clear the target bits.
-    uint64_t valueMask = (1ULL << info.width) - 1;
-    uint64_t clearMask = ~(valueMask << info.bitOffset);
+    // Build masks in the actual parent width. uint64_t arithmetic is not
+    // sufficient for XMM/YMM parents, and `1ULL << 64` is undefined even for
+    // the common scalar-double low-lane write.
+    const unsigned valueWidth = std::min(info.width, parentWidth);
+    llvm::APInt shiftedMask = llvm::APInt::getLowBitsSet(
+        parentWidth, valueWidth).shl(info.bitOffset);
+    llvm::APInt clearMask = ~shiftedMask;
 
     auto clearMaskConst = builder.create<arith::ConstantOp>(
-        loc, i64Ty, builder.getI64IntegerAttr(static_cast<int64_t>(clearMask)));
+		loc, parentTy,
+		IntegerAttr::get(parentTy, clearMask));
     auto clearedParent = builder.create<arith::AndIOp>(
         loc, parentVar, clearMaskConst);
 
     // Zero-extend the new value to 64 bits.
     Value extendedNew;
-    if (newValue.getType() != i64Ty) {
-        extendedNew = builder.create<helix::high::CastOp>(loc, i64Ty, newValue);
+	if (newValue.getType() != parentTy) {
+        extendedNew = builder.create<helix::high::CastOp>(
+			loc, parentTy, newValue, mlir::IntegerAttr{},
+            helix::high::CastKindAttr{});
     } else {
         extendedNew = newValue;
     }
@@ -654,16 +813,17 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
     // Shift the new value to the correct bit position.
     if (info.bitOffset > 0) {
         auto shiftAmount = builder.create<arith::ConstantOp>(
-            loc, i64Ty, builder.getI64IntegerAttr(info.bitOffset));
+			loc, parentTy,
+			IntegerAttr::get(parentTy,
+				llvm::APInt(parentWidth, info.bitOffset)));
         extendedNew = builder.create<arith::ShLIOp>(
             loc, extendedNew, shiftAmount);
     }
 
     // Mask the new value to prevent overflow into adjacent bits.
     auto valueMaskConst = builder.create<arith::ConstantOp>(
-        loc, i64Ty,
-        builder.getI64IntegerAttr(
-            static_cast<int64_t>(valueMask << info.bitOffset)));
+		loc, parentTy,
+		IntegerAttr::get(parentTy, shiftedMask));
     auto maskedNew = builder.create<arith::AndIOp>(
         loc, extendedNew, valueMaskConst);
 
@@ -768,23 +928,28 @@ private:
             tracker.initArgRegPositionsAapcs64();
         } else {
             tracker.initArgRegPositions(isWin64);
-            // FIX-CC-SRET round 3: intersect the ABI argument-register set with
-            // the parameter positions RecoverCallingConvention actually certified
-            // (its Phase-1 read-before-write verdict, published as
-            // "reg_param_indices").  This drops a scratch/copy arg register that
-            // merely HOLDS a recovered pointer -- classically the Win64/SysV sret
-            // hidden pointer parked via `mov r8, rcx` -- so RecoverVariables does
-            // NOT re-name it param_N with a phantom NULL base.  It then becomes an
-            // ordinary local, the reg-copy propagates, and the struct-field writes
-            // root at the real return pointer (param_1).  Mirrors the
-            // x86_thiscall_this gate for the multi-register x86-64 ABIs.  When the
-            // attribute is absent (older IR / inference skipped) no filtering is
-            // applied and the previous behaviour is preserved byte for byte.
+        }
+        // FIX-CC-SRET / FIX-139: intersect the ABI register map with the
+        // positions RecoverCallingConvention certified. On x86-64 this drops
+        // hidden/scratch register copies; on AAPCS64 the attribute is emitted
+        // only for an exact debug signature, so legacy/no-debug behavior stays
+        // byte-identical while extra live-in scratch registers become locals.
+        if (!isCdecl32) {
             if (auto idxAttr = func->getAttrOfType<DenseI32ArrayAttr>(
                     "reg_param_indices")) {
-                auto certified = idxAttr.asArrayRef();
-                llvm::SmallVector<std::string, 4> toDrop;
+                auto certifiedInteger = idxAttr.asArrayRef();
+                auto fpAttr = func->getAttrOfType<DenseI32ArrayAttr>(
+                    "fp_reg_param_indices");
+                auto certifiedFp = fpAttr
+                    ? fpAttr.asArrayRef() : llvm::ArrayRef<int32_t>{};
+                llvm::SmallVector<std::string, 8> toDrop;
                 for (auto& kv : tracker.argRegPositions) {
+                    const bool floatingLane =
+                        kv.first().starts_with_insensitive("XMM") ||
+                        kv.first().starts_with_insensitive("YMM") ||
+                        kv.first().starts_with_insensitive("ZMM");
+                    auto certified = floatingLane
+                        ? certifiedFp : certifiedInteger;
                     bool keep = false;
                     for (int32_t idx : certified)
                         if (static_cast<unsigned>(idx) == kv.second) {
@@ -806,6 +971,26 @@ private:
         }
         tracker.hasReturnValue =
             func->hasAttr("has_return_value");
+        bool hasProgramCalls = false;
+        funcBody.walk([&](Operation* op) {
+            if (!helix::isAnyCallOp(op))
+                return;
+            if (op->hasAttr("helix.machine_intrinsic") ||
+                op->hasAttr("helix.unqualified_instrumentation"))
+                return;
+
+            // CQO_RAX is a Remill machine helper for the x86 CQO
+            // instruction, not a source-level call. Treating it as a call
+            // disabled exact return recovery in arithmetic leaf functions
+            // such as signed division and opaque-predicate helpers.
+            auto targetName = helix::getCallTargetName(op);
+            if (targetName && *targetName == "CQO_RAX")
+                return;
+
+            hasProgramCalls = true;
+        });
+        tracker.preserveExactReturnIdentity =
+            tracker.isAapcs64 || !hasProgramCalls;
 
         // Position the builder at the entry block's start for variable
         // declarations.  All var.decl ops go at the top of the function
@@ -874,7 +1059,159 @@ private:
         // register versions create fresh merge versions (conservative,
         // no phi nodes needed — CAstOptimizer inlines single-use vars).
         //
-        // Each RegWrite creates a NEW variable version (rax, rax_1, ...)
+        // A register crossing structured regions needs a mutable slot:
+        // block-exit SSA snapshots cannot represent branch/loop-entry state.
+        // Freeze each read at its original location before lowering writes, so
+        // later slot updates cannot retroactively change an SSA operand.
+        llvm::StringRef structuredReturnRegister = "RAX";
+        if (auto returnType = func->getAttrOfType<StringAttr>(
+                "inferred_return_type")) {
+            if (returnType.getValue() == "float" ||
+                returnType.getValue() == "double")
+                structuredReturnRegister = "XMM0";
+        }
+        bool hasStructuredReturnRegister = false;
+        if (tracker.hasReturnValue && !isAapcs64) {
+            funcBody.walk([&](Operation* op) {
+                StringRef reg;
+                if (auto read = dyn_cast<helix::low::RegReadOp>(op))
+                    reg = read.getRegName();
+                else if (auto write = dyn_cast<helix::low::RegWriteOp>(op))
+                    reg = write.getRegName();
+                else
+                    return;
+                auto subReg = getSubRegInfo(reg);
+                if (subReg && subReg->parent == structuredReturnRegister &&
+                    op->getBlock()->getParent() != &funcBody)
+                    hasStructuredReturnRegister = true;
+            });
+        }
+        if (hasStructuredReturnRegister) {
+            unsigned parentWidth = isCdecl32 ? 32u : 64u;
+            if (structuredReturnRegister == "XMM0") {
+                // This lane is selected only from a scalar float/double return
+                // contract. Upper vector lanes are not part of the ABI result
+                // and retaining a 128-bit mutable slot needlessly expands every
+                // structured low-lane update into wide mask arithmetic.
+                auto returnType = func->getAttrOfType<StringAttr>(
+                    "inferred_return_type");
+                parentWidth = returnType && returnType.getValue() == "float"
+                    ? 32u : 64u;
+            }
+            auto parentType = builder.getIntegerType(parentWidth);
+            auto declareSlot = [&](StringRef name,
+                                   helix::high::StorageKind storage) {
+                OpBuilder declarations(func->getContext());
+                declarations.setInsertionPointToStart(&entryBlock);
+                auto decl = declarations.create<helix::high::VarDeclOp>(
+                    funcLoc, tracker.varIdCounter++, name, storage,
+                    IntegerAttr{}, Value{}, IntegerAttr{});
+                decl->setAttr("helix.value_snapshot", declarations.getUnitAttr());
+                return decl;
+            };
+            auto slot = declareSlot("result", helix::high::StorageKind::Register);
+            slot->setAttr("helix.region_register_slot",
+                          builder.getStringAttr(structuredReturnRegister));
+            if (auto returnType = func->getAttrOfType<StringAttr>(
+                    "inferred_return_type"))
+                helix::applyTypeEvidence(
+                    slot, returnType.getValue(),
+                    helix::TypeEvidenceSource::Structural);
+            tracker.regToDecl["__ret_result"] = slot;
+
+            // XMM0 is both Win64 FP argument slot 1 and the FP return register.
+            // Seed the mutable return slot with the proven incoming parameter
+            // so early-return arithmetic branches observe the original value.
+            if (structuredReturnRegister == "XMM0" &&
+                tracker.argRegPositions.contains("XMM0")) {
+                helix::high::VarDeclOp incoming;
+                func.walk([&](helix::high::VarDeclOp decl) {
+                    if (!incoming &&
+                        decl.getStorage() ==
+                            helix::high::StorageKind::Parameter &&
+                        decl.getVarName() == "param_1")
+                        incoming = decl;
+                });
+                if (incoming) {
+                    OpBuilder init(slot);
+                    init.setInsertionPointAfter(slot);
+                    auto target = init.create<helix::high::VarRefOp>(
+                        slot.getLoc(), parentType, slot.getVarId(),
+                        slot.getVarName(), IntegerAttr{});
+                    auto source = init.create<helix::high::VarRefOp>(
+                        slot.getLoc(), parentType, incoming.getVarId(),
+                        incoming.getVarName(), IntegerAttr{});
+                    init.create<helix::high::AssignOp>(
+                        slot.getLoc(), target.getResult(), source.getResult(),
+                        IntegerAttr{});
+                }
+            }
+            SmallVector<Operation*, 32> registerOps;
+            funcBody.walk<WalkOrder::PreOrder>([&](Operation* op) {
+                StringRef reg;
+                if (auto read = dyn_cast<helix::low::RegReadOp>(op))
+                    reg = read.getRegName();
+                else if (auto write = dyn_cast<helix::low::RegWriteOp>(op))
+                    reg = write.getRegName();
+                else
+                    return;
+                auto subReg = getSubRegInfo(reg);
+                if (subReg && subReg->parent == structuredReturnRegister)
+                    registerOps.push_back(op);
+            });
+            for (Operation* op : registerOps) {
+                OpBuilder at(op);
+                auto loc = op->getLoc();
+                auto slotRef = [&]() {
+                    return at.create<helix::high::VarRefOp>(
+                        loc, parentType, slot.getVarId(), slot.getVarName(),
+                        IntegerAttr{});
+                };
+                if (auto read = dyn_cast<helix::low::RegReadOp>(op)) {
+                    auto info = *getSubRegInfo(read.getRegName());
+                    auto readType = cast<IntegerType>(read.getResult().getType());
+                    info.width = std::min(info.width, std::min(parentWidth, readType.getWidth()));
+                    const std::string name = llvm::formatv(
+                        "{0}_read_{1}",
+                        structuredReturnRegister.lower(),
+                        tracker.varIdCounter).str();
+                    auto snapshot = declareSlot(name, helix::high::StorageKind::Temporary);
+                    helix::copyTypeEvidence(snapshot, slot);
+                    auto source = slotRef();
+                    auto target = at.create<helix::high::VarRefOp>(
+                        loc, parentType, snapshot.getVarId(), snapshot.getVarName(), IntegerAttr{});
+                    at.create<helix::high::AssignOp>(loc, target.getResult(), source.getResult(), IntegerAttr{});
+                    Value value = at.create<helix::high::VarRefOp>(
+                        loc, parentType, snapshot.getVarId(), snapshot.getVarName(), IntegerAttr{}).getResult();
+                    if (info.bitOffset)
+                        value = emitHighByteExtract(value, info.bitOffset, info.width, at, loc);
+                    else
+                        value = emitTruncation(value, info.width, at, loc);
+                    if (value.getType() != read.getResult().getType())
+                        value = at.create<helix::high::CastOp>(loc, read.getResult().getType(), value,
+                            IntegerAttr{}, helix::high::CastKindAttr{});
+                    read.getResult().replaceAllUsesWith(value);
+                    read.erase();
+                    ++NumReadsReplaced;
+                } else {
+                    auto write = cast<helix::low::RegWriteOp>(op);
+                    auto info = *getSubRegInfo(write.getRegName());
+                    auto valueType = cast<IntegerType>(write.getValue().getType());
+                    info.width = std::min(info.width, std::min(parentWidth, valueType.getWidth()));
+                    Value value = write.getValue();
+                    if (info.width < parentWidth)
+                        value = emitSubRegInsert(slotRef().getResult(), value, info, at, loc);
+                    else
+                        value = emitTruncation(value, parentWidth, at, loc);
+                    at.create<helix::high::AssignOp>(loc, slotRef().getResult(), value, IntegerAttr{});
+                    write.erase();
+                    ++NumWritesReplaced;
+                }
+            }
+            declBuilder.setInsertionPointAfter(slot);
+        }
+
+        // Each remaining RegWrite creates a NEW version (rax, rax_1, ...)
         // and each RegRead references the MOST RECENT version.
         //
         // Industry standard: SAILR, Osprey, ReSym, Ghidra, IDA Pro all
@@ -1049,6 +1386,8 @@ private:
 
         // Per-block SSA exit state snapshots (for idom seeding)
         llvm::DenseMap<Block*, SSAVersionTracker::Snapshot> blockExitState;
+        llvm::DenseMap<Operation*, SSAVersionTracker::Snapshot>
+            structuredEntryState;
 
         // Walk blocks in computed order (RPO or region-order fallback).
         for (Block* blockPtr : blockOrder) {
@@ -1103,6 +1442,8 @@ private:
 
             // ── Process ops in program order within the block ───────
             for (auto& op : llvm::make_early_inc_range(block)) {
+                if (op.getNumRegions() != 0)
+                    structuredEntryState[&op] = ssaTracker.snapshot();
 
                 // ── Handle RegRead ──────────────────────────────────────
                 if (auto readOp = dyn_cast<helix::low::RegReadOp>(&op)) {
@@ -1140,7 +1481,14 @@ private:
                         continue;
                     }
 
-                    auto& subReg = *subRegOpt;
+					auto subReg = *subRegOpt;
+					const unsigned parentWidth =
+						getParentRegisterWidth(subReg, isCdecl32);
+					if (auto readType =
+							dyn_cast<IntegerType>(readOp.getResult().getType()))
+						subReg.width = std::min(
+							subReg.width,
+							std::min(parentWidth, readType.getWidth()));
 
                     // Get the current SSA version for this register.
                     // If no version exists yet (read before any write),
@@ -1164,18 +1512,23 @@ private:
                             readOp->getAttrOfType<StringAttr>(
                                 "inferred_type")) {
                         bool shouldSet = !varDeclOp->hasAttr("inferred_type");
+                        bool pointerRefinement = false;
                         if (!shouldSet) {
                             // Pointer overrides int (more specific type)
                             auto curType = varDeclOp->getAttrOfType<
                                 StringAttr>("inferred_type");
                             if (curType &&
                                 !curType.getValue().ends_with("*") &&
-                                inferredType.getValue().ends_with("*"))
+                                inferredType.getValue().ends_with("*")) {
                                 shouldSet = true;
+                                pointerRefinement = true;
+                            }
                         }
                         if (shouldSet)
-                            varDeclOp->setAttr("inferred_type",
-                                               inferredType);
+                            helix::applyTypeEvidence(
+                                varDeclOp, inferredType.getValue(),
+                                helix::TypeEvidenceSource::DataFlow,
+                                pointerRefinement ? 45u : 40u);
                     }
 
                     // Track param naming statistics.
@@ -1187,16 +1540,17 @@ private:
                         ++NumReturnVarsNamed;
 
                     // Create VarRef with THIS version's var_id.
-                    auto i64Ty = builder.getIntegerType(64);
+					auto parentType = builder.getIntegerType(parentWidth);
                     auto varRef = builder.create<helix::high::VarRefOp>(
-                        readOp.getLoc(), i64Ty,
+                        readOp.getLoc(), parentType,
                         ver->varId,
                         builder.getStringAttr(ver->varName),
                         mlir::IntegerAttr{});
+                    helix::copyTypeEvidence(varRef, varDeclOp);
 
                     // Handle sub-register truncation.
                     Value result;
-                    if (subReg.width == 64 && subReg.bitOffset == 0) {
+                    if (subReg.width == parentWidth && subReg.bitOffset == 0) {
                         result = varRef.getResult();
                     } else if (subReg.bitOffset == 0) {
                         result = emitTruncation(varRef.getResult(),
@@ -1261,12 +1615,19 @@ private:
                         continue;
                     }
 
-                    auto& subReg = *subRegOpt;
+					auto subReg = *subRegOpt;
 
-                    builder.setInsertionPoint(writeOp);
+					builder.setInsertionPoint(writeOp);
 
-                    Value valueToStore;
-                    if (subReg.width == 64 && subReg.bitOffset == 0) {
+					Value valueToStore;
+					const unsigned parentWidth =
+						getParentRegisterWidth(subReg, isCdecl32);
+					if (auto writeType =
+							dyn_cast<IntegerType>(writeOp.getValue().getType()))
+						subReg.width = std::min(
+							subReg.width,
+							std::min(parentWidth, writeType.getWidth()));
+                    if (subReg.width == parentWidth && subReg.bitOffset == 0) {
                         // Full-width write — direct assignment.
                         valueToStore = writeOp.getValue();
                     } else {
@@ -1283,10 +1644,10 @@ private:
                                 subReg.parent);
                         }
 
-                        auto i64Ty = builder.getIntegerType(64);
+                        auto parentType = builder.getIntegerType(parentWidth);
                         auto currentVar =
                             builder.create<helix::high::VarRefOp>(
-                                writeOp.getLoc(), i64Ty,
+                                writeOp.getLoc(), parentType,
                                 prevVer->varId,
                                 builder.getStringAttr(prevVer->varName),
                                 mlir::IntegerAttr{});
@@ -1309,18 +1670,16 @@ private:
                     if (!newDeclTyped->hasAttr("inferred_type")) {
                         if (auto* valDef =
                                 writeOp.getValue().getDefiningOp()) {
-                            if (auto inferredType =
-                                    valDef->getAttrOfType<StringAttr>(
-                                        "inferred_type"))
-                                newDeclTyped->setAttr("inferred_type",
-                                                      inferredType);
+                            auto inferred = valDef->getAttrOfType<StringAttr>("inferred_type");
+                            // A void call has no C value; it cannot type reused
+                            // register storage that receives a later value.
+                            if (!inferred || inferred.getValue() != "void")
+                                helix::copyTypeEvidence(newDeclTyped, valDef);
                         }
                         if (!newDeclTyped->hasAttr("inferred_type")) {
-                            if (auto inferredType =
-                                    writeOp->getAttrOfType<StringAttr>(
-                                        "inferred_type"))
-                                newDeclTyped->setAttr("inferred_type",
-                                                      inferredType);
+                            auto inferred = writeOp->getAttrOfType<StringAttr>("inferred_type");
+                            if (!inferred || inferred.getValue() != "void")
+                                helix::copyTypeEvidence(newDeclTyped, writeOp);
                         }
                     }
 
@@ -1332,6 +1691,7 @@ private:
                             newDeclTyped.getVarId(),
                             newDeclTyped.getVarName(),
                             mlir::IntegerAttr{});
+                    helix::copyTypeEvidence(targetRef, newDeclTyped);
                     auto assignOp2 =
                         builder.create<helix::high::AssignOp>(
                             writeOp.getLoc(),
@@ -1428,6 +1788,9 @@ private:
                 Operation* topOp = findTopLevelAncestor(op);
                 if (!topOp)
                     return nullptr;
+                if (auto entry = structuredEntryState.find(topOp);
+                    entry != structuredEntryState.end())
+                    return &entry->second;
                 Block* topBlock = topOp->getBlock();
                 auto it = blockExitState.find(topBlock);
                 if (it == blockExitState.end())
@@ -1455,6 +1818,158 @@ private:
                 survivingWrites.push_back(w);
             });
 
+            // Strategy B models nested regions with mutable register slots.
+            // A parameter must not be that slot: compiled code freely reuses
+            // ABI registers after consuming their entry value.
+            // Create one initialized shadow per top-level block/register when
+            // a nested full-width write would otherwise target a parameter.
+            using RegionRegKey = std::pair<Block*, std::string>;
+            std::set<RegionRegKey> nestedWrittenRegs;
+            for (auto writeOp : survivingWrites) {
+                auto subReg = getSubRegInfo(writeOp.getRegName());
+                Operation* topOp = findTopLevelAncestor(writeOp);
+                if (!subReg || !topOp)
+                    continue;
+				auto constrained = *subReg;
+				const unsigned parentWidth =
+					getParentRegisterWidth(constrained, isCdecl32);
+				if (auto valueType = dyn_cast<IntegerType>(
+						writeOp.getValue().getType()))
+					constrained.width = std::min(
+						constrained.width,
+						std::min(parentWidth, valueType.getWidth()));
+				if (constrained.width != parentWidth ||
+					constrained.bitOffset != 0)
+					continue;
+                nestedWrittenRegs.emplace(topOp->getBlock(),
+									  constrained.parent);
+            }
+
+            std::map<RegionRegKey, SSAVersionTracker::Version>
+                nestedParameterShadows;
+            auto hasPriorNestedWriteOnPath =
+                [&](Operation* op, llvm::StringRef canonicalReg) {
+                    for (Operation* ancestor = op ? op->getParentOp() : nullptr;
+                         ancestor && ancestor != func.getOperation();
+                         ancestor = ancestor->getParentOp()) {
+                        if (!isa<mlir::scf::WhileOp, mlir::scf::ForOp,
+                                 helix::high::WhileOp,
+                                 helix::high::DoWhileOp,
+                                 helix::high::ForOp>(ancestor))
+                            continue;
+                        bool loopWritesRegister = false;
+                        ancestor->walk([&](helix::low::RegWriteOp write) {
+                            auto info = getSubRegInfo(write.getRegName());
+                            if (info && info->parent == canonicalReg)
+                                loopWritesRegister = true;
+                        });
+                        if (loopWritesRegister)
+                            return true;
+                    }
+                    Operation* cursor = op;
+                    while (cursor) {
+                        Block* block = cursor->getBlock();
+                        if (!block)
+                            return true;
+                        for (Operation& candidate : block->getOperations()) {
+                            if (&candidate == cursor)
+                                break;
+                            bool writesRegister = false;
+                            candidate.walk([&](helix::low::RegWriteOp write) {
+                                auto info = getSubRegInfo(write.getRegName());
+                                if (info && info->parent == canonicalReg)
+                                    writesRegister = true;
+                            });
+                            if (writesRegister)
+                                return true;
+                        }
+                        Operation* parent = block->getParentOp();
+                        if (!parent || parent == func.getOperation())
+                            break;
+                        cursor = parent;
+                    }
+                    return false;
+                };
+            auto versionForNestedOp =
+                [&](Operation* op, llvm::StringRef canonicalReg)
+                    -> const SSAVersionTracker::Version* {
+                const SSAVersionTracker::Snapshot* snap = snapshotForOp(op);
+                if (!snap)
+                    return nullptr;
+                auto vit = snap->find(canonicalReg);
+                if (vit == snap->end())
+                    return nullptr;
+
+                const auto& reaching = vit->second;
+                auto reachingDecl =
+                    dyn_cast_or_null<helix::high::VarDeclOp>(reaching.decl);
+                Operation* topOp = findTopLevelAncestor(op);
+                if (!reachingDecl || !topOp ||
+                    reachingDecl.getStorage() !=
+                        helix::high::StorageKind::Parameter)
+                    return &reaching;
+
+                // Reads before any possible nested write still observe the
+                // immutable entry parameter. Once a preceding sibling or
+                // ancestor operation may write the register, use the mutable
+                // region shadow. This prevents a later register lifetime from
+                // donating structural uses to the source parameter while
+                // retaining correct branch/loop-carried state.
+                if (isa<helix::low::RegReadOp>(op) &&
+                    !hasPriorNestedWriteOnPath(op, canonicalReg))
+                    return &reaching;
+
+                RegionRegKey key{topOp->getBlock(),
+                                 canonicalReg.str()};
+                if (!nestedWrittenRegs.contains(key))
+                    return &reaching;
+
+                auto existing = nestedParameterShadows.find(key);
+                if (existing != nestedParameterShadows.end())
+                    return &existing->second;
+
+                std::string shadowName =
+                    llvm::formatv("{0}_region_{1}",
+                                  regToVarName(canonicalReg),
+                                  tracker.varIdCounter).str();
+                auto shadowDecl =
+                    declBuilder.create<helix::high::VarDeclOp>(
+                        funcLoc,
+                        /*var_id=*/tracker.varIdCounter++,
+                        /*var_name=*/shadowName,
+                        /*storage=*/helix::high::StorageKind::Register,
+                        /*stack_offset=*/IntegerAttr{},
+                        /*init=*/Value{},
+                        /*address=*/IntegerAttr{});
+                if (reaching.decl)
+                    helix::copyTypeEvidence(
+                        shadowDecl, reaching.decl);
+
+                OpBuilder initBuilder(topOp);
+                auto i64Ty = initBuilder.getIntegerType(64);
+                auto sourceRef =
+                    initBuilder.create<helix::high::VarRefOp>(
+                        topOp->getLoc(), i64Ty, reaching.varId,
+                        initBuilder.getStringAttr(reaching.varName),
+                        mlir::IntegerAttr{});
+                auto shadowRef =
+                    initBuilder.create<helix::high::VarRefOp>(
+                        topOp->getLoc(), i64Ty, shadowDecl.getVarId(),
+                        shadowDecl.getVarName(), mlir::IntegerAttr{});
+                initBuilder.create<helix::high::AssignOp>(
+                    topOp->getLoc(), shadowRef.getResult(),
+                    sourceRef.getResult(), mlir::IntegerAttr{});
+
+                auto [inserted, _] = nestedParameterShadows.emplace(
+                    std::move(key),
+                    SSAVersionTracker::Version{
+                        shadowDecl, shadowDecl.getVarId(),
+                        shadowDecl.getVarName().str()});
+                ++NumRegVarsCreated;
+                ++NumSSAVersions;
+                return &inserted->second;
+            };
+
             // ── Return-context fallback for in-region RAX writes ──────────
             //
             // For hash-loop style functions (FNV, CRC, etc.) the final RAX
@@ -1471,27 +1986,46 @@ private:
             // unassigned `int64_t result;` and the loop body is empty
             // except for the byte-load.
             //
-            // Fix: when the function returns a value AND main-loop
-            // processing produced no "RAX__result" decl AND a surviving
-            // in-region RAX (full-width) write exists, synthesise a
-            // "result" VarDecl at function entry and use it as the
-            // override target for every full-width in-region RAX
-            // read/write below.  This gives the accumulator chain a
-            // user-visible consumer (the synthesised `return result`)
-            // and keeps it alive through DCE.
-            // Conservatism guard: only apply this fallback when the RAX
-            // chain lives inside a LOOP region (do_while / while / for).
-            // Hash-loop functions (FNV, CRC, …) match this shape; if-only
-            // RAX writes are conditional return paths whose pre-fix DCE
-            // behaviour is already what callers expect, and renaming them
-            // to "result" exposes raw-VA derefs that score worse without
-            // adding semantic content.
-            auto isInsideLoopRegion = [](Operation* op) {
+            // Fix: when a surviving in-region RAX (full-width) write exists,
+            // reuse the exact `result` SSA identity already created by the
+            // top-level walk. Only synthesize that identity when the nested
+            // region is the first place that writes the return register.
+            // Looking this up by var_id matters: the old string-map probe used
+            // the non-existent key "RAX__result", so it created a second
+            // VarDecl named `result` even when one already existed. The C AST
+            // then contained two declarations with the same identifier.
+            // FIX (return-context, if-region extension): originally gated
+            // to LOOP regions only (do_while/while/for) -- hash-loop
+            // functions (FNV, CRC, ...) match that shape. If-only RAX
+            // writes (an early-return guard clause: `if (cond) { ...;
+            // return 1; } else { ...; return 0; }`, both writes converging
+            // on one shared exit block via jmp) were deliberately excluded
+            // per a prior note that doing so "exposes raw-VA derefs that
+            // score worse without adding semantic content." Empirically
+            // (isolated repro: a bare `if(argc<4){printf;return 1;}
+            // return 0;` guard clause) if-only writes are NOT already
+            // handled elsewhere -- they hit exactly the failure mode this
+            // whole fallback exists to fix (uninitialized `result`,
+            // DCE'd write, damning-honesty confidence cap), so the
+            // original premise doesn't hold for this shape. Extending to
+            // `IfOp` is still additive-only: it only widens which
+            // orphaned in-region RAX writes get a real backing variable
+            // instead of being silently DCE'd; it never touches a write
+            // that was already being handled by another path. Validate
+            // corpus-wide before trusting this over the prior guard's
+            // warning -- that warning came from a real (if unspecified)
+            // regression case, not a guess.
+            auto isInsideLoopOrIfRegion = [](Operation* op) {
                 for (Operation* cur = op->getParentOp(); cur;
                      cur = cur->getParentOp()) {
                     if (isa<helix::high::DoWhileOp,
                             helix::high::WhileOp,
-                            helix::high::ForOp>(cur))
+                            helix::high::ForOp,
+                            helix::high::IfOp,
+                            mlir::scf::IfOp,
+                            mlir::scf::WhileOp,
+                            mlir::scf::ForOp,
+                            mlir::scf::IndexSwitchOp>(cur))
                         return true;
                 }
                 return false;
@@ -1499,33 +2033,60 @@ private:
 
             SSAVersionTracker::Version resultOverride;
             bool useResultOverrideForRAX = false;
-            if (tracker.hasReturnValue
-                && !tracker.regToDecl.count("RAX__result")) {
+            if (tracker.hasReturnValue) {
                 bool hasInRegionFullRaxWrite = false;
                 for (auto w : survivingWrites) {
                     auto sr = getSubRegInfo(w.getRegName());
-                    if (sr && sr->parent == "RAX"
-                        && sr->width == 64 && sr->bitOffset == 0
-                        && isInsideLoopRegion(w)) {
+					if (!sr)
+						continue;
+					auto constrained = *sr;
+					const unsigned parentWidth =
+						getParentRegisterWidth(constrained, isCdecl32);
+					if (auto valueType = dyn_cast<IntegerType>(
+							w.getValue().getType()))
+						constrained.width = std::min(
+							constrained.width,
+							std::min(parentWidth, valueType.getWidth()));
+                    if (constrained.parent == "RAX"
+						&& constrained.width == parentWidth
+						&& constrained.bitOffset == 0
+                        && isInsideLoopOrIfRegion(w)) {
                         hasInRegionFullRaxWrite = true;
                         break;
                     }
                 }
                 if (hasInRegionFullRaxWrite) {
-                    auto declOp = declBuilder.create<helix::high::VarDeclOp>(
-                        funcLoc,
-                        /*var_id=*/tracker.varIdCounter++,
-                        /*var_name=*/"result",
-                        /*storage=*/helix::high::StorageKind::Register,
-                        /*stack_offset=*/IntegerAttr{},
-                        /*init=*/Value{},
-                        /*address=*/IntegerAttr{});
-                    tracker.regToDecl["RAX__result"] = declOp;
-                    resultOverride.decl = declOp;
-                    resultOverride.varId = declOp.getVarId();
-                    resultOverride.varName = "result";
-                    useResultOverrideForRAX = true;
-                    ++NumReturnVarsNamed;
+                    auto versionsIt = ssaTracker.allVersions.find("RAX");
+                    if (versionsIt != ssaTracker.allVersions.end()) {
+                        for (auto it = versionsIt->second.rbegin();
+                             it != versionsIt->second.rend(); ++it) {
+                            if (it->varName == "result") {
+                                resultOverride = *it;
+                                useResultOverrideForRAX = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!useResultOverrideForRAX) {
+                        auto declOp =
+                            declBuilder.create<helix::high::VarDeclOp>(
+                                funcLoc,
+                                /*var_id=*/tracker.varIdCounter++,
+                                /*var_name=*/"result",
+                                /*storage=*/helix::high::StorageKind::Register,
+                                /*stack_offset=*/IntegerAttr{},
+                                /*init=*/Value{},
+                                /*address=*/IntegerAttr{});
+                        tracker.regToDecl["__ret_result"] = declOp;
+                        resultOverride.decl = declOp;
+                        resultOverride.varId = declOp.getVarId();
+                        resultOverride.varName = "result";
+                        ++NumRegVarsCreated;
+                        ++NumSSAVersions;
+                        ++NumReturnVarsNamed;
+                        useResultOverrideForRAX = true;
+                    }
                 }
             }
 
@@ -1536,32 +2097,30 @@ private:
                 auto subRegOpt = getSubRegInfo(regName);
                 if (!subRegOpt)
                     continue;
-                auto& subReg = *subRegOpt;
+				auto subReg = *subRegOpt;
+				const unsigned parentWidth =
+					getParentRegisterWidth(subReg, isCdecl32);
+				if (auto readType =
+						dyn_cast<IntegerType>(readOp.getResult().getType()))
+					subReg.width = std::min(
+						subReg.width,
+						std::min(parentWidth, readType.getWidth()));
 
                 const SSAVersionTracker::Version* verPtr = nullptr;
                 if (useResultOverrideForRAX && subReg.parent == "RAX"
-                    && isInsideLoopRegion(readOp)) {
+                    && isInsideLoopOrIfRegion(readOp)) {
                     // Hash-loop-style return-context fallback: every
                     // in-loop RAX access shares the "result" identity
                     // (sub-register narrowing still applies below).
                     verPtr = &resultOverride;
                 } else {
-                    const SSAVersionTracker::Snapshot* snap =
-                        snapshotForOp(readOp);
-                    if (!snap) {
+                    verPtr = versionForNestedOp(readOp, subReg.parent);
+                    if (!verPtr) {
                         if (stratBTrace)
                             llvm::errs() << "[STRATB] read reg=" << subReg.parent
                                          << " -> NOSNAP (fallthrough->hash-slot)\n";
                         continue;
                     }
-                    auto vit = snap->find(subReg.parent);
-                    if (vit == snap->end()) {
-                        if (stratBTrace)
-                            llvm::errs() << "[STRATB] read reg=" << subReg.parent
-                                         << " -> NOREG-in-snap (fallthrough)\n";
-                        continue;
-                    }
-                    verPtr = &vit->second;
                 }
                 const SSAVersionTracker::Version& ver = *verPtr;
                 if (stratBTrace)
@@ -1569,15 +2128,15 @@ private:
                                  << " -> bound:" << ver.varName << "\n";
 
                 OpBuilder b(readOp);
-                auto i64Ty = b.getIntegerType(64);
+				auto parentType = b.getIntegerType(parentWidth);
                 auto varRef = b.create<helix::high::VarRefOp>(
-                    readOp.getLoc(), i64Ty,
+					readOp.getLoc(), parentType,
                     ver.varId,
                     b.getStringAttr(ver.varName),
                     mlir::IntegerAttr{});
 
                 Value result;
-                if (subReg.width == 64 && subReg.bitOffset == 0) {
+				if (subReg.width == parentWidth && subReg.bitOffset == 0) {
                     result = varRef.getResult();
                 } else if (subReg.bitOffset == 0) {
                     result = emitTruncation(varRef.getResult(),
@@ -1610,23 +2169,35 @@ private:
                 auto subRegOpt = getSubRegInfo(regName);
                 if (!subRegOpt)
                     continue;
-                auto& subReg = *subRegOpt;
-                if (!(subReg.width == 64 && subReg.bitOffset == 0))
+				auto subReg = *subRegOpt;
+				unsigned parentWidth =
+					getParentRegisterWidth(subReg, isCdecl32);
+				if (auto writeType = dyn_cast<IntegerType>(
+						writeOp.getValue().getType())) {
+					// A scalar SSE result is the complete recovered C value even
+					// though it occupies only the low lane of XMM/YMM storage.
+					// Treat 32/64-bit vector writes as full-width here so the
+					// structured-region value is not discarded as an unsupported
+					// partial register update.
+					if (subReg.parent.starts_with("XMM") &&
+						writeType.getWidth() <= 64)
+						parentWidth = writeType.getWidth();
+					subReg.width = std::min(
+						subReg.width,
+						std::min(parentWidth, writeType.getWidth()));
+				}
+				if (!(subReg.width == parentWidth &&
+						subReg.bitOffset == 0))
                     continue;
 
                 const SSAVersionTracker::Version* verPtr = nullptr;
                 if (useResultOverrideForRAX && subReg.parent == "RAX"
-                    && isInsideLoopRegion(writeOp)) {
+                    && isInsideLoopOrIfRegion(writeOp)) {
                     verPtr = &resultOverride;
                 } else {
-                    const SSAVersionTracker::Snapshot* snap =
-                        snapshotForOp(writeOp);
-                    if (!snap)
+                    verPtr = versionForNestedOp(writeOp, subReg.parent);
+                    if (!verPtr)
                         continue;
-                    auto vit = snap->find(subReg.parent);
-                    if (vit == snap->end())
-                        continue;
-                    verPtr = &vit->second;
                 }
                 const SSAVersionTracker::Version& ver = *verPtr;
 
@@ -1905,6 +2476,34 @@ private:
         LLVM_DEBUG(llvm::dbgs()
             << "  Phase 3.5: same-register SSA version coalescing\n");
 
+        // Preserve exact locals initialized directly from an ABI parameter.
+        // Structural recovery runs later, so merging this alias now with an
+        // unrelated address-bearing lifetime would make its future nominal
+        // type ambiguous and prevent a proven copy from typing the input.
+        llvm::DenseMap<uint32_t, helix::high::StorageKind> preMergeStorage;
+        llvm::DenseSet<uint32_t> parameterCopyIds;
+        funcBody.walk([&](helix::high::VarDeclOp decl) {
+            preMergeStorage[decl.getVarId()] = decl.getStorage();
+        });
+        funcBody.walk([&](helix::high::AssignOp assign) {
+            auto target = assign.getTarget()
+                .getDefiningOp<helix::high::VarRefOp>();
+            auto source = assign.getValue()
+                .getDefiningOp<helix::high::VarRefOp>();
+            if (!target || !source)
+                return;
+            auto sourceStorage = preMergeStorage.find(source.getVarId());
+            auto targetStorage = preMergeStorage.find(target.getVarId());
+            if (sourceStorage != preMergeStorage.end() &&
+                sourceStorage->second ==
+                    helix::high::StorageKind::Parameter &&
+                targetStorage != preMergeStorage.end() &&
+                targetStorage->second !=
+                    helix::high::StorageKind::Parameter) {
+                parameterCopyIds.insert(target.getVarId());
+            }
+        });
+
         // Pre-compute usage classification for every variable referenced in
         // the function.  Each variable is classified as:
         //   - Address: used as a pointer (mem.read addr, field access base)
@@ -1915,7 +2514,6 @@ private:
         // Used for semantic compatibility in coalescing — we refuse to merge
         // an Address-only variable with a Value-only variable, even if the
         // explicit type attributes don't conflict.
-        enum class UsageKind : uint8_t { None, Address, Value, Mixed };
         llvm::DenseMap<unsigned, uint8_t> usageMap;
         funcBody.walk([&](helix::high::VarRefOp ref) {
             unsigned varId = ref.getVarId();
@@ -1932,6 +2530,23 @@ private:
                     else flags |= 0x2;            // value operand
                 } else if (isa<helix::high::FieldAccessOp>(user)) {
                     if (idx == 0) flags |= 0x1;  // base operand
+                } else if (auto addOp = dyn_cast<LLVM::AddOp>(user)) {
+                    // FIX (Maya R. review): the address-forming
+                    // `llvm.add(base, const)` shape RecoverVariables
+                    // actually sees pre-HelixLowToMid (mid::FieldPtrOp
+                    // doesn't exist yet at this pipeline stage -- see
+                    // isAddressFormingAdd's comment). Any operand of this
+                    // add is address-forming, so it counts regardless of
+                    // which side (lhs/rhs) `ref` is on.
+                    if (isAddressFormingAdd(addOp))
+                        flags |= 0x1;  // addr-forming operand
+                    else
+                        flags |= 0x2;  // plain integer add
+                } else if (isa<helix::low::LeaOp>(user)) {
+                    // LEA is pure address computation by definition
+                    // (base + index*scale + disp) -- both base (operand 0)
+                    // and index (operand 1) are address-forming.
+                    flags |= 0x1;
                 } else if (isa<arith::AddIOp>(user) ||
                            isa<arith::SubIOp>(user) ||
                            isa<arith::MulIOp>(user) ||
@@ -1952,14 +2567,23 @@ private:
             usageMap[varId] = flags;
         });
 
-        auto getUsageKind = [&](unsigned varId) -> UsageKind {
-            uint8_t flags = usageMap.lookup(varId);
-            bool addr = (flags & 0x1) != 0;
-            bool val  = (flags & 0x2) != 0;
-            if (addr && val) return UsageKind::Mixed;
-            if (addr) return UsageKind::Address;
-            if (val) return UsageKind::Value;
-            return UsageKind::None;
+        // A mixed version is not split here: it may legitimately use one
+        // pointer value in both address and scalar contexts. It must not,
+        // however, absorb a separate version that has only scalar uses.
+        // Keep this flag-level rule shared with Phase 4 below.
+        auto isAddressBearing = [](uint8_t flags) {
+            return (flags & 0x1) != 0;
+        };
+        auto isPureValue = [](uint8_t flags) {
+            return (flags & 0x2) != 0 && (flags & 0x1) == 0;
+        };
+        auto areUsageFlagsCompatible = [&](uint8_t lhs, uint8_t rhs) {
+            return !(isAddressBearing(lhs) && isPureValue(rhs)) &&
+                   !(isAddressBearing(rhs) && isPureValue(lhs));
+        };
+        auto areSemanticsCompatible = [&](uint32_t idA, uint32_t idB) {
+            return areUsageFlagsCompatible(usageMap.lookup(idA),
+                                           usageMap.lookup(idB));
         };
 
         // Helper: returns true if a type string represents a pointer.
@@ -1974,10 +2598,29 @@ private:
                 auto& versions = entry.getValue();
                 if (versions.size() <= 1)
                     continue;
+                const bool returnRegisterFamily =
+                    helix::analysis::isX86GeneralPurposeReturnRegister(
+                        entry.getKey()) ||
+                    entry.getKey().equals_insensitive("XMM0") ||
+                    entry.getKey().equals_insensitive("X0") ||
+                    entry.getKey().equals_insensitive("V0");
 
                 // Base version (version 0) — the one we keep.
                 auto& base = versions[0];
                 if (!base.decl)
+                    continue;
+                if (!returnRegisterFamily &&
+                    parameterCopyIds.contains(base.varId))
+                    continue;
+
+                // Version zero of an ABI live-in is the entry value. Reusing
+                // the physical register later cannot mutate that parameter,
+                // even when no external debug signature is available.
+                auto baseDecl =
+                    dyn_cast<helix::high::VarDeclOp>(base.decl);
+                if (baseDecl &&
+                    baseDecl.getStorage() ==
+                        helix::high::StorageKind::Parameter)
                     continue;
 
                 // Type of the base version (for compatibility check).
@@ -1985,23 +2628,23 @@ private:
                     base.decl->getAttrOfType<StringAttr>("inferred_type");
                 bool basePtr = static_cast<bool>(baseTypeAttr) &&
                                isPtrTypeStr(baseTypeAttr.getValue());
-                auto baseKind = getUsageKind(base.varId);
 
                 for (size_t vi = 1; vi < versions.size(); ++vi) {
                     auto& ver = versions[vi];
                     if (!ver.decl)
                         continue;
+                    if (!returnRegisterFamily &&
+                        parameterCopyIds.contains(ver.varId))
+                        continue;
 
                     // ── Preserve the "result" return-value identity ───────
-                    // On AArch64 AAPCS64, X0 is both the first argument and
-                    // the integer return register: version 0 is the param
-                    // ("param_1") and a return-context write produces a
-                    // distinct "result" version. Coalescing "result" into the
-                    // param base would erase the return-value name that the C
-                    // emitter and DCE preservation key on. Keep them separate.
-                    // Gated to AAPCS64 so x86 coalescing is unchanged.
-                    if (tracker.isAapcs64 &&
-                        ver.varName == "result" && base.varName != "result")
+                    // The return-register version is an implicit output, even
+                    // though helix_low.ret has no SSA operand. Coalescing it
+                    // into an earlier scratch/parameter version erases the
+                    // exact "result" identity used by DCE and CAstBuilder.
+                    if (tracker.preserveExactReturnIdentity &&
+                        ver.varName == "result" &&
+                        base.varName != "result")
                         continue;
 
                     // ── Type compatibility check ──────────────────────────
@@ -2023,16 +2666,12 @@ private:
                     }
 
                     // ── Semantic usage compatibility ──────────────────────
-                    // Refuse coalescing if one version is used exclusively
-                    // as an address (pointer) and the other exclusively as
-                    // a value (arithmetic operand).  This catches the case
-                    // where the Remill lift assigned the same register to
-                    // semantically distinct values that share no type info.
-                    auto verKind = getUsageKind(ver.varId);
-                    if ((baseKind == UsageKind::Address &&
-                         verKind == UsageKind::Value) ||
-                        (baseKind == UsageKind::Value &&
-                         verKind == UsageKind::Address))
+                    // Refuse coalescing when one version is address-bearing
+                    // (Address or Mixed) and the other is pure scalar value.
+                    // This catches a pointer-bearing register version trying
+                    // to absorb an unrelated counter without splitting the
+                    // Mixed version's own uses.
+                    if (!areSemanticsCompatible(base.varId, ver.varId))
                         continue;
 
                     // ── Liveness interference check ───────────────────────
@@ -2196,7 +2835,7 @@ private:
 
                     // Propagate type from ver → base if base lacks one.
                     if (!baseTypeAttr && verTypeAttr)
-                        base.decl->setAttr("inferred_type", verTypeAttr);
+                        helix::copyTypeEvidence(base.decl, ver.decl);
 
                     // Erase ver's VarDeclOp.
                     ver.decl->erase();
@@ -2246,6 +2885,7 @@ private:
             // call-return SSA versions into one vN (the v3 = printk(0, v3)
             // x4 defect documented under FIX-081).
             bool definedByCall = false;
+            bool definedFromParameter = false;
         };
 
         auto buildVarInfoMap = [&](Region& body)
@@ -2257,6 +2897,8 @@ private:
             body.walk([&](helix::high::VarDeclOp decl) {
                 auto id = decl.getVarId();
                 infoMap[id].decl = decl;
+                infoMap[id].definedFromParameter =
+                    parameterCopyIds.contains(id);
             });
 
             // 2. Collect references and live blocks.
@@ -2348,6 +2990,16 @@ private:
                     else flags |= 0x2;
                 } else if (isa<helix::high::FieldAccessOp>(user)) {
                     if (idx == 0) flags |= 0x1;
+                } else if (auto addOp = dyn_cast<LLVM::AddOp>(user)) {
+                    // Keep this duplicate Phase 4 classifier in sync with
+                    // Phase 3.5: this pass still sees raw llvm.add before
+                    // HelixLowToMid has materialized field-pointer ops.
+                    if (isAddressFormingAdd(addOp))
+                        flags |= 0x1;
+                    else
+                        flags |= 0x2;
+                } else if (isa<helix::low::LeaOp>(user)) {
+                    flags |= 0x1;
                 } else if (isa<arith::AddIOp>(user) ||
                            isa<arith::SubIOp>(user) ||
                            isa<arith::MulIOp>(user) ||
@@ -2368,20 +3020,8 @@ private:
             usageMap[varId] = flags;
         });
 
-        // Phase 4 semantic compatibility: refuse merging an Address-only
-        // variable with a Value-only variable.
-        auto areSemanticsCompatible = [&](uint32_t idA, uint32_t idB) -> bool {
-            uint8_t a = usageMap.lookup(idA);
-            uint8_t b = usageMap.lookup(idB);
-            bool aAddr = (a & 0x1) != 0;
-            bool aVal  = (a & 0x2) != 0;
-            bool bAddr = (b & 0x1) != 0;
-            bool bVal  = (b & 0x2) != 0;
-            // Address-only and Value-only conflict
-            if (aAddr && !aVal && bVal && !bAddr) return false;
-            if (bAddr && !bVal && aVal && !aAddr) return false;
-            return true;
-        };
+        // Phase 4 reuses the Phase 3.5 rule above after rebuilding usageMap
+        // for the varIds rewritten by same-register coalescing.
 
         // ---------- Helper: check if live ranges overlap ----------
 
@@ -2437,6 +3077,8 @@ private:
             for (auto& [id, info] : infoMap) {
                 if (!info.decl)
                     continue;
+                if (info.decl->hasAttr("helix.value_snapshot"))
+                    continue;
                 // Skip parameters.
                 if (info.decl.getStorage() ==
                     helix::high::StorageKind::Parameter)
@@ -2468,18 +3110,58 @@ private:
                     if (!infoB.decl || isErased(infoB.decl.getOperation()))
                         continue;
 
+                    // Phase 3.5 preserves the implicit return-register
+                    // identity for same-register versions. Phase 4 must not
+                    // subsequently merge that `result` into an unrelated
+                    // register variable merely because their explicit live
+                    // ranges do not overlap.
+                    bool aIsResult =
+                        infoA.decl.getVarName() == "result";
+                    bool bIsResult =
+                        infoB.decl.getVarName() == "result";
+                    if (tracker.preserveExactReturnIdentity &&
+                        aIsResult != bIsResult)
+                        continue;
+
+                    // FIX-132: scf_r*/scf_w* are explicit storage identities
+                    // introduced by StructureControlFlow for region results,
+                    // loop-carried state, the loop condition, and parallel-copy
+                    // shadows. Their lexical live ranges may appear disjoint,
+                    // but tuple components and values carried across a loop
+                    // backedge are simultaneously live by construction.
+                    // Generic cover-based reuse can merge next_state, auxiliary
+                    // results, and continue into one slot, making the last
+                    // sequential assignment overwrite the others and turning a
+                    // finite cleanup chain into an infinite do-while. Keep every
+                    // bridge identity distinct here; the C-AST dispatcher pass
+                    // separately coalesces proven scf_r copy chains without
+                    // touching scf_w loop storage.
+                    const bool aIsSCFBridge =
+                        infoA.decl.getVarName().starts_with("scf_");
+                    const bool bIsSCFBridge =
+                        infoB.decl.getVarName().starts_with("scf_");
+                    if (aIsSCFBridge || bIsSCFBridge)
+                        continue;
+
                     // Don't merge if either touches a call block — the
                     // function call may clobber registers, making it unsafe
                     // to assume non-interference.
                     if (infoA.touchesCallBlock && infoB.touchesCallBlock)
                         continue;
 
+                    // Preserve direct parameter-copy aliases as exact
+                    // single-definition identities until structural/type
+                    // recovery has consumed their proven copy relation.
+                    if (infoA.definedFromParameter ||
+                        infoB.definedFromParameter)
+                        continue;
+
                     // Types must be compatible.
                     if (!areTypesCompatible(infoA.decl, infoB.decl))
                         continue;
 
-                    // Semantic usage must be compatible (refuse merging
-                    // address-only with value-only).
+                    // Semantic usage must be compatible (refuse an
+                    // address-bearing variable with a pure-value variable).
                     if (!areSemanticsCompatible(idA, idB))
                         continue;
 
@@ -2623,6 +3305,10 @@ private:
             for (auto& [id, info] : infoMap) {
                 if (!info.decl)
                     continue;
+                // A snapshot captures mutable state at its definition point.
+                // Inlining can re-read that state after a later overwrite.
+                if (info.decl->hasAttr("helix.value_snapshot"))
+                    continue;
                 // Only consider temporaries and registers (not params/stack).
                 auto storage = info.decl.getStorage();
                 if (storage == helix::high::StorageKind::Parameter)
@@ -2728,6 +3414,12 @@ private:
             << " SSA versions, merged " << totalMerged
             << " variables, inlined " << NumTempsInlined
             << " temporaries\n");
+
+        // Replacing a recovered VarRef with its assigned value can turn an
+        // existing LLVM extension/truncation into an identity cast. Remove
+        // only those exact no-ops before the verifier observes the function.
+        helix::removeIdentityLLVMIntegerCasts(
+            func->getParentOfType<mlir::ModuleOp>());
 
         return success();
     }

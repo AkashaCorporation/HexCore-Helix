@@ -208,6 +208,8 @@ TEST(Remill6DemanglerTest, MOVZX) {
     EXPECT_EQ(result->semantic, RemillSemantic::MOVZX);
     EXPECT_EQ(result->raw_name, "MOVZX");
     EXPECT_FALSE(result->is_helper);
+	EXPECT_EQ(result->src_width, 64u);
+	EXPECT_EQ(result->dst_width, 64u);
 }
 
 // ---------------------------------------------------------------------------

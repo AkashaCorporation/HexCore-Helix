@@ -16,21 +16,29 @@
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/analysis/DataSectionProvider.h"  // FIX-097: rodata string recovery
+#include "helix/analysis/TypeEvidence.h"
 
 #include <unordered_set>
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -44,6 +52,156 @@ using namespace helix::cast;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace {
+
+static CTypeEvidenceSource mapEvidenceSource(helix::TypeEvidenceSource source) {
+    switch (source) {
+    case helix::TypeEvidenceSource::Legacy: return CTypeEvidenceSource::Legacy;
+    case helix::TypeEvidenceSource::DataFlow: return CTypeEvidenceSource::DataFlow;
+    case helix::TypeEvidenceSource::Structural: return CTypeEvidenceSource::Structural;
+    case helix::TypeEvidenceSource::Interprocedural: return CTypeEvidenceSource::Interprocedural;
+    case helix::TypeEvidenceSource::SignatureDatabase: return CTypeEvidenceSource::SignatureDatabase;
+    case helix::TypeEvidenceSource::DebugInfo: return CTypeEvidenceSource::DebugInfo;
+    case helix::TypeEvidenceSource::User: return CTypeEvidenceSource::User;
+    }
+    return CTypeEvidenceSource::Unknown;
+}
+
+static CTypeEvidenceSource parseEvidenceSource(llvm::StringRef source) {
+    return llvm::StringSwitch<CTypeEvidenceSource>(source)
+        .Case("legacy", CTypeEvidenceSource::Legacy)
+        .Case("dataflow", CTypeEvidenceSource::DataFlow)
+        .Case("structural", CTypeEvidenceSource::Structural)
+        .Case("interprocedural", CTypeEvidenceSource::Interprocedural)
+        .Case("signature-db", CTypeEvidenceSource::SignatureDatabase)
+        .Case("debug-info", CTypeEvidenceSource::DebugInfo)
+        .Case("user", CTypeEvidenceSource::User)
+        .Default(CTypeEvidenceSource::Unknown);
+}
+
+static std::optional<CTypeEvidenceOrigin> readEvidenceOrigin(Operation* operation) {
+    auto module = operation ? operation->getParentOfType<ModuleOp>() : ModuleOp{};
+    if (!module)
+        return std::nullopt;
+    CTypeEvidenceOrigin origin;
+    if (auto producer = module->getAttrOfType<StringAttr>(
+            "helix.type_origin.producer"))
+        origin.producer = producer.getValue().str();
+    if (auto generation = module->getAttrOfType<IntegerAttr>(
+            "helix.type_origin.generation"))
+        origin.generation = generation.getValue().getZExtValue();
+    if (auto target = module->getAttrOfType<StringAttr>(
+            "helix.type_origin.target_identity"))
+        origin.targetIdentity = target.getValue().str();
+    if (auto snapshot = module->getAttrOfType<StringAttr>(
+            "helix.type_origin.snapshot_hash"))
+        origin.snapshotHash = snapshot.getValue().str();
+    if (origin.producer.empty() && !origin.generation &&
+        origin.targetIdentity.empty() && origin.snapshotHash.empty())
+        return std::nullopt;
+    return origin;
+}
+
+static CTypeEvidenceAuthority evidenceAuthority(
+        CTypeEvidenceSource source,
+        const std::optional<CTypeEvidenceOrigin>& origin) {
+    switch (source) {
+    case CTypeEvidenceSource::DataFlow:
+    case CTypeEvidenceSource::Structural:
+    case CTypeEvidenceSource::Interprocedural:
+    case CTypeEvidenceSource::SignatureDatabase:
+        return CTypeEvidenceAuthority::Derived;
+    case CTypeEvidenceSource::DebugInfo:
+    case CTypeEvidenceSource::User:
+        if (origin && !origin->targetIdentity.empty() &&
+            !origin->snapshotHash.empty())
+            return CTypeEvidenceAuthority::Authoritative;
+        return CTypeEvidenceAuthority::Heuristic;
+    case CTypeEvidenceSource::Legacy:
+        return CTypeEvidenceAuthority::Heuristic;
+    case CTypeEvidenceSource::Unknown:
+        return CTypeEvidenceAuthority::Unknown;
+    }
+    return CTypeEvidenceAuthority::Unknown;
+}
+
+static std::optional<CTypeEvidence> convertTypeEvidence(Operation* operation) {
+    auto evidence = helix::readTypeEvidence(operation);
+    if (!evidence)
+        return std::nullopt;
+    CTypeEvidence result;
+    result.source = mapEvidenceSource(evidence->source);
+    result.state = evidence->conflict
+        ? CTypeEvidenceState::SelectedWithConflict
+        : CTypeEvidenceState::Selected;
+    result.strength = static_cast<uint16_t>(
+        std::min<unsigned>(evidence->strength,
+                           std::numeric_limits<uint16_t>::max()));
+    if (auto rejected = operation->getAttrOfType<StringAttr>(
+            "helix.type.rejected"))
+        result.rejectedSpelling = rejected.getValue().str();
+    if (result.source == CTypeEvidenceSource::DebugInfo ||
+        result.source == CTypeEvidenceSource::User)
+        result.origin = readEvidenceOrigin(operation);
+    result.authority = evidenceAuthority(result.source, result.origin);
+    return result;
+}
+
+static std::optional<CTypeEvidence> convertTypeEvidence(
+        DictionaryAttr attributes, Operation* originOwner) {
+    if (!attributes)
+        return std::nullopt;
+    auto source = attributes.getAs<StringAttr>("helix.type.source");
+    auto strength = attributes.getAs<IntegerAttr>("helix.type.strength");
+    if (!source && !strength && !attributes.contains("helix.type.conflict") &&
+        !attributes.contains("helix.type.rejected"))
+        return std::nullopt;
+    CTypeEvidence result;
+    result.source = source
+        ? parseEvidenceSource(source.getValue())
+        : CTypeEvidenceSource::Unknown;
+    result.state = attributes.contains("helix.type.conflict")
+        ? CTypeEvidenceState::SelectedWithConflict
+        : CTypeEvidenceState::Selected;
+    if (strength)
+        result.strength = static_cast<uint16_t>(std::min<uint64_t>(
+            strength.getValue().getZExtValue(),
+            std::numeric_limits<uint16_t>::max()));
+    if (auto rejected = attributes.getAs<StringAttr>("helix.type.rejected"))
+        result.rejectedSpelling = rejected.getValue().str();
+    if (result.source == CTypeEvidenceSource::DebugInfo ||
+        result.source == CTypeEvidenceSource::User)
+        result.origin = readEvidenceOrigin(originOwner);
+    result.authority = evidenceAuthority(result.source, result.origin);
+    return result;
+}
+
+static std::optional<CTypeEvidence> convertReturnTypeEvidence(
+        Operation* operation) {
+    if (!operation)
+        return std::nullopt;
+    auto source = operation->getAttrOfType<StringAttr>(
+        "helix.return_type.source");
+    if (!source)
+        return std::nullopt;
+    CTypeEvidence result;
+    result.source = parseEvidenceSource(source.getValue());
+    result.state = operation->hasAttr("helix.return_type.conflict")
+        ? CTypeEvidenceState::SelectedWithConflict
+        : CTypeEvidenceState::Selected;
+    if (auto strength = operation->getAttrOfType<IntegerAttr>(
+            "helix.return_type.strength"))
+        result.strength = static_cast<uint16_t>(std::min<uint64_t>(
+            strength.getValue().getZExtValue(),
+            std::numeric_limits<uint16_t>::max()));
+    if (auto rejected = operation->getAttrOfType<StringAttr>(
+            "helix.return_type.rejected"))
+        result.rejectedSpelling = rejected.getValue().str();
+    if (result.source == CTypeEvidenceSource::DebugInfo ||
+        result.source == CTypeEvidenceSource::User)
+        result.origin = readEvidenceOrigin(operation);
+    result.authority = evidenceAuthority(result.source, result.origin);
+    return result;
+}
 
 /// Parse "param_N" → N, or nullopt.
 static std::optional<unsigned> parseParamIndex(std::string_view name) {
@@ -60,6 +218,48 @@ static std::optional<unsigned> parseParamIndex(std::string_view name) {
     if (value == 0)
         return std::nullopt;
     return value;
+}
+
+static std::string_view trimType(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.remove_suffix(1);
+    return s;
+}
+
+/// Parse the canonical C spellings supplied by DWARF/BTF and PropagateTypes.
+/// Unknown typedefs intentionally remain int64_t rather than inventing a type.
+static CTypePtr cTypeFromString(std::string_view raw, bool nominalPointee = false) {
+    raw = trimType(raw);
+    for (std::string_view qualifier : {"const ", "volatile ", "restrict "}) {
+        if (raw.starts_with(qualifier)) {
+            raw.remove_prefix(qualifier.size());
+            raw = trimType(raw);
+        }
+    }
+    if (raw.ends_with('*')) {
+        raw.remove_suffix(1);
+        return CType::pointerTo(cTypeFromString(trimType(raw), true));
+    }
+    if (raw.starts_with("struct ")) {
+        raw.remove_prefix(7);
+        return CType::structTy(std::string(trimType(raw)));
+    }
+    if (raw == "void") return CType::voidTy();
+    if (raw == "bool") return CType::boolTy();
+    if (raw == "int8_t" || raw == "int8" || raw == "char" || raw == "signed char") return CType::int8();
+    if (raw == "uint8_t" || raw == "uint8" || raw == "u8" || raw == "unsigned char") return CType::uint8();
+    if (raw == "int16_t" || raw == "int16" || raw == "short") return CType::int16();
+    if (raw == "uint16_t" || raw == "uint16" || raw == "u16" || raw == "unsigned short") return CType::uint16();
+    if (raw == "int32_t" || raw == "int32" || raw == "int") return CType::int32();
+    if (raw == "uint32_t" || raw == "uint32" || raw == "u32" || raw == "unsigned int") return CType::uint32();
+    if (raw == "int64_t" || raw == "int64" || raw == "long" || raw == "long int") return CType::int64();
+    if (raw == "uint64_t" || raw == "uint64" || raw == "u64" || raw == "unsigned long" || raw == "long unsigned int") return CType::uint64();
+    if (raw == "float" || raw == "float32") return CType::floatTy();
+    if (raw == "double" || raw == "float64") return CType::doubleTy();
+    // Preserve the existing nominal fallback only for unresolved pointees.
+    return nominalPointee ? CType::structTy(std::string(raw)) : CType::int64();
 }
 
 /// True for synthetic variable names (var_N, spill_N).
@@ -100,6 +300,10 @@ static BinaryOp mapBinaryOp(helix::high::BinaryOpKind kind) {
     case helix::high::BinaryOpKind::Ge:     return BinaryOp::Ge;
     case helix::high::BinaryOpKind::LogAnd: return BinaryOp::LogAnd;
     case helix::high::BinaryOpKind::LogOr:  return BinaryOp::LogOr;
+    case helix::high::BinaryOpKind::Ult:    return BinaryOp::Lt;
+    case helix::high::BinaryOpKind::Ule:    return BinaryOp::Le;
+    case helix::high::BinaryOpKind::Ugt:    return BinaryOp::Gt;
+    case helix::high::BinaryOpKind::Uge:    return BinaryOp::Ge;
     }
     return BinaryOp::Add; // unreachable
 }
@@ -123,6 +327,10 @@ static BinaryOp mapMidBinaryOp(helix::mid::BinExprKind kind) {
     case helix::mid::BinExprKind::Sub:    return BinaryOp::Sub;
     case helix::mid::BinExprKind::Mul:    return BinaryOp::Mul;
     case helix::mid::BinExprKind::Div:    return BinaryOp::Div;
+    case helix::mid::BinExprKind::UMul:   return BinaryOp::Mul;
+    case helix::mid::BinExprKind::SMul:   return BinaryOp::Mul;
+    case helix::mid::BinExprKind::UDiv:   return BinaryOp::Div;
+    case helix::mid::BinExprKind::SDiv:   return BinaryOp::Div;
     case helix::mid::BinExprKind::Mod:    return BinaryOp::Mod;
     case helix::mid::BinExprKind::Shl:    return BinaryOp::Shl;
     case helix::mid::BinExprKind::Shr:    return BinaryOp::Shr;
@@ -138,6 +346,13 @@ static BinaryOp mapMidBinaryOp(helix::mid::BinExprKind kind) {
     case helix::mid::BinExprKind::Ge:     return BinaryOp::Ge;
     case helix::mid::BinExprKind::LogAnd: return BinaryOp::LogAnd;
     case helix::mid::BinExprKind::LogOr:  return BinaryOp::LogOr;
+    case helix::mid::BinExprKind::Ult:    return BinaryOp::Lt;
+    case helix::mid::BinExprKind::Ule:    return BinaryOp::Le;
+    case helix::mid::BinExprKind::Ugt:    return BinaryOp::Gt;
+    case helix::mid::BinExprKind::Uge:    return BinaryOp::Ge;
+    case helix::mid::BinExprKind::Rol:
+    case helix::mid::BinExprKind::Ror:
+        llvm_unreachable("rotate must use the explicit builtin path");
     }
     return BinaryOp::Add; // unreachable
 }
@@ -150,6 +365,10 @@ static UnaryOp mapMidUnaryOp(helix::mid::UnExprKind kind) {
     case helix::mid::UnExprKind::BitNot: return UnaryOp::BitNot;
     case helix::mid::UnExprKind::Deref:  return UnaryOp::Deref;
     case helix::mid::UnExprKind::AddrOf: return UnaryOp::AddressOf;
+    case helix::mid::UnExprKind::Bswap:
+    case helix::mid::UnExprKind::Bsf:
+    case helix::mid::UnExprKind::Bsr:
+        llvm_unreachable("machine unary must use the explicit builtin path");
     }
     return UnaryOp::Neg; // unreachable
 }
@@ -169,10 +388,88 @@ static BinaryOp mapLowBinaryOp(helix::low::BinOpKind kind) {
     case helix::low::BinOpKind::Shl:  return BinaryOp::Shl;
     case helix::low::BinOpKind::Shr:  return BinaryOp::Shr;
     case helix::low::BinOpKind::Sar:  return BinaryOp::Sar;
-    case helix::low::BinOpKind::Rol:  return BinaryOp::Shl; // approximate
-    case helix::low::BinOpKind::Ror:  return BinaryOp::Shr; // approximate
+    case helix::low::BinOpKind::Rol:
+    case helix::low::BinOpKind::Ror:
+        llvm_unreachable("rotate must use the explicit builtin path");
     }
-    return BinaryOp::Add; // unreachable
+    llvm_unreachable("unknown HelixLow binary operation");
+}
+
+static bool isSignedOrderedComparison(helix::high::BinaryOpKind kind) {
+    return kind == helix::high::BinaryOpKind::Lt ||
+           kind == helix::high::BinaryOpKind::Le ||
+           kind == helix::high::BinaryOpKind::Gt ||
+           kind == helix::high::BinaryOpKind::Ge;
+}
+
+static bool isUnsignedOrderedComparison(helix::high::BinaryOpKind kind) {
+    return kind == helix::high::BinaryOpKind::Ult ||
+           kind == helix::high::BinaryOpKind::Ule ||
+           kind == helix::high::BinaryOpKind::Ugt ||
+           kind == helix::high::BinaryOpKind::Uge;
+}
+
+static bool isSignedOrderedComparison(helix::mid::BinExprKind kind) {
+    return kind == helix::mid::BinExprKind::Lt ||
+           kind == helix::mid::BinExprKind::Le ||
+           kind == helix::mid::BinExprKind::Gt ||
+           kind == helix::mid::BinExprKind::Ge;
+}
+
+static bool isUnsignedOrderedComparison(helix::mid::BinExprKind kind) {
+    return kind == helix::mid::BinExprKind::Ult ||
+           kind == helix::mid::BinExprKind::Ule ||
+           kind == helix::mid::BinExprKind::Ugt ||
+           kind == helix::mid::BinExprKind::Uge;
+}
+
+static CTypePtr integerTypeForComparison(Type type, bool isSigned) {
+    unsigned width = 64;
+    if (auto integerType = dyn_cast<IntegerType>(type))
+        width = integerType.getWidth();
+    switch (width) {
+    case 8:  return isSigned ? CType::int8()  : CType::uint8();
+    case 16: return isSigned ? CType::int16() : CType::uint16();
+    case 32: return isSigned ? CType::int32() : CType::uint32();
+    default: return isSigned ? CType::int64() : CType::uint64();
+    }
+}
+
+static ExprPtr castForOrderedComparison(
+        ExprPtr expression, Type type, bool isSigned, uint64_t address) {
+    return std::make_unique<CCastExpr>(
+        integerTypeForComparison(type, isSigned), std::move(expression),
+        address);
+}
+
+static ExprPtr castForIntegerExtension(
+        ExprPtr expression, Type sourceType, Type destinationType,
+        bool isSigned, uint64_t address) {
+    if (!expression)
+        return nullptr;
+
+    CTypePtr sourceCType;
+    if (auto integer = dyn_cast<IntegerType>(sourceType);
+        integer && integer.getWidth() == 1) {
+        if (isSigned) {
+            auto resultType = integerTypeForComparison(destinationType, true);
+            return std::make_unique<CTernaryExpr>(
+                std::move(expression),
+                std::make_unique<CIntLitExpr>(-1, resultType, address),
+                std::make_unique<CIntLitExpr>(0, resultType, address),
+                resultType, address);
+        }
+        sourceCType = CType::boolTy();
+    } else {
+        sourceCType = integerTypeForComparison(sourceType, isSigned);
+    }
+    if (!expression->type || *expression->type != *sourceCType) {
+        expression = std::make_unique<CCastExpr>(
+            sourceCType, std::move(expression), address);
+    }
+    return std::make_unique<CCastExpr>(
+        integerTypeForComparison(destinationType, isSigned),
+        std::move(expression), address);
 }
 
 /// Map LLVM::ICmpPredicate to cast::BinaryOp.
@@ -277,6 +574,38 @@ static std::optional<int64_t> tryExtractIntLiteral(Value value) {
     if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value"))
         return intAttr.getValue().getSExtValue();
     return std::nullopt;
+}
+
+/// Read an integer from the synthetic ET_REL .rodata address range.
+///
+/// The IDE maps immutable sections at 0x7F000000..0x7FFEFFFF and reserves
+/// 0x7FFF0000+ for external call targets. Restricting the fold to that range
+/// avoids treating ordinary reads from mutable PE/ELF data as compile-time
+/// constants merely because their initial bytes are available.
+static std::optional<uint64_t>
+tryReadRelocatedDataWord(Value address, Type resultType) {
+    auto literal = tryExtractIntLiteral(address);
+    if (!literal)
+        return std::nullopt;
+
+    const uint64_t rawAddress = static_cast<uint64_t>(*literal);
+    if (rawAddress < 0x7F000000ULL || rawAddress >= 0x7FFF0000ULL)
+        return std::nullopt;
+
+    auto intType = dyn_cast<IntegerType>(resultType);
+    if (!intType || intType.getWidth() == 0 ||
+        intType.getWidth() % 8 != 0)
+        return std::nullopt;
+    const unsigned byteWidth = intType.getWidth() / 8;
+    if (byteWidth != 1 && byteWidth != 2 &&
+        byteWidth != 4 && byteWidth != 8)
+        return std::nullopt;
+
+    const helix::DataSectionProvider* provider =
+        helix::getActiveDataSectionProvider();
+    if (!provider || !provider->isAvailable())
+        return std::nullopt;
+    return provider->readWord(rawAddress, byteWidth);
 }
 
 /// FIX-091 (issue #15) extension: recursively fold a *fully-constant* add/sub
@@ -386,6 +715,22 @@ static bool parseIntLiteralName(const std::string& s, int64_t& out) {
 
 } // anonymous namespace
 
+/// LLVM integer arithmetic must not acquire C pointee-size scaling.
+ExprPtr CAstBuilder::preserveIntegerAddressOperand(ExprPtr value, CTypePtr integerType,
+                                                 uint64_t address) {
+    if (auto* ref = llvm::dyn_cast_or_null<CVarRefExpr>(value.get())) {
+        if (auto found = declaredPointerTypes_.find(ref->varId); found != declaredPointerTypes_.end())
+            value->type = found->second;
+    }
+    if (value && value->type && value->type->kind == TypeKind::Pointer &&
+        integerType && integerType->kind == TypeKind::Int) {
+        auto unsignedType = std::make_shared<CType>(*integerType);
+        unsignedType->isSigned = false;
+        return std::make_unique<CCastExpr>(unsignedType, std::move(value), address);
+    }
+    return value;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public API
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -399,11 +744,10 @@ CAstBuilder::buildModule(ModuleOp moduleOp) {
     // gates code-typed values through this single authoritative registry.
     buildFunctionRegistry(moduleOp);
 
-    // Walk helix_low.func ops — the pipeline keeps functions as low::FuncOp
-    // even after internal ops are raised to HelixHigh.
-    // This matches PseudoCEmitter's behavior.
+    // Walk legalized Helix functions.  The compatibility path may still
+    // present low.func, while tier-closed pipelines end in high.func.
     moduleOp.walk([&](Operation* op) {
-        if (isa<helix::low::FuncOp>(op)) {
+        if (isa<helix::low::FuncOp, helix::high::FuncOp>(op)) {
             if (auto func = buildFunction(op))
                 result.push_back(std::move(func));
         }
@@ -938,6 +1282,23 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         referencedLabelNames_.insert(gotoOp.getLabel().str());
     });
 
+    // A small irreducible remainder may legitimately survive CFG-to-SCF.
+    // Track only those explicit cf.* edges here. The legacy low.jmp/low.jcc
+    // population remains disabled because it labels already-structured blocks
+    // and recreates the old goto soup.
+    op->walk([&](mlir::cf::BranchOp branch) {
+        referencedBlocks_.insert(branch.getDest());
+    });
+    op->walk([&](mlir::cf::CondBranchOp branch) {
+        referencedBlocks_.insert(branch.getTrueDest());
+        referencedBlocks_.insert(branch.getFalseDest());
+    });
+    op->walk([&](mlir::cf::SwitchOp switchOp) {
+        referencedBlocks_.insert(switchOp.getDefaultDestination());
+        for (Block* destination : switchOp.getCaseDestinations())
+            referencedBlocks_.insert(destination);
+    });
+
     // FIX-053 (Wave 12 REVERT of FIX-051): populating `referencedBlocks_`
     // from JmpOp/JccOp successors caused label emission for EVERY block
     // reached by a low-level jump — even those already absorbed by
@@ -1018,48 +1379,23 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             return;
 
         CTypePtr varType = CType::int64(); // default
-        if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type")) {
-            auto typeStr = inferredType.getValue().str();
-            if (typeStr == "void*")
-                varType = CType::voidPtr();
-            else if (typeStr == "int32_t")
-                varType = CType::int32();
-            else if (typeStr == "uint32_t")
-                varType = CType::uint32();
-            else if (typeStr == "int16_t")
-                varType = CType::int16();
-            else if (typeStr == "uint16_t")
-                varType = CType::uint16();
-            else if (typeStr == "int8_t")
-                varType = CType::int8();
-            else if (typeStr == "uint8_t")
-                varType = CType::uint8();
-            else if (typeStr == "uint64_t")
-                varType = CType::uint64();
-            else if (typeStr == "float")
-                varType = CType::floatTy();
-            else if (typeStr == "double")
-                varType = CType::doubleTy();
-            else if (typeStr == "bool")
-                varType = CType::boolTy();
-            else if (typeStr.ends_with("*")) {
-                // Pointer-to-struct (e.g., "auto_struct_0*")
-                auto pointeeName = typeStr.substr(0, typeStr.size() - 1);
-                if (!pointeeName.empty() && pointeeName != "void") {
-                    varType = CType::pointerTo(CType::structTy(pointeeName));
-                } else {
-                    varType = CType::voidPtr();
-                }
-            }
-        }
+        const auto inferredType =
+            decl->getAttrOfType<StringAttr>("inferred_type");
+        if (inferredType)
+            varType = cTypeFromString(inferredType.getValue().str());
 
-        // XMM/YMM registers are floating-point
+        // Legacy fallback for untyped XMM/YMM storage. Do not overwrite
+        // structural/debug evidence that distinguishes scalar float/double.
         auto varName = decl.getVarName().str();
-        if (varName.starts_with("xmm") || varName.starts_with("XMM") ||
-            varName.starts_with("ymm") || varName.starts_with("YMM"))
+        if (!inferredType &&
+            (varName.starts_with("xmm") || varName.starts_with("XMM") ||
+             varName.starts_with("ymm") || varName.starts_with("YMM")))
             varType = CType::floatTy();
 
         auto storage = mapStorageKind(decl.getStorage());
+        declaredVarTypes_[decl.getVarId()] = varType;
+        if (varType->kind == TypeKind::Pointer)
+            declaredPointerTypes_[decl.getVarId()] = varType;
         std::optional<int64_t> stackOffset;
         if (decl.getStackOffset())
             stackOffset = *decl.getStackOffset();
@@ -1071,27 +1407,87 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             storage,
             stackOffset,
             /*initExpr=*/nullptr,
-            extractAddress(decl));
+            extractAddress(decl),
+            convertTypeEvidence(decl.getOperation()));
     });
 
     // ── Infer parameters (Win64 ABI) ────────────────────────────────────
     struct ParamInfo {
         std::string typeStr;
         std::string rawName;
+        std::optional<uint32_t> varId;
+        std::optional<CTypeEvidence> typeEvidence;
     };
     std::map<unsigned, ParamInfo> paramInfoByIndex;
 
     auto recordParam = [&](unsigned index, const std::string& typeStr,
-                           const std::string& rawName) {
+                           const std::string& rawName,
+                           std::optional<uint32_t> varId,
+                           std::optional<CTypeEvidence> typeEvidence = std::nullopt) {
         auto [it, inserted] =
-            paramInfoByIndex.try_emplace(index, ParamInfo{typeStr, rawName});
+            paramInfoByIndex.try_emplace(
+                index, ParamInfo{typeStr, rawName, varId, typeEvidence});
         if (!inserted) {
             if (it->second.typeStr == "int64_t" && typeStr != "int64_t")
                 it->second.typeStr = typeStr;
             if (it->second.rawName.empty())
                 it->second.rawName = rawName;
+            if (!it->second.varId && varId)
+                it->second.varId = varId;
+            if (typeEvidence &&
+                (!it->second.typeEvidence ||
+                 typeEvidence->strength > it->second.typeEvidence->strength ||
+                 typeEvidence->state == CTypeEvidenceState::SelectedWithConflict)) {
+                it->second.typeEvidence = std::move(typeEvidence);
+            }
         }
     };
+
+    // FunctionOpInterface argument metadata is authoritative for the final
+    // legalized container. It survives after parameter VarRefs are replaced by
+    // entry block arguments, so both MLIR analyses and the C-AST use the same
+    // identity/order instead of rebuilding ABI names independently.
+    if (auto highFunc = dyn_cast<helix::high::FuncOp>(op)) {
+        auto argumentAttrs =
+            highFunc->getAttrOfType<ArrayAttr>("arg_attrs");
+        if (argumentAttrs && !highFunc.getBody().empty()) {
+            Block& entry = highFunc.getBody().front();
+            unsigned count = std::min<unsigned>(
+                entry.getNumArguments(), argumentAttrs.size());
+            for (unsigned i = 0; i < count; ++i) {
+                auto metadata = dyn_cast<DictionaryAttr>(argumentAttrs[i]);
+                if (!metadata)
+                    continue;
+                unsigned sourceIndex = i + 1;
+                if (auto index = metadata.getAs<IntegerAttr>(
+                        "helix.param_index")) {
+                    sourceIndex = static_cast<unsigned>(index.getUInt());
+                }
+                uint32_t varId = sourceIndex;
+                if (auto id = metadata.getAs<IntegerAttr>("helix.var_id"))
+                    varId = static_cast<uint32_t>(id.getUInt());
+                std::string identityName = std::format(
+                    "param_{}", sourceIndex);
+                if (auto name = metadata.getAs<StringAttr>("helix.name"))
+                    identityName = name.getValue().str();
+                std::string displayName = identityName;
+                if (auto debugName = metadata.getAs<StringAttr>(
+                        "helix.debug_name")) {
+                    displayName = debugName.getValue().str();
+                    nameAliases_[identityName] = displayName;
+                }
+                std::string typeName = "int64_t";
+                if (auto inferred = metadata.getAs<StringAttr>(
+                        "helix.inferred_type")) {
+                    typeName = inferred.getValue().str();
+                }
+                recordParam(sourceIndex, typeName, displayName, varId,
+                            convertTypeEvidence(metadata, op));
+                functionArguments_[entry.getArgument(i)] = MaterializedValue{
+                    varId, identityName, cTypeFromString(typeName)};
+            }
+        }
+    }
 
     // Collect from VarDeclOp with Parameter storage
     op->walk([&](helix::high::VarDeclOp decl) {
@@ -1101,32 +1497,50 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         std::string paramType = "int64_t";
         if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type"))
             paramType = inferredType.getValue().str();
+        auto declarationType = cTypeFromString(paramType);
+        declaredVarTypes_[decl.getVarId()] = declarationType;
+        if (declarationType->kind == TypeKind::Pointer)
+            declaredPointerTypes_[decl.getVarId()] = declarationType;
 
-        std::string rawName = decl.getVarName().str();
-        if (auto index = parseParamIndex(rawName))
-            recordParam(*index, paramType, rawName);
+        std::string identityName = decl.getVarName().str();
+        if (auto index = parseParamIndex(identityName)) {
+            std::string displayName = identityName;
+            if (auto debugName = decl->getAttrOfType<StringAttr>("helix.debug_name")) {
+                displayName = debugName.getValue().str();
+                nameAliases_[identityName] = displayName;
+            }
+            recordParam(*index, paramType, displayName, decl.getVarId(),
+                        convertTypeEvidence(decl.getOperation()));
+        }
     });
 
     // Also from VarRefOps that look like param_N
     op->walk([&](helix::high::VarRefOp ref) {
         if (auto index = parseParamIndex(ref.getVarName().str()))
-            recordParam(*index, "int64_t", ref.getVarName().str());
+            recordParam(*index, "int64_t", ref.getVarName().str(),
+                        ref.getVarId(), convertTypeEvidence(ref.getOperation()));
     });
 
     // param_1 -> this heuristic: if param_1 used >= 3 times as struct base
     if (paramInfoByIndex.count(1)) {
         unsigned objectUseScore = 0;
         op->walk([&](helix::high::FieldAccessOp field) {
-            auto* baseOp = field.getBase().getDefiningOp();
-            if (!baseOp)
-                return;
-            if (auto varRef = dyn_cast<helix::high::VarRefOp>(baseOp)) {
+            if (auto varRef =
+                    field.getBase().getDefiningOp<helix::high::VarRefOp>()) {
                 if (varRef.getVarName() == "param_1")
                     objectUseScore += 2;
+                return;
+            }
+            if (auto argument = dyn_cast<BlockArgument>(field.getBase())) {
+                auto it = functionArguments_.find(argument);
+                if (it != functionArguments_.end() &&
+                    it->second.varName == "param_1") {
+                    objectUseScore += 2;
+                }
             }
         });
 
-        if (objectUseScore >= 3) {
+        if (objectUseScore >= 3 && !nameAliases_.contains("param_1")) {
             nameAliases_["param_1"] = "this";
             auto& selfParam = paramInfoByIndex[1];
             selfParam.rawName = "this";
@@ -1143,39 +1557,12 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             : info.rawName;
         paramName = applyNameAliases(paramName);
 
-        CTypePtr paramType = CType::int64(); // default
-        if (info.typeStr == "void*")
-            paramType = CType::voidPtr();
-        else if (info.typeStr == "int32_t")
-            paramType = CType::int32();
-        else if (info.typeStr == "uint32_t")
-            paramType = CType::uint32();
-        else if (info.typeStr == "int16_t")
-            paramType = CType::int16();
-        else if (info.typeStr == "uint16_t")
-            paramType = CType::uint16();
-        else if (info.typeStr == "int8_t")
-            paramType = CType::int8();
-        else if (info.typeStr == "uint8_t")
-            paramType = CType::uint8();
-        else if (info.typeStr == "uint64_t")
-            paramType = CType::uint64();
-        else if (info.typeStr == "float")
-            paramType = CType::floatTy();
-        else if (info.typeStr == "double")
-            paramType = CType::doubleTy();
-        else if (info.typeStr == "bool")
-            paramType = CType::boolTy();
-        else if (info.typeStr.ends_with("*")) {
-            auto pointeeName =
-                info.typeStr.substr(0, info.typeStr.size() - 1);
-            if (!pointeeName.empty() && pointeeName != "void")
-                paramType = CType::pointerTo(CType::structTy(pointeeName));
-            else
-                paramType = CType::voidPtr();
-        }
+        CTypePtr paramType = cTypeFromString(info.typeStr);
+        if (info.varId && paramType->kind == TypeKind::Pointer)
+            declaredPointerTypes_[*info.varId] = paramType;
 
-        params.emplace_back(paramName, paramType, index);
+        params.emplace_back(paramName, paramType, index,
+                            /*address=*/0, info.varId, info.typeEvidence);
     }
 
     // ── Detect return value name ────────────────────────────────────────
@@ -1196,11 +1583,36 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     // ── Return type ─────────────────────────────────────────────────────
     CTypePtr returnType =
         currentFunctionHasReturnValue_ ? CType::int64() : CType::voidTy();
+    if (auto inferredReturn =
+            op->getAttrOfType<StringAttr>("inferred_return_type")) {
+        returnType = cTypeFromString(inferredReturn.getValue().str());
+    }
+
+    // Materialize block arguments belonging to a residual top-level CFG.
+    // Structured-region block arguments are handled by the native SCF
+    // source legalizers below; function entry arguments were mapped above.
+    if (bodyRegion && !bodyRegion->empty()) {
+        for (Block& block : llvm::drop_begin(bodyRegion->getBlocks())) {
+            for (BlockArgument argument : block.getArguments()) {
+                uint32_t id = nextSourceLegalizedVarId_++;
+                std::string name = std::format("cfg_phi{}", id);
+                CTypePtr type = convertType(argument.getType());
+                lateLocalVars_.emplace_back(
+                    id, name, type, StorageKind::Temporary,
+                    std::nullopt, nullptr, entryAddr);
+                sourceLegalizedValues_[argument] = MaterializedValue{
+                    id, std::move(name), std::move(type)};
+            }
+        }
+    }
 
     // ── Build body ──────────────────────────────────────────────────────
     std::vector<StmtPtr> body;
     if (!bodyRegion->empty())
         body = buildRegionBody(*bodyRegion);
+
+    for (CVarDecl& declaration : lateLocalVars_)
+        localVars.push_back(std::move(declaration));
 
     // ── Assemble CFuncDecl ──────────────────────────────────────────────
     auto funcDecl = std::make_unique<CFuncDecl>(
@@ -1212,7 +1624,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         std::move(body),
         std::move(localVars),
         callingConv,
-        entryAddr);
+        entryAddr,
+        convertReturnTypeEvidence(op));
 
     // ── Confidence analysis ───────────────────────────────────────────
     // D4 (charter exit-metric 4): stamp the damning-honesty flag onto the decl
@@ -1237,11 +1650,18 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
 void CAstBuilder::clearFunctionState() {
     lastRegValue_.clear();
     varUseCount_.clear();
+    declaredVarTypes_.clear();
+    declaredPointerTypes_.clear();
     deadStoreOps_.clear();
     nameAliases_.clear();
     stackOffsetToVarName_.clear();
     globalAddrToVarName_.clear();
     exprToBestName_.clear();
+    materializedValues_.clear();
+    functionArguments_.clear();
+    sourceLegalizedValues_.clear();
+    lateLocalVars_.clear();
+    nextSourceLegalizedVarId_ = 950000;
     syntheticCallBaseAddrs_.clear();
     recoveredStructFields_.clear();
     currentFunctionIsWin64_ = true;
@@ -1276,76 +1696,18 @@ std::vector<StmtPtr> CAstBuilder::buildRegionBody(Region& region) {
     std::vector<StmtPtr> stmts;
     bool multiBlock = (std::distance(region.begin(), region.end()) > 1);
 
-    // ── Cross-block dead store pre-scan ─────────────────────────────────
-    {
-        llvm::SmallVector<helix::high::AssignOp, 64> allAssigns;
-        for (auto& block : region) {
-            for (auto& inst : block) {
-                if (auto assign = dyn_cast<helix::high::AssignOp>(&inst))
-                    allAssigns.push_back(assign);
-            }
-        }
-
-        std::unordered_set<std::string> writtenNotRead;
-        for (auto it = allAssigns.rbegin(); it != allAssigns.rend(); ++it) {
-            auto assignOp = *it;
-            auto* targetDef = assignOp.getTarget().getDefiningOp();
-            if (!targetDef)
-                continue;
-
-            std::string targetStr;
-            if (auto varRef = dyn_cast<helix::high::VarRefOp>(targetDef))
-                targetStr = applyNameAliases(varRef.getVarName().str());
-            else
-                continue;
-
-            // Skip complex targets
-            if (targetStr.find("->") != std::string::npos ||
-                targetStr.find("*(") != std::string::npos)
-                continue;
-
-            // M4 (fix-A): never DSE scf_* dispatcher selectors / loop-carry vars
-            // (their consumer is a switch/if/loop selector this RHS-only scan does
-            // not see -- see the precomputeDeadStores guard for the full rationale).
-            if (targetStr.starts_with("scf_"))
-                continue;
-
-            // Check RHS for side effects
-            auto* valueDef = assignOp.getValue().getDefiningOp();
-            bool hasSideEffects =
-                valueDef && isa<helix::high::CallOp>(valueDef);
-
-            if (!hasSideEffects) {
-                if (writtenNotRead.count(targetStr)) {
-                    deadStoreOps_.insert(assignOp.getOperation());
-                    continue;
-                }
-                writtenNotRead.insert(targetStr);
-            } else {
-                writtenNotRead.erase(targetStr);
-            }
-
-            // Check if RHS reads tracked variables
-            assignOp.getValue().getDefiningOp();
-            // Walk RHS operands
-            if (valueDef) {
-                for (auto operand : valueDef->getOperands()) {
-                    if (auto ref =
-                            operand.getDefiningOp<helix::high::VarRefOp>()) {
-                        auto refName =
-                            applyNameAliases(ref.getVarName().str());
-                        writtenNotRead.erase(refName);
-                    }
-                }
-            }
-        }
-    }
+    // Dead-store elimination is deliberately block-local here. A region-wide
+    // reverse scan cannot model loop back-edges or branch joins and previously
+    // deleted loop-carried copies such as `tmp = accumulator` before the C AST
+    // existed. The structured CAstOptimizer performs the cross-scope liveness
+    // pass after the complete tree has been built.
 
     bool firstBlock = true;
     for (auto& block : region) {
         // Reset copy propagation state at block boundaries
         lastRegValue_.clear();
         exprToBestName_.clear();
+        materializedValues_.clear();
 
         // Emit block label for non-entry blocks
         if (multiBlock && !firstBlock) {
@@ -1390,6 +1752,311 @@ std::vector<StmtPtr> CAstBuilder::buildRegionBody(Region& region) {
 StmtPtr CAstBuilder::buildStatement(Operation* op) {
     uint64_t addr = extractAddress(op);
 
+    // ─── Native scf.if -> C-AST (de-SSA at the source boundary) ────────
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        if (!ifOp.getThenRegion().hasOneBlock() ||
+            !ifOp.getElseRegion().hasOneBlock()) {
+            return std::make_unique<CCommentStmt>(
+                "unsupported multi-block scf.if", addr);
+        }
+
+        std::vector<MaterializedValue> results;
+        results.reserve(ifOp.getNumResults());
+        for (Value result : ifOp.getResults()) {
+            uint32_t id = nextSourceLegalizedVarId_++;
+            std::string name = std::format("scf_r{}", id);
+            CTypePtr type = convertType(result.getType());
+            lateLocalVars_.emplace_back(
+                id, name, type, StorageKind::Temporary,
+                std::nullopt, nullptr, addr);
+            MaterializedValue materialized{id, name, type};
+            sourceLegalizedValues_[result] = materialized;
+            results.push_back(std::move(materialized));
+        }
+
+        auto buildArm = [&](Region& region) {
+            auto yield = dyn_cast<scf::YieldOp>(
+                region.front().getTerminator());
+            std::vector<StmtPtr> body = buildRegionBody(region);
+            if (!yield)
+                return body;
+            for (unsigned i = 0;
+                 i < yield.getNumOperands() && i < results.size(); ++i) {
+                const MaterializedValue& result = results[i];
+                auto target = std::make_unique<CVarRefExpr>(
+                    result.varId, result.varName, result.type, addr);
+                auto value = buildExpression(yield.getOperand(i));
+                if (value) {
+                    body.push_back(std::make_unique<CAssignStmt>(
+                        std::move(target), std::move(value), "", addr));
+                }
+            }
+            return body;
+        };
+
+        auto condition = buildExpression(ifOp.getCondition());
+        auto thenBody = buildArm(ifOp.getThenRegion());
+        auto elseBody = buildArm(ifOp.getElseRegion());
+        return std::make_unique<CIfStmt>(
+            std::move(condition), std::move(thenBody), std::move(elseBody),
+            addr);
+    }
+
+    // ─── Native scf.index_switch -> C-AST ──────────────────────────────
+    if (auto switchOp = dyn_cast<scf::IndexSwitchOp>(op)) {
+        bool supported = switchOp.getDefaultRegion().hasOneBlock();
+        for (Region& region : switchOp.getCaseRegions())
+            supported &= region.hasOneBlock();
+        if (!supported) {
+            return std::make_unique<CCommentStmt>(
+                "unsupported multi-block scf.index_switch", addr);
+        }
+
+        std::vector<MaterializedValue> results;
+        for (Value result : switchOp.getResults()) {
+            uint32_t id = nextSourceLegalizedVarId_++;
+            std::string name = std::format("scf_r{}", id);
+            CTypePtr type = convertType(result.getType());
+            lateLocalVars_.emplace_back(
+                id, name, type, StorageKind::Temporary,
+                std::nullopt, nullptr, addr);
+            MaterializedValue materialized{id, name, type};
+            sourceLegalizedValues_[result] = materialized;
+            results.push_back(std::move(materialized));
+        }
+
+        auto buildCaseBody = [&](Region& region) {
+            auto yield = dyn_cast<scf::YieldOp>(
+                region.front().getTerminator());
+            std::vector<StmtPtr> body = buildRegionBody(region);
+            if (yield) {
+                for (unsigned i = 0;
+                     i < yield.getNumOperands() && i < results.size(); ++i) {
+                    const MaterializedValue& result = results[i];
+                    auto target = std::make_unique<CVarRefExpr>(
+                        result.varId, result.varName, result.type, addr);
+                    auto value = buildExpression(yield.getOperand(i));
+                    if (value) {
+                        body.push_back(std::make_unique<CAssignStmt>(
+                            std::move(target), std::move(value), "", addr));
+                    }
+                }
+            }
+            body.push_back(std::make_unique<CBreakStmt>(addr));
+            return body;
+        };
+
+        std::vector<CSwitchStmt::SwitchCase> cases;
+        auto caseValues = switchOp.getCases();
+        auto caseRegions = switchOp.getCaseRegions();
+        for (unsigned i = 0; i < caseRegions.size(); ++i) {
+            CSwitchStmt::SwitchCase switchCase;
+            switchCase.value = caseValues[i];
+            switchCase.body = buildCaseBody(caseRegions[i]);
+            cases.push_back(std::move(switchCase));
+        }
+        CSwitchStmt::SwitchCase defaultCase;
+        defaultCase.isDefault = true;
+        defaultCase.body = buildCaseBody(switchOp.getDefaultRegion());
+        cases.push_back(std::move(defaultCase));
+        return std::make_unique<CSwitchStmt>(
+            buildExpression(switchOp.getArg()), std::move(cases), addr);
+    }
+
+    // ─── Native scf.while -> C-AST ─────────────────────────────────────
+    if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+        if (!whileOp.getBefore().hasOneBlock() ||
+            !whileOp.getAfter().hasOneBlock()) {
+            return std::make_unique<CCommentStmt>(
+                "unsupported multi-block scf.while", addr);
+        }
+        Block& before = whileOp.getBefore().front();
+        Block& after = whileOp.getAfter().front();
+        auto conditionOp = dyn_cast<scf::ConditionOp>(before.getTerminator());
+        auto afterYield = dyn_cast<scf::YieldOp>(after.getTerminator());
+        if (!conditionOp || !afterYield ||
+            after.getOperations().size() != 1 ||
+            conditionOp.getArgs().size() != whileOp.getNumResults() ||
+            afterYield.getNumOperands() != whileOp.getNumOperands()) {
+            return std::make_unique<CCommentStmt>(
+                "unsupported scf.while contract", addr);
+        }
+
+        std::vector<unsigned> nextInputFromResult;
+        for (Value value : afterYield.getOperands()) {
+            auto argument = dyn_cast<BlockArgument>(value);
+            if (!argument || argument.getOwner() != &after) {
+                return std::make_unique<CCommentStmt>(
+                    "unsupported scf.while after mapping", addr);
+            }
+            nextInputFromResult.push_back(argument.getArgNumber());
+        }
+
+        auto createVariable = [&](StringRef prefix, CTypePtr type) {
+            uint32_t id = nextSourceLegalizedVarId_++;
+            std::string name = std::format("{}{}", prefix.str(), id);
+            lateLocalVars_.emplace_back(
+                id, name, type, StorageKind::Temporary,
+                std::nullopt, nullptr, addr);
+            return MaterializedValue{id, std::move(name), std::move(type)};
+        };
+
+        std::vector<MaterializedValue> carried;
+        std::vector<MaterializedValue> results;
+        std::vector<ExprPtr> initialValues;
+        for (unsigned i = 0; i < whileOp.getNumOperands(); ++i) {
+            CTypePtr type = convertType(whileOp.getOperand(i).getType());
+            carried.push_back(createVariable("scf_w", type));
+            sourceLegalizedValues_[before.getArgument(i)] = carried.back();
+            initialValues.push_back(buildExpression(whileOp.getOperand(i)));
+        }
+        for (Value result : whileOp.getResults()) {
+            CTypePtr type = convertType(result.getType());
+            results.push_back(createVariable("scf_r", type));
+            sourceLegalizedValues_[result] = results.back();
+        }
+        MaterializedValue condition = createVariable(
+            "scf_w", CType::boolTy());
+
+        std::vector<StmtPtr> prelude;
+        for (unsigned i = 0; i < carried.size(); ++i) {
+            if (!initialValues[i])
+                continue;
+            prelude.push_back(std::make_unique<CAssignStmt>(
+                std::make_unique<CVarRefExpr>(
+                    carried[i].varId, carried[i].varName,
+                    carried[i].type, addr),
+                std::move(initialValues[i]), "", addr));
+        }
+
+        std::vector<StmtPtr> body = buildRegionBody(whileOp.getBefore());
+        if (auto conditionExpr = buildExpression(conditionOp.getCondition())) {
+            body.push_back(std::make_unique<CAssignStmt>(
+                std::make_unique<CVarRefExpr>(
+                    condition.varId, condition.varName,
+                    condition.type, addr),
+                std::move(conditionExpr), "", addr));
+        }
+        for (unsigned i = 0; i < results.size(); ++i) {
+            auto value = buildExpression(conditionOp.getArgs()[i]);
+            if (!value)
+                continue;
+            body.push_back(std::make_unique<CAssignStmt>(
+                std::make_unique<CVarRefExpr>(
+                    results[i].varId, results[i].varName,
+                    results[i].type, addr),
+                std::move(value), "", addr));
+        }
+        for (unsigned i = 0; i < carried.size(); ++i) {
+            unsigned resultIndex = nextInputFromResult[i];
+            if (resultIndex >= results.size())
+                continue;
+            body.push_back(std::make_unique<CAssignStmt>(
+                std::make_unique<CVarRefExpr>(
+                    carried[i].varId, carried[i].varName,
+                    carried[i].type, addr),
+                std::make_unique<CVarRefExpr>(
+                    results[resultIndex].varId,
+                    results[resultIndex].varName,
+                    results[resultIndex].type, addr),
+                "", addr));
+        }
+
+        prelude.push_back(std::make_unique<CDoWhileStmt>(
+            std::move(body),
+            std::make_unique<CVarRefExpr>(
+                condition.varId, condition.varName,
+                condition.type, addr),
+            addr));
+        return std::make_unique<CBlockStmt>(std::move(prelude), addr);
+    }
+
+    // ─── Residual cf.* -> explicit C labels/gotos ─────────────────────
+    // CFG-to-SCF can conservatively leave an irreducible tail. Preserve it
+    // explicitly instead of treating the terminator as an opaque call. Edge
+    // operands are snapshotted before assigning destination block arguments,
+    // which retains MLIR's simultaneous phi-transfer semantics on back-edges.
+    auto buildCfgEdge = [&](Block* destination, ValueRange operands) {
+        std::vector<StmtPtr> edge;
+        std::vector<std::pair<MaterializedValue, MaterializedValue>> transfers;
+        const unsigned count = std::min<unsigned>(
+            destination ? destination->getNumArguments() : 0,
+            operands.size());
+        transfers.reserve(count);
+        for (unsigned i = 0; i < count; ++i) {
+            BlockArgument argument = destination->getArgument(i);
+            auto destinationIt = sourceLegalizedValues_.find(argument);
+            auto value = buildExpression(operands[i]);
+            if (destinationIt == sourceLegalizedValues_.end() || !value)
+                continue;
+
+            uint32_t snapshotId = nextSourceLegalizedVarId_++;
+            std::string snapshotName = std::format("cfg_edge{}", snapshotId);
+            CTypePtr snapshotType = destinationIt->second.type;
+            lateLocalVars_.emplace_back(
+                snapshotId, snapshotName, snapshotType,
+                StorageKind::Temporary, std::nullopt, nullptr, addr);
+            MaterializedValue snapshot{
+                snapshotId, std::move(snapshotName), snapshotType};
+            edge.push_back(std::make_unique<CAssignStmt>(
+                std::make_unique<CVarRefExpr>(
+                    snapshot.varId, snapshot.varName, snapshot.type, addr),
+                std::move(value), "", addr));
+            transfers.emplace_back(destinationIt->second, std::move(snapshot));
+        }
+        for (const auto& [target, snapshot] : transfers) {
+            edge.push_back(std::make_unique<CAssignStmt>(
+                std::make_unique<CVarRefExpr>(
+                    target.varId, target.varName, target.type, addr),
+                std::make_unique<CVarRefExpr>(
+                    snapshot.varId, snapshot.varName, snapshot.type, addr),
+                "", addr));
+        }
+        auto label = blockLabels_.find(destination);
+        edge.push_back(std::make_unique<CGotoStmt>(
+            label != blockLabels_.end() ? label->second : "cfg_target", addr));
+        return edge;
+    };
+
+    if (auto branch = dyn_cast<mlir::cf::BranchOp>(op)) {
+        auto edge = buildCfgEdge(
+            branch.getDest(), branch.getDestOperands());
+        if (edge.size() == 1)
+            return std::move(edge.front());
+        return std::make_unique<CBlockStmt>(std::move(edge), addr);
+    }
+
+    if (auto branch = dyn_cast<mlir::cf::CondBranchOp>(op)) {
+        auto trueEdge = buildCfgEdge(
+            branch.getTrueDest(), branch.getTrueDestOperands());
+        auto falseEdge = buildCfgEdge(
+            branch.getFalseDest(), branch.getFalseDestOperands());
+        return std::make_unique<CIfStmt>(
+            buildExpression(branch.getCondition()),
+            std::move(trueEdge), std::move(falseEdge), addr);
+    }
+
+    if (auto switchOp = dyn_cast<mlir::cf::SwitchOp>(op)) {
+        std::vector<CSwitchStmt::SwitchCase> cases;
+        auto values = switchOp.getCaseValues();
+        auto destinations = switchOp.getCaseDestinations();
+        for (unsigned i = 0; i < destinations.size(); ++i) {
+            CSwitchStmt::SwitchCase switchCase;
+            if (values)
+                switchCase.value = (*values).getValues<APInt>()[i].getSExtValue();
+            switchCase.body = buildCfgEdge(
+                destinations[i], switchOp.getCaseOperands(i));
+            cases.push_back(std::move(switchCase));
+        }
+        CSwitchStmt::SwitchCase defaultCase;
+        defaultCase.isDefault = true;
+        defaultCase.body = buildCfgEdge(
+            switchOp.getDefaultDestination(), switchOp.getDefaultOperands());
+        cases.push_back(std::move(defaultCase));
+        return std::make_unique<CSwitchStmt>(
+            buildExpression(switchOp.getFlag()), std::move(cases), addr);
+    }
+
     // ─── Assignment ─────────────────────────────────────────────────────
     if (auto assign = dyn_cast<helix::high::AssignOp>(op)) {
         // ── Heuristic filters for infrastructure that escaped attribute
@@ -1423,18 +2090,83 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             }
         }
 
-        auto targetExpr = buildExpression(assign.getTarget());
-        auto valueExpr = buildExpression(assign.getValue());
+        // A plain variable assignment target is an lvalue identity, not a
+        // value use. Do not run it through buildExpression's transitive copy
+        // resolver: after `tmp = result`, resolving the next target `tmp`
+        // to `result` changes `tmp <<= 5` into `result <<= 5`.
+        ExprPtr targetExpr;
+        if (auto targetRef = assign.getTarget().getDefiningOp<
+                helix::high::VarRefOp>()) {
+            auto name = applyNameAliases(targetRef.getVarName().str());
+            auto type = convertType(assign.getTarget().getType());
+            if (auto declared = declaredVarTypes_.find(targetRef.getVarId());
+                declared != declaredVarTypes_.end() && declared->second &&
+                declared->second->kind == TypeKind::Float)
+                type = declared->second;
+            if (int64_t literal; parseIntLiteralName(name, literal))
+                targetExpr = std::make_unique<CIntLitExpr>(
+                    literal, std::move(type), extractAddress(targetRef));
+            else
+                targetExpr = std::make_unique<CVarRefExpr>(
+                    targetRef.getVarId(), std::move(name), std::move(type),
+                    extractAddress(targetRef));
+        } else {
+            targetExpr = buildExpression(assign.getTarget());
+        }
+        ExprPtr valueExpr;
+        const bool floatingTarget = targetExpr && targetExpr->type &&
+            targetExpr->type->kind == TypeKind::Float;
+        if (floatingTarget) {
+            // Remill stores scalar FP register values as same-width integer
+            // bit patterns. When the recovered destination is authoritatively
+            // floating, preserve the original FP expression instead of
+            // printing a numeric `(int64_t)double_expr` conversion.
+            if (auto bitcast = assign.getValue().getDefiningOp<
+                    LLVM::BitcastOp>()) {
+                auto sourceType = dyn_cast<FloatType>(
+                    bitcast.getArg().getType());
+                auto resultType = dyn_cast<IntegerType>(
+                    bitcast.getResult().getType());
+                if (sourceType && resultType &&
+                    sourceType.getWidth() == resultType.getWidth())
+                    valueExpr = buildExpression(bitcast.getArg());
+            }
+        }
+        if (!valueExpr)
+            valueExpr = buildExpression(assign.getValue());
+
+        if (floatingTarget && valueExpr) {
+            const CExpr* base = valueExpr.get();
+            while (auto* cast = llvm::dyn_cast<CCastExpr>(base))
+                base = cast->operand.get();
+            const bool sameFloatingValue = base && base->type &&
+                base->type->kind == TypeKind::Float &&
+                base->type->bitWidth == targetExpr->type->bitWidth;
+            if (sameFloatingValue) {
+                while (auto* cast = llvm::dyn_cast<CCastExpr>(valueExpr.get()))
+                    valueExpr = std::move(cast->operand);
+            }
+        }
 
         if (!targetExpr || !valueExpr)
             return nullptr;
+
+        // A lifted ABI result register may still bind a call whose debug
+        // signature proves it returns void. Preserve the side effect, but do
+        // not emit invalid C such as `result = kfree(ptr)`.
+        if (auto* call = llvm::dyn_cast<CCallExpr>(valueExpr.get());
+            call && call->type && call->type->kind == TypeKind::Void) {
+            lastRegValue_.clear();
+            exprToBestName_.clear();
+            return std::make_unique<CExprStmt>(std::move(valueExpr), addr);
+        }
 
         // FIX-047, part 2): guard against malformed lvalue targets.
         //
         // `buildExpression` is context-unaware: when it encounters a
         // `__remill_undefined_{8,16,32,64}` intrinsic (see line ~2429) it
-        // returns a `CIntLitExpr(0)` because 0 is the best static stand-in
-        // for "undefined" in an rvalue position.  When that same intrinsic
+        // historically returned `CIntLitExpr(0)` for undefined in an rvalue
+        // position.  Legacy IR can still contain that old shape. When it
         // drives an assignment TARGET the emitted C is the malformed
         // `0 = <rhs>;`, observed in SOTR's `HealthData-read.c` line 41
         // before this fix.
@@ -1553,6 +2285,28 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             }
         }
 
+        // Source legalization must preserve MLIR's single-evaluation
+        // semantics. Once an SSA value has been emitted into a plain C
+        // variable, later users of that exact Value must read the materialized
+        // variable instead of recursively rebuilding the expression against
+        // possibly-mutated operands.
+        auto* valueDef = assign.getValue().getDefiningOp();
+        if (auto* targetVar = llvm::dyn_cast<CVarRefExpr>(targetExpr.get());
+            targetVar && valueDef &&
+            valueDef->hasAttr("helix.fixed_width_unsigned")) {
+            for (auto it = materializedValues_.begin();
+                 it != materializedValues_.end();) {
+                if (it->second.varName == targetVar->varName) {
+                    auto victim = it++;
+                    materializedValues_.erase(victim);
+                } else {
+                    ++it;
+                }
+            }
+            materializedValues_[assign.getValue()] = MaterializedValue{
+                targetVar->varId, targetVar->varName, targetVar->type};
+        }
+
         return std::make_unique<CAssignStmt>(
             std::move(targetExpr), std::move(valueExpr), compoundOp, addr);
     }
@@ -1576,15 +2330,27 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         if (call->getNumResults() > 0) {
             bool hasReachableEmittingUser = false;
             Block* callBlock = call->getBlock();
-            for (Operation* user : call->getResult(0).getUsers()) {
-                bool isEmitter = isa<helix::high::AssignOp,
-                                     helix::high::ReturnOp,
-                                     helix::low::RetOp>(user);
-                if (!isEmitter)
-                    continue;
-                if (user->getBlock() == callBlock) {
-                    hasReachableEmittingUser = true;
-                    break;
+            SmallVector<Value, 4> pending{call->getResult(0)};
+            llvm::SmallPtrSet<Operation*, 8> visited;
+            while (!pending.empty() && !hasReachableEmittingUser) {
+                Value value = pending.pop_back_val();
+                for (Operation* user : value.getUsers()) {
+                    if (user->getBlock() != callBlock)
+                        continue;
+                    if (isa<helix::high::AssignOp,
+                            helix::high::ReturnOp,
+                            helix::low::RetOp>(user)) {
+                        hasReachableEmittingUser = true;
+                        break;
+                    }
+                    if (!visited.insert(user).second)
+                        continue;
+                    if (isa<helix::high::CastOp, helix::mid::CastOp,
+                            LLVM::ZExtOp, LLVM::SExtOp, LLVM::TruncOp,
+                            LLVM::BitcastOp>(user)) {
+                        for (Value result : user->getResults())
+                            pending.push_back(result);
+                    }
                 }
             }
             if (hasReachableEmittingUser)
@@ -1806,6 +2572,14 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     if (auto comment = dyn_cast<helix::high::CommentOp>(op))
         return std::make_unique<CCommentStmt>(comment.getText().str());
 
+    if (isa<helix::high::DebugBreakOp>(op)) {
+        return std::make_unique<CExprStmt>(
+            std::make_unique<CCallExpr>(
+                "__debugbreak", 0, std::vector<ExprPtr>{}, CType::voidTy(),
+                addr),
+            addr);
+    }
+
     // ─── Inline assembly ────────────────────────────────────────────────
     if (auto asmOp = dyn_cast<helix::high::AsmOp>(op))
         return std::make_unique<CAsmStmt>(asmOp.getText().str(), addr);
@@ -1943,8 +2717,8 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             return nullptr;
 
         // FIX-047, part 2): if the address resolves to a bare
-        // integer literal (typically 0 from a `__remill_undefined_*`
-        // intrinsic collapse), wrapping it in a Deref and then printing
+        // integer literal (typically 0 from a legacy undefined collapse),
+        // wrapping it in a Deref and then printing
         // yields `*0 = rhs` which the CAstOptimizer's `*(T)NULL → 0`
         // rule later folds to `0 = rhs` — malformed C.  Since the
         // address is a synthesized "don't know" value, there is no
@@ -1984,14 +2758,91 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     if (isa<helix::low::NopOp>(op))
         return nullptr;
 
+    // ─── helix_high.xchg ───────────────────────────────────────────────
+    if (auto xchg = dyn_cast<helix::high::XchgOp>(op)) {
+        std::string regA = xchg.getRegA().str();
+        std::string regB = xchg.getRegB().str();
+        for (auto& c : regA) c = std::tolower(c);
+        for (auto& c : regB) c = std::tolower(c);
+        CTypePtr valueType;
+        switch (xchg.getBitWidth()) {
+        case 8:  valueType = CType::uint8(); break;
+        case 16: valueType = CType::uint16(); break;
+        case 32: valueType = CType::uint32(); break;
+        default: valueType = CType::uint64(); break;
+        }
+        std::vector<ExprPtr> args;
+        args.push_back(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf,
+            std::make_unique<CVarRefExpr>(0, regA, valueType),
+            CType::pointerTo(valueType), addr));
+        args.push_back(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf,
+            std::make_unique<CVarRefExpr>(0, regB, valueType),
+            CType::pointerTo(valueType), addr));
+        return std::make_unique<CExprStmt>(
+            std::make_unique<CCallExpr>(
+                std::format("__helix_xchg_reg{}", xchg.getBitWidth()),
+                0, std::move(args), CType::voidTy(), addr),
+            addr);
+    }
+
+    // ─── helix_mid.xchg ────────────────────────────────────────────────
+    if (auto xchg = dyn_cast<helix::mid::XchgOp>(op)) {
+        std::string regA = xchg.getRegA().str();
+        std::string regB = xchg.getRegB().str();
+        for (auto& c : regA) c = std::tolower(c);
+        for (auto& c : regB) c = std::tolower(c);
+        CTypePtr valueType;
+        switch (xchg.getBitWidth()) {
+        case 8:  valueType = CType::uint8(); break;
+        case 16: valueType = CType::uint16(); break;
+        case 32: valueType = CType::uint32(); break;
+        default: valueType = CType::uint64(); break;
+        }
+        std::vector<ExprPtr> args;
+        args.push_back(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf,
+            std::make_unique<CVarRefExpr>(0, regA, valueType),
+            CType::pointerTo(valueType), addr));
+        args.push_back(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf,
+            std::make_unique<CVarRefExpr>(0, regB, valueType),
+            CType::pointerTo(valueType), addr));
+        return std::make_unique<CExprStmt>(
+            std::make_unique<CCallExpr>(
+                std::format("__helix_xchg_reg{}", xchg.getBitWidth()),
+                0, std::move(args), CType::voidTy(), addr),
+            addr);
+    }
+
     // ─── helix_low.xchg ────────────────────────────────────────────────
     if (auto xchg = dyn_cast<helix::low::XchgOp>(op)) {
         std::string regA = xchg.getRegA().str();
         std::string regB = xchg.getRegB().str();
         for (auto& c : regA) c = std::tolower(c);
         for (auto& c : regB) c = std::tolower(c);
-        return std::make_unique<CCommentStmt>(
-            std::format("xchg {}, {}", regA, regB), addr);
+        CTypePtr valueType;
+        switch (xchg.getBitWidth()) {
+        case 8:  valueType = CType::uint8(); break;
+        case 16: valueType = CType::uint16(); break;
+        case 32: valueType = CType::uint32(); break;
+        default: valueType = CType::uint64(); break;
+        }
+        std::vector<ExprPtr> args;
+        args.push_back(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf,
+            std::make_unique<CVarRefExpr>(0, regA, valueType),
+            CType::pointerTo(valueType), addr));
+        args.push_back(std::make_unique<CUnaryExpr>(
+            UnaryOp::AddressOf,
+            std::make_unique<CVarRefExpr>(0, regB, valueType),
+            CType::pointerTo(valueType), addr));
+        return std::make_unique<CExprStmt>(
+            std::make_unique<CCallExpr>(
+                std::format("__helix_xchg_reg{}", xchg.getBitWidth()),
+                0, std::move(args), CType::voidTy(), addr),
+            addr);
     }
 
     // ─── helix_low.int3 ────────────────────────────────────────────────
@@ -2120,8 +2971,7 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 
         // FIX-047, part 2): same lvalue-sanity guard as
         // helix_low.mem_write.  If the store address is a bare integer
-        // literal (commonly 0, originating from `__remill_undefined_*`
-        // collapse to `CIntLitExpr(0)` via buildExpression), refuse to
+        // literal (commonly 0 from legacy lifted IR), refuse to
         // build the malformed `*0 = rhs` / `0 = rhs` assignment.
         // Preserve any call-valued RHS as an ExprStmt so side effects
         // are retained; otherwise drop.
@@ -2189,9 +3039,100 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 // Expression builder
 // ═══════════════════════════════════════════════════════════════════════════════
 
+ExprPtr CAstBuilder::buildDebugIndexedField(Value address, Type accessType) {
+    auto outer = address.getDefiningOp<LLVM::AddOp>();
+    if (!outer)
+        return nullptr;
+    auto fieldName = outer->getAttrOfType<StringAttr>(
+        "helix.debug_indexed_field_name");
+    auto elementType = outer->getAttrOfType<StringAttr>(
+        "helix.debug_indexed_element_type");
+    auto fieldOffset = outer->getAttrOfType<IntegerAttr>(
+        "helix.debug_indexed_field_offset");
+    if (!fieldName || !elementType || !fieldOffset)
+        return nullptr;
+
+    Value innerValue;
+    if (tryExtractIntLiteral(outer.getRhs()))
+        innerValue = outer.getLhs();
+    else if (tryExtractIntLiteral(outer.getLhs()))
+        innerValue = outer.getRhs();
+    else
+        return nullptr;
+    auto inner = innerValue.getDefiningOp<LLVM::AddOp>();
+    if (!inner)
+        return nullptr;
+
+    Value baseValue;
+    Value indexValue;
+    if (inner.getLhs().getDefiningOp<helix::high::VarRefOp>() &&
+        !tryExtractIntLiteral(inner.getRhs())) {
+        baseValue = inner.getLhs();
+        indexValue = inner.getRhs();
+    } else if (inner.getRhs().getDefiningOp<helix::high::VarRefOp>() &&
+               !tryExtractIntLiteral(inner.getLhs())) {
+        baseValue = inner.getRhs();
+        indexValue = inner.getLhs();
+    } else {
+        return nullptr;
+    }
+
+    auto strideAttr = outer->getAttrOfType<IntegerAttr>("helix.debug_indexed_element_stride");
+    const int64_t stride = strideAttr ? strideAttr.getInt() : 1;
+    auto width = dyn_cast<IntegerType>(accessType);
+    if (!width || stride < 1 || stride > 8 || width.getWidth() != stride * 8)
+        return nullptr;
+    if (stride > 1) {
+        if (auto shift = indexValue.getDefiningOp<LLVM::ShlOp>()) {
+            auto amount = tryExtractIntLiteral(shift.getRhs());
+            if (!amount || *amount < 0 || *amount >= 4 ||
+                (int64_t{1} << *amount) != stride) return nullptr;
+            indexValue = shift.getLhs();
+        } else if (auto multiply = indexValue.getDefiningOp<LLVM::MulOp>()) {
+            if (tryExtractIntLiteral(multiply.getRhs()) == stride)
+                indexValue = multiply.getLhs();
+            else if (tryExtractIntLiteral(multiply.getLhs()) == stride)
+                indexValue = multiply.getRhs();
+            else return nullptr;
+        } else return nullptr;
+    }
+    auto base = buildExpression(baseValue);
+    auto index = buildExpression(indexValue);
+    if (!base || !index)
+        return nullptr;
+    auto elemType = cTypeFromString(elementType.getValue().str());
+    auto arrayType = CType::arrayOf(elemType);
+    auto field = std::make_unique<CFieldAccessExpr>(
+        std::move(base), fieldName.getValue().str(),
+        fieldOffset.getValue().getZExtValue(), /*isPointer=*/true,
+        std::move(arrayType), extractAddress(outer));
+    return std::make_unique<CSubscriptExpr>(
+        std::move(field), std::move(index), std::move(elemType),
+        extractAddress(outer));
+}
+
 ExprPtr CAstBuilder::buildExpression(Value val) {
     if (!val)
         return std::make_unique<CVarRefExpr>(0, "/* null */", CType::unknownTy());
+
+    if (auto it = sourceLegalizedValues_.find(val);
+        it != sourceLegalizedValues_.end()) {
+        return std::make_unique<CVarRefExpr>(
+            it->second.varId, it->second.varName, it->second.type);
+    }
+
+    if (auto it = functionArguments_.find(val);
+        it != functionArguments_.end()) {
+        return std::make_unique<CVarRefExpr>(
+            it->second.varId, applyNameAliases(it->second.varName),
+            it->second.type);
+    }
+
+    if (auto it = materializedValues_.find(val);
+        it != materializedValues_.end()) {
+        return std::make_unique<CVarRefExpr>(
+            it->second.varId, it->second.varName, it->second.type);
+    }
 
     auto* defOp = val.getDefiningOp();
     if (!defOp) {
@@ -2235,11 +3176,32 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             addrLit.getAddrValue(), convertType(val.getType()), addr);
     }
 
+    if (auto unknown = dyn_cast<helix::high::UnknownValueOp>(defOp)) {
+        std::vector<ExprPtr> args;
+        args.push_back(std::make_unique<CStringLitExpr>(
+            unknown.getReason().str(), addr));
+        return std::make_unique<CCallExpr>(
+            "__helix_unknown", 0, std::move(args),
+            convertType(val.getType()), addr);
+    }
+
+    // CFG-to-SCF introduces index casts solely to satisfy scf.index_switch's
+    // index selector contract. At the C boundary the original integer value
+    // already has the required switch semantics, so no opaque helper is needed.
+    if (auto indexCast = dyn_cast<mlir::arith::IndexCastOp>(defOp))
+        return buildExpression(indexCast.getIn());
+    if (auto indexCast = dyn_cast<mlir::arith::IndexCastUIOp>(defOp))
+        return buildExpression(indexCast.getIn());
+
     // ─── Variable reference ─────────────────────────────────────────────
     if (auto varRef = dyn_cast<helix::high::VarRefOp>(defOp)) {
         auto name = applyNameAliases(varRef.getVarName().str());
         auto varId = varRef.getVarId();
         auto type = convertType(val.getType());
+        if (auto declared = declaredVarTypes_.find(varId);
+            declared != declaredVarTypes_.end() && declared->second &&
+            declared->second->kind == TypeKind::Float)
+            type = declared->second;
 
         // Copy propagation: resolve synthetic temporaries
         if (isSyntheticTemporaryName(name) || isSyntheticValueName(name)) {
@@ -2266,6 +3228,33 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     if (auto binary = dyn_cast<helix::high::BinaryOp>(defOp)) {
         auto lhs = buildExpression(binary.getLhs());
         auto rhs = buildExpression(binary.getRhs());
+        if (binary->hasAttr("helix.fixed_width_unsigned")) {
+            lhs = castForOrderedComparison(
+                std::move(lhs), binary.getLhs().getType(), false, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), binary.getRhs().getType(), false, addr);
+        } else if (binary->hasAttr("helix.fixed_width_compare")) {
+            lhs = castForOrderedComparison(
+                std::move(lhs), binary.getLhs().getType(), false, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), binary.getRhs().getType(), false, addr);
+        }
+        if (isSignedOrderedComparison(binary.getOp()) ||
+            isUnsignedOrderedComparison(binary.getOp())) {
+            const bool isSigned = isSignedOrderedComparison(binary.getOp());
+            lhs = castForOrderedComparison(
+                std::move(lhs), binary.getLhs().getType(), isSigned, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), binary.getRhs().getType(), isSigned, addr);
+        }
+        if (auto signedness = binary->getAttrOfType<StringAttr>(
+                "helix.arithmetic_signedness")) {
+            const bool isSigned = signedness.getValue() == "signed";
+            lhs = castForOrderedComparison(
+                std::move(lhs), binary.getLhs().getType(), isSigned, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), binary.getRhs().getType(), isSigned, addr);
+        }
         auto op = mapBinaryOp(binary.getOp());
         auto type = convertType(val.getType());
 
@@ -2275,9 +3264,34 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── Unary expression ───────────────────────────────────────────────
     if (auto unary = dyn_cast<helix::high::UnaryOp>(defOp)) {
+        if (unary.getOp() == helix::high::UnaryOpKind::Deref) {
+            // Cancel the explicit field-address operation only. A bare
+            // field used as a pointer still requires its dereference.
+            if (auto address = unary.getOperand()
+                    .getDefiningOp<helix::high::UnaryOp>();
+                address && address.getOp() == helix::high::UnaryOpKind::AddressOf &&
+                address.getOperand().getDefiningOp<helix::high::FieldAccessOp>()) {
+                return buildExpression(address.getOperand());
+            }
+            if (auto word =
+                    tryReadRelocatedDataWord(unary.getOperand(), val.getType())) {
+                return std::make_unique<CIntLitExpr>(
+                    static_cast<int64_t>(*word),
+                    convertType(val.getType()), addr);
+            }
+            if (auto indexed = buildDebugIndexedField(unary.getOperand(), val.getType()))
+                return indexed;
+        }
         auto operand = buildExpression(unary.getOperand());
         auto op = mapUnaryOp(unary.getOp());
         auto type = convertType(val.getType());
+
+        if (op == UnaryOp::Deref && operand && operand->type &&
+            (operand->type->kind != TypeKind::Pointer ||
+             !operand->type->pointeeType || *operand->type->pointeeType != *type)) {
+            operand = std::make_unique<CCastExpr>(
+                CType::pointerTo(type), std::move(operand), addr);
+        }
 
         return std::make_unique<CUnaryExpr>(
             op, std::move(operand), type, addr);
@@ -2297,10 +3311,15 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         auto srcType = castOp.getInput().getType();
         auto dstType = castOp.getResult().getType();
         bool elide = false;
+        auto castKind = castOp->getAttrOfType<
+            helix::high::CastKindAttr>("cast_kind");
+        const bool exactExtension = castKind &&
+            (castKind.getValue() == helix::high::CastKind::ZeroExtend ||
+             castKind.getValue() == helix::high::CastKind::SignExtend);
 
         auto srcInt = dyn_cast<IntegerType>(srcType);
         auto dstInt = dyn_cast<IntegerType>(dstType);
-        if (srcInt && dstInt &&
+        if (!exactExtension && srcInt && dstInt &&
             dstInt.getWidth() >= srcInt.getWidth()) {
             // Check if the cast result feeds into a comparison or assignment
             // where implicit promotion is safe.
@@ -2318,6 +3337,18 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
         auto operand = buildExpression(castOp.getInput());
         auto targetType = convertType(castOp.getResult().getType());
+        if (castKind) {
+            if (castKind.getValue() == helix::high::CastKind::ZeroExtend)
+                return castForIntegerExtension(
+                    std::move(operand), srcType, dstType,
+                    /*isSigned=*/false, addr);
+            if (castKind.getValue() ==
+                helix::high::CastKind::SignExtend) {
+                return castForIntegerExtension(
+                    std::move(operand), srcType, dstType,
+                    /*isSigned=*/true, addr);
+            }
+        }
 
         return std::make_unique<CCastExpr>(
             targetType, std::move(operand), addr);
@@ -2328,6 +3359,10 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         auto calleeName = call.getTargetName().str();
         auto targetAddr = call.getTargetAddr();
         auto returnType = convertType(val.getType());
+        if (auto inferredType =
+                call->getAttrOfType<StringAttr>("inferred_type")) {
+            returnType = cTypeFromString(inferredType.getValue().str());
+        }
 
         std::vector<ExprPtr> callArgs;
         for (auto arg : call.getArgs()) {
@@ -2442,6 +3477,53 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     if (auto midBin = dyn_cast<helix::mid::BinExprOp>(defOp)) {
         auto lhs = buildExpression(midBin.getLhs());
         auto rhs = buildExpression(midBin.getRhs());
+        if (midBin.getKind() == helix::mid::BinExprKind::Rol ||
+            midBin.getKind() == helix::mid::BinExprKind::Ror) {
+            unsigned width = 64;
+            if (auto integer = dyn_cast<IntegerType>(val.getType()))
+                width = integer.getWidth();
+            const char* direction =
+                midBin.getKind() == helix::mid::BinExprKind::Rol
+                    ? "rotateleft"
+                    : "rotateright";
+            std::vector<ExprPtr> args;
+            args.push_back(std::move(lhs));
+            args.push_back(std::move(rhs));
+            return std::make_unique<CCallExpr>(
+                std::format("__builtin_{}{}", direction, width), 0,
+                std::move(args), convertType(val.getType()), addr);
+        }
+        if (midBin->hasAttr("helix.fixed_width_unsigned")) {
+            lhs = castForOrderedComparison(
+                std::move(lhs), midBin.getLhs().getType(), false, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), midBin.getRhs().getType(), false, addr);
+        } else if (midBin->hasAttr("helix.fixed_width_compare")) {
+            lhs = castForOrderedComparison(
+                std::move(lhs), midBin.getLhs().getType(), false, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), midBin.getRhs().getType(), false, addr);
+        }
+        if (isSignedOrderedComparison(midBin.getKind()) ||
+            isUnsignedOrderedComparison(midBin.getKind())) {
+            const bool isSigned = isSignedOrderedComparison(midBin.getKind());
+            lhs = castForOrderedComparison(
+                std::move(lhs), midBin.getLhs().getType(), isSigned, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), midBin.getRhs().getType(), isSigned, addr);
+        }
+        if (midBin.getKind() == helix::mid::BinExprKind::UMul ||
+            midBin.getKind() == helix::mid::BinExprKind::UDiv ||
+            midBin.getKind() == helix::mid::BinExprKind::SMul ||
+            midBin.getKind() == helix::mid::BinExprKind::SDiv) {
+            const bool isSigned =
+                midBin.getKind() == helix::mid::BinExprKind::SMul ||
+                midBin.getKind() == helix::mid::BinExprKind::SDiv;
+            lhs = castForOrderedComparison(
+                std::move(lhs), midBin.getLhs().getType(), isSigned, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), midBin.getRhs().getType(), isSigned, addr);
+        }
         auto op = mapMidBinaryOp(midBin.getKind());
         return std::make_unique<CBinaryExpr>(
             op, std::move(lhs), std::move(rhs),
@@ -2451,6 +3533,31 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── mid.unexpr ────────────────────────────────────────────────────
     if (auto midUn = dyn_cast<helix::mid::UnExprOp>(defOp)) {
         auto operand = buildExpression(midUn.getOperand());
+        if (midUn.getKind() == helix::mid::UnExprKind::Bswap ||
+            midUn.getKind() == helix::mid::UnExprKind::Bsf ||
+            midUn.getKind() == helix::mid::UnExprKind::Bsr) {
+            unsigned width = 64;
+            if (auto integer = dyn_cast<IntegerType>(val.getType()))
+                width = integer.getWidth();
+            std::string name;
+            switch (midUn.getKind()) {
+            case helix::mid::UnExprKind::Bswap:
+                name = std::format("__builtin_bswap{}", width);
+                break;
+            case helix::mid::UnExprKind::Bsf:
+                name = std::format("__helix_bsf{}", width);
+                break;
+            case helix::mid::UnExprKind::Bsr:
+                name = std::format("__helix_bsr{}", width);
+                break;
+            default:
+                llvm_unreachable("checked machine unary kind");
+            }
+            std::vector<ExprPtr> args;
+            args.push_back(std::move(operand));
+            return std::make_unique<CCallExpr>(
+                name, 0, std::move(args), convertType(val.getType()), addr);
+        }
         auto op = mapMidUnaryOp(midUn.getKind());
         return std::make_unique<CUnaryExpr>(
             op, std::move(operand), convertType(val.getType()), addr);
@@ -2461,13 +3568,31 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         if (midCast.getInput().getType() == midCast.getResult().getType())
             return buildExpression(midCast.getInput());
         auto operand = buildExpression(midCast.getInput());
+        auto targetType = convertType(midCast.getResult().getType());
+        if (auto castKind = midCast->getAttrOfType<
+                helix::mid::CastKindAttr>("cast_kind")) {
+            if (castKind.getValue() == helix::mid::CastKind::ZeroExtend)
+                return castForIntegerExtension(
+                    std::move(operand), midCast.getInput().getType(),
+                    midCast.getResult().getType(), /*isSigned=*/false, addr);
+            else if (castKind.getValue() ==
+                     helix::mid::CastKind::SignExtend)
+                return castForIntegerExtension(
+                    std::move(operand), midCast.getInput().getType(),
+                    midCast.getResult().getType(), /*isSigned=*/true, addr);
+        }
         return std::make_unique<CCastExpr>(
-            convertType(midCast.getResult().getType()),
-            std::move(operand), addr);
+            targetType, std::move(operand), addr);
     }
 
     // ─── mid.load ──────────────────────────────────────────────────────
     if (auto midLoad = dyn_cast<helix::mid::LoadOp>(defOp)) {
+        if (auto word =
+                tryReadRelocatedDataWord(midLoad.getAddr(), val.getType())) {
+            return std::make_unique<CIntLitExpr>(
+                static_cast<int64_t>(*word),
+                convertType(val.getType()), addr);
+        }
         auto addrExpr = buildExpression(midLoad.getAddr());
         return std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
@@ -2520,6 +3645,15 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             midAddr.getAddrValue(), convertType(val.getType()), addr);
     }
 
+    if (auto unknown = dyn_cast<helix::mid::UnknownValueOp>(defOp)) {
+        std::vector<ExprPtr> args;
+        args.push_back(std::make_unique<CStringLitExpr>(
+            unknown.getReason().str(), addr));
+        return std::make_unique<CCallExpr>(
+            "__helix_unknown", 0, std::move(args),
+            convertType(val.getType()), addr);
+    }
+
     // ─── mid.call ──────────────────────────────────────────────────────
     if (auto midCall = dyn_cast<helix::mid::CallOp>(defOp)) {
         std::string calleeName;
@@ -2544,6 +3678,16 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ═════════════════════════════════════════════════════════════════════
     // HelixLow Dialect fallback expressions
     // ═════════════════════════════════════════════════════════════════════
+
+    // ─── helix_low.unknown_value ───────────────────────────────────────
+    if (auto unknown = dyn_cast<helix::low::UnknownValueOp>(defOp)) {
+        std::vector<ExprPtr> args;
+        args.push_back(std::make_unique<CStringLitExpr>(
+            unknown.getReason().str(), addr));
+        return std::make_unique<CCallExpr>(
+            "__helix_unknown", 0, std::move(args),
+            convertType(val.getType()), addr);
+    }
 
     // ─── helix_low.reg_read ────────────────────────────────────────────
     if (auto regRead = dyn_cast<helix::low::RegReadOp>(defOp)) {
@@ -2584,6 +3728,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── helix_low.mem_read ────────────────────────────────────────────
     if (auto memRead = dyn_cast<helix::low::MemReadOp>(defOp)) {
+        if (auto word =
+                tryReadRelocatedDataWord(memRead.getAddr(), val.getType())) {
+            return std::make_unique<CIntLitExpr>(
+                static_cast<int64_t>(*word),
+                convertType(val.getType()), addr);
+        }
         auto addrExpr = buildExpression(memRead.getAddr());
         return std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
@@ -2594,6 +3744,22 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     if (auto binop = dyn_cast<helix::low::BinOp>(defOp)) {
         auto lhs = buildExpression(binop.getLhs());
         auto rhs = buildExpression(binop.getRhs());
+        if (binop.getKind() == helix::low::BinOpKind::Rol ||
+            binop.getKind() == helix::low::BinOpKind::Ror) {
+            unsigned width = 64;
+            if (auto integerType = dyn_cast<IntegerType>(val.getType()))
+                width = integerType.getWidth();
+            const char* direction =
+                binop.getKind() == helix::low::BinOpKind::Rol
+                    ? "rotateleft"
+                    : "rotateright";
+            std::vector<ExprPtr> args;
+            args.push_back(std::move(lhs));
+            args.push_back(std::move(rhs));
+            return std::make_unique<CCallExpr>(
+                std::format("__builtin_{}{}", direction, width), 0,
+                std::move(args), convertType(val.getType()), addr);
+        }
         auto op = mapLowBinaryOp(binop.getKind());
         return std::make_unique<CBinaryExpr>(
             op, std::move(lhs), std::move(rhs),
@@ -2782,6 +3948,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
                 return std::move(*label);
         auto lhs = buildExpression(addOp.getLhs());
         auto rhs = buildExpression(addOp.getRhs());
+        lhs = preserveIntegerAddressOperand(std::move(lhs), convertType(val.getType()), addr);
+        rhs = preserveIntegerAddressOperand(std::move(rhs), convertType(val.getType()), addr);
         return std::make_unique<CBinaryExpr>(
             BinaryOp::Add, std::move(lhs), std::move(rhs),
             convertType(val.getType()), addr);
@@ -2796,6 +3964,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
                 return std::move(*label);
         auto lhs = buildExpression(subOp.getLhs());
         auto rhs = buildExpression(subOp.getRhs());
+        lhs = preserveIntegerAddressOperand(std::move(lhs), convertType(val.getType()), addr);
+        rhs = preserveIntegerAddressOperand(std::move(rhs), convertType(val.getType()), addr);
         return std::make_unique<CBinaryExpr>(
             BinaryOp::Sub, std::move(lhs), std::move(rhs),
             convertType(val.getType()), addr);
@@ -2925,9 +4095,9 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         if (zextOp.getArg().getType() == zextOp.getResult().getType())
             return buildExpression(zextOp.getArg());
         auto operand = buildExpression(zextOp.getArg());
-        return std::make_unique<CCastExpr>(
-            convertType(zextOp.getResult().getType()),
-            std::move(operand), addr);
+        return castForIntegerExtension(
+            std::move(operand), zextOp.getArg().getType(),
+            zextOp.getResult().getType(), /*isSigned=*/false, addr);
     }
 
     // ─── llvm.sext ─────────────────────────────────────────────────────
@@ -2935,9 +4105,9 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
         if (sextOp.getArg().getType() == sextOp.getResult().getType())
             return buildExpression(sextOp.getArg());
         auto operand = buildExpression(sextOp.getArg());
-        return std::make_unique<CCastExpr>(
-            convertType(sextOp.getResult().getType()),
-            std::move(operand), addr);
+        return castForIntegerExtension(
+            std::move(operand), sextOp.getArg().getType(),
+            sextOp.getResult().getType(), /*isSigned=*/true, addr);
     }
 
     // ─── llvm.trunc ────────────────────────────────────────────────────
@@ -3094,6 +4264,17 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.extractelement ───────────────────────────────────────────
     if (auto extract = dyn_cast<LLVM::ExtractElementOp>(defOp)) {
         auto vec = buildExpression(extract.getVector());
+
+        // convertType deliberately scalarizes vectors to their element type.
+        // Under that representation the expression denotes lane zero already;
+        // emitting `vec[0]` produces invalid C such as `float v; v[0]`.
+        // Keep non-zero lanes explicit until the C AST has a sized vector type.
+        Type vectorType = extract.getVector().getType();
+        if ((isa<VectorType>(vectorType) ||
+             isa<LLVM::LLVMFixedVectorType>(vectorType)) &&
+            tryExtractIntLiteral(extract.getPosition()).value_or(-1) == 0)
+            return vec;
+
         auto idx = buildExpression(extract.getPosition());
         return std::make_unique<CSubscriptExpr>(
             std::move(vec), std::move(idx),
@@ -3115,9 +4296,20 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.bitcast ──────────────────────────────────────────────────
     if (auto bitcast = dyn_cast<LLVM::BitcastOp>(defOp)) {
         auto operand = buildExpression(bitcast.getArg());
+        auto resultType = convertType(bitcast.getResult().getType());
+        if (resultType->kind == TypeKind::Float && operand) {
+            const CExpr* base = operand.get();
+            while (auto* cast = llvm::dyn_cast<CCastExpr>(base))
+                base = cast->operand.get();
+            if (base && base->type && base->type->kind == TypeKind::Float &&
+                base->type->bitWidth == resultType->bitWidth) {
+                while (auto* cast = llvm::dyn_cast<CCastExpr>(operand.get()))
+                    operand = std::move(cast->operand);
+                return operand;
+            }
+        }
         return std::make_unique<CCastExpr>(
-            convertType(bitcast.getResult().getType()),
-            std::move(operand), addr);
+            std::move(resultType), std::move(operand), addr);
     }
 
     // ─── llvm.freeze ───────────────────────────────────────────────────
@@ -3128,6 +4320,8 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.load ─────────────────────────────────────────────────────
     if (auto load = dyn_cast<LLVM::LoadOp>(defOp)) {
+        if (auto indexed = buildDebugIndexedField(load.getAddr(), val.getType()))
+            return indexed;
         auto addrExpr = buildExpression(load.getAddr());
         return std::make_unique<CUnaryExpr>(
             UnaryOp::Deref, std::move(addrExpr),
@@ -3225,7 +4419,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
             calleeName == "__remill_undefined_16" ||
             calleeName == "__remill_undefined_32" ||
             calleeName == "__remill_undefined_64") {
-            return std::make_unique<CIntLitExpr>(0, convertType(val.getType()), addr);
+            std::vector<ExprPtr> args;
+            args.push_back(std::make_unique<CStringLitExpr>(
+                calleeName, addr));
+            return std::make_unique<CCallExpr>(
+                "__helix_unknown", 0, std::move(args),
+                convertType(val.getType()), addr);
         }
 
         std::vector<ExprPtr> callArgs;
@@ -3651,6 +4850,15 @@ bool CAstBuilder::shouldSkip(Operation* op) {
     if (!op)
         return true;
 
+    // Opaque state providers are pure reads. If later simplification removed
+    // every consumer, do not preserve them as misleading bare calls.
+    if (op->hasAttr("helix.machine_intrinsic") &&
+        op->hasAttr("helix.opaque_post_call_register") &&
+        llvm::all_of(op->getResults(), [](Value result) {
+            return result.use_empty();
+        }))
+        return true;
+
     // Infrastructure attribute
     if (op->hasAttr("helix.infrastructure"))
         return true;
@@ -3677,6 +4885,7 @@ bool CAstBuilder::shouldSkip(Operation* op) {
         isa<helix::high::FloatLitOp>(op) ||
         isa<helix::high::StringLitOp>(op) ||
         isa<helix::high::AddrLitOp>(op) ||
+        isa<helix::high::UnknownValueOp>(op) ||
         isa<helix::high::BinaryOp>(op) ||
         isa<helix::high::UnaryOp>(op) ||
         isa<helix::high::CastOp>(op) ||
@@ -3698,6 +4907,12 @@ bool CAstBuilder::shouldSkip(Operation* op) {
         isa<helix::mid::AddrConstOp>(op))
         return true;
 
+    if (isa<helix::mid::UnknownValueOp>(op))
+        return true;
+
+    if (isa<scf::YieldOp, scf::ConditionOp>(op))
+        return true;
+
     // HelixMid VarDeclOp (already handled at function level)
     if (isa<helix::mid::VarDeclOp>(op))
         return true;
@@ -3714,6 +4929,7 @@ bool CAstBuilder::shouldSkip(Operation* op) {
         isa<helix::low::CMovOp>(op) ||
         isa<helix::low::MovZxOp>(op) ||
         isa<helix::low::MovSxOp>(op) ||
+        isa<helix::low::UnknownValueOp>(op) ||
         isa<helix::low::LeaOp>(op))
         return true;
 
@@ -4059,7 +5275,14 @@ CAstBuilder::precomputeDeadStores(Block& block) {
                     deadOps.insert(op);
                     continue;
                 }
-                writtenNotRead.insert(targetStr);
+                // A self-update consumes the value that reached this store,
+                // so an earlier definition of the same variable is live.
+                // Re-inserting the target here used to erase loop-iteration
+                // setup such as `tmp = accumulator; tmp <<= 5`.
+                if (rhsReadsSelf)
+                    writtenNotRead.erase(targetStr);
+                else
+                    writtenNotRead.insert(targetStr);
             } else {
                 writtenNotRead.erase(targetStr);
             }
@@ -4081,8 +5304,11 @@ CAstBuilder::precomputeDeadStores(Block& block) {
             continue;
         }
 
-        // Conservative: calls and control flow clear all tracked writes
-        if (isa<helix::high::CallOp>(op) ||
+        // This pre-scan is block-local. Any nested region or successor can
+        // consume the earlier value, including native SCF nodes not yet
+        // converted to HelixHigh. Cross-scope DSE belongs to CAstOptimizer.
+        if (op->getNumRegions() != 0 || op->getNumSuccessors() != 0 ||
+            isa<helix::high::CallOp>(op) ||
             isa<helix::high::ExprStmtOp>(op) ||
             isa<helix::high::IfOp>(op) ||
             isa<helix::high::WhileOp>(op) ||
@@ -4430,10 +5656,14 @@ void analyzeStmt(const CStmt* s,
                 (assign->compoundOp == "+=" || assign->compoundOp == "-=" ||
                  assign->compoundOp == "|=" || assign->compoundOp == "^=") &&
                 isZeroLiteralExpr(assign->value.get());
+            bool canonicalIncDec =
+                assign->compoundOp == "++" || assign->compoundOp == "--";
 
             if (plainSelfAssign || selfOrAnd || opZero) {
                 g.identityNoOp++;
-            } else if (rhsRefs) {
+            } else if (!canonicalIncDec && rhsRefs &&
+                       !helix::cast::detail::isConditionalPreserveUpdate(
+                           assign->value.get(), targetName)) {
                 // Not exact identity, but the RHS still references the same
                 // variable we're writing to — non-canonical self-reference
                 // (e.g. `x += x - 16` = `2x - 16`, the AmmoUsage case).
@@ -4514,8 +5744,32 @@ GarbageCounts collectGarbagePatterns(const CFuncDecl& func) {
 } // namespace
 
 void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
+    func.nativeQualityEvaluated = true;
     double deduction = 0.0;
     auto& issues = func.confidenceIssues;
+    op->walk([&](Operation* nested) {
+        if (!nested->hasAttr("helix.opaque_post_call_register")) return;
+        if (llvm::any_of(nested->getResults(), [](Value result) {
+                return !result.use_empty();
+            }))
+            ++func.opaquePostCallReads;
+    });
+    if (func.opaquePostCallReads)
+        issues.push_back(std::format("damning honesty defect ({} opaque post-call register read(s)) - confidence capped at 50%", func.opaquePostCallReads));
+    if (auto count = op->getAttrOfType<mlir::IntegerAttr>(
+            "helix.unqualified_instrumentation_call_count"))
+        func.unqualifiedInstrumentationCalls =
+            static_cast<unsigned>(count.getInt());
+    if (func.unqualifiedInstrumentationCalls)
+        issues.push_back(std::format(
+            "unqualified runtime instrumentation ({} call(s)); source-level register preservation only",
+            func.unqualifiedInstrumentationCalls));
+    if (auto count = op->getAttrOfType<mlir::IntegerAttr>("helix.abi.incomplete_call_count"))
+        func.incompleteAbiCalls = static_cast<unsigned>(count.getInt());
+    if (func.incompleteAbiCalls)
+        issues.push_back(std::format(
+            "damning honesty defect ({} call(s) with incomplete ABI arguments) - confidence capped at 50%",
+            func.incompleteAbiCalls));
 
     // FIX-083: op may be low::FuncOp when the pipeline retains functions
     // in the low dialect. mlir::cast would abort; use dyn_cast + fallback.
@@ -4664,6 +5918,7 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
             "{} null-deref of zero-initialised placeholder",
             g.nullDerefPlaceholder));
     }
+    func.suspiciousSelfReferences = g.suspiciousSelfRef;
     if (g.suspiciousSelfRef > 0) {
         // `x op= … x …` — non-canonical self-reference (the
         // `param_2 += param_2 - 16` AmmoUsage case). 5 points each,
@@ -4705,8 +5960,11 @@ void CAstBuilder::analyzeConfidence(CFuncDecl& func, mlir::Operation* op) {
     // the score the user sees and runs the identical re-derivation.
     auto damning = detectDamningDefects(func);
     bool d2Call = func.hasDamningHonestyDefect;
-    if ((damning.any() || d2Call) && func.confidenceScore > 50.0) {
-        func.confidenceScore = 50.0;
+    if (func.incompleteAbiCalls || func.opaquePostCallReads)
+        func.confidenceScore = std::min(func.confidenceScore, 50.0);
+    if (damning.any() || d2Call) {
+        if (func.confidenceScore > 50.0)
+            func.confidenceScore = 50.0;
         std::string reason = damning.reason();
         if (d2Call) {
             if (!reason.empty()) reason += "; ";

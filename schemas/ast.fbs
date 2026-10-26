@@ -16,7 +16,51 @@ enum TypeKind : byte {
     Struct = 6,
     Union = 7,
     FuncPtr = 8,
-    Unknown = 255,
+    Unknown = -1,
+}
+
+/// Source category for one declaration-to-type association.
+enum TypeEvidenceSource : byte {
+    Unknown = 0,
+    Legacy = 1,
+    DataFlow = 2,
+    Structural = 3,
+    Interprocedural = 4,
+    SignatureDatabase = 5,
+    DebugInfo = 6,
+    User = 7,
+}
+
+enum TypeEvidenceState : byte {
+    Unreported = 0,
+    Selected = 1,
+    SelectedWithConflict = 2,
+    Unresolved = 3,
+}
+
+enum TypeEvidenceAuthority : byte {
+    Unknown = 0,
+    Heuristic = 1,
+    Derived = 2,
+    Authoritative = 3,
+}
+
+/// Canonical origin shared by declaration evidence records in one module.
+table EvidenceOrigin {
+    producer: string;
+    generation: uint64 = null;
+    target_identity: string;
+    snapshot_hash: string;
+}
+
+/// Evidence attached to a declaration/type binding, never to DataType itself.
+table TypeEvidence {
+    source: TypeEvidenceSource;
+    state: TypeEvidenceState;
+    authority: TypeEvidenceAuthority;
+    strength: uint16;
+    rejected_spelling: string;
+    origin_id: uint32 = null;
 }
 
 /// A recovered/inferred data type.
@@ -53,6 +97,7 @@ enum StorageClass : byte {
     Register = 1,
     Global = 2,
     Parameter = 3,
+    Temporary = 4,
 }
 
 /// A recovered variable.
@@ -61,6 +106,14 @@ table Variable {
     type: DataType;
     storage: StorageClass;
     stack_offset: int64;
+    /// Stable storage/value identity. Optional scalar presence distinguishes
+    /// an unknown identity from the valid identity value zero.
+    identity_id: uint64 = null;
+    /// Source/ABI parameter ordinal. Present only for parameters; ordinal zero
+    /// remains representable and distinct from an absent ordinal.
+    parameter_index: uint32 = null;
+    /// HAST 1.2: explicit even when state is Unreported.
+    type_evidence: TypeEvidence;
 }
 
 /// Expression node types.
@@ -78,7 +131,7 @@ enum ExprKind : byte {
     DerefMember = 10,
     Ternary = 11,
     AddressLit = 12,
-    Unknown = 255,
+    Unknown = -1,
 }
 
 /// An expression node (tree structure via children).
@@ -100,6 +153,16 @@ table Expression {
     variable: Variable;
     /// Address value (for AddressLit).
     address: Address;
+    /// Recovered result type for every expression kind.
+    result_type: DataType;
+    /// Stable canonical preorder ID. Zero is reserved for "not assigned".
+    node_id: uint64;
+    /// Address of the machine/IR operation that produced this expression.
+    source_address: Address;
+    /// Resolved direct target for Call expressions, when known.
+    call_target: Address;
+    /// Byte offset for Member/DerefMember. Optional so offset zero is exact.
+    field_offset: uint64 = null;
 }
 
 /// Statement node types.
@@ -119,12 +182,24 @@ enum StmtKind : byte {
     Label = 12,
     Asm = 13,
     Comment = 14,
+    Block = 15,
 }
 
 /// A switch case.
 table SwitchCase {
     values: [int64];
     body: [Statement];
+}
+
+/// Semantic role of an entry in Statement.children. Values are append-only.
+enum StatementChildRole : byte {
+    Unknown = 0,
+    Then = 1,
+    Else = 2,
+    Body = 3,
+    Init = 4,
+    Step = 5,
+    BlockItem = 6,
 }
 
 /// A statement node.
@@ -140,9 +215,25 @@ table Statement {
     cases: [SwitchCase];
     /// Label name / goto target / asm / comment text.
     text: string;
+    /// Stable canonical preorder ID. Zero is reserved for "not assigned".
+    node_id: uint64;
+    /// Address of the machine/IR operation that produced this statement.
+    source_address: Address;
+    /// One semantic role per entry in children, in identical order.
+    child_roles: [StatementChildRole];
 }
 
 /// A fully decompiled function.
+/// Native quality barriers; values are append-only, not severity scores.
+enum NativeQualityIssue : byte {
+    OpaquePostCallRegister = 0,
+    IncompleteAbiArguments = 1,
+    SynthesizedVariable = 2,
+    DamningDefect = 3,
+    RegistryMiss = 4,
+    SuspiciousSelfReference = 5,
+}
+
 table DecompiledFunction {
     name: string;
     address: Address;
@@ -152,6 +243,24 @@ table DecompiledFunction {
     body: [Statement];
     calling_convention: string;
     is_variadic: bool;
+    /// HAST 1.1: absence means native quality was not reported.
+    native_quality_reported: bool;
+    native_quality_issues: [NativeQualityIssue];
+    /// HAST 1.2: evidence for return_type.
+    return_type_evidence: TypeEvidence;
+}
+
+/// Features guaranteed by a canonical HAST producer. Values are append-only.
+enum HastCapability : byte {
+    VariableIdentity = 0,
+    TypedExpressions = 1,
+    StableNodeIds = 2,
+    SourceAddresses = 3,
+    DirectCallTargets = 4,
+    StructFieldOffsets = 5,
+    StatementChildRoles = 6,
+    NativeFunctionQuality = 7,
+    DeclarationTypeEvidence = 8,
 }
 
 /// Top-level decompiled module.
@@ -160,6 +269,19 @@ table AstModule {
     functions: [DecompiledFunction];
     global_vars: [Variable];
     type_defs: [DataType];
+    /// Canonical HAST contract version. Schema changes are append-only within
+    /// a major version; consumers reject unsupported majors.
+    schema_major: uint16;
+    schema_minor: uint16;
+    /// Explicit feature negotiation for fields introduced after the legacy
+    /// four-field AstModule prefix.
+    capabilities: [HastCapability];
+    producer: string;
+    version: string;
+    arch: Arch;
+    pointer_bits: uint16;
+    /// HAST 1.2: sorted, deduplicated declaration evidence origins.
+    evidence_origins: [EvidenceOrigin];
 }
 
 root_type AstModule;

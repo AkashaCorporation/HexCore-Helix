@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <format>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace helix {
@@ -108,6 +109,8 @@ void Engine::setSkipOptimization(bool skip) {
     // Re-apply preserve-cfg onto the fresh pipeline (rebuild loses state).
     if (preserve_cfg_)
         pipeline_->setPreserveCfg(true);
+    if (!debug_type_info_json_.empty())
+        pipeline_->setDebugTypeInfoJson(debug_type_info_json_);
 }
 
 void Engine::setPreserveCfg(bool v) {
@@ -146,6 +149,12 @@ void Engine::setFunctionStarts(const int64_t* starts, size_t len) {
     }
 }
 
+void Engine::setDebugTypeInfoJson(const char* json, size_t len) {
+    debug_type_info_json_.assign(json ? json : "", json ? len : 0);
+    if (pipeline_)
+        pipeline_->setDebugTypeInfoJson(debug_type_info_json_);
+}
+
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
@@ -154,7 +163,7 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 
 const char* Engine::version() noexcept {
     // Helix v2 redesign sandbox. Baseline forked from main-line v0.9.2.
-    return "0.1.8";
+    return "0.1.9";
 }
 
 HelixStatus Engine::decompile(
@@ -215,28 +224,12 @@ HelixStatus Engine::decompileIR(
         return HELIX_ERROR_INVALID_INPUT;
     }
 
-    // Run the full MLIR decompilation pipeline.
-    //
-    // NOTE: MLIR can recurse deeply on large IR inputs (400+ SSA values
-    // in a single basic block).  Callers MUST ensure adequate stack space:
-    //   - helix_tool.exe: /STACK:16777216 set in CMakeLists.txt
-    //   - Rust FFI: caller spawns a thread with 16 MB stack via
-    //     std::thread::Builder::stack_size()
-    // FIX-097: pick up relocated .rodata string bytes embedded as
-    // !helix.strings metadata (ET_REL string loads) before installing the
-    // provider — no-op when the metadata is absent.
-    parseHelixStringsMetadata(ir_text, ir_len);
-    ScopedDataSectionProvider scopedProvider(&data_sections_);
-    llvm::StringRef irStr(ir_text, ir_len);
-    auto result = pipeline_->decompile(irStr);
-
-    if (!result) {
-        last_error_ = result.error();
-        return HELIX_ERROR_INTERNAL;
-    }
+    DecompileOutput output;
+    HelixStatus status = decompileIRCombined(ir_text, ir_len, output);
+    if (status != HELIX_OK)
+        return status;
 
     // Copy FlatBuffer output to the caller's buffer.
-    auto& output = result.value();
     auto& flatbuf = output.flatbuffer;
 
     if (*out_len < flatbuf.size()) {
@@ -271,22 +264,12 @@ HelixStatus Engine::decompileIRText(
         return HELIX_ERROR_INVALID_INPUT;
     }
 
-    // Run the full MLIR decompilation pipeline.
-    // Stack requirements documented in decompileIR().
-    // FIX-097: see decompileIR() — register !helix.strings data before the
-    // provider is installed.
-    parseHelixStringsMetadata(ir_text, ir_len);
-    ScopedDataSectionProvider scopedProvider(&data_sections_);
-    llvm::StringRef irStr(ir_text, ir_len);
-    auto result = pipeline_->decompile(irStr);
-
-    if (!result) {
-        last_error_ = result.error();
-        return HELIX_ERROR_INTERNAL;
-    }
+    DecompileOutput output;
+    HelixStatus status = decompileIRCombined(ir_text, ir_len, output);
+    if (status != HELIX_OK)
+        return status;
 
     // Copy pseudo-C text to the caller's buffer.
-    auto& output = result.value();
     auto& pseudo_c = output.pseudo_c;
     size_t needed = pseudo_c.size() + 1;  // +1 for null terminator
 
@@ -303,6 +286,32 @@ HelixStatus Engine::decompileIRText(
     *out_len = needed;
     last_error_.clear();
 
+    return HELIX_OK;
+}
+
+HelixStatus Engine::decompileIRCombined(
+    const char* ir_text,
+    size_t ir_len,
+    DecompileOutput& output)
+{
+    output = {};
+    if (!ir_text || ir_len == 0) {
+        last_error_ = "IR text is null or empty";
+        return HELIX_ERROR_INVALID_INPUT;
+    }
+
+    // MLIR can recurse deeply on large IR inputs. Native tools and Rust/N-API
+    // callers must retain the documented 16 MiB worker-stack contract.
+    parseHelixStringsMetadata(ir_text, ir_len);
+    ScopedDataSectionProvider scopedProvider(&data_sections_);
+    auto result = pipeline_->decompile(llvm::StringRef(ir_text, ir_len));
+    if (!result) {
+        last_error_ = result.error();
+        return HELIX_ERROR_INTERNAL;
+    }
+
+    output = std::move(*result);
+    last_error_.clear();
     return HELIX_OK;
 }
 

@@ -331,11 +331,18 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
     case NodeKind::AssignStmt: {
         const auto& s = static_cast<const CAssignStmt&>(stmt);
         indent(depth);
-        printExpr(*s.target, 0);
         if (s.compoundOp == "++" || s.compoundOp == "--") {
+            const bool needsParens =
+                s.target->getKind() != NodeKind::VarRefExpr &&
+                s.target->getKind() != NodeKind::FieldAccessExpr &&
+                s.target->getKind() != NodeKind::SubscriptExpr;
+            if (needsParens) os << "(";
+            printExpr(*s.target, 0);
+            if (needsParens) os << ")";
             os << s.compoundOp << ";\n";
             break;
         }
+        printExpr(*s.target, 0);
         if (s.compoundOp.empty())
             os << " = ";
         else
@@ -422,10 +429,19 @@ void CAstPrinter::printStmt(const CStmt& stmt, unsigned depth) {
         auto printLoopPart = [&](const CStmt& part) {
             if (part.getKind() == NodeKind::AssignStmt) {
                 const auto& a = static_cast<const CAssignStmt&>(part);
-                if (a.target) printExpr(*a.target, 0);
                 if (a.compoundOp == "++" || a.compoundOp == "--") {
+                    if (!a.target)
+                        return;
+                    const bool needsParens =
+                        a.target->getKind() != NodeKind::VarRefExpr &&
+                        a.target->getKind() != NodeKind::FieldAccessExpr &&
+                        a.target->getKind() != NodeKind::SubscriptExpr;
+                    if (needsParens) os << "(";
+                    printExpr(*a.target, 0);
+                    if (needsParens) os << ")";
                     os << a.compoundOp;
                 } else {
+                    if (a.target) printExpr(*a.target, 0);
                     os << (a.compoundOp.empty() ? " = " : " " + a.compoundOp + " ");
                     if (a.value) printExpr(*a.value, 0);
                 }

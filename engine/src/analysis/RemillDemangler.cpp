@@ -83,7 +83,8 @@ RemillSemantic classifyJcc(std::string_view name) {
 /// block in decode_mangled_name().
 RemillSemantic classifySemantic(std::string_view name) {
     // ---- Data movement ------------------------------------------------------
-    if (name == "MOV"   || name == "MOVI")   return RemillSemantic::MOV;
+    if (name == "MOV"   || name == "MOVI" || name == "ADRP")
+                                              return RemillSemantic::MOV;
     // AArch64 operand-accessor template: `Load<RnW<T>, In<T>>` is how Remill
     // models `MOV Xd, #imm` / register-from-immediate moves. It carries the
     // same (mem, state, dest_reg_ptr, value) operand layout as x86 MOV, so it
@@ -102,8 +103,10 @@ RemillSemantic classifySemantic(std::string_view name) {
     if (name == "CDQ"   || name == "CWD")    return RemillSemantic::CDQ;
 
     // ---- Arithmetic ---------------------------------------------------------
-    if (name == "ADD"   || name == "ADDI")   return RemillSemantic::ADD;
-    if (name == "SUB"   || name == "SUBI")   return RemillSemantic::SUB;
+    if (name == "ADD"   || name == "ADDI" || name == "ADDS")
+                                              return RemillSemantic::ADD;
+    if (name == "SUB"   || name == "SUBI" || name == "SUBS")
+                                              return RemillSemantic::SUB;
     if (name == "MUL"   || name == "MULI")   return RemillSemantic::MUL;
     if (name == "IMUL"  || name == "IMULI")  return RemillSemantic::IMUL;
     if (name == "DIV"   || name == "DIVI")   return RemillSemantic::DIV;
@@ -111,17 +114,22 @@ RemillSemantic classifySemantic(std::string_view name) {
     if (name == "INC"   || name == "INCI")   return RemillSemantic::INC;
     if (name == "DEC"   || name == "DECI")   return RemillSemantic::DEC;
     if (name == "NEG"   || name == "NEGI")   return RemillSemantic::NEG;
+    if (name == "MADD")                      return RemillSemantic::MADD;
 
     // ---- Logic / Bitwise ----------------------------------------------------
     if (name == "AND"   || name == "ANDI")   return RemillSemantic::AND;
-    if (name == "OR"    || name == "ORI")    return RemillSemantic::OR;
-    if (name == "XOR"   || name == "XORI")   return RemillSemantic::XOR;
+    if (name == "OR"    || name == "ORI" || name == "ORR")
+                                              return RemillSemantic::OR;
+    if (name == "XOR"   || name == "XORI" || name == "EOR")
+                                              return RemillSemantic::XOR;
     if (name == "NOT"   || name == "NOTI")   return RemillSemantic::NOT;
     if (name == "SHL"   || name == "SHLI")   return RemillSemantic::SHL;
     if (name == "SHR"   || name == "SHRI")   return RemillSemantic::SHR;
     if (name == "SAR"   || name == "SARI")   return RemillSemantic::SAR;
     if (name == "ROL"   || name == "ROLI")   return RemillSemantic::ROL;
     if (name == "ROR"   || name == "RORI")   return RemillSemantic::ROR;
+    if (name == "UBFM")                      return RemillSemantic::UBFM;
+    if (name == "SBFM")                      return RemillSemantic::SBFM;
 
     // ---- Comparison ---------------------------------------------------------
     if (name == "CMP"   || name == "CMPI")   return RemillSemantic::CMP;
@@ -155,10 +163,14 @@ RemillSemantic classifySemantic(std::string_view name) {
     if (name == "BSF"   || name == "BSFI")   return RemillSemantic::BSF;
     if (name == "BSR"   || name == "BSRI")   return RemillSemantic::BSR;
     if (name == "BSWAP" || name == "BSWAPI") return RemillSemantic::BSWAP;
-    if (name == "BT"    || name == "BTI")    return RemillSemantic::BT;
-    if (name == "BTS"   || name == "BTSI")   return RemillSemantic::BTS;
-    if (name == "BTR"   || name == "BTRI")   return RemillSemantic::BTR;
-    if (name == "BTC"   || name == "BTCI")   return RemillSemantic::BTC;
+    if (name == "BT"    || name == "BTI" || name == "BTmem" ||
+        name == "BTreg" || name == "BTimm")  return RemillSemantic::BT;
+    if (name == "BTS"    || name == "BTSI" || name == "BTSmem" ||
+        name == "BTSreg" || name == "BTSimm") return RemillSemantic::BTS;
+    if (name == "BTR"    || name == "BTRI" || name == "BTRmem" ||
+        name == "BTRreg" || name == "BTRimm") return RemillSemantic::BTR;
+    if (name == "BTC"    || name == "BTCI" || name == "BTCmem" ||
+        name == "BTCreg" || name == "BTCimm") return RemillSemantic::BTC;
 
     // ---- String operations --------------------------------------------------
     // Handled below in the fallback section (REP* prefix logic).
@@ -199,11 +211,13 @@ RemillSemantic classifySemantic(std::string_view name) {
     // ---- SSE/AVX packed & misc ------------------------------------------
     if (name == "MOVxPS")                       return RemillSemantic::MOVxPS;
     if (name == "MOVSS_MEM")                    return RemillSemantic::MOVSS_MEM;
+    if (name == "MOVSD_MEM")                    return RemillSemantic::MOVSD_MEM;
     if (name == "SHUFPS" || name == "SHUFPSI")  return RemillSemantic::SHUFPS;
     if (name == "SUBPS"  || name == "SUBPSI")   return RemillSemantic::SUBPS;
     if (name == "ADDPS"  || name == "ADDPSI")   return RemillSemantic::ADDPS;
     if (name == "MULPS"  || name == "MULPSI")   return RemillSemantic::MULPS;
     if (name == "COMISS" || name == "COMISSI")  return RemillSemantic::COMISS;
+    if (name == "UNPCKLPS")                     return RemillSemantic::UNPCKLPS;
     if (name == "UNPCKHPS")                     return RemillSemantic::UNPCKHPS;
 
     // ---- PREFETCH (hint, no semantic effect) ----------------------------
@@ -271,11 +285,11 @@ RemillSemantic classifySemantic(std::string_view name) {
     if (name == "STOSD" || name == "STOSB" || name == "STOSW" ||
         name == "STOSQ")
         return RemillSemantic::REP_STOS;
-    if (name == "LAHF")  return RemillSemantic::NOP;   // flags→AH (no semantic effect for decompiler)
-    if (name == "SAHF")  return RemillSemantic::NOP;   // AH→flags (no semantic effect for decompiler)
+    if (name == "LAHF" || name == "SAHF")
+        return RemillSemantic::HANDLE_UNSUPPORTED;
     if (name == "CLC" || name == "STC" || name == "CMC" ||
         name == "CLD" || name == "STD" || name == "STI" || name == "CLI")
-        return RemillSemantic::NOP;   // flag manipulation (no semantic effect)
+        return RemillSemantic::HANDLE_UNSUPPORTED;
 
     // Exchange and add (XADD) -- present in the Rust reference but not as a
     // dedicated enum value in the C++ header, so map to Unknown.  If the header
@@ -332,11 +346,40 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
         bool has_mem_src = false;
         bool has_mem_dst = false;
         unsigned src_w = 64;
+		unsigned dst_w = 64;
+
+        // CMP/TEST have no write destination. Their first read-register
+        // accessor carries the machine operand width, even when Remill passes
+        // its value as a zero-extended i64 function argument.
+        if ((sem == RemillSemantic::CMP || sem == RemillSemantic::TEST) &&
+            suffix.starts_with("I2RnI") && suffix.size() > 5) {
+            switch (suffix[5]) {
+            case 'h': case 'a': src_w = 8; break;
+            case 't': case 's': src_w = 16; break;
+            case 'j': case 'i': src_w = 32; break;
+            case 'm': case 'l': src_w = 64; break;
+            default: break;
+            }
+        }
+
+		// Register destinations encode their exact view in RnWI<T>.
+		// Keep this separate from the source width for MOVZX/MOVSX.
+		if (auto rnwPos = suffix.find("RnWI");
+			rnwPos != std::string_view::npos && rnwPos + 4 < suffix.size()) {
+			char typeChar = suffix[rnwPos + 4];
+			if (typeChar == 'j') dst_w = 32;
+			else if (typeChar == 'm') dst_w = 64;
+			else if (typeChar == 'h') dst_w = 8;
+			else if (typeChar == 't') dst_w = 16;
+		}
 
         // Find the first operand type (destination):
         // "3MnW" = memory write destination
         // "3RnW" = register write destination
-        if (auto mnwPos = suffix.find("MnW"); mnwPos != std::string_view::npos) {
+        auto mnwPos = suffix.find("MnW");
+        auto mvnwPos = suffix.find("MVnW");
+        if (mnwPos != std::string_view::npos ||
+            mvnwPos != std::string_view::npos) {
             has_mem_dst = true;
             // Infer width from the destination memory operand for forms like:
             //   MnWIjE -> 32-bit store
@@ -350,6 +393,7 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
                 else if (typeChar == 'm') src_w = 64;
                 else if (typeChar == 'h') src_w = 8;
                 else if (typeChar == 't') src_w = 16;
+				dst_w = src_w;
             }
         }
 
@@ -358,13 +402,16 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
         // Pattern: "2MnI" = memory read source.
         {
             auto pos = suffix.find("MnI");
+            auto vectorPos = suffix.find("MVnI");
             // MnW also has Mn, so check it's not MnW
-            if (pos != std::string_view::npos) {
+            if (pos != std::string_view::npos ||
+                vectorPos != std::string_view::npos) {
                 // Check that this Mn is NOT preceded by a context that makes it MnW.
                 // If "MnW" exists, the "MnI" we found might be a second one (the source).
                 // Just check: if the "MnI" is at a different position than where "MnW" starts.
                 auto mnw_pos = suffix.find("MnW");
-                if (mnw_pos == std::string_view::npos || pos != mnw_pos) {
+                if (vectorPos != std::string_view::npos ||
+                    mnw_pos == std::string_view::npos || pos != mnw_pos) {
                     has_mem_src = true;
                     // Infer width from the type char after "MnI":
                     // IjE = uint32 (32-bit), ImE = uint64 (64-bit),
@@ -380,8 +427,15 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
             }
         }
 
+        // Remill's scalar SSE memory operands use MVnI/MVnW wrappers whose
+        // payload type carries the width instead of an Itanium primitive code.
+        if (suffix.find("vec32_t") != std::string_view::npos)
+            src_w = 32;
+        else if (suffix.find("vec64_t") != std::string_view::npos)
+            src_w = 64;
+
         return RemillSemanticInfo{sem, std::move(raw), /*is_helper=*/false,
-                                  has_mem_src, has_mem_dst, src_w};
+								  has_mem_src, has_mem_dst, src_w, dst_w};
     }
 
     // ---- Pattern 2: __remill_{read,write}_memory_<N> intrinsics -------------
@@ -482,6 +536,7 @@ llvm::StringRef semanticToString(RemillSemantic semantic) {
     case RemillSemantic::INC:    return "INC";
     case RemillSemantic::DEC:    return "DEC";
     case RemillSemantic::NEG:    return "NEG";
+    case RemillSemantic::MADD:   return "MADD";
 
     // Logic
     case RemillSemantic::AND:    return "AND";
@@ -493,6 +548,8 @@ llvm::StringRef semanticToString(RemillSemantic semantic) {
     case RemillSemantic::SAR:    return "SAR";
     case RemillSemantic::ROL:    return "ROL";
     case RemillSemantic::ROR:    return "ROR";
+    case RemillSemantic::UBFM:   return "UBFM";
+    case RemillSemantic::SBFM:   return "SBFM";
 
     // Comparison
     case RemillSemantic::CMP:    return "CMP";
@@ -573,11 +630,13 @@ llvm::StringRef semanticToString(RemillSemantic semantic) {
     // SSE/AVX packed & misc
     case RemillSemantic::MOVxPS:      return "MOVxPS";
     case RemillSemantic::MOVSS_MEM:   return "MOVSS_MEM";
+    case RemillSemantic::MOVSD_MEM:   return "MOVSD_MEM";
     case RemillSemantic::SHUFPS:      return "SHUFPS";
     case RemillSemantic::SUBPS:       return "SUBPS";
     case RemillSemantic::ADDPS:       return "ADDPS";
     case RemillSemantic::MULPS:       return "MULPS";
     case RemillSemantic::COMISS:      return "COMISS";
+    case RemillSemantic::UNPCKLPS:    return "UNPCKLPS";
     case RemillSemantic::UNPCKHPS:    return "UNPCKHPS";
 
     // SETcc
