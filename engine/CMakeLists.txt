@@ -460,7 +460,10 @@ endif()
 
 option(HELIX_BUILD_TOOLS "Build Helix CLI tools" ON)
 if(HELIX_BUILD_TOOLS)
-    add_executable(helix_tool tools/helix_tool.cpp)
+    add_executable(helix_tool
+        tools/helix_tool.cpp
+        tools/CanonicalRequest.cpp
+    )
     target_link_libraries(helix_tool PRIVATE helix_engine)
     target_include_directories(helix_tool PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
