@@ -8,6 +8,7 @@
 #include "helix/cast/CAstPrinter.h"
 #include "helix/cast/CDecl.h"
 #include "helix/cast/DamningDefect.h"
+#include "helix/cast/SelfRefWitness.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -1834,6 +1835,59 @@ TEST(CAstOptimizerTest, CanonicalIncrementDecrementIsNotSuspiciousSelfReference)
     dependent.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
     CAstOptimizer().reanalyzeConfidence(dependent);
     EXPECT_EQ(dependent.suspiciousSelfReferences, 1u);
+}
+
+TEST(CAstOptimizerTest, SelfReferenceWitnessesPreservePrePostStructuralInterval) {
+    CFuncDecl func("witnessed_self_reference", 0x401000, CType::int64());
+    func.params.emplace_back("condition", CType::boolTy(), 0);
+    func.params.emplace_back("value", CType::int64(), 1);
+    std::vector<ExprPtr> arguments;
+    arguments.push_back(makeVar("value"));
+    auto replacement = std::make_unique<CCallExpr>(
+        "transform", 0, std::move(arguments), CType::int64(), 0x401010);
+    auto value = std::make_unique<CTernaryExpr>(
+        makeVar("condition"), std::move(replacement), makeVar("value"),
+        CType::int64(), 0x401010);
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"), std::move(value), "", 0x401010));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
+
+    auto before = collectSelfRefObservations(func);
+    ASSERT_EQ(before.size(), 1u);
+    EXPECT_EQ(before[0].sourceAddress, 0x401010u);
+    EXPECT_EQ(before[0].targetName, "value");
+
+    CAstOptimizer().reanalyzeConfidence(func);
+    auto after = collectSelfRefObservations(func);
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].matchKey(), before[0].matchKey());
+
+    const auto reportPath = std::filesystem::temp_directory_path() /
+        "helix-self-ref-witness-test.json";
+    std::string error;
+    ASSERT_TRUE(writeSelfRefWitnessReport(reportPath, {{
+        .functionEntry = func.entryAddr,
+        .functionName = func.name,
+        .beforeOptimizer = std::move(before),
+        .afterOptimizer = std::move(after),
+    }}, error)) << error;
+    const std::string report = [&] {
+        std::ifstream input(reportPath, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    }();
+    std::filesystem::remove(reportPath);
+    EXPECT_NE(report.find("before_c_ast_optimizer"), std::string::npos);
+    EXPECT_NE(report.find("not-collected"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, SelfReferenceWitnessesExcludePointerWalks) {
+    CFuncDecl func("pointer_walk", 0x402000, CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"),
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref, makeVar("value"), CType::int64(), 0x402010),
+        "", 0x402010));
+    EXPECT_TRUE(collectSelfRefObservations(func).empty());
 }
 
 TEST(CAstOptimizerTest, SynthesizedPlaceholderIssueListsDeterministicNames) {

@@ -4,6 +4,8 @@
 #include "helix/cast/CExpr.h"
 
 #include <string>
+#include <functional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -24,6 +26,12 @@ class CAstOptimizer {
 public:
     /// Run all passes on a function declaration.
     void optimize(CFuncDecl& func);
+
+    /// Audit-only variant that observes the immutable result after each pass.
+    /// The ordinary optimize() path delegates here with no observer.
+    void optimizeWithObserver(
+        CFuncDecl& func,
+        const std::function<void(std::string_view, const CFuncDecl&)>& observer);
 
     /// Individual passes (can be called selectively for testing).
     void removePrologueEpilogue(CFuncDecl& func);

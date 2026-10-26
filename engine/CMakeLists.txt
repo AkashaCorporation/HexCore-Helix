@@ -297,6 +297,7 @@ set(HELIX_SOURCES
     src/cast/CAstPrinter.cpp
     src/cast/CAstBuilder.cpp
     src/cast/CAstOptimizer.cpp
+    src/cast/SelfRefWitness.cpp
 )
 
 set(HELIX_HEADERS
@@ -346,6 +347,7 @@ set(HELIX_HEADERS
     include/helix/cast/CAstPrinter.h
     include/helix/cast/CAstBuilder.h
     include/helix/cast/CAstOptimizer.h
+    include/helix/cast/SelfRefWitness.h
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})

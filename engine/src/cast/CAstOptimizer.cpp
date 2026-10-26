@@ -213,108 +213,78 @@ static bool isCommutative(BinaryOp op) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void CAstOptimizer::optimize(CFuncDecl& func) {
-    // M4: collapse the RVSDG exit-dispatcher switches FIRST, so every existing
-    // pass below (copy-prop, dead-store, empty-if, invert, polarity) then cleans
-    // up the now-ordinary if/else and the exposed scf_r selector copy chains.
-    dissolveExitDispatchers(func);   // P3/P4: switch(selector) -> if/else-if chain
-    // Structuring can leave orphaned gotos whose labels were already absorbed.
-    // Remove those before liveness-based copy coalescing; a real surviving goto
-    // still makes the coalescer bail out conservatively.
-    removeDanglingGotos(func);
-    coalesceSelectorChains(func);    // P2: collapse the scf_r routing copy chains
-    // P5: with every `switch(scf_r)` now an if-chain, the synthetic selector is
-    // read only by `if (scf_r==c)` conditions; the overwhelming majority of the
-    // per-arm `scf_r = const` writes are dead (overwritten or never reached by
-    // any read).  A proper recursive backward liveness restricted to scf_r* sweeps
-    // them — this is the verbosity lever (dead selector writes are ~36% of the
-    // dispatcher-heavy functions).  Must run AFTER dissolveExitDispatchers so the
-    // selector is no longer kept artificially live by a surviving switch.
-    eliminateDeadSelectorStores(func);
-    foldBooleanExitSelectors(func);
-    removePrologueEpilogue(func);
-    eliminateInfrastructure(func);
-    eliminateNullPtrStores(func);
-    recognizeStackCanary(func);
-    inferSemanticNames(func);
-    renameRemainingRegisterVars(func);
-    decomposeNativeOpcodes(func);
-    eliminateDeadStores(func);
-    propagateCopies(func);
-    canonicalizeXorPatterns(func);
-    recoverStructFieldAccess(func);
-    simplifyExpressions(func);
-    // FIX-086 (dewolf-inspired): strip casts that are no-ops at the C
-    // type level (e.g. `(int64_t)(void*)0` → `0`).  Must run after
-    // `simplifyExpressions` so we operate on the canonicalized tree but
-    // before `synthesizeCompoundAssign` so cast-wrapped RHSs are matched
-    // against bare-LHS targets in `tryCompound`.
-    eliminateRedundantCasts(func);
-    synthesizeCompoundAssign(func);
-    eliminateConstantBranches(func);
-    foldIdenticalNestedSCFArms(func);
-    removeEmptyIfStatements(func);
-    cleanupFloatZeros(func);
-    collapseMinMaxPatterns(func);
-    foldRedundantReturnAfterElse(func);
-    invertEmptyIfThen(func);
-    simplifyConditionPolarity(func);
-    foldDegenerateCompounds(func);
-    downgradeDeadAssignedCalls(func);
-    eliminateInfrastructure(func);
-    declareUndeclaredVars(func);
-    removeSelfAssignments(func);
-    removeDanglingGotos(func);
-    removeDeadCodeAfterReturn(func);
-    removeEmptyIfStatements(func);
-    unwrapTrivialDoWhile(func);
-    cleanupParameterSSASuffixes(func);
-    resolveFramePointerLeaks(func);
-    removeAdjacentDuplicateStmts(func);
-    removeDeadStoresBeforeReturn(func);
-    collapseAssignBeforeReturn(func);
-    initializeReadBeforeWriteVars(func);
-    // v0.9.1 (G-002): drop the lift's downstream garbage — null-deref
-    // stores on placeholder vars and unreachable tails after a leading
-    // return. These passes run last in the optimisation order so they
-    // see the AST after every other simplification has had a chance to
-    // legitimise the patterns (e.g. propagateCopies may rewrite `*v` to
-    // a real lvalue if `v` was a simple alias of a real pointer).
-    removeNullDerefPlaceholderStores(func);
-    removeUnreachableAfterFirstReturn(func);
-    // Sweep nested/globally-dead pure stores (e.g. the scf-structurer's deeply-
-    // nested `var_0 = 0xADDR` PC-tracking shadow) that the top-level-only
-    // dseStmtList leaves behind.
-    removeGloballyDeadStores(func);
-    // Early dispatcher cleanup can leave a source independently live until a
-    // later DSE pass removes that last consumer. Re-run the same guarded
-    // coalescer on the simplified AST; its no-interference test is recomputed
-    // from current reads, so this recovers routing-only chains without merging
-    // tuple components that remain independently observable.
-    coalesceSelectorChains(func);
-    removeSelfAssignments(func);
-    removeGloballyDeadStores(func);
-    // Global DSE can make two SCF yield arms identical only at this late
-    // point. Re-run the narrow tuple fold so those newly exposed cases are
-    // combined before declarations and confidence are finalized.
-    foldIdenticalNestedSCFArms(func);
-    // FIX-133: every body-emptying pass must precede the final empty-if sweep.
-    // In particular, removeGloballyDeadStores can erase the last selector store
-    // from a deeply nested RVSDG arm and expose an empty if/else chain. Running
-    // this post-order cleanup afterwards removes the whole shell in one pass.
-    removeEmptyIfStatements(func);
-    // The tuple fold above can remove the last read of one of its routing
-    // selectors. Close that cleanup cycle once more, then repeat the narrow
-    // fold/empty-shell cleanup on anything the DSE exposes.
-    removeGloballyDeadStores(func);
-    foldIdenticalNestedSCFArms(func);
-    removeEmptyIfStatements(func);
-    invertEmptyIfThen(func);
-    simplifyConditionPolarity(func);
-    foldBooleanExitSelectors(func);
-    removeEmptyIfStatements(func);
-    // Drop declarations made unused by the final DCE/empty-branch cleanup.
-    removeUnusedDeclarations(func);
-    reanalyzeConfidence(func);
+    optimizeWithObserver(func, {});
+}
+
+void CAstOptimizer::optimizeWithObserver(
+    CFuncDecl& func,
+    const std::function<void(std::string_view, const CFuncDecl&)>& observer) {
+    auto run = [&](std::string_view name, auto&& pass) {
+        pass();
+        if (observer) observer(name, func);
+    };
+
+    // Keep this list in the exact production order. The observer is read-only
+    // and absent on the ordinary path, so it cannot alter optimizer semantics.
+    run("dissolveExitDispatchers", [&] { dissolveExitDispatchers(func); });
+    run("removeDanglingGotos.1", [&] { removeDanglingGotos(func); });
+    run("coalesceSelectorChains.1", [&] { coalesceSelectorChains(func); });
+    run("eliminateDeadSelectorStores", [&] { eliminateDeadSelectorStores(func); });
+    run("foldBooleanExitSelectors.1", [&] { foldBooleanExitSelectors(func); });
+    run("removePrologueEpilogue", [&] { removePrologueEpilogue(func); });
+    run("eliminateInfrastructure.1", [&] { eliminateInfrastructure(func); });
+    run("eliminateNullPtrStores", [&] { eliminateNullPtrStores(func); });
+    run("recognizeStackCanary", [&] { recognizeStackCanary(func); });
+    run("inferSemanticNames", [&] { inferSemanticNames(func); });
+    run("renameRemainingRegisterVars", [&] { renameRemainingRegisterVars(func); });
+    run("decomposeNativeOpcodes", [&] { decomposeNativeOpcodes(func); });
+    run("eliminateDeadStores", [&] { eliminateDeadStores(func); });
+    run("propagateCopies", [&] { propagateCopies(func); });
+    run("canonicalizeXorPatterns", [&] { canonicalizeXorPatterns(func); });
+    run("recoverStructFieldAccess", [&] { recoverStructFieldAccess(func); });
+    run("simplifyExpressions", [&] { simplifyExpressions(func); });
+    run("eliminateRedundantCasts", [&] { eliminateRedundantCasts(func); });
+    run("synthesizeCompoundAssign", [&] { synthesizeCompoundAssign(func); });
+    run("eliminateConstantBranches", [&] { eliminateConstantBranches(func); });
+    run("foldIdenticalNestedSCFArms.1", [&] { foldIdenticalNestedSCFArms(func); });
+    run("removeEmptyIfStatements.1", [&] { removeEmptyIfStatements(func); });
+    run("cleanupFloatZeros", [&] { cleanupFloatZeros(func); });
+    run("collapseMinMaxPatterns", [&] { collapseMinMaxPatterns(func); });
+    run("foldRedundantReturnAfterElse", [&] { foldRedundantReturnAfterElse(func); });
+    run("invertEmptyIfThen.1", [&] { invertEmptyIfThen(func); });
+    run("simplifyConditionPolarity.1", [&] { simplifyConditionPolarity(func); });
+    run("foldDegenerateCompounds", [&] { foldDegenerateCompounds(func); });
+    run("downgradeDeadAssignedCalls", [&] { downgradeDeadAssignedCalls(func); });
+    run("eliminateInfrastructure.2", [&] { eliminateInfrastructure(func); });
+    run("declareUndeclaredVars", [&] { declareUndeclaredVars(func); });
+    run("removeSelfAssignments.1", [&] { removeSelfAssignments(func); });
+    run("removeDanglingGotos.2", [&] { removeDanglingGotos(func); });
+    run("removeDeadCodeAfterReturn", [&] { removeDeadCodeAfterReturn(func); });
+    run("removeEmptyIfStatements.2", [&] { removeEmptyIfStatements(func); });
+    run("unwrapTrivialDoWhile", [&] { unwrapTrivialDoWhile(func); });
+    run("cleanupParameterSSASuffixes", [&] { cleanupParameterSSASuffixes(func); });
+    run("resolveFramePointerLeaks", [&] { resolveFramePointerLeaks(func); });
+    run("removeAdjacentDuplicateStmts", [&] { removeAdjacentDuplicateStmts(func); });
+    run("removeDeadStoresBeforeReturn", [&] { removeDeadStoresBeforeReturn(func); });
+    run("collapseAssignBeforeReturn", [&] { collapseAssignBeforeReturn(func); });
+    run("initializeReadBeforeWriteVars", [&] { initializeReadBeforeWriteVars(func); });
+    run("removeNullDerefPlaceholderStores", [&] { removeNullDerefPlaceholderStores(func); });
+    run("removeUnreachableAfterFirstReturn", [&] { removeUnreachableAfterFirstReturn(func); });
+    run("removeGloballyDeadStores.1", [&] { removeGloballyDeadStores(func); });
+    run("coalesceSelectorChains.2", [&] { coalesceSelectorChains(func); });
+    run("removeSelfAssignments.2", [&] { removeSelfAssignments(func); });
+    run("removeGloballyDeadStores.2", [&] { removeGloballyDeadStores(func); });
+    run("foldIdenticalNestedSCFArms.2", [&] { foldIdenticalNestedSCFArms(func); });
+    run("removeEmptyIfStatements.3", [&] { removeEmptyIfStatements(func); });
+    run("removeGloballyDeadStores.3", [&] { removeGloballyDeadStores(func); });
+    run("foldIdenticalNestedSCFArms.3", [&] { foldIdenticalNestedSCFArms(func); });
+    run("removeEmptyIfStatements.4", [&] { removeEmptyIfStatements(func); });
+    run("invertEmptyIfThen.2", [&] { invertEmptyIfThen(func); });
+    run("simplifyConditionPolarity.2", [&] { simplifyConditionPolarity(func); });
+    run("foldBooleanExitSelectors.2", [&] { foldBooleanExitSelectors(func); });
+    run("removeEmptyIfStatements.5", [&] { removeEmptyIfStatements(func); });
+    run("removeUnusedDeclarations", [&] { removeUnusedDeclarations(func); });
+    run("reanalyzeConfidence", [&] { reanalyzeConfidence(func); });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
