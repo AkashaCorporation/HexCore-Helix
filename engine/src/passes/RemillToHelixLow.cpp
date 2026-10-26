@@ -21,6 +21,7 @@
 #include "mlir/IR/BuiltinTypes.h"            // builtin VectorType (FIX-CRASH-VEC)
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -1210,14 +1211,94 @@ private:
     struct PendingFpFlagSource {
         Value lhs;
         Value rhs;
+        Block* originBlock = nullptr;
         uint64_t address = 0;
         unsigned observedFlags = 0;
     };
+    std::optional<PendingFpFlagSource> pendingFpFlagCandidate_;
     std::optional<PendingFpFlagSource> pendingFpFlags_;
 
     static constexpr unsigned kFpFlagCF = 1u << 0;
     static constexpr unsigned kFpFlagPF = 1u << 1;
     static constexpr unsigned kFpFlagZF = 1u << 2;
+
+    static bool preservesX86ArithmeticFlags(RemillSemantic semantic) {
+        switch (semantic) {
+        case RemillSemantic::MOV:
+        case RemillSemantic::MOVZX:
+        case RemillSemantic::MOVSX:
+        case RemillSemantic::CMOV:
+        case RemillSemantic::XCHG:
+        case RemillSemantic::LEA:
+        case RemillSemantic::CDQ:
+        case RemillSemantic::CDQE:
+        case RemillSemantic::NOT:
+        case RemillSemantic::PUSH:
+        case RemillSemantic::POP:
+        case RemillSemantic::RET:
+        case RemillSemantic::JMP:
+        case RemillSemantic::JZ:
+        case RemillSemantic::JNZ:
+        case RemillSemantic::JB:
+        case RemillSemantic::JNB:
+        case RemillSemantic::JBE:
+        case RemillSemantic::JNBE:
+        case RemillSemantic::JL:
+        case RemillSemantic::JNL:
+        case RemillSemantic::JLE:
+        case RemillSemantic::JNLE:
+        case RemillSemantic::JS:
+        case RemillSemantic::JNS:
+        case RemillSemantic::JO:
+        case RemillSemantic::JNO:
+        case RemillSemantic::JP:
+        case RemillSemantic::JNP:
+        case RemillSemantic::CBZ:
+        case RemillSemantic::CBNZ:
+        case RemillSemantic::TBZ:
+        case RemillSemantic::TBNZ:
+        case RemillSemantic::BSWAP:
+        case RemillSemantic::NOP:
+        case RemillSemantic::FLD:
+        case RemillSemantic::FST:
+        case RemillSemantic::FSTP:
+        case RemillSemantic::FADD:
+        case RemillSemantic::FSUB:
+        case RemillSemantic::FMUL:
+        case RemillSemantic::FDIV:
+        case RemillSemantic::MOVSS:
+        case RemillSemantic::MOVSD:
+        case RemillSemantic::MOVAPS:
+        case RemillSemantic::MOVUPS:
+        case RemillSemantic::ADDSS:
+        case RemillSemantic::ADDSD:
+        case RemillSemantic::MULSS:
+        case RemillSemantic::MULSD:
+        case RemillSemantic::SUBSS:
+        case RemillSemantic::SUBSD:
+        case RemillSemantic::DIVSS:
+        case RemillSemantic::DIVSD:
+        case RemillSemantic::XORPS:
+        case RemillSemantic::XORPD:
+        case RemillSemantic::PXOR:
+        case RemillSemantic::MOVxPS:
+        case RemillSemantic::MOVSS_MEM:
+        case RemillSemantic::MOVSD_MEM:
+        case RemillSemantic::SHUFPS:
+        case RemillSemantic::SUBPS:
+        case RemillSemantic::ADDPS:
+        case RemillSemantic::MULPS:
+        case RemillSemantic::UNPCKLPS:
+        case RemillSemantic::UNPCKHPS:
+        case RemillSemantic::SETcc:
+        case RemillSemantic::PREFETCH:
+        case RemillSemantic::CDQ_EAX:
+        case RemillSemantic::CDQE_EAX:
+            return true;
+        default:
+            return false;
+        }
+    }
 
     // The common signed-division sequence is CQO_RAX immediately followed by
     // IDIVrdxrax in the same block. Track that proven pairing so we can lower
@@ -1254,6 +1335,7 @@ private:
         liftStats = LiftStats{}; // reset per-function
         pendingCqoBlock_ = nullptr;
         pendingCqoWrite_ = nullptr;
+        pendingFpFlagCandidate_.reset();
         pendingFpFlags_.reset();
         OpBuilder builder(llvmFunc->getContext());
         builder.setInsertionPointAfter(llvmFunc);
@@ -1754,36 +1836,71 @@ private:
         return true;
     }
 
-    Value synthesizePendingFpFlagCondition(RemillSemantic semantic,
+    Value synthesizePendingFpFlagCondition(llvm::StringRef condition,
                                            OpBuilder& builder,
                                            Location loc,
                                            IntegerAttr addrAttr) {
         if (!pendingFpFlags_ || isAArch64_ || !addrAttr)
             return nullptr;
         const auto& source = *pendingFpFlags_;
-        const unsigned required = kFpFlagCF | kFpFlagPF | kFpFlagZF;
-        if ((source.observedFlags & required) != required)
+        Block* consumerBlock = builder.getInsertionBlock();
+        if (!source.originBlock || !consumerBlock)
             return nullptr;
 
-        const uint64_t branchAddress = addrAttr.getValue().getZExtValue();
-        if (branchAddress < source.address ||
-            branchAddress - source.address > 16)
+        DominanceInfo dominance(consumerBlock->getParentOp());
+        if (!dominance.dominates(source.originBlock, consumerBlock))
             return nullptr;
 
         std::optional<LLVM::FCmpPredicate> predicate;
-        switch (semantic) {
-        case RemillSemantic::JP:   predicate = LLVM::FCmpPredicate::uno; break;
-        case RemillSemantic::JNP:  predicate = LLVM::FCmpPredicate::ord; break;
-        case RemillSemantic::JZ:   predicate = LLVM::FCmpPredicate::ueq; break;
-        case RemillSemantic::JNZ:  predicate = LLVM::FCmpPredicate::one; break;
-        case RemillSemantic::JB:   predicate = LLVM::FCmpPredicate::ult; break;
-        case RemillSemantic::JNB:  predicate = LLVM::FCmpPredicate::oge; break;
-        case RemillSemantic::JBE:  predicate = LLVM::FCmpPredicate::ule; break;
-        case RemillSemantic::JNBE: predicate = LLVM::FCmpPredicate::ogt; break;
-        default: return nullptr;
-        }
+        if (condition.equals_insensitive("P"))
+            predicate = LLVM::FCmpPredicate::uno;
+        else if (condition.equals_insensitive("NP"))
+            predicate = LLVM::FCmpPredicate::ord;
+        else if (condition.equals_insensitive("E") ||
+                 condition.equals_insensitive("Z"))
+            predicate = LLVM::FCmpPredicate::ueq;
+        else if (condition.equals_insensitive("NE") ||
+                 condition.equals_insensitive("NZ"))
+            predicate = LLVM::FCmpPredicate::one;
+        else if (condition.equals_insensitive("B") ||
+                 condition.equals_insensitive("C") ||
+                 condition.equals_insensitive("NAE"))
+            predicate = LLVM::FCmpPredicate::ult;
+        else if (condition.equals_insensitive("NB") ||
+                 condition.equals_insensitive("NC") ||
+                 condition.equals_insensitive("AE"))
+            predicate = LLVM::FCmpPredicate::oge;
+        else if (condition.equals_insensitive("BE") ||
+                 condition.equals_insensitive("NA"))
+            predicate = LLVM::FCmpPredicate::ule;
+        else if (condition.equals_insensitive("NBE") ||
+                 condition.equals_insensitive("A"))
+            predicate = LLVM::FCmpPredicate::ogt;
+        else
+            return nullptr;
+
         return builder.create<LLVM::FCmpOp>(
             loc, *predicate, source.lhs, source.rhs).getResult();
+    }
+
+    Value synthesizePendingFpFlagCondition(RemillSemantic semantic,
+                                           OpBuilder& builder,
+                                           Location loc,
+                                           IntegerAttr addrAttr) {
+        llvm::StringRef condition;
+        switch (semantic) {
+        case RemillSemantic::JP:   condition = "P"; break;
+        case RemillSemantic::JNP:  condition = "NP"; break;
+        case RemillSemantic::JZ:   condition = "Z"; break;
+        case RemillSemantic::JNZ:  condition = "NZ"; break;
+        case RemillSemantic::JB:   condition = "B"; break;
+        case RemillSemantic::JNB:  condition = "NB"; break;
+        case RemillSemantic::JBE:  condition = "BE"; break;
+        case RemillSemantic::JNBE: condition = "NBE"; break;
+        default: return nullptr;
+        }
+        return synthesizePendingFpFlagCondition(
+            condition, builder, loc, addrAttr);
     }
 
     /// Convert a single LLVM Dialect operation to HelixLow.
@@ -1811,8 +1928,9 @@ private:
             if (!isAArch64_ &&
                 fcmp.getPredicate() == LLVM::FCmpPredicate::uno &&
                 addrAttr) {
-                pendingFpFlags_ = PendingFpFlagSource{
+                pendingFpFlagCandidate_ = PendingFpFlagSource{
                     fcmp.getLhs(), fcmp.getRhs(),
+                    fcmp->getBlock(),
                     addrAttr.getValue().getZExtValue(), 0};
             }
         }
@@ -2015,21 +2133,29 @@ private:
 
             if (auto regName = regs.getRegName(store.getAddr())) {
                 // Skip PC/NEXT_PC updates — these are bookkeeping
-                if (*regName == "PC" || *regName == "NEXT_PC")
+                if (*regName == "PC" || *regName == "NEXT_PC") {
+                    pendingFpFlagCandidate_.reset();
                     return;
+                }
                 // Skip MEMORY, STATE, segment bases — Remill internals
                 if (*regName == "MEMORY" || *regName == "STATE" ||
                     regName->ends_with("BASE"))
                     return;
 
-                if (pendingFpFlags_ && pcTracker.has_pc &&
-                    pendingFpFlags_->address == pcTracker.current_pc) {
+                if (pendingFpFlagCandidate_) {
                     if (*regName == "CF")
-                        pendingFpFlags_->observedFlags |= kFpFlagCF;
+                        pendingFpFlagCandidate_->observedFlags |= kFpFlagCF;
                     else if (*regName == "PF")
-                        pendingFpFlags_->observedFlags |= kFpFlagPF;
+                        pendingFpFlagCandidate_->observedFlags |= kFpFlagPF;
                     else if (*regName == "ZF")
-                        pendingFpFlags_->observedFlags |= kFpFlagZF;
+                        pendingFpFlagCandidate_->observedFlags |= kFpFlagZF;
+
+                    const unsigned required =
+                        kFpFlagCF | kFpFlagPF | kFpFlagZF;
+                    if ((pendingFpFlagCandidate_->observedFlags & required) ==
+                        required) {
+                        pendingFpFlags_ = pendingFpFlagCandidate_;
+                    }
                 }
 
                 Value registerValue =
@@ -2253,6 +2379,8 @@ private:
             // Try to demangle as a Remill semantic function.
             auto semInfo = demangleRemillSemantic(calleeName);
             if (!semInfo) {
+                pendingFpFlagCandidate_.reset();
+                pendingFpFlags_.reset();
                 ++liftStats.externalCalls;
 
                 // FIX-124: Plain direct LLVM calls with floating-point data
@@ -2386,6 +2514,10 @@ private:
             }
 
             ++liftStats.converted;
+            if (!preservesX86ArithmeticFlags(semInfo->semantic)) {
+                pendingFpFlagCandidate_.reset();
+                pendingFpFlags_.reset();
+            }
             convertSemantic(call, builder, regs, *semInfo, addrAttr, loc, dummyBlock, deferredTerminator, pcTracker);
 
             // Break the use-def chain and mark for erasure.
@@ -2942,37 +3074,56 @@ private:
         return nullptr;
     }
 
-    /// Recursively search predecessor blocks for a RegWriteOp to the named
-    /// flag.  Returns nullptr if not found, if depth is exhausted, or if
-    /// multiple predecessors disagree (provide different SSA values).
+    /// Search the complete predecessor slice for the reaching flag write.
+    /// Return nullptr if an entry path lacks a write or paths disagree.
     static Value findFlagValueInPredecessors(
-        Block* block, llvm::StringRef flagName,
-        unsigned depth, llvm::DenseSet<Block*>& visiting) {
-        if (!block || depth == 0 || !visiting.insert(block).second)
+        Block* block, llvm::StringRef flagName) {
+        if (!block)
             return nullptr;
 
-        Value candidate = nullptr;
-        for (Block* pred : block->getPredecessors()) {
-            Value value = findFlagValueInBlock(pred, pred->end(), flagName);
-            if (!value) {
-                value = findFlagValueInPredecessors(
-                    pred, flagName, depth - 1, visiting);
-            }
-            if (!value) {
-                // Predecessor has no flag write — ambiguous, bail out.
-                visiting.erase(block);
-                return nullptr;
-            }
-            if (candidate && candidate != value) {
-                // Multiple predecessors provide different values — ambiguous.
-                visiting.erase(block);
-                return nullptr;
-            }
-            candidate = value;
-        }
+        llvm::SmallVector<Block*, 16> pending;
+        llvm::DenseSet<Block*> visited;
+        visited.insert(block);
+        for (Block* pred : block->getPredecessors())
+            pending.push_back(pred);
 
-        visiting.erase(block);
+        Value candidate = nullptr;
+        while (!pending.empty()) {
+            Block* current = pending.pop_back_val();
+            if (!visited.insert(current).second)
+                continue;
+
+            Value value = findFlagValueInBlock(
+                current, current->end(), flagName);
+            if (value) {
+                if (candidate && candidate != value)
+                    return nullptr;
+                candidate = value;
+                continue;
+            }
+
+            auto predecessors = current->getPredecessors();
+            if (predecessors.empty())
+                return nullptr;
+            for (Block* pred : predecessors)
+                pending.push_back(pred);
+        }
         return candidate;
+    }
+
+    static Value coerceFlagToBool(
+        Value value, OpBuilder& builder, Location loc) {
+        if (!value)
+            return nullptr;
+        auto integer = dyn_cast<IntegerType>(value.getType());
+        if (!integer)
+            return nullptr;
+        if (integer.getWidth() == 1)
+            return value;
+        auto zero = builder.create<arith::ConstantOp>(
+            loc, integer, builder.getIntegerAttr(integer, 0));
+        return builder.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::ne, value, zero).getResult();
     }
 
     /// Find the most recent flag-producing operation (CmpOp, BinOp, TestOp)
@@ -4314,28 +4465,14 @@ private:
                 Block* block = builder.getInsertionBlock();
                 if (!block) return nullptr;
 
-                auto asBoolean = [&](Value value) -> Value {
-                    if (!value)
-                        return nullptr;
-                    auto integer = dyn_cast<IntegerType>(value.getType());
-                    if (!integer || integer.getWidth() == 1)
-                        return value;
-                    auto zero = builder.create<arith::ConstantOp>(
-                        loc, integer, builder.getIntegerAttr(integer, 0));
-                    return builder.create<arith::CmpIOp>(
-                        loc, arith::CmpIPredicate::ne,
-                        value, zero).getResult();
-                };
-
                 // Step 1: Search current block (fast path, covers 95%+ of cases)
                 Value result = findFlagValueInBlock(
                     block, builder.getInsertionPoint(), flagName);
-                if (result) return asBoolean(result);
+                if (result) return coerceFlagToBool(result, builder, loc);
 
                 // Step 2: Search predecessor blocks (handles cross-block CMP→JCC)
-                llvm::DenseSet<Block*> visiting;
-                return asBoolean(findFlagValueInPredecessors(
-                    block, flagName, /*depth=*/3, visiting));
+                return coerceFlagToBool(
+                    findFlagValueInPredecessors(block, flagName), builder, loc);
             };
 
             Value condValue = synthesizePendingFpFlagCondition(
@@ -4792,10 +4929,9 @@ private:
                     if (!block) return nullptr;
                     Value value = findFlagValueInBlock(
                         block, builder.getInsertionPoint(), flagName);
-                    if (value) return value;
-                    llvm::DenseSet<Block*> visiting;
-                    return findFlagValueInPredecessors(
-                        block, flagName, /*depth=*/3, visiting);
+                    if (!value)
+                        value = findFlagValueInPredecessors(block, flagName);
+                    return coerceFlagToBool(value, builder, loc);
                 };
                 auto invert = [&](Value value) -> Value {
                     if (!value) return nullptr;
@@ -4805,62 +4941,65 @@ private:
                         loc, value, one).getResult();
                 };
 
-                Value i1Val;
+                Value i1Val = synthesizePendingFpFlagCondition(
+                    condStr, builder, loc, addrAttr);
                 llvm::StringRef cond = condStr;
-                if (cond == "E" || cond == "Z")
-                    i1Val = findFlag("ZF");
-                else if (cond == "NE" || cond == "NZ")
-                    i1Val = invert(findFlag("ZF"));
-                else if (cond == "B" || cond == "C" || cond == "NAE")
-                    i1Val = findFlag("CF");
-                else if (cond == "NB" || cond == "NC" || cond == "AE")
-                    i1Val = invert(findFlag("CF"));
-                else if (cond == "S")
-                    i1Val = findFlag("SF");
-                else if (cond == "NS")
-                    i1Val = invert(findFlag("SF"));
-                else if (cond == "O")
-                    i1Val = findFlag("OF");
-                else if (cond == "NO")
-                    i1Val = invert(findFlag("OF"));
-                else if (cond == "BE" || cond == "NA") {
-                    Value cf = findFlag("CF"), zf = findFlag("ZF");
-                    if (cf && zf)
-                        i1Val = builder.create<arith::OrIOp>(
-                            loc, cf, zf).getResult();
-                } else if (cond == "NBE" || cond == "A") {
-                    Value cf = invert(findFlag("CF"));
-                    Value zf = invert(findFlag("ZF"));
-                    if (cf && zf)
-                        i1Val = builder.create<arith::AndIOp>(
-                            loc, cf, zf).getResult();
-                } else if (cond == "L" || cond == "NGE") {
-                    Value sf = findFlag("SF"), of = findFlag("OF");
-                    if (sf && of)
-                        i1Val = builder.create<arith::XOrIOp>(
-                            loc, sf, of).getResult();
-                } else if (cond == "NL" || cond == "GE") {
-                    Value sf = findFlag("SF"), of = findFlag("OF");
-                    if (sf && of)
-                        i1Val = invert(builder.create<arith::XOrIOp>(
-                            loc, sf, of).getResult());
-                } else if (cond == "LE" || cond == "NG") {
-                    Value zf = findFlag("ZF");
-                    Value sf = findFlag("SF"), of = findFlag("OF");
-                    if (zf && sf && of) {
-                        Value less = builder.create<arith::XOrIOp>(
-                            loc, sf, of).getResult();
-                        i1Val = builder.create<arith::OrIOp>(
-                            loc, zf, less).getResult();
-                    }
-                } else if (cond == "NLE" || cond == "G") {
-                    Value zf = invert(findFlag("ZF"));
-                    Value sf = findFlag("SF"), of = findFlag("OF");
-                    if (zf && sf && of) {
-                        Value ge = invert(builder.create<arith::XOrIOp>(
-                            loc, sf, of).getResult());
-                        i1Val = builder.create<arith::AndIOp>(
-                            loc, zf, ge).getResult();
+                if (!i1Val) {
+                    if (cond == "E" || cond == "Z")
+                        i1Val = findFlag("ZF");
+                    else if (cond == "NE" || cond == "NZ")
+                        i1Val = invert(findFlag("ZF"));
+                    else if (cond == "B" || cond == "C" || cond == "NAE")
+                        i1Val = findFlag("CF");
+                    else if (cond == "NB" || cond == "NC" || cond == "AE")
+                        i1Val = invert(findFlag("CF"));
+                    else if (cond == "S")
+                        i1Val = findFlag("SF");
+                    else if (cond == "NS")
+                        i1Val = invert(findFlag("SF"));
+                    else if (cond == "O")
+                        i1Val = findFlag("OF");
+                    else if (cond == "NO")
+                        i1Val = invert(findFlag("OF"));
+                    else if (cond == "BE" || cond == "NA") {
+                        Value cf = findFlag("CF"), zf = findFlag("ZF");
+                        if (cf && zf)
+                            i1Val = builder.create<arith::OrIOp>(
+                                loc, cf, zf).getResult();
+                    } else if (cond == "NBE" || cond == "A") {
+                        Value cf = invert(findFlag("CF"));
+                        Value zf = invert(findFlag("ZF"));
+                        if (cf && zf)
+                            i1Val = builder.create<arith::AndIOp>(
+                                loc, cf, zf).getResult();
+                    } else if (cond == "L" || cond == "NGE") {
+                        Value sf = findFlag("SF"), of = findFlag("OF");
+                        if (sf && of)
+                            i1Val = builder.create<arith::XOrIOp>(
+                                loc, sf, of).getResult();
+                    } else if (cond == "NL" || cond == "GE") {
+                        Value sf = findFlag("SF"), of = findFlag("OF");
+                        if (sf && of)
+                            i1Val = invert(builder.create<arith::XOrIOp>(
+                                loc, sf, of).getResult());
+                    } else if (cond == "LE" || cond == "NG") {
+                        Value zf = findFlag("ZF");
+                        Value sf = findFlag("SF"), of = findFlag("OF");
+                        if (zf && sf && of) {
+                            Value less = builder.create<arith::XOrIOp>(
+                                loc, sf, of).getResult();
+                            i1Val = builder.create<arith::OrIOp>(
+                                loc, zf, less).getResult();
+                        }
+                    } else if (cond == "NLE" || cond == "G") {
+                        Value zf = invert(findFlag("ZF"));
+                        Value sf = findFlag("SF"), of = findFlag("OF");
+                        if (zf && sf && of) {
+                            Value ge = invert(builder.create<arith::XOrIOp>(
+                                loc, sf, of).getResult());
+                            i1Val = builder.create<arith::AndIOp>(
+                                loc, zf, ge).getResult();
+                        }
                     }
                 }
                 if (!i1Val) {
@@ -5749,10 +5888,9 @@ private:
                     if (!block) return nullptr;
                     Value result = findFlagValueInBlock(
                         block, builder.getInsertionPoint(), flagName);
-                    if (result) return result;
-                    llvm::DenseSet<Block*> visiting;
-                    return findFlagValueInPredecessors(
-                        block, flagName, /*depth=*/3, visiting);
+                    if (!result)
+                        result = findFlagValueInPredecessors(block, flagName);
+                    return coerceFlagToBool(result, builder, loc);
                 };
 
                 // Derive condition from raw_name (e.g. "SETE", "SETNE", "SETL").
@@ -5760,37 +5898,38 @@ private:
                 // Strip leading "SET" prefix.
                 llvm::StringRef cond = rn.starts_with("SET") ? rn.drop_front(3) : rn;
 
-                Value condVal = nullptr;
+                Value condVal = synthesizePendingFpFlagCondition(
+                    cond, builder, loc, addrAttr);
                 auto one = builder.create<arith::ConstantOp>(
                     loc, i1Ty, builder.getBoolAttr(true));
 
-                if (cond == "E" || cond == "Z") {
+                if (!condVal && (cond == "E" || cond == "Z")) {
                     condVal = findFlagValueSET("ZF");
-                } else if (cond == "NE" || cond == "NZ") {
+                } else if (!condVal && (cond == "NE" || cond == "NZ")) {
                     if (auto zf = findFlagValueSET("ZF"))
                         condVal = builder.create<arith::XOrIOp>(loc, zf, one).getResult();
-                } else if (cond == "B" || cond == "C" || cond == "NAE") {
+                } else if (!condVal && (cond == "B" || cond == "C" || cond == "NAE")) {
                     condVal = findFlagValueSET("CF");
-                } else if (cond == "NB" || cond == "NC" || cond == "AE") {
+                } else if (!condVal && (cond == "NB" || cond == "NC" || cond == "AE")) {
                     if (auto cf = findFlagValueSET("CF"))
                         condVal = builder.create<arith::XOrIOp>(loc, cf, one).getResult();
-                } else if (cond == "S") {
+                } else if (!condVal && cond == "S") {
                     condVal = findFlagValueSET("SF");
-                } else if (cond == "NS") {
+                } else if (!condVal && cond == "NS") {
                     if (auto sf = findFlagValueSET("SF"))
                         condVal = builder.create<arith::XOrIOp>(loc, sf, one).getResult();
-                } else if (cond == "O") {
+                } else if (!condVal && cond == "O") {
                     condVal = findFlagValueSET("OF");
-                } else if (cond == "NO") {
+                } else if (!condVal && cond == "NO") {
                     if (auto of = findFlagValueSET("OF"))
                         condVal = builder.create<arith::XOrIOp>(loc, of, one).getResult();
-                } else if (cond == "L" || cond == "NGE") {
+                } else if (!condVal && (cond == "L" || cond == "NGE")) {
                     // SF != OF
                     Value sf = findFlagValueSET("SF");
                     Value of = findFlagValueSET("OF");
                     if (sf && of)
                         condVal = builder.create<arith::XOrIOp>(loc, sf, of).getResult();
-                } else if (cond == "NL" || cond == "GE") {
+                } else if (!condVal && (cond == "NL" || cond == "GE")) {
                     // !(SF != OF)
                     Value sf = findFlagValueSET("SF");
                     Value of = findFlagValueSET("OF");
@@ -5798,7 +5937,7 @@ private:
                         auto xorVal = builder.create<arith::XOrIOp>(loc, sf, of);
                         condVal = builder.create<arith::XOrIOp>(loc, xorVal, one).getResult();
                     }
-                } else if (cond == "LE" || cond == "NG") {
+                } else if (!condVal && (cond == "LE" || cond == "NG")) {
                     // ZF || (SF != OF)
                     Value zf = findFlagValueSET("ZF");
                     Value sf = findFlagValueSET("SF");
@@ -5807,7 +5946,7 @@ private:
                         auto sfNeOf = builder.create<arith::XOrIOp>(loc, sf, of);
                         condVal = builder.create<arith::OrIOp>(loc, zf, sfNeOf).getResult();
                     }
-                } else if (cond == "NLE" || cond == "G") {
+                } else if (!condVal && (cond == "NLE" || cond == "G")) {
                     // !ZF && (SF == OF)
                     Value zf = findFlagValueSET("ZF");
                     Value sf = findFlagValueSET("SF");
@@ -5818,13 +5957,13 @@ private:
                         auto notSfNeOf = builder.create<arith::XOrIOp>(loc, sfEqOf, one);
                         condVal = builder.create<arith::AndIOp>(loc, notZf, notSfNeOf).getResult();
                     }
-                } else if (cond == "BE" || cond == "NA") {
+                } else if (!condVal && (cond == "BE" || cond == "NA")) {
                     // CF || ZF
                     Value cf = findFlagValueSET("CF");
                     Value zf = findFlagValueSET("ZF");
                     if (cf && zf)
                         condVal = builder.create<arith::OrIOp>(loc, cf, zf).getResult();
-                } else if (cond == "NBE" || cond == "A") {
+                } else if (!condVal && (cond == "NBE" || cond == "A")) {
                     // !CF && !ZF
                     Value cf = findFlagValueSET("CF");
                     Value zf = findFlagValueSET("ZF");

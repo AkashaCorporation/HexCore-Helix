@@ -645,6 +645,127 @@ TEST(IntegrationPipelineRegressionTest,
 }
 
 TEST(IntegrationPipelineRegressionTest,
+     CmovFindsReachingFlagsAcrossTransparentCfgChain) {
+    constexpr const char* ir = R"(
+        target triple = "x86_64-pc-windows-msvc"
+
+        %State = type { %X86State }
+        %X86State = type { i64, i64, %Flags, i64, i64, i64, %GPR }
+        %Flags = type {
+            i8, i8, i8, i8, i8, i8, i8, i8,
+            i8, i8, i8, i8, i8, i8, i8, i8
+        }
+        %GPR = type { i64, i64, i64, i64, i64, i64 }
+
+        declare ptr @_ZN12_GLOBAL__N_16CMOVBEI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_(
+            ptr, ptr, ptr, i64)
+        declare void @consume(i64)
+
+        define ptr @lifted_4096(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %cf = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 2, i32 1
+          %zf = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 2, i32 7
+          %rax = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 6, i32 1
+          %rcx = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 6, i32 5
+          %cf.value = trunc i64 %pc to i8
+          %shifted = lshr i64 %pc, 1
+          %zf.value = trunc i64 %shifted to i8
+          store i8 %cf.value, ptr %cf
+          store i8 %zf.value, ptr %zf
+          br label %transparent1
+        transparent1:
+          br label %transparent2
+        transparent2:
+          br label %transparent3
+        transparent3:
+          br label %transparent4
+        transparent4:
+          %source = load i64, ptr %rax
+          %cmov = call ptr
+              @_ZN12_GLOBAL__N_16CMOVBEI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_(
+                  ptr %memory, ptr %state, ptr %rcx, i64 %source)
+          %selected = load i64, ptr %rcx
+          call void @consume(i64 %selected)
+          ret ptr %memory
+        }
+    )";
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_X86_64);
+    auto output = pipeline.decompile(ir);
+
+    ASSERT_TRUE(output.has_value()) << output.error();
+    ASSERT_FALSE(output->pseudo_c.empty());
+    EXPECT_NE(output->pseudo_c.find("?"), std::string::npos)
+        << "The CMOV must survive as a conditional value\n" << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find(
+                  "CMOV condition unavailable from flag state"),
+              std::string::npos) << output->pseudo_c;
+}
+
+TEST(IntegrationPipelineRegressionTest,
+     CmovKeepsUnknownWhenPredecessorFlagsDisagree) {
+    constexpr const char* ir = R"(
+        target triple = "x86_64-pc-windows-msvc"
+
+        %State = type { %X86State }
+        %X86State = type { i64, i64, %Flags, i64, i64, i64, %GPR }
+        %Flags = type {
+            i8, i8, i8, i8, i8, i8, i8, i8,
+            i8, i8, i8, i8, i8, i8, i8, i8
+        }
+        %GPR = type { i64, i64, i64, i64, i64, i64 }
+
+        declare ptr @_ZN12_GLOBAL__N_16CMOVBEI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_(
+            ptr, ptr, ptr, i64)
+        declare void @consume(i64)
+
+        define ptr @lifted_4096(ptr %state, i64 %pc, ptr %memory) {
+        entry:
+          %cf = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 2, i32 1
+          %zf = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 2, i32 7
+          %rax = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 6, i32 1
+          %rcx = getelementptr %State, ptr %state,
+              i64 0, i32 0, i32 6, i32 5
+          %take.left = icmp eq i64 %pc, 0
+          br i1 %take.left, label %left, label %right
+        left:
+          store i8 1, ptr %cf
+          store i8 1, ptr %zf
+          br label %merge
+        right:
+          store i8 0, ptr %cf
+          store i8 0, ptr %zf
+          br label %merge
+        merge:
+          %source = load i64, ptr %rax
+          %cmov = call ptr
+              @_ZN12_GLOBAL__N_16CMOVBEI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_(
+                  ptr %memory, ptr %state, ptr %rcx, i64 %source)
+          %selected = load i64, ptr %rcx
+          call void @consume(i64 %selected)
+          ret ptr %memory
+        }
+    )";
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_X86_64);
+    auto output = pipeline.decompile(ir);
+
+    ASSERT_TRUE(output.has_value()) << output.error();
+    EXPECT_NE(output->pseudo_c.find(
+                  "CMOV condition unavailable from flag state"),
+              std::string::npos) << output->pseudo_c;
+}
+
+TEST(IntegrationPipelineRegressionTest,
      Win64ScalarFpArgumentsAndReturnSurviveStructuredBranches) {
     constexpr const char* ir = R"(
         target triple = "x86_64-pc-windows-msvc"
