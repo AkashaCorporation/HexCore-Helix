@@ -162,8 +162,11 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 // ─── API ───────────────────────────────────────────────────────────────────────
 
 const char* Engine::version() noexcept {
-    // Helix v2 redesign sandbox. Baseline forked from main-line v0.9.2.
-    return "0.1.9";
+#ifdef HELIX_VERSION_STRING
+    return HELIX_VERSION_STRING;
+#else
+    return "0.0.0-dev";
+#endif
 }
 
 HelixStatus Engine::decompile(

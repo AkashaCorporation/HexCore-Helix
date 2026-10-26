@@ -3,6 +3,7 @@
 
 #include "helix/emit/PseudoCEmitter.h"
 #include "helix/emit/FlatBufSerializer.h"
+#include "helix/Engine.h"
 #include "helix/cast/CAstOptimizer.h"
 #include "helix/cast/CAstPrinter.h"
 #include "helix/cast/CDecl.h"
@@ -25,6 +26,11 @@ using namespace helix;
 namespace {
 
 using namespace helix::cast;
+
+TEST(EngineVersionContractTest, UsesReleaseVersionAuthority) {
+    EXPECT_STREQ(Engine::version(), HELIX_VERSION_STRING);
+    EXPECT_STRNE(Engine::version(), "0.0.0-dev");
+}
 
 ExprPtr makeVar(std::string name) {
     return std::make_unique<CVarRefExpr>(

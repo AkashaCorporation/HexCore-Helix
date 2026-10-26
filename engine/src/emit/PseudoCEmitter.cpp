@@ -10,6 +10,7 @@
 ///   - Header comment: "// Decompiled by HexCore Helix"
 
 #include "helix/emit/PseudoCEmitter.h"
+#include "helix/Engine.h"
 #include "helix/analysis/RemillDemangler.h"
 #include "helix/analysis/SignatureDb.h"
 #include "helix/dialects/HelixHighOps.h"
@@ -1434,7 +1435,7 @@ bool PseudoCEmitter::isNearBlockStart(Operation* op, unsigned budget) {
 
 void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
     os << "// Decompiled by HexCore Helix\n";
-    os << "// Engine version: 0.8.0-nightly\n";
+    os << "// Engine version: " << Engine::version() << "\n";
     os << "\n";
 }
 

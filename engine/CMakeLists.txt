@@ -1,9 +1,25 @@
 cmake_minimum_required(VERSION 3.20)
+set(HELIX_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION")
+if(NOT EXISTS "${HELIX_VERSION_FILE}")
+    message(FATAL_ERROR "Missing Helix version authority: ${HELIX_VERSION_FILE}")
+endif()
+file(STRINGS "${HELIX_VERSION_FILE}" HELIX_RELEASE_VERSION LIMIT_COUNT 1)
+string(STRIP "${HELIX_RELEASE_VERSION}" HELIX_RELEASE_VERSION)
+if(HELIX_RELEASE_VERSION STREQUAL "")
+    message(FATAL_ERROR "Helix version authority is empty")
+endif()
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" HELIX_PROJECT_VERSION "${HELIX_RELEASE_VERSION}")
+if(HELIX_PROJECT_VERSION STREQUAL "")
+    message(FATAL_ERROR "Invalid Helix release version: ${HELIX_RELEASE_VERSION}")
+endif()
+
 project(helix_engine
-    VERSION 1.0.0
+    VERSION ${HELIX_PROJECT_VERSION}
     LANGUAGES CXX C
     DESCRIPTION "HexCore Helix Decompilation Engine — C++23/MLIR 3-Tier Architecture"
 )
+
+message(STATUS "Helix release version: ${HELIX_RELEASE_VERSION}")
 
 # ─── C++23 Standard ─────────────────────────────────────────────────────────────
 
@@ -333,6 +349,9 @@ set(HELIX_HEADERS
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})
+target_compile_definitions(helix_engine PUBLIC
+    HELIX_VERSION_STRING="${HELIX_RELEASE_VERSION}"
+)
 
 target_include_directories(helix_engine
     PUBLIC
@@ -477,7 +496,7 @@ endif()
 
 message(STATUS "")
 message(STATUS "╔══════════════════════════════════════════╗")
-message(STATUS "║   HexCore Helix Engine v${PROJECT_VERSION}           ║")
+message(STATUS "║   HexCore Helix Engine v${HELIX_RELEASE_VERSION}     ║")
 message(STATUS "╠══════════════════════════════════════════╣")
 message(STATUS "║  Architecture:  3-Tier (Low→Mid→High)   ║")
 message(STATUS "║  C++ Standard:  C++${CMAKE_CXX_STANDARD}                    ║")
