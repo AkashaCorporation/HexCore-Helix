@@ -75,11 +75,14 @@ struct DamningDefectInfo {
     bool explicitUnknown = false;       // (8) localized semantic gap survived
     bool uninitRead = false;            // (9) intermediate read has no reaching initialization
     std::string uninitReadVarName;
+    bool literalNullAccess = false;     // (10) read/write through literal address zero
+    int literalNullAccessCount = 0;
 
     bool any() const {
         return codeAddrLeak || uninitReturn || irreducibleNoReturn ||
                droppedControlFlow || floatSubscript || postReturnUnreachable ||
-               emptyStubBody || explicitUnknown || uninitRead;
+               emptyStubBody || explicitUnknown || uninitRead ||
+               literalNullAccess;
     }
 
     /// One-line, ASCII, located reason naming the ACTUAL surviving defect(s).
@@ -117,6 +120,13 @@ struct DamningDefectInfo {
             add("explicit unknown machine semantics survived");
         if (uninitRead)
             add("read without any reaching initialization '" + uninitReadVarName + "'");
+        if (literalNullAccess) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "%d literal null memory access(es) survived",
+                          literalNullAccessCount > 0 ? literalNullAccessCount : 1);
+            add(buf);
+        }
         return r;
     }
 };
@@ -1032,6 +1042,103 @@ inline int countUnreachableAfterReturn(const std::vector<StmtPtr>& body) {
     return n;
 }
 
+inline bool isLiteralNullPointer(const CExpr* expr) {
+    if (!expr) return false;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isLiteralNullPointer(cast->operand.get());
+    if (auto* address = llvm::dyn_cast<CAddrLitExpr>(expr))
+        return address->addrValue == 0;
+    if (auto* integer = llvm::dyn_cast<CIntLitExpr>(expr))
+        return integer->value == 0;
+    return false;
+}
+
+inline int countLiteralNullAccessesInExpr(const CExpr* expr) {
+    if (!expr) return 0;
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(expr)) {
+        int count = unary->op == UnaryOp::Deref &&
+                    isLiteralNullPointer(unary->operand.get()) ? 1 : 0;
+        return count + countLiteralNullAccessesInExpr(unary->operand.get());
+    }
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return countLiteralNullAccessesInExpr(cast->operand.get());
+    if (auto* binary = llvm::dyn_cast<CBinaryExpr>(expr))
+        return countLiteralNullAccessesInExpr(binary->lhs.get()) +
+               countLiteralNullAccessesInExpr(binary->rhs.get());
+    if (auto* ternary = llvm::dyn_cast<CTernaryExpr>(expr))
+        return countLiteralNullAccessesInExpr(ternary->cond.get()) +
+               countLiteralNullAccessesInExpr(ternary->trueVal.get()) +
+               countLiteralNullAccessesInExpr(ternary->falseVal.get());
+    if (auto* subscript = llvm::dyn_cast<CSubscriptExpr>(expr)) {
+        int count = isLiteralNullPointer(subscript->base.get()) ? 1 : 0;
+        return count + countLiteralNullAccessesInExpr(subscript->base.get()) +
+               countLiteralNullAccessesInExpr(subscript->index.get());
+    }
+    if (auto* field = llvm::dyn_cast<CFieldAccessExpr>(expr)) {
+        int count = isLiteralNullPointer(field->base.get()) ? 1 : 0;
+        return count + countLiteralNullAccessesInExpr(field->base.get());
+    }
+    if (auto* call = llvm::dyn_cast<CCallExpr>(expr)) {
+        int count = 0;
+        for (const auto& argument : call->args)
+            count += countLiteralNullAccessesInExpr(argument.get());
+        return count;
+    }
+    return 0;
+}
+
+inline int countLiteralNullAccesses(const std::vector<StmtPtr>& body) {
+    int count = 0;
+    for (const auto& statementPtr : body) {
+        const CStmt* statement = statementPtr.get();
+        if (!statement) continue;
+        if (auto* assign = llvm::dyn_cast<CAssignStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(assign->target.get());
+            count += countLiteralNullAccessesInExpr(assign->value.get());
+        } else if (auto* expression = llvm::dyn_cast<CExprStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(expression->expr.get());
+        } else if (auto* result = llvm::dyn_cast<CReturnStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(result->value.get());
+        } else if (auto* branch = llvm::dyn_cast<CIfStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(branch->condition.get());
+            count += countLiteralNullAccesses(branch->thenBody);
+            count += countLiteralNullAccesses(branch->elseBody);
+        } else if (auto* whileLoop = llvm::dyn_cast<CWhileStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(whileLoop->condition.get());
+            count += countLiteralNullAccesses(whileLoop->body);
+        } else if (auto* doLoop = llvm::dyn_cast<CDoWhileStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(doLoop->condition.get());
+            count += countLiteralNullAccesses(doLoop->body);
+        } else if (auto* forLoop = llvm::dyn_cast<CForStmt>(statement)) {
+            if (forLoop->init) {
+                // For-init and step are scanned directly below to avoid moving
+                // ownership out of the AST.
+                if (auto* initAssign = llvm::dyn_cast<CAssignStmt>(forLoop->init.get())) {
+                    count += countLiteralNullAccessesInExpr(initAssign->target.get());
+                    count += countLiteralNullAccessesInExpr(initAssign->value.get());
+                } else if (auto* initExpression = llvm::dyn_cast<CExprStmt>(forLoop->init.get())) {
+                    count += countLiteralNullAccessesInExpr(initExpression->expr.get());
+                }
+            }
+            count += countLiteralNullAccessesInExpr(forLoop->condition.get());
+            if (auto* stepAssign = llvm::dyn_cast_or_null<CAssignStmt>(forLoop->step.get())) {
+                count += countLiteralNullAccessesInExpr(stepAssign->target.get());
+                count += countLiteralNullAccessesInExpr(stepAssign->value.get());
+            } else if (auto* stepExpression = llvm::dyn_cast_or_null<CExprStmt>(forLoop->step.get())) {
+                count += countLiteralNullAccessesInExpr(stepExpression->expr.get());
+            }
+            count += countLiteralNullAccesses(forLoop->body);
+        } else if (auto* selection = llvm::dyn_cast<CSwitchStmt>(statement)) {
+            count += countLiteralNullAccessesInExpr(selection->selector.get());
+            for (const auto& arm : selection->cases)
+                count += countLiteralNullAccesses(arm.body);
+        } else if (auto* block = llvm::dyn_cast<CBlockStmt>(statement)) {
+            count += countLiteralNullAccesses(block->stmts);
+        }
+    }
+    return count;
+}
+
 } // namespace detail
 
 /// Scan the FINAL function AST for surviving damning defects (located).
@@ -1190,6 +1297,14 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
     // equivalence is incomplete. It must remain visible and cap confidence.
     if (detail::scanForExplicitUnknown(func.body))
         info.explicitUnknown = true;
+
+    // (10) A literal address-zero dereference is not the same as a nullable
+    // pointer value. If it survives into emitted C, memory semantics are lost.
+    info.literalNullAccessCount = detail::countLiteralNullAccesses(func.body);
+    for (const auto& local : func.localVars)
+        info.literalNullAccessCount +=
+            detail::countLiteralNullAccessesInExpr(local.initExpr.get());
+    info.literalNullAccess = info.literalNullAccessCount > 0;
 
     return info;
 }

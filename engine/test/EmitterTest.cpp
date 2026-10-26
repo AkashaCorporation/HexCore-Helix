@@ -680,6 +680,37 @@ TEST(CAstOptimizerTest, RemovesOnlyLiteralNullDerefSelfStores) {
     EXPECT_NE(code.find("*ptr"), std::string::npos) << code;
 }
 
+TEST(CAstOptimizerTest, LiteralNullMemoryAccessCapsConfidence) {
+    auto nullPointer = []() -> ExprPtr {
+        return std::make_unique<CCastExpr>(
+            CType::pointerTo(CType::int32()),
+            std::make_unique<CAddrLitExpr>(0));
+    };
+
+    CFuncDecl invalid("literal_null_store", 0x1000, CType::voidTy());
+    invalid.body.push_back(std::make_unique<CAssignStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref, nullPointer(), CType::int32()),
+        makeInt(7)));
+
+    auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.literalNullAccess);
+    EXPECT_EQ(defect.literalNullAccessCount, 1);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+    EXPECT_TRUE(std::any_of(
+        invalid.confidenceIssues.begin(), invalid.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("literal null memory access") != std::string::npos;
+        }));
+
+    CFuncDecl nullable("nullable_pointer_value", 0x2000, CType::voidTy());
+    nullable.localVars.emplace_back(
+        1, "ptr", CType::pointerTo(CType::int32()), StorageKind::Stack,
+        std::nullopt, nullPointer());
+    EXPECT_FALSE(detectDamningDefects(nullable).literalNullAccess);
+}
+
 TEST(CAstOptimizerTest, PreservesConstantZeroComparisonOperands) {
     using namespace helix::cast;
 
