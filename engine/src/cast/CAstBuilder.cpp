@@ -5661,7 +5661,9 @@ void analyzeStmt(const CStmt* s,
 
             if (plainSelfAssign || selfOrAnd || opZero) {
                 g.identityNoOp++;
-            } else if (!canonicalIncDec && rhsRefs &&
+            // Plain `x = x + y` is a valid destructive update. A compound
+            // operator already reads x implicitly, so `x += x - y` repeats it.
+            } else if (!canonicalIncDec && !assign->compoundOp.empty() && rhsRefs &&
                        !helix::cast::detail::isConditionalPreserveUpdate(
                            assign->value.get(), targetName)) {
                 // Not exact identity, but the RHS still references the same

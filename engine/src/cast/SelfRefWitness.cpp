@@ -189,8 +189,11 @@ bool isSuspicious(const CAssignStmt& assign, const CVarRefExpr& target) {
     const bool opZero = (assign.compoundOp == "+=" || assign.compoundOp == "-=" ||
         assign.compoundOp == "|=" || assign.compoundOp == "^=") && isZeroLiteral(assign.value.get());
     const bool canonicalIncDec = assign.compoundOp == "++" || assign.compoundOp == "--";
+    // Plain destructive updates are canonical; only a compound operator can
+    // duplicate the target read already implicit in the assignment syntax.
     return !plainSelf && !selfOrAnd && !opZero && !canonicalIncDec &&
-        referencesVar(assign.value.get(), name) && !isPureSelfWalk(assign.value.get(), name) &&
+        !assign.compoundOp.empty() && referencesVar(assign.value.get(), name) &&
+        !isPureSelfWalk(assign.value.get(), name) &&
         !helix::cast::detail::isConditionalPreserveUpdate(assign.value.get(), name);
 }
 

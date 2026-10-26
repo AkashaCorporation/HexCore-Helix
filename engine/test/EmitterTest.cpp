@@ -1781,7 +1781,7 @@ TEST(CAstOptimizerTest, ConditionalPreserveUpdateIsNotSuspiciousSelfReference) {
     }
 }
 
-TEST(CAstOptimizerTest, ConditionalSelfDependentReplacementRemainsSuspicious) {
+TEST(CAstOptimizerTest, PlainConditionalSelfDependentReplacementIsCanonical) {
     for (unsigned shape = 0; shape < 3; ++shape) {
         CFuncDecl func("conditional_self_dependency", 0x1000, CType::int64());
         func.params.emplace_back("condition", CType::boolTy(), 0);
@@ -1804,8 +1804,7 @@ TEST(CAstOptimizerTest, ConditionalSelfDependentReplacementRemainsSuspicious) {
                 makeVar("value"), CType::int64())));
         func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
         CAstOptimizer().reanalyzeConfidence(func);
-        EXPECT_EQ(func.suspiciousSelfReferences, 1u) << shape;
-        EXPECT_LE(func.confidenceScore, 95.0) << shape;
+        EXPECT_EQ(func.suspiciousSelfReferences, 0u) << shape;
     }
 }
 
@@ -1837,19 +1836,36 @@ TEST(CAstOptimizerTest, CanonicalIncrementDecrementIsNotSuspiciousSelfReference)
     EXPECT_EQ(dependent.suspiciousSelfReferences, 1u);
 }
 
+TEST(CAstOptimizerTest, PlainDestructiveUpdatesAreNotSuspiciousSelfReferences) {
+    CFuncDecl func("canonical_destructive_updates", 0x1000, CType::int64());
+    func.localVars.emplace_back(
+        1, "value", CType::int64(), StorageKind::Stack,
+        std::nullopt, makeInt(3));
+    func.localVars.emplace_back(
+        2, "delta", CType::int64(), StorageKind::Stack,
+        std::nullopt, makeInt(4));
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"), std::make_unique<CBinaryExpr>(
+            BinaryOp::Add, makeVar("value"), makeVar("delta"), CType::int64())));
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"), std::make_unique<CBinaryExpr>(
+            BinaryOp::Mul, makeVar("value"), makeVar("value"), CType::int64())));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
+
+    CAstOptimizer().reanalyzeConfidence(func);
+    EXPECT_EQ(func.suspiciousSelfReferences, 0u);
+    EXPECT_TRUE(collectSelfRefObservations(func).empty());
+}
+
 TEST(CAstOptimizerTest, SelfReferenceWitnessesPreservePrePostStructuralInterval) {
     CFuncDecl func("witnessed_self_reference", 0x401000, CType::int64());
     func.params.emplace_back("condition", CType::boolTy(), 0);
     func.params.emplace_back("value", CType::int64(), 1);
-    std::vector<ExprPtr> arguments;
-    arguments.push_back(makeVar("value"));
-    auto replacement = std::make_unique<CCallExpr>(
-        "transform", 0, std::move(arguments), CType::int64(), 0x401010);
-    auto value = std::make_unique<CTernaryExpr>(
-        makeVar("condition"), std::move(replacement), makeVar("value"),
+    auto value = std::make_unique<CBinaryExpr>(
+        BinaryOp::Sub, makeVar("value"), makeInt(16),
         CType::int64(), 0x401010);
     func.body.push_back(std::make_unique<CAssignStmt>(
-        makeVar("value"), std::move(value), "", 0x401010));
+        makeVar("value"), std::move(value), "+=", 0x401010));
     func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
 
     auto before = collectSelfRefObservations(func);

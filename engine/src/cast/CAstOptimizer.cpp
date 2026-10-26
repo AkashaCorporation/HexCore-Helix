@@ -3247,7 +3247,9 @@ void CAstOptimizer::reanalyzeConfidence(CFuncDecl& func) {
                     a->compoundOp == "++" || a->compoundOp == "--";
                 if (plainSelf || selfOrAnd || opZero) {
                     cnt.identityNoOp++;
-                } else if (!canonicalIncDec && rhsRefs &&
+                // Plain `x = x + y` is valid. In `x += x - y`, the explicit
+                // RHS occurrence repeats the target already implicit in `+=`.
+                } else if (!canonicalIncDec && !a->compoundOp.empty() && rhsRefs &&
                            !isPureSelfWalk(a->value.get(), tn) &&
                            !helix::cast::detail::isConditionalPreserveUpdate(
                                a->value.get(), tn)) {
