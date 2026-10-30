@@ -124,6 +124,29 @@ jobs:
       - name: Build NAPI-RS
         run: npm run build
 
+      - name: Stage canonical NAPI-RS artifact
+        shell: bash
+        run: |
+          expected="hexcore-helix.linux-x64-gnu.node"
+          if [[ -f "$expected" ]]; then
+            printf 'NAPI artifact already staged: %s\n' "$expected"
+            exit 0
+          fi
+
+          mapfile -t nodes < <(
+            find . \
+              -path './.git' -prune -o \
+              -path './node_modules' -prune -o \
+              -type f -name '*.node' -print
+          )
+          printf 'Discovered NAPI artifacts:\n'
+          printf '  %s\n' "${nodes[@]:-<none>}"
+          if [[ ${#nodes[@]} -ne 1 ]]; then
+            printf 'Expected exactly one built NAPI artifact, found %s\n' "${#nodes[@]}" >&2
+            exit 1
+          fi
+          cp -- "${nodes[0]}" "$expected"
+
       - name: Smoke test package
         run: node tools/smoke_napi.cjs
 
