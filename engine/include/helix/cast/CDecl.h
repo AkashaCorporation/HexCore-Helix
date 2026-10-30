@@ -13,6 +13,51 @@
 
 namespace helix::cast {
 
+enum class CTypeEvidenceSource : uint8_t {
+    Unknown = 0,
+    Legacy = 1,
+    DataFlow = 2,
+    Structural = 3,
+    Interprocedural = 4,
+    SignatureDatabase = 5,
+    DebugInfo = 6,
+    User = 7,
+};
+
+enum class CTypeEvidenceState : uint8_t {
+    Unreported = 0,
+    Selected = 1,
+    SelectedWithConflict = 2,
+    Unresolved = 3,
+};
+
+enum class CTypeEvidenceAuthority : uint8_t {
+    Unknown = 0,
+    Heuristic = 1,
+    Derived = 2,
+    Authoritative = 3,
+};
+
+struct CTypeEvidenceOrigin {
+    std::string producer;
+    std::optional<uint64_t> generation;
+    std::string targetIdentity;
+    std::string snapshotHash;
+
+    bool operator==(const CTypeEvidenceOrigin&) const = default;
+};
+
+/// Evidence for one declaration-to-type association. This metadata is kept
+/// outside CType because the same structural type can have different origins.
+struct CTypeEvidence {
+    CTypeEvidenceSource source = CTypeEvidenceSource::Unknown;
+    CTypeEvidenceState state = CTypeEvidenceState::Unreported;
+    CTypeEvidenceAuthority authority = CTypeEvidenceAuthority::Unknown;
+    uint16_t strength = 0;
+    std::string rejectedSpelling;
+    std::optional<CTypeEvidenceOrigin> origin;
+};
+
 // ── Base declaration node ───────────────────────────────────────────────────
 
 /// Base class for all C declaration nodes.
@@ -38,15 +83,17 @@ public:
     StorageKind storage;
     std::optional<int64_t> stackOffset;
     ExprPtr initExpr; // nullable
+    std::optional<CTypeEvidence> typeEvidence;
 
     CVarDecl(uint32_t varId, std::string varName, CTypePtr type,
              StorageKind storage = StorageKind::Stack,
              std::optional<int64_t> stackOffset = std::nullopt,
-             ExprPtr initExpr = nullptr, uint64_t address = 0)
+              ExprPtr initExpr = nullptr, uint64_t address = 0,
+              std::optional<CTypeEvidence> evidence = std::nullopt)
         : CDecl(NodeKind::VarDecl, address),
           varId(varId), varName(std::move(varName)), type(std::move(type)),
           storage(storage), stackOffset(stackOffset),
-          initExpr(std::move(initExpr)) {}
+          initExpr(std::move(initExpr)), typeEvidence(std::move(evidence)) {}
 
     static bool classof(const CAstNode* n) {
         return n->getKind() == NodeKind::VarDecl;
@@ -63,13 +110,15 @@ public:
     /// inferred only from a legacy ABI name do not necessarily have a source
     /// VarDecl/argument identity. A present value of zero remains meaningful.
     std::optional<uint32_t> varId;
+    std::optional<CTypeEvidence> typeEvidence;
 
     CParamDecl(std::string name, CTypePtr type, unsigned index,
                uint64_t address = 0,
-               std::optional<uint32_t> varId = std::nullopt)
+               std::optional<uint32_t> varId = std::nullopt,
+               std::optional<CTypeEvidence> evidence = std::nullopt)
         : CDecl(NodeKind::ParamDecl, address),
           name(std::move(name)), type(std::move(type)), index(index),
-          varId(varId) {}
+          varId(varId), typeEvidence(std::move(evidence)) {}
 
     static bool classof(const CAstNode* n) {
         return n->getKind() == NodeKind::ParamDecl;
@@ -82,6 +131,7 @@ public:
     std::string name;
     uint64_t entryAddr;
     CTypePtr returnType;
+    std::optional<CTypeEvidence> returnTypeEvidence;
     std::vector<CParamDecl> params;
     bool isVariadic;
     std::vector<StmtPtr> body;
@@ -122,6 +172,11 @@ public:
     /// target is not allowed to self-report as plausible.
     bool hasDamningHonestyDefect = false;
 
+    /// A goto whose target label did not survive C-AST construction was
+    /// removed to keep the emitted C compilable. The removal is still a CFG
+    /// integrity loss and must remain visible after final rescoring.
+    bool droppedDanglingGoto = false;
+
     /// FIX-112 (L1): count of out-of-table indirect calls (the honest
     /// `(*(code*)0xADDR)()` form).  This is FAITHFUL output, so it no longer
     /// trips the 50% damning cap (it used to, pinning cleanly-structured
@@ -146,10 +201,13 @@ public:
               std::vector<StmtPtr> body = {},
               std::vector<CVarDecl> localVars = {},
               std::string callingConvention = "",
-              uint64_t address = 0)
+              uint64_t address = 0,
+              std::optional<CTypeEvidence> returnEvidence = std::nullopt)
         : CDecl(NodeKind::FuncDecl, address),
           name(std::move(name)), entryAddr(entryAddr),
-          returnType(std::move(returnType)), params(std::move(params)),
+          returnType(std::move(returnType)),
+          returnTypeEvidence(std::move(returnEvidence)),
+          params(std::move(params)),
           isVariadic(isVariadic), body(std::move(body)),
           localVars(std::move(localVars)),
           callingConvention(std::move(callingConvention)) {}

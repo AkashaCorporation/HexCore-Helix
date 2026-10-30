@@ -13,6 +13,7 @@
 
 #include "helix/Engine.h"
 #include "helix/Types.h"
+#include "CanonicalRequest.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -146,6 +147,7 @@ static void printUsage(const char* argv0) {
         << "  " << argv0 << " <input.ll>              Decompile to stdout\n"
         << "  " << argv0 << " <input.ll> <output.c>   Decompile to file\n"
         << "  " << argv0 << " --dir <folder>          Process all .ll files\n"
+        << "  " << argv0 << " --canonical-request <request.json> --c-out <output.c> --hast-out <output.hast.fb> [--result-out <result.json>]\n"
         << "  " << argv0 << " --version               Show version\n\n"
         << "Flags:\n"
         << "  --no-opt              Skip optimization passes\n"
@@ -168,6 +170,10 @@ int main(int argc, char* argv[]) {
     bool skip_opt = false;
     bool preserve_cfg = false;
     bool legacy_emitter = false;
+    fs::path canonical_request;
+    fs::path canonical_c_output;
+    fs::path canonical_hast_output;
+    fs::path canonical_result_output;
     std::vector<std::string> enabled_passes;
     std::vector<std::string_view> positional;
     for (int i = 1; i < argc; i++) {
@@ -181,11 +187,31 @@ int main(int argc, char* argv[]) {
         } else if (a == "--use-cast-layer") {
             // Backwards compat — now the default, silently accept
             (void)0;
+        } else if (a == "--canonical-request" && i + 1 < argc) {
+            canonical_request = argv[++i];
+        } else if (a == "--c-out" && i + 1 < argc) {
+            canonical_c_output = argv[++i];
+        } else if (a == "--hast-out" && i + 1 < argc) {
+            canonical_hast_output = argv[++i];
+        } else if (a == "--result-out" && i + 1 < argc) {
+            canonical_result_output = argv[++i];
         } else if (a.starts_with("--enable-pass=")) {
             enabled_passes.emplace_back(a.substr(14));
         } else {
             positional.push_back(a);
         }
+    }
+
+    if (!canonical_request.empty()) {
+        if (canonical_c_output.empty() || canonical_hast_output.empty()) {
+            std::cerr << "error: --canonical-request requires --c-out and --hast-out\n";
+            return 1;
+        }
+        return runCanonicalRequest(
+            canonical_request,
+            canonical_c_output,
+            canonical_hast_output,
+            canonical_result_output);
     }
 
     if (positional.empty()) {

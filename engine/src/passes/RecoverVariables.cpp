@@ -1506,29 +1506,54 @@ private:
                     // Propagate inferred_type to the VarDeclOp.
                     // Pointer types override int types (TIE lattice:
                     // ptr is more specific than num).
+                    // A narrow sub-register read (e.g., R8B on param_3 or R12D
+                    // on r12_1) may only seed `inferred_type` when this version
+                    // is the initial live-in parameter version (`ver->version == 0`
+                    // and `storage_kind == Parameter`); if a later full-width
+                    // read of the same version occurs, widen the narrow integer
+                    // inferred_type to full parent width.
                     auto varDeclOp =
                         llvm::cast<helix::high::VarDeclOp>(ver->decl);
                     if (auto inferredType =
                             readOp->getAttrOfType<StringAttr>(
                                 "inferred_type")) {
-                        bool shouldSet = !varDeclOp->hasAttr("inferred_type");
-                        bool pointerRefinement = false;
-                        if (!shouldSet) {
-                            // Pointer overrides int (more specific type)
-                            auto curType = varDeclOp->getAttrOfType<
-                                StringAttr>("inferred_type");
-                            if (curType &&
-                                !curType.getValue().ends_with("*") &&
-                                inferredType.getValue().ends_with("*")) {
-                                shouldSet = true;
-                                pointerRefinement = true;
+                        const bool isFullWidthParentRead =
+                            (subReg.width == parentWidth &&
+                             subReg.bitOffset == 0);
+                        const bool isPointerEvidence =
+                            inferredType.getValue().ends_with("*");
+                        const bool isInitialParameterVersion =
+                            (varDeclOp.getStorage() ==
+                             helix::high::StorageKind::Parameter);
+                        if (isFullWidthParentRead || isPointerEvidence ||
+                            isInitialParameterVersion) {
+                            bool shouldSet = !varDeclOp->hasAttr("inferred_type");
+                            bool pointerRefinement = false;
+                            if (!shouldSet) {
+                                auto curType = varDeclOp->getAttrOfType<
+                                    StringAttr>("inferred_type");
+                                if (curType &&
+                                    !curType.getValue().ends_with("*")) {
+                                    if (isPointerEvidence) {
+                                        shouldSet = true;
+                                        pointerRefinement = true;
+                                    } else if (isFullWidthParentRead &&
+                                               (curType.getValue() == "int8_t" ||
+                                                curType.getValue() == "uint8_t" ||
+                                                curType.getValue() == "int16_t" ||
+                                                curType.getValue() == "uint16_t" ||
+                                                curType.getValue() == "int32_t" ||
+                                                curType.getValue() == "uint32_t")) {
+                                        shouldSet = true;
+                                    }
+                                }
                             }
+                            if (shouldSet)
+                                helix::applyTypeEvidence(
+                                    varDeclOp, inferredType.getValue(),
+                                    helix::TypeEvidenceSource::DataFlow,
+                                    pointerRefinement ? 45u : 40u);
                         }
-                        if (shouldSet)
-                            helix::applyTypeEvidence(
-                                varDeclOp, inferredType.getValue(),
-                                helix::TypeEvidenceSource::DataFlow,
-                                pointerRefinement ? 45u : 40u);
                     }
 
                     // Track param naming statistics.
@@ -1667,18 +1692,28 @@ private:
                         llvm::cast<helix::high::VarDeclOp>(newDecl);
 
                     // Propagate inferred_type from the written value.
+                    // Only full-width writes (or pointer evidence) may seed the
+                    // parent register's VarDeclOp; narrow sub-register writes
+                    // (e.g., R12D on 64-bit R12) must not narrow the 64-bit
+                    // parent variable declaration.
+                    const bool isFullWidthParentWrite =
+                        (subReg.width == parentWidth && subReg.bitOffset == 0);
                     if (!newDeclTyped->hasAttr("inferred_type")) {
                         if (auto* valDef =
                                 writeOp.getValue().getDefiningOp()) {
                             auto inferred = valDef->getAttrOfType<StringAttr>("inferred_type");
                             // A void call has no C value; it cannot type reused
                             // register storage that receives a later value.
-                            if (!inferred || inferred.getValue() != "void")
+                            if (inferred && inferred.getValue() != "void" &&
+                                (isFullWidthParentWrite ||
+                                 inferred.getValue().ends_with("*")))
                                 helix::copyTypeEvidence(newDeclTyped, valDef);
                         }
                         if (!newDeclTyped->hasAttr("inferred_type")) {
                             auto inferred = writeOp->getAttrOfType<StringAttr>("inferred_type");
-                            if (!inferred || inferred.getValue() != "void")
+                            if (inferred && inferred.getValue() != "void" &&
+                                (isFullWidthParentWrite ||
+                                 inferred.getValue().ends_with("*")))
                                 helix::copyTypeEvidence(newDeclTyped, writeOp);
                         }
                     }
@@ -3382,6 +3417,81 @@ private:
                     }
                 }
                 if (!assignBeforeUse)
+                    continue;
+
+                // Protect against clobbering between `theAssign` and all users
+                // of `useRef.getResult()`. Collect referenced varIds and memory
+                // reads in `assignedVal`'s expression tree.
+                llvm::DenseSet<uint32_t> referencedVarIds;
+                bool readsMemory = false;
+                llvm::SmallVector<Value, 8> worklist{assignedVal};
+                llvm::DenseSet<Operation*> visitedDefs;
+                while (!worklist.empty()) {
+                    Value cur = worklist.pop_back_val();
+                    Operation* def = cur.getDefiningOp();
+                    if (!def || !visitedDefs.insert(def).second)
+                        continue;
+                    if (auto vr = dyn_cast<helix::high::VarRefOp>(def)) {
+                        referencedVarIds.insert(vr.getVarId());
+                    } else if (auto uOp = dyn_cast<helix::high::UnaryOp>(def)) {
+                        if (uOp.getOp() == helix::high::UnaryOpKind::Deref)
+                            readsMemory = true;
+                    } else if (isa<helix::high::SubscriptOp,
+                                   helix::high::FieldAccessOp,
+                                   helix::low::MemReadOp,
+                                   LLVM::LoadOp>(def)) {
+                        readsMemory = true;
+                    }
+                    for (Value operand : def->getOperands())
+                        worklist.push_back(operand);
+                }
+
+                // Find the latest user of `useRef.getResult()` in the block; if
+                // any user lives in a different block, do not inline across
+                // block boundaries when mutable dependencies exist.
+                Block* assignBlock = targetRef->getBlock();
+                Operation* latestConsumer = useRef.getOperation();
+                bool crossBlockConsumer = false;
+                for (Operation* user : useRef.getResult().getUsers()) {
+                    Operation* ancestor = assignBlock->findAncestorOpInBlock(*user);
+                    if (!ancestor) {
+                        crossBlockConsumer = true;
+                        break;
+                    }
+                    if (latestConsumer->isBeforeInBlock(ancestor))
+                        latestConsumer = ancestor;
+                }
+                if (crossBlockConsumer &&
+                    (!referencedVarIds.empty() || readsMemory))
+                    continue;
+
+                bool clobberedBetweenAssignAndUse = false;
+                for (auto it2 = std::next(Block::iterator(theAssign)),
+                     end = assignBlock->end();
+                     it2 != end; ++it2) {
+                    Operation* intervening = &*it2;
+                    bool reachedLatest = (intervening == latestConsumer);
+                    intervening->walk([&](Operation* nested) {
+                        if (auto aOp = dyn_cast<helix::high::AssignOp>(nested)) {
+                            if (auto lhsRef = aOp.getTarget()
+                                    .getDefiningOp<helix::high::VarRefOp>()) {
+                                if (referencedVarIds.contains(lhsRef.getVarId()))
+                                    clobberedBetweenAssignAndUse = true;
+                            } else if (readsMemory) {
+                                clobberedBetweenAssignAndUse = true;
+                            }
+                        } else if (readsMemory &&
+                                   (isa<helix::low::MemWriteOp, LLVM::StoreOp>(
+                                        nested) ||
+                                    isa<helix::high::CallOp>(nested) ||
+                                    helix::isAnyCallOp(nested))) {
+                            clobberedBetweenAssignAndUse = true;
+                        }
+                    });
+                    if (clobberedBetweenAssignAndUse || reachedLatest)
+                        break;
+                }
+                if (clobberedBetweenAssignAndUse)
                     continue;
 
                 tempCandidates.push_back(

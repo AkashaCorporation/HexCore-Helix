@@ -18,8 +18,10 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassManager.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 
 namespace {
 
@@ -731,6 +733,141 @@ TEST(StructureControlFlowTest, CastSnapshotsResidualCfBlockArguments) {
     EXPECT_NE(output.find("return cfg_phi950000"), std::string::npos);
     EXPECT_EQ(output.find("block_arg"), std::string::npos);
     EXPECT_EQ(output.find("__helix_unhandled_cf"), std::string::npos);
+}
+
+TEST(StructureControlFlowTest, PreservesIrreducibleTwoEntryLoopAsMixedGoto) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto function = builder.create<helix::high::FuncOp>(
+        loc, "irreducible_two_entry", /*entry_address=*/0x7550,
+        builder.getFunctionType({}, {builder.getI64Type()}),
+        mlir::StringAttr{}, mlir::UnitAttr{},
+        mlir::ArrayAttr{}, mlir::ArrayAttr{});
+    function->setAttr("has_return_value", builder.getUnitAttr());
+    function->setAttr("helix.signature_complete", builder.getBoolAttr(true));
+
+    auto* entry = builder.createBlock(&function.getBody());
+    auto* left = builder.createBlock(&function.getBody());
+    auto* right = builder.createBlock(&function.getBody());
+    auto* exit = builder.createBlock(&function.getBody());
+
+    builder.setInsertionPointToStart(entry);
+    auto firstEntry = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+    builder.create<mlir::cf::CondBranchOp>(
+        loc, firstEntry, left, mlir::ValueRange{},
+        right, mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(left);
+    builder.create<mlir::cf::BranchOp>(loc, right);
+
+    builder.setInsertionPointToStart(right);
+    auto repeat = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 1);
+    builder.create<mlir::cf::CondBranchOp>(
+        loc, repeat, left, mlir::ValueRange{},
+        exit, mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(exit);
+    auto result = builder.create<mlir::arith::ConstantIntOp>(loc, 7, 64);
+    builder.create<helix::high::ReturnOp>(
+        loc, result, mlir::IntegerAttr{});
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    helix::cast::CAstBuilder astBuilder;
+    auto functions = astBuilder.buildModule(module);
+    ASSERT_EQ(functions.size(), 1u);
+    const std::string output =
+        helix::cast::CAstPrinter().print(*functions.front());
+
+    EXPECT_NE(output.find("goto block_2"), std::string::npos) << output;
+    EXPECT_NE(output.find("goto block_3"), std::string::npos) << output;
+    EXPECT_NE(output.find("block_2:"), std::string::npos) << output;
+    EXPECT_NE(output.find("block_3:"), std::string::npos) << output;
+    EXPECT_NE(output.find("return 7"), std::string::npos) << output;
+    EXPECT_EQ(output.find("__helix_unhandled_cf"), std::string::npos);
+    EXPECT_TRUE(std::none_of(
+        functions.front()->confidenceIssues.begin(),
+        functions.front()->confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("goto(s)") != std::string::npos;
+        }));
+}
+
+TEST(StructureControlFlowTest, FailedCfgToScfIsTransactionalAndNeverBridged) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::ub::UBDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto function = builder.create<helix::low::FuncOp>(
+        loc, "forced_cfg_to_scf_failure", /*entry_address=*/0x7600,
+        /*original_name=*/mlir::StringAttr{});
+    function->setAttr("helix.scf.force_transform_failure",
+                      builder.getUnitAttr());
+
+    auto* entry = builder.createBlock(&function.getBody());
+    auto* trueBlock = builder.createBlock(&function.getBody());
+    auto* falseBlock = builder.createBlock(&function.getBody());
+    auto* mergeBlock = builder.createBlock(&function.getBody());
+
+    builder.setInsertionPointToStart(entry);
+    auto condition = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+    builder.create<helix::low::JccOp>(
+        loc, "ne", condition.getResult(), mlir::ValueRange{},
+        mlir::ValueRange{}, mlir::IntegerAttr{}, trueBlock, falseBlock);
+    builder.setInsertionPointToStart(trueBlock);
+    builder.create<helix::low::JmpOp>(
+        loc, mlir::ValueRange{}, mlir::IntegerAttr{}, mlir::IntegerAttr{},
+        mergeBlock);
+    builder.setInsertionPointToStart(falseBlock);
+    builder.create<helix::low::JmpOp>(
+        loc, mlir::ValueRange{}, mlir::IntegerAttr{}, mlir::IntegerAttr{},
+        mergeBlock);
+    builder.setInsertionPointToStart(mergeBlock);
+    builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    std::string before;
+    {
+        llvm::raw_string_ostream stream(before);
+        function.print(stream);
+    }
+
+    mlir::PassManager manager(&ctx);
+    manager.enableVerifier(false);
+    manager.addPass(helix::createStructureControlFlowPass());
+    EXPECT_TRUE(mlir::failed(manager.run(module)));
+
+    std::string after;
+    {
+        llvm::raw_string_ostream stream(after);
+        function.print(stream);
+    }
+    EXPECT_EQ(after, before)
+        << "a failed upstream transform must not mutate the owned function";
+    EXPECT_TRUE(mlir::succeeded(mlir::verify(module)));
+
+    unsigned highIfCount = 0;
+    unsigned scfIfCount = 0;
+    unsigned cfBranchCount = 0;
+    function.walk([&](helix::high::IfOp) { ++highIfCount; });
+    function.walk([&](mlir::scf::IfOp) { ++scfIfCount; });
+    function.walk([&](mlir::cf::BranchOp) { ++cfBranchCount; });
+    EXPECT_EQ(highIfCount, 0u);
+    EXPECT_EQ(scfIfCount, 0u);
+    EXPECT_EQ(cfBranchCount, 0u);
 }
 
 } // namespace

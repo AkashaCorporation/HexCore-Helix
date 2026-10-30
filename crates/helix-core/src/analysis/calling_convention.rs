@@ -597,11 +597,12 @@ fn is_result_used(
         HirStmt::Assign {
             lhs: HirExpr::Var { id, .. },
             ..
-        } if var_names
-            .get(id)
-            .is_some_and(|name| name.eq_ignore_ascii_case("rax")) =>
-        {
-            *id
+        } => {
+            if var_names.get(id).map(|n| n.to_lowercase()) == Some("rax".to_string()) {
+                *id
+            } else {
+                return false;
+            }
         }
         _ => return false,
     };

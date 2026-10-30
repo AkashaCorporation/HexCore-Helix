@@ -1,14 +1,25 @@
 cmake_minimum_required(VERSION 3.20)
+set(HELIX_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION")
+if(NOT EXISTS "${HELIX_VERSION_FILE}")
+    message(FATAL_ERROR "Missing Helix version authority: ${HELIX_VERSION_FILE}")
+endif()
+file(STRINGS "${HELIX_VERSION_FILE}" HELIX_RELEASE_VERSION LIMIT_COUNT 1)
+string(STRIP "${HELIX_RELEASE_VERSION}" HELIX_RELEASE_VERSION)
+if(HELIX_RELEASE_VERSION STREQUAL "")
+    message(FATAL_ERROR "Helix version authority is empty")
+endif()
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" HELIX_PROJECT_VERSION "${HELIX_RELEASE_VERSION}")
+if(HELIX_PROJECT_VERSION STREQUAL "")
+    message(FATAL_ERROR "Invalid Helix release version: ${HELIX_RELEASE_VERSION}")
+endif()
+
 project(helix_engine
-    VERSION 0.9.4
+    VERSION ${HELIX_PROJECT_VERSION}
     LANGUAGES CXX C
     DESCRIPTION "HexCore Helix Decompilation Engine — C++23/MLIR 3-Tier Architecture"
 )
 
-# Keep prerelease identity aligned with the package without using a nonnumeric
-# CMake project version. CMake 3.20 provides a structured JSON reader.
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../package.json" HELIX_PACKAGE_JSON)
-string(JSON HELIX_RELEASE_VERSION GET "${HELIX_PACKAGE_JSON}" version)
+message(STATUS "Helix release version: ${HELIX_RELEASE_VERSION}")
 
 # ─── C++23 Standard ─────────────────────────────────────────────────────────────
 
@@ -54,7 +65,6 @@ if(HELIX_USE_LLVM)
     include(${MLIR_DIR}/AddMLIR.cmake OPTIONAL)
 
     set(HELIX_TABLEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dialects)
-    file(GLOB HELIX_TABLEGEN_INPUTS CONFIGURE_DEPENDS "${HELIX_TABLEGEN_DIR}/*.td")
     set(HELIX_TABLEGEN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/helix/dialects)
     set(HELIX_IFACE_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/helix)
 
@@ -88,14 +98,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Ops.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-op-decls ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Ops.h.inc
-                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_OPS_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} op declarations"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Ops.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-op-defs ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Ops.cpp.inc
-                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_OPS_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} op definitions"
             )
 
@@ -104,14 +114,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Dialect.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-decls ${TBLGEN_INCLUDES}
                     ${_DIALECT_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Dialect.h.inc
-                DEPENDS ${_DIALECT_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_DIALECT_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} dialect declaration"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Dialect.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-dialect-defs ${TBLGEN_INCLUDES}
                     ${_DIALECT_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Dialect.cpp.inc
-                DEPENDS ${_DIALECT_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_DIALECT_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} dialect definition"
             )
 
@@ -120,14 +130,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Enums.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-decls ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Enums.h.inc
-                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_OPS_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} enum declarations"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Enums.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-enum-defs ${TBLGEN_INCLUDES} ${_OPS_TD_PATH}
                     -o ${_OUT}/${DIALECT_NAME}Enums.cpp.inc
-                DEPENDS ${_OPS_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_OPS_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} enum definitions"
             )
 
@@ -136,14 +146,14 @@ if(HELIX_USE_LLVM)
                 OUTPUT ${_OUT}/${DIALECT_NAME}Types.h.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-decls ${TBLGEN_INCLUDES}
                     ${_TYPES_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Types.h.inc
-                DEPENDS ${_TYPES_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_TYPES_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} type declarations"
             )
             add_custom_command(
                 OUTPUT ${_OUT}/${DIALECT_NAME}Types.cpp.inc
                 COMMAND ${MLIR_TBLGEN_EXE} -gen-typedef-defs ${TBLGEN_INCLUDES}
                     ${_TYPES_TD_PATH} -o ${_OUT}/${DIALECT_NAME}Types.cpp.inc
-                DEPENDS ${_TYPES_TD_PATH} ${HELIX_TABLEGEN_INPUTS}
+                DEPENDS ${_TYPES_TD_PATH}
                 COMMENT "Generating ${DIALECT_NAME} type definitions"
             )
         endmacro()
@@ -159,14 +169,14 @@ if(HELIX_USE_LLVM)
             OUTPUT ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
             COMMAND ${MLIR_TBLGEN_EXE} -gen-op-interface-decls ${TBLGEN_INCLUDES}
                 ${HELIX_IFACE_TD} -o ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.h.inc
-            DEPENDS ${HELIX_IFACE_TD} ${HELIX_TABLEGEN_INPUTS}
+            DEPENDS ${HELIX_IFACE_TD}
             COMMENT "Generating Helix interface declarations"
         )
         add_custom_command(
             OUTPUT ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
             COMMAND ${MLIR_TBLGEN_EXE} -gen-op-interface-defs ${TBLGEN_INCLUDES}
                 ${HELIX_IFACE_TD} -o ${HELIX_IFACE_OUTPUT_DIR}/HelixInterfaces.cpp.inc
-            DEPENDS ${HELIX_IFACE_TD} ${HELIX_TABLEGEN_INPUTS}
+            DEPENDS ${HELIX_IFACE_TD}
             COMMENT "Generating Helix interface definitions"
         )
 
@@ -287,6 +297,7 @@ set(HELIX_SOURCES
     src/cast/CAstPrinter.cpp
     src/cast/CAstBuilder.cpp
     src/cast/CAstOptimizer.cpp
+    src/cast/SelfRefWitness.cpp
 )
 
 set(HELIX_HEADERS
@@ -317,8 +328,6 @@ set(HELIX_HEADERS
     include/helix/passes/Patterns.h
     include/helix/analysis/TypeLattice.h
     include/helix/analysis/TypeEvidence.h
-    include/helix/diagnostics/VerifyAudit.h
-    include/helix/dialects/HelixEffects.h
     include/helix/analysis/JumpTableAnalysis.h
     include/helix/analysis/DataSectionProvider.h
     include/helix/analysis/CallingConventionDb.h
@@ -338,10 +347,13 @@ set(HELIX_HEADERS
     include/helix/cast/CAstPrinter.h
     include/helix/cast/CAstBuilder.h
     include/helix/cast/CAstOptimizer.h
+    include/helix/cast/SelfRefWitness.h
 )
 
 add_library(helix_engine STATIC ${HELIX_SOURCES} ${HELIX_HEADERS})
-target_compile_definitions(helix_engine PRIVATE HELIX_ENGINE_VERSION="${HELIX_RELEASE_VERSION}")
+target_compile_definitions(helix_engine PUBLIC
+    HELIX_VERSION_STRING="${HELIX_RELEASE_VERSION}"
+)
 
 target_include_directories(helix_engine
     PUBLIC
@@ -357,31 +369,25 @@ endif()
 
 # Link LLVM/MLIR
 if(HELIX_USE_LLVM)
-    # Debian/Ubuntu MLIR packages link against libLLVM.so. Mixing that shared
-    # library with component archives registers LLVM command-line options twice
-    # when the test executable starts. Prefer the monolithic target there while
-    # retaining component libraries for the validated Windows static toolchain.
-    if(NOT WIN32 AND TARGET LLVM)
-        target_link_libraries(helix_engine PRIVATE LLVM)
-    else()
-        llvm_map_components_to_libnames(LLVM_LIBS
-            core
-            support
-            irreader
-            analysis
-            passes
-            target
-            x86codegen
-            x86asmparser
-            x86desc
-            x86info
-            aarch64codegen
-            aarch64asmparser
-            aarch64desc
-            aarch64info
-        )
-        target_link_libraries(helix_engine PRIVATE ${LLVM_LIBS})
-    endif()
+    # Core LLVM libraries needed for decompilation
+    llvm_map_components_to_libnames(LLVM_LIBS
+        core
+        support
+        irreader
+        analysis
+        passes
+        target
+        x86codegen
+        x86asmparser
+        x86desc
+        x86info
+        aarch64codegen
+        aarch64asmparser
+        aarch64desc
+        aarch64info
+    )
+
+    target_link_libraries(helix_engine PRIVATE ${LLVM_LIBS})
 
     # MLIR libraries for dialect infrastructure and translation
     target_link_libraries(helix_engine PRIVATE
@@ -434,14 +440,11 @@ endif()
 
 # ─── FlatBuffers (optional) ──────────────────────────────────────────────────────
 
-set(HELIX_FLATBUFFERS_STATUS "disabled")
-option(HELIX_REQUIRE_FLATBUFFERS "Reject builds without canonical HAST serialization" ON)
 find_package(flatbuffers QUIET)
 if(flatbuffers_FOUND)
     message(STATUS "Found FlatBuffers (package) -- enabling real serialization")
     target_link_libraries(helix_engine PRIVATE flatbuffers::flatbuffers)
     target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
-    set(HELIX_FLATBUFFERS_STATUS "package")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include/flatbuffers/flatbuffers.h")
     # Vendored FlatBuffers C++ headers (v25.12.19, matches the Rust crate). The
     # FlatBufferBuilder path is header-only, so no link is required -- just the
@@ -450,12 +453,8 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include/flatbuffers/
     message(STATUS "Using vendored FlatBuffers headers -- enabling real serialization")
     target_include_directories(helix_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/include")
     target_compile_definitions(helix_engine PRIVATE HELIX_HAS_FLATBUFFERS)
-    set(HELIX_FLATBUFFERS_STATUS "vendored")
 else()
-    if(HELIX_REQUIRE_FLATBUFFERS)
-        message(FATAL_ERROR "FlatBuffers is required for canonical HAST; vendor headers before configuring.")
-    endif()
-    message(WARNING "FlatBuffers not found -- canonical HAST serialization will fail closed.")
+    message(WARNING "FlatBuffers not found -- canonical HAST serialization is unavailable and fails closed.")
     message(STATUS "  To enable: run  bash engine/vendor_flatbuffers.sh  then reconfigure.")
 endif()
 
@@ -463,7 +462,10 @@ endif()
 
 option(HELIX_BUILD_TOOLS "Build Helix CLI tools" ON)
 if(HELIX_BUILD_TOOLS)
-    add_executable(helix_tool tools/helix_tool.cpp)
+    add_executable(helix_tool
+        tools/helix_tool.cpp
+        tools/CanonicalRequest.cpp
+    )
     target_link_libraries(helix_tool PRIVATE helix_engine)
     target_include_directories(helix_tool PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -492,7 +494,6 @@ install(DIRECTORY include/ DESTINATION include)
 
 option(HELIX_BUILD_TESTS "Build Helix engine tests" OFF)
 if(HELIX_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(test)
 endif()
 
@@ -500,13 +501,13 @@ endif()
 
 message(STATUS "")
 message(STATUS "╔══════════════════════════════════════════╗")
-message(STATUS "║   HexCore Helix Engine v${PROJECT_VERSION}           ║")
+message(STATUS "║   HexCore Helix Engine v${HELIX_RELEASE_VERSION}     ║")
 message(STATUS "╠══════════════════════════════════════════╣")
 message(STATUS "║  Architecture:  3-Tier (Low→Mid→High)   ║")
 message(STATUS "║  C++ Standard:  C++${CMAKE_CXX_STANDARD}                    ║")
 message(STATUS "║  LLVM/MLIR:     ${HELIX_USE_LLVM}                      ║")
 message(STATUS "║  Emitter:       PseudoC                   ║")
-message(STATUS "║  FlatBuffers:   ${HELIX_FLATBUFFERS_STATUS}")
+message(STATUS "║  FlatBuffers:   ${flatbuffers_FOUND}")
 message(STATUS "║  CLI Tool:      ${HELIX_BUILD_TOOLS}")
 message(STATUS "║  Tests:         ${HELIX_BUILD_TESTS}")
 message(STATUS "║  Build Type:    ${CMAKE_BUILD_TYPE}")

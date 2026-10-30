@@ -40,7 +40,7 @@ void CAstPrinter::print(const CFuncDecl& func, llvm::raw_ostream& os) {
         func.confidenceScore > 50.0 ? "Medium" : "Low";
     os << "// Confidence: "
        << llvm::format("%.1f", func.confidenceScore) << "% ("
-       << rating << ")";
+       << rating << ") [translation/structuring axis only]";
     if (!func.callingConvention.empty())
         os << "  |  " << func.callingConvention;
     os << "\n";

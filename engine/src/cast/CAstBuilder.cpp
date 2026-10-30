@@ -16,6 +16,7 @@
 #include "helix/dialects/HelixLowOps.h"
 #include "helix/dialects/HelixMidOps.h"
 #include "helix/analysis/DataSectionProvider.h"  // FIX-097: rodata string recovery
+#include "helix/analysis/TypeEvidence.h"
 
 #include <unordered_set>
 
@@ -30,12 +31,14 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -49,6 +52,156 @@ using namespace helix::cast;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace {
+
+static CTypeEvidenceSource mapEvidenceSource(helix::TypeEvidenceSource source) {
+    switch (source) {
+    case helix::TypeEvidenceSource::Legacy: return CTypeEvidenceSource::Legacy;
+    case helix::TypeEvidenceSource::DataFlow: return CTypeEvidenceSource::DataFlow;
+    case helix::TypeEvidenceSource::Structural: return CTypeEvidenceSource::Structural;
+    case helix::TypeEvidenceSource::Interprocedural: return CTypeEvidenceSource::Interprocedural;
+    case helix::TypeEvidenceSource::SignatureDatabase: return CTypeEvidenceSource::SignatureDatabase;
+    case helix::TypeEvidenceSource::DebugInfo: return CTypeEvidenceSource::DebugInfo;
+    case helix::TypeEvidenceSource::User: return CTypeEvidenceSource::User;
+    }
+    return CTypeEvidenceSource::Unknown;
+}
+
+static CTypeEvidenceSource parseEvidenceSource(llvm::StringRef source) {
+    return llvm::StringSwitch<CTypeEvidenceSource>(source)
+        .Case("legacy", CTypeEvidenceSource::Legacy)
+        .Case("dataflow", CTypeEvidenceSource::DataFlow)
+        .Case("structural", CTypeEvidenceSource::Structural)
+        .Case("interprocedural", CTypeEvidenceSource::Interprocedural)
+        .Case("signature-db", CTypeEvidenceSource::SignatureDatabase)
+        .Case("debug-info", CTypeEvidenceSource::DebugInfo)
+        .Case("user", CTypeEvidenceSource::User)
+        .Default(CTypeEvidenceSource::Unknown);
+}
+
+static std::optional<CTypeEvidenceOrigin> readEvidenceOrigin(Operation* operation) {
+    auto module = operation ? operation->getParentOfType<ModuleOp>() : ModuleOp{};
+    if (!module)
+        return std::nullopt;
+    CTypeEvidenceOrigin origin;
+    if (auto producer = module->getAttrOfType<StringAttr>(
+            "helix.type_origin.producer"))
+        origin.producer = producer.getValue().str();
+    if (auto generation = module->getAttrOfType<IntegerAttr>(
+            "helix.type_origin.generation"))
+        origin.generation = generation.getValue().getZExtValue();
+    if (auto target = module->getAttrOfType<StringAttr>(
+            "helix.type_origin.target_identity"))
+        origin.targetIdentity = target.getValue().str();
+    if (auto snapshot = module->getAttrOfType<StringAttr>(
+            "helix.type_origin.snapshot_hash"))
+        origin.snapshotHash = snapshot.getValue().str();
+    if (origin.producer.empty() && !origin.generation &&
+        origin.targetIdentity.empty() && origin.snapshotHash.empty())
+        return std::nullopt;
+    return origin;
+}
+
+static CTypeEvidenceAuthority evidenceAuthority(
+        CTypeEvidenceSource source,
+        const std::optional<CTypeEvidenceOrigin>& origin) {
+    switch (source) {
+    case CTypeEvidenceSource::DataFlow:
+    case CTypeEvidenceSource::Structural:
+    case CTypeEvidenceSource::Interprocedural:
+    case CTypeEvidenceSource::SignatureDatabase:
+        return CTypeEvidenceAuthority::Derived;
+    case CTypeEvidenceSource::DebugInfo:
+    case CTypeEvidenceSource::User:
+        if (origin && !origin->targetIdentity.empty() &&
+            !origin->snapshotHash.empty())
+            return CTypeEvidenceAuthority::Authoritative;
+        return CTypeEvidenceAuthority::Heuristic;
+    case CTypeEvidenceSource::Legacy:
+        return CTypeEvidenceAuthority::Heuristic;
+    case CTypeEvidenceSource::Unknown:
+        return CTypeEvidenceAuthority::Unknown;
+    }
+    return CTypeEvidenceAuthority::Unknown;
+}
+
+static std::optional<CTypeEvidence> convertTypeEvidence(Operation* operation) {
+    auto evidence = helix::readTypeEvidence(operation);
+    if (!evidence)
+        return std::nullopt;
+    CTypeEvidence result;
+    result.source = mapEvidenceSource(evidence->source);
+    result.state = evidence->conflict
+        ? CTypeEvidenceState::SelectedWithConflict
+        : CTypeEvidenceState::Selected;
+    result.strength = static_cast<uint16_t>(
+        std::min<unsigned>(evidence->strength,
+                           std::numeric_limits<uint16_t>::max()));
+    if (auto rejected = operation->getAttrOfType<StringAttr>(
+            "helix.type.rejected"))
+        result.rejectedSpelling = rejected.getValue().str();
+    if (result.source == CTypeEvidenceSource::DebugInfo ||
+        result.source == CTypeEvidenceSource::User)
+        result.origin = readEvidenceOrigin(operation);
+    result.authority = evidenceAuthority(result.source, result.origin);
+    return result;
+}
+
+static std::optional<CTypeEvidence> convertTypeEvidence(
+        DictionaryAttr attributes, Operation* originOwner) {
+    if (!attributes)
+        return std::nullopt;
+    auto source = attributes.getAs<StringAttr>("helix.type.source");
+    auto strength = attributes.getAs<IntegerAttr>("helix.type.strength");
+    if (!source && !strength && !attributes.contains("helix.type.conflict") &&
+        !attributes.contains("helix.type.rejected"))
+        return std::nullopt;
+    CTypeEvidence result;
+    result.source = source
+        ? parseEvidenceSource(source.getValue())
+        : CTypeEvidenceSource::Unknown;
+    result.state = attributes.contains("helix.type.conflict")
+        ? CTypeEvidenceState::SelectedWithConflict
+        : CTypeEvidenceState::Selected;
+    if (strength)
+        result.strength = static_cast<uint16_t>(std::min<uint64_t>(
+            strength.getValue().getZExtValue(),
+            std::numeric_limits<uint16_t>::max()));
+    if (auto rejected = attributes.getAs<StringAttr>("helix.type.rejected"))
+        result.rejectedSpelling = rejected.getValue().str();
+    if (result.source == CTypeEvidenceSource::DebugInfo ||
+        result.source == CTypeEvidenceSource::User)
+        result.origin = readEvidenceOrigin(originOwner);
+    result.authority = evidenceAuthority(result.source, result.origin);
+    return result;
+}
+
+static std::optional<CTypeEvidence> convertReturnTypeEvidence(
+        Operation* operation) {
+    if (!operation)
+        return std::nullopt;
+    auto source = operation->getAttrOfType<StringAttr>(
+        "helix.return_type.source");
+    if (!source)
+        return std::nullopt;
+    CTypeEvidence result;
+    result.source = parseEvidenceSource(source.getValue());
+    result.state = operation->hasAttr("helix.return_type.conflict")
+        ? CTypeEvidenceState::SelectedWithConflict
+        : CTypeEvidenceState::Selected;
+    if (auto strength = operation->getAttrOfType<IntegerAttr>(
+            "helix.return_type.strength"))
+        result.strength = static_cast<uint16_t>(std::min<uint64_t>(
+            strength.getValue().getZExtValue(),
+            std::numeric_limits<uint16_t>::max()));
+    if (auto rejected = operation->getAttrOfType<StringAttr>(
+            "helix.return_type.rejected"))
+        result.rejectedSpelling = rejected.getValue().str();
+    if (result.source == CTypeEvidenceSource::DebugInfo ||
+        result.source == CTypeEvidenceSource::User)
+        result.origin = readEvidenceOrigin(operation);
+    result.authority = evidenceAuthority(result.source, result.origin);
+    return result;
+}
 
 /// Parse "param_N" → N, or nullopt.
 static std::optional<unsigned> parseParamIndex(std::string_view name) {
@@ -1254,7 +1407,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             storage,
             stackOffset,
             /*initExpr=*/nullptr,
-            extractAddress(decl));
+            extractAddress(decl),
+            convertTypeEvidence(decl.getOperation()));
     });
 
     // ── Infer parameters (Win64 ABI) ────────────────────────────────────
@@ -1262,15 +1416,17 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         std::string typeStr;
         std::string rawName;
         std::optional<uint32_t> varId;
+        std::optional<CTypeEvidence> typeEvidence;
     };
     std::map<unsigned, ParamInfo> paramInfoByIndex;
 
     auto recordParam = [&](unsigned index, const std::string& typeStr,
                            const std::string& rawName,
-                           std::optional<uint32_t> varId) {
+                           std::optional<uint32_t> varId,
+                           std::optional<CTypeEvidence> typeEvidence = std::nullopt) {
         auto [it, inserted] =
             paramInfoByIndex.try_emplace(
-                index, ParamInfo{typeStr, rawName, varId});
+                index, ParamInfo{typeStr, rawName, varId, typeEvidence});
         if (!inserted) {
             if (it->second.typeStr == "int64_t" && typeStr != "int64_t")
                 it->second.typeStr = typeStr;
@@ -1278,6 +1434,12 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
                 it->second.rawName = rawName;
             if (!it->second.varId && varId)
                 it->second.varId = varId;
+            if (typeEvidence &&
+                (!it->second.typeEvidence ||
+                 typeEvidence->strength > it->second.typeEvidence->strength ||
+                 typeEvidence->state == CTypeEvidenceState::SelectedWithConflict)) {
+                it->second.typeEvidence = std::move(typeEvidence);
+            }
         }
     };
 
@@ -1319,7 +1481,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
                         "helix.inferred_type")) {
                     typeName = inferred.getValue().str();
                 }
-                recordParam(sourceIndex, typeName, displayName, varId);
+                recordParam(sourceIndex, typeName, displayName, varId,
+                            convertTypeEvidence(metadata, op));
                 functionArguments_[entry.getArgument(i)] = MaterializedValue{
                     varId, identityName, cTypeFromString(typeName)};
             }
@@ -1346,7 +1509,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
                 displayName = debugName.getValue().str();
                 nameAliases_[identityName] = displayName;
             }
-            recordParam(*index, paramType, displayName, decl.getVarId());
+            recordParam(*index, paramType, displayName, decl.getVarId(),
+                        convertTypeEvidence(decl.getOperation()));
         }
     });
 
@@ -1354,7 +1518,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     op->walk([&](helix::high::VarRefOp ref) {
         if (auto index = parseParamIndex(ref.getVarName().str()))
             recordParam(*index, "int64_t", ref.getVarName().str(),
-                        ref.getVarId());
+                        ref.getVarId(), convertTypeEvidence(ref.getOperation()));
     });
 
     // param_1 -> this heuristic: if param_1 used >= 3 times as struct base
@@ -1398,7 +1562,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             declaredPointerTypes_[*info.varId] = paramType;
 
         params.emplace_back(paramName, paramType, index,
-                            /*address=*/0, info.varId);
+                            /*address=*/0, info.varId, info.typeEvidence);
     }
 
     // ── Detect return value name ────────────────────────────────────────
@@ -1460,7 +1624,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         std::move(body),
         std::move(localVars),
         callingConv,
-        entryAddr);
+        entryAddr,
+        convertReturnTypeEvidence(op));
 
     // ── Confidence analysis ───────────────────────────────────────────
     // D4 (charter exit-metric 4): stamp the damning-honesty flag onto the decl
@@ -1589,10 +1754,15 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 
     // ─── Native scf.if -> C-AST (de-SSA at the source boundary) ────────
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        const bool hasElse = !ifOp.getElseRegion().empty();
         if (!ifOp.getThenRegion().hasOneBlock() ||
-            !ifOp.getElseRegion().hasOneBlock()) {
-            return std::make_unique<CCommentStmt>(
-                "unsupported multi-block scf.if", addr);
+            (hasElse && !ifOp.getElseRegion().hasOneBlock())) {
+            hasDamningHonestyDefect_ = true;
+            return std::make_unique<CExprStmt>(
+                std::make_unique<CCallExpr>(
+                    "__helix_unhandled_cf_scf_if", 0,
+                    std::vector<ExprPtr>{}, CType::voidTy(), addr),
+                addr);
         }
 
         std::vector<MaterializedValue> results;
@@ -1631,7 +1801,8 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
 
         auto condition = buildExpression(ifOp.getCondition());
         auto thenBody = buildArm(ifOp.getThenRegion());
-        auto elseBody = buildArm(ifOp.getElseRegion());
+        auto elseBody = hasElse ? buildArm(ifOp.getElseRegion())
+                                : std::vector<StmtPtr>{};
         return std::make_unique<CIfStmt>(
             std::move(condition), std::move(thenBody), std::move(elseBody),
             addr);
@@ -1643,8 +1814,12 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         for (Region& region : switchOp.getCaseRegions())
             supported &= region.hasOneBlock();
         if (!supported) {
-            return std::make_unique<CCommentStmt>(
-                "unsupported multi-block scf.index_switch", addr);
+            hasDamningHonestyDefect_ = true;
+            return std::make_unique<CExprStmt>(
+                std::make_unique<CCallExpr>(
+                    "__helix_unhandled_cf_scf_index_switch", 0,
+                    std::vector<ExprPtr>{}, CType::voidTy(), addr),
+                addr);
         }
 
         std::vector<MaterializedValue> results;
@@ -1702,8 +1877,12 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
     if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
         if (!whileOp.getBefore().hasOneBlock() ||
             !whileOp.getAfter().hasOneBlock()) {
-            return std::make_unique<CCommentStmt>(
-                "unsupported multi-block scf.while", addr);
+            hasDamningHonestyDefect_ = true;
+            return std::make_unique<CExprStmt>(
+                std::make_unique<CCallExpr>(
+                    "__helix_unhandled_cf_scf_while", 0,
+                    std::vector<ExprPtr>{}, CType::voidTy(), addr),
+                addr);
         }
         Block& before = whileOp.getBefore().front();
         Block& after = whileOp.getAfter().front();
@@ -1713,16 +1892,24 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
             after.getOperations().size() != 1 ||
             conditionOp.getArgs().size() != whileOp.getNumResults() ||
             afterYield.getNumOperands() != whileOp.getNumOperands()) {
-            return std::make_unique<CCommentStmt>(
-                "unsupported scf.while contract", addr);
+            hasDamningHonestyDefect_ = true;
+            return std::make_unique<CExprStmt>(
+                std::make_unique<CCallExpr>(
+                    "__helix_unhandled_cf_scf_while", 0,
+                    std::vector<ExprPtr>{}, CType::voidTy(), addr),
+                addr);
         }
 
         std::vector<unsigned> nextInputFromResult;
         for (Value value : afterYield.getOperands()) {
             auto argument = dyn_cast<BlockArgument>(value);
             if (!argument || argument.getOwner() != &after) {
-                return std::make_unique<CCommentStmt>(
-                    "unsupported scf.while after mapping", addr);
+                hasDamningHonestyDefect_ = true;
+                return std::make_unique<CExprStmt>(
+                    std::make_unique<CCallExpr>(
+                        "__helix_unhandled_cf_scf_while", 0,
+                        std::vector<ExprPtr>{}, CType::voidTy(), addr),
+                    addr);
             }
             nextInputFromResult.push_back(argument.getArgNumber());
         }
@@ -3817,8 +4004,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.udiv ──────────────────────────────────────────────────────
     if (auto udivOp = dyn_cast<LLVM::UDivOp>(defOp)) {
-        auto lhs = buildExpression(udivOp.getLhs());
-        auto rhs = buildExpression(udivOp.getRhs());
+        auto lhs = castForOrderedComparison(
+            buildExpression(udivOp.getLhs()), udivOp.getLhs().getType(),
+            /*isSigned=*/false, addr);
+        auto rhs = castForOrderedComparison(
+            buildExpression(udivOp.getRhs()), udivOp.getRhs().getType(),
+            /*isSigned=*/false, addr);
         return std::make_unique<CBinaryExpr>(
             BinaryOp::Div, std::move(lhs), std::move(rhs),
             convertType(val.getType()), addr);
@@ -3826,8 +4017,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.sdiv ─────────────────────────────────────────────────────
     if (auto sdivOp = dyn_cast<LLVM::SDivOp>(defOp)) {
-        auto lhs = buildExpression(sdivOp.getLhs());
-        auto rhs = buildExpression(sdivOp.getRhs());
+        auto lhs = castForOrderedComparison(
+            buildExpression(sdivOp.getLhs()), sdivOp.getLhs().getType(),
+            /*isSigned=*/true, addr);
+        auto rhs = castForOrderedComparison(
+            buildExpression(sdivOp.getRhs()), sdivOp.getRhs().getType(),
+            /*isSigned=*/true, addr);
         return std::make_unique<CBinaryExpr>(
             BinaryOp::Div, std::move(lhs), std::move(rhs),
             convertType(val.getType()), addr);
@@ -3835,8 +4030,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.urem ─────────────────────────────────────────────────────
     if (auto uremOp = dyn_cast<LLVM::URemOp>(defOp)) {
-        auto lhs = buildExpression(uremOp.getLhs());
-        auto rhs = buildExpression(uremOp.getRhs());
+        auto lhs = castForOrderedComparison(
+            buildExpression(uremOp.getLhs()), uremOp.getLhs().getType(),
+            /*isSigned=*/false, addr);
+        auto rhs = castForOrderedComparison(
+            buildExpression(uremOp.getRhs()), uremOp.getRhs().getType(),
+            /*isSigned=*/false, addr);
         return std::make_unique<CBinaryExpr>(
             BinaryOp::Mod, std::move(lhs), std::move(rhs),
             convertType(val.getType()), addr);
@@ -3844,8 +4043,12 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
 
     // ─── llvm.srem ─────────────────────────────────────────────────────
     if (auto sremOp = dyn_cast<LLVM::SRemOp>(defOp)) {
-        auto lhs = buildExpression(sremOp.getLhs());
-        auto rhs = buildExpression(sremOp.getRhs());
+        auto lhs = castForOrderedComparison(
+            buildExpression(sremOp.getLhs()), sremOp.getLhs().getType(),
+            /*isSigned=*/true, addr);
+        auto rhs = castForOrderedComparison(
+            buildExpression(sremOp.getRhs()), sremOp.getRhs().getType(),
+            /*isSigned=*/true, addr);
         return std::make_unique<CBinaryExpr>(
             BinaryOp::Mod, std::move(lhs), std::move(rhs),
             convertType(val.getType()), addr);
@@ -3909,7 +4112,24 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     if (auto icmp = dyn_cast<LLVM::ICmpOp>(defOp)) {
         auto lhs = buildExpression(icmp.getLhs());
         auto rhs = buildExpression(icmp.getRhs());
-        auto cmpOp = mapLLVMICmpPred(icmp.getPredicate());
+        auto pred = icmp.getPredicate();
+        const bool isSignedOrdered =
+            (pred == LLVM::ICmpPredicate::slt ||
+             pred == LLVM::ICmpPredicate::sle ||
+             pred == LLVM::ICmpPredicate::sgt ||
+             pred == LLVM::ICmpPredicate::sge);
+        const bool isUnsignedOrdered =
+            (pred == LLVM::ICmpPredicate::ult ||
+             pred == LLVM::ICmpPredicate::ule ||
+             pred == LLVM::ICmpPredicate::ugt ||
+             pred == LLVM::ICmpPredicate::uge);
+        if (isSignedOrdered || isUnsignedOrdered) {
+            lhs = castForOrderedComparison(
+                std::move(lhs), icmp.getLhs().getType(), isSignedOrdered, addr);
+            rhs = castForOrderedComparison(
+                std::move(rhs), icmp.getRhs().getType(), isSignedOrdered, addr);
+        }
+        auto cmpOp = mapLLVMICmpPred(pred);
         return std::make_unique<CBinaryExpr>(
             cmpOp, std::move(lhs), std::move(rhs),
             CType::boolTy(), addr);
@@ -4166,16 +4386,43 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.gep ──────────────────────────────────────────────────────
     if (auto gep = dyn_cast<LLVM::GEPOp>(defOp)) {
         auto base = buildExpression(gep.getBase());
-        auto dynIndices = gep.getDynamicIndices();
-        if (dynIndices.empty())
+        auto indices = gep.getIndices();
+        if (indices.empty())
             return base;
-        // Simplified: base + sum of indices
+        uint64_t elemBytes = 1;
+        if (Type elemTy = gep.getElemType()) {
+            if (auto intTy = dyn_cast<IntegerType>(elemTy))
+                elemBytes = std::max<uint64_t>(1, intTy.getWidth() / 8);
+            else if (auto fltTy = dyn_cast<FloatType>(elemTy))
+                elemBytes = std::max<uint64_t>(1, fltTy.getWidth() / 8);
+            else if (isa<LLVM::LLVMPointerType>(elemTy))
+                elemBytes = 8;
+        }
         ExprPtr result = std::move(base);
-        for (auto idx : dynIndices) {
-            auto indexExpr = buildExpression(idx);
-            result = std::make_unique<CBinaryExpr>(
-                BinaryOp::Add, std::move(result), std::move(indexExpr),
-                convertType(val.getType()), addr);
+        auto resultTy = convertType(val.getType());
+        for (auto gepArg : indices) {
+            ExprPtr offsetExpr;
+            if (auto attr = dyn_cast<IntegerAttr>(gepArg)) {
+                int64_t byteOff = attr.getInt() * static_cast<int64_t>(elemBytes);
+                if (byteOff == 0)
+                    continue;
+                offsetExpr = std::make_unique<CIntLitExpr>(
+                    byteOff, CType::int64(), addr);
+            } else if (auto dynVal = dyn_cast<Value>(gepArg)) {
+                offsetExpr = buildExpression(dynVal);
+                if (elemBytes > 1 && offsetExpr) {
+                    offsetExpr = std::make_unique<CBinaryExpr>(
+                        BinaryOp::Mul, std::move(offsetExpr),
+                        std::make_unique<CIntLitExpr>(
+                            static_cast<int64_t>(elemBytes), CType::int64(), addr),
+                        CType::int64(), addr);
+                }
+            }
+            if (offsetExpr) {
+                result = std::make_unique<CBinaryExpr>(
+                    BinaryOp::Add, std::move(result), std::move(offsetExpr),
+                    resultTy, addr);
+            }
         }
         return result;
     }
@@ -5496,7 +5743,9 @@ void analyzeStmt(const CStmt* s,
 
             if (plainSelfAssign || selfOrAnd || opZero) {
                 g.identityNoOp++;
-            } else if (!canonicalIncDec && rhsRefs &&
+            // Plain `x = x + y` is a valid destructive update. A compound
+            // operator already reads x implicitly, so `x += x - y` repeats it.
+            } else if (!canonicalIncDec && !assign->compoundOp.empty() && rhsRefs &&
                        !helix::cast::detail::isConditionalPreserveUpdate(
                            assign->value.get(), targetName)) {
                 // Not exact identity, but the RHS still references the same

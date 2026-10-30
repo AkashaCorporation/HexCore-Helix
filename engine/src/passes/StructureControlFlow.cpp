@@ -105,6 +105,9 @@ namespace {
 // adapted so createUnreachableTerminator works on a helix_low.func.
 class HelixSCFInterface : public mlir::CFGToSCFInterface {
 public:
+    explicit HelixSCFInterface(bool forceStructuredTerminatorFailure = false)
+        : forceStructuredTerminatorFailure_(forceStructuredTerminatorFailure) {}
+
     mlir::FailureOr<mlir::Operation*> createStructuredBranchRegionOp(
         mlir::OpBuilder& builder, mlir::Operation* controlFlowCondOp,
         mlir::TypeRange resultTypes,
@@ -143,6 +146,12 @@ public:
     mlir::LogicalResult createStructuredBranchRegionTerminatorOp(
         mlir::Location loc, mlir::OpBuilder& builder, mlir::Operation*,
         mlir::Operation*, mlir::ValueRange results) override {
+        // Deterministic negative control for CORE-09. Fail after the upstream
+        // transform has moved the conditional regions into their structured
+        // owner, so the caller observes a real partial-mutation failure while
+        // avoiding malformed input or a destructor assert inside MLIR itself.
+        if (forceStructuredTerminatorFailure_)
+            return mlir::failure();
         builder.create<mlir::scf::YieldOp>(loc, results);
         return mlir::success();
     }
@@ -203,6 +212,9 @@ public:
         return builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{})
             .getOperation();
     }
+
+private:
+    bool forceStructuredTerminatorFailure_ = false;
 };
 
 // [M1] Bridge scf.* -> helix_high.*, de-SSA'ing region results into variables so
@@ -911,8 +923,8 @@ static LogicalResult eraseUnreachableBlocksSafely(
 }
 
 // Run the spike on one HelixLow function: convert jmp/jcc -> cf, then lift to scf.
-static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
-                                      bool bridgeToHigh) {
+static mlir::LogicalResult runSCFSpikeInPlace(helix::low::FuncOp func,
+                                             bool bridgeToHigh) {
     if (func.getBody().empty())
         return mlir::success();
 
@@ -1076,7 +1088,8 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
                      func.getSymName().str().c_str());
         std::fflush(stderr);
     }
-    HelixSCFInterface iface;
+    HelixSCFInterface iface(
+        func->hasAttr("helix.scf.force_transform_failure"));
     auto changed = mlir::transformCFGToSCF(func.getBody(), iface, domInfo);
     if (helix::scfDebugEnabled()) {
         std::fprintf(stderr, "[SCF-SPIKE] %s: stage=after-transformCFGToSCF\n",
@@ -1084,6 +1097,11 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
         std::fflush(stderr);
     }
 
+    if (mlir::failed(changed)) {
+        std::fprintf(stderr, "[SCF-SPIKE] transformCFGToSCF FAILED on %s\n",
+                     func.getSymName().str().c_str());
+        return mlir::failure();
+    }
     if (bridgeToHigh) {
         bridgeSCFToHelixHigh(func);
         if (helix::scfDebugEnabled()) {
@@ -1091,11 +1109,6 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
                          func.getSymName().str().c_str());
             std::fflush(stderr);
         }
-    }
-    if (mlir::failed(changed)) {
-        std::fprintf(stderr, "[SCF-SPIKE] transformCFGToSCF FAILED on %s\n",
-                     func.getSymName().str().c_str());
-        return mlir::failure();
     }
     if (helix::scfDebugEnabled()) {
         std::fprintf(stderr, "[SCF-SPIKE] OK on %s (changed=%d)\n",
@@ -1110,6 +1123,34 @@ static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
         if (!ec)
             func.print(os);
     }
+    return mlir::success();
+}
+
+// transformCFGToSCF documents the input region as unspecified after failure.
+// Run the complete normalization/transform/bridge attempt on a detached clone
+// and commit only a successful result. This keeps the original function valid
+// and byte-stable on every failure path, including callbacks that fail after
+// the upstream transform has already mutated part of the trial region.
+static mlir::LogicalResult runSCFSpike(helix::low::FuncOp func,
+                                      bool bridgeToHigh) {
+    mlir::Operation* trialOperation = func->clone();
+    auto trial = mlir::cast<helix::low::FuncOp>(trialOperation);
+    auto destroyDetachedTrial = [](mlir::Operation* operation) {
+        // A failed CFGToSCF attempt may leave cyclic or dangling SSA uses in
+        // the unspecified trial IR. Break both value and CFG references before
+        // invoking normal MLIR destruction, which asserts that uses are empty.
+        operation->dropAllDefinedValueUses();
+        operation->dropAllReferences();
+        operation->destroy();
+    };
+    if (mlir::failed(runSCFSpikeInPlace(trial, bridgeToHigh))) {
+        destroyDetachedTrial(trialOperation);
+        return mlir::failure();
+    }
+
+    func->setAttrs(trialOperation->getAttrs());
+    func.getBody().takeBody(trial.getBody());
+    destroyDetachedTrial(trialOperation);
     return mlir::success();
 }
 

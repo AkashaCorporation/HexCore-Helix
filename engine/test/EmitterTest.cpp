@@ -3,10 +3,12 @@
 
 #include "helix/emit/PseudoCEmitter.h"
 #include "helix/emit/FlatBufSerializer.h"
+#include "helix/Engine.h"
 #include "helix/cast/CAstOptimizer.h"
 #include "helix/cast/CAstPrinter.h"
 #include "helix/cast/CDecl.h"
 #include "helix/cast/DamningDefect.h"
+#include "helix/cast/SelfRefWitness.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,11 @@ using namespace helix;
 namespace {
 
 using namespace helix::cast;
+
+TEST(EngineVersionContractTest, UsesReleaseVersionAuthority) {
+    EXPECT_STREQ(Engine::version(), HELIX_VERSION_STRING);
+    EXPECT_STRNE(Engine::version(), "0.0.0-dev");
+}
 
 ExprPtr makeVar(std::string name) {
     return std::make_unique<CVarRefExpr>(
@@ -99,6 +106,100 @@ std::optional<size_t> rootTable(const std::vector<uint8_t>& buffer) {
 }
 
 } // namespace
+
+TEST(CAstOptimizerTest, SmallSemanticReturnIsNotClassifiedAsStub) {
+    using namespace helix::cast;
+    CFuncDecl func("tiny_leaf", 0x140001037, CType::int64());
+    func.params.emplace_back("param_1", CType::int64(), 0);
+    func.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CBinaryExpr>(
+            BinaryOp::Add, makeVar("param_1"), makeInt(7), CType::int64())));
+
+    CAstOptimizer().reanalyzeConfidence(func);
+
+    EXPECT_GT(func.confidenceScore, 90.0);
+    EXPECT_TRUE(std::none_of(
+        func.confidenceIssues.begin(), func.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("stub function") != std::string::npos ||
+                   issue.find("very short function") != std::string::npos;
+        }));
+
+    const std::string source = CAstPrinter().print(func);
+    EXPECT_NE(source.find(
+        "[translation/structuring axis only]"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, BareReturnRemainsAnEmptyStubDefect) {
+    using namespace helix::cast;
+    CFuncDecl func("empty_leaf", 0x140001000, CType::voidTy());
+    func.body.push_back(std::make_unique<CReturnStmt>());
+
+    CAstOptimizer().reanalyzeConfidence(func);
+
+    EXPECT_LE(func.confidenceScore, 50.0);
+    EXPECT_TRUE(std::any_of(
+        func.confidenceIssues.begin(), func.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("stub/empty body") != std::string::npos;
+        }));
+}
+
+TEST(CAstOptimizerTest, HonestResidualGotoIsNotPenalizedByShape) {
+    using namespace helix::cast;
+    CFuncDecl func("mixed_cfg", 0x140002000, CType::int64());
+    func.body.push_back(std::make_unique<CGotoStmt>("block_2"));
+    func.body.push_back(std::make_unique<CLabelStmt>("block_2"));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeInt(1)));
+
+    CAstOptimizer().reanalyzeConfidence(func);
+
+    EXPECT_GT(func.confidenceScore, 90.0);
+    EXPECT_TRUE(std::none_of(
+        func.confidenceIssues.begin(), func.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("goto(s)") != std::string::npos;
+        }));
+    EXPECT_NE(CAstPrinter().print(func).find("goto block_2;"),
+              std::string::npos);
+}
+
+TEST(CAstOptimizerTest, DroppedDanglingGotoCapsAndNamesCfgIntegrityLoss) {
+    using namespace helix::cast;
+    CFuncDecl func("broken_cfg", 0x140003000, CType::int64());
+    func.body.push_back(std::make_unique<CGotoStmt>("missing_target"));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeInt(1)));
+
+    CAstOptimizer optimizer;
+    optimizer.removeDanglingGotos(func);
+    optimizer.reanalyzeConfidence(func);
+
+    EXPECT_TRUE(func.droppedDanglingGoto);
+    EXPECT_LE(func.confidenceScore, 50.0);
+    EXPECT_TRUE(std::any_of(
+        func.confidenceIssues.begin(), func.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("dropped dangling goto; CFG integrity lost") !=
+                   std::string::npos;
+        }));
+}
+
+TEST(CAstOptimizerTest, RemovesSequentialCodeAfterProvenReturn) {
+    using namespace helix::cast;
+    CFuncDecl func("terminal_return", 0x140004000, CType::int64());
+    func.body.push_back(std::make_unique<CReturnStmt>(makeInt(7)));
+    func.body.push_back(std::make_unique<CExprStmt>(
+        std::make_unique<CCallExpr>(
+            "must_not_execute", 0x140004010, std::vector<ExprPtr>{},
+            CType::voidTy(), 0x140004010)));
+
+    CAstOptimizer().optimize(func);
+
+    ASSERT_EQ(func.body.size(), 1u);
+    const std::string source = CAstPrinter().print(func);
+    EXPECT_NE(source.find("return 7;"), std::string::npos);
+    EXPECT_EQ(source.find("must_not_execute"), std::string::npos);
+}
 
 TEST(FlatBufSerializerTest, VerifyEmpty) {
     EXPECT_FALSE(FlatBufSerializer::verify(nullptr, 0));
@@ -298,8 +399,8 @@ TEST(FlatBufSerializerTest, CanonicalContractIsExactAndDeterministic) {
     ASSERT_TRUE(major && minor && capabilities && producer && version &&
                 arch && pointerBits);
     EXPECT_EQ(*readScalar<uint16_t>(first, *major), 1);
-    EXPECT_EQ(*readScalar<uint16_t>(first, *minor), 1);
-    EXPECT_EQ(*readScalar<uint32_t>(first, *capabilities), 8u);
+    EXPECT_EQ(*readScalar<uint16_t>(first, *minor), 2);
+    EXPECT_EQ(*readScalar<uint32_t>(first, *capabilities), 9u);
     EXPECT_EQ(first[*arch], 3u);
     EXPECT_EQ(*readScalar<uint16_t>(first, *pointerBits), 64u);
 
@@ -395,6 +496,147 @@ TEST(FlatBufSerializerTest, CanonicalContractIsExactAndDeterministic) {
     ASSERT_TRUE(callNodeId && callTarget);
     EXPECT_EQ(*readScalar<uint64_t>(first, *callNodeId), 7u);
     EXPECT_EQ(*readScalar<uint64_t>(first, *callTarget), kCallTarget);
+}
+
+TEST(FlatBufSerializerTest, DeclarationTypeEvidenceIsExplicitAndDeterministic) {
+    CTypeEvidenceOrigin laterOrigin{
+        "z-provider", uint64_t(9), "target:z", std::string(64, 'f')};
+    CTypeEvidenceOrigin firstOrigin{
+        "a-provider", uint64_t(2), "target:a", std::string(64, '1')};
+
+    CTypeEvidence returnEvidence;
+    returnEvidence.source = CTypeEvidenceSource::DebugInfo;
+    returnEvidence.state = CTypeEvidenceState::Selected;
+    returnEvidence.authority = CTypeEvidenceAuthority::Authoritative;
+    returnEvidence.strength = 100;
+    returnEvidence.origin = laterOrigin;
+
+    CTypeEvidence parameterEvidence = returnEvidence;
+    parameterEvidence.origin = firstOrigin;
+
+    CTypeEvidence localEvidence;
+    localEvidence.source = CTypeEvidenceSource::Structural;
+    localEvidence.state = CTypeEvidenceState::SelectedWithConflict;
+    localEvidence.authority = CTypeEvidenceAuthority::Derived;
+    localEvidence.strength = 60;
+    localEvidence.rejectedSpelling = "uint64_t";
+
+    auto function = std::make_unique<CFuncDecl>(
+        "declaration_evidence", 0x401000, CType::int32());
+    function->returnTypeEvidence = returnEvidence;
+    function->params.emplace_back(
+        "input", CType::pointerTo(CType::structTy("Input")), 0,
+        0, uint32_t(0), parameterEvidence);
+    function->localVars.emplace_back(
+        7, "value", CType::int32(), StorageKind::Stack,
+        std::nullopt, nullptr, 0, localEvidence);
+    function->localVars.emplace_back(
+        8, "unreported_value", CType::int32(), StorageKind::Stack);
+    function->body.push_back(std::make_unique<CReturnStmt>(makeInt(0)));
+
+    std::vector<std::unique_ptr<CFuncDecl>> functions;
+    functions.push_back(std::move(function));
+    FlatBufSerializer serializer;
+    const auto first = serializer.serialize(
+        functions, "declaration_evidence", HELIX_ARCH_X86_64);
+    const auto second = serializer.serialize(
+        functions, "declaration_evidence", HELIX_ARCH_X86_64);
+    ASSERT_TRUE(FlatBufSerializer::verify(first.data(), first.size()));
+    EXPECT_EQ(first, second);
+
+    auto module = rootTable(first);
+    ASSERT_TRUE(module);
+    auto minor = tableField(first, *module, 14, sizeof(uint16_t));
+    auto capabilities = offsetField(first, *module, 16);
+    auto origins = offsetField(first, *module, 26);
+    ASSERT_TRUE(minor && capabilities && origins);
+    EXPECT_EQ(*readScalar<uint16_t>(first, *minor), 2u);
+    ASSERT_EQ(*readScalar<uint32_t>(first, *capabilities), 9u);
+    EXPECT_EQ(first[*capabilities + 4 + 8], 8u);
+    ASSERT_EQ(*readScalar<uint32_t>(first, *origins), 2u);
+
+    auto functionsVector = offsetField(first, *module, 6);
+    ASSERT_TRUE(functionsVector);
+    auto functionTable = vectorTableElement(first, *functionsVector, 0);
+    ASSERT_TRUE(functionTable);
+    auto returnEvidenceTable = offsetField(first, *functionTable, 24);
+    ASSERT_TRUE(returnEvidenceTable);
+    auto returnOrigin = tableField(
+        first, *returnEvidenceTable, 14, sizeof(uint32_t));
+    ASSERT_TRUE(returnOrigin);
+    EXPECT_EQ(*readScalar<uint32_t>(first, *returnOrigin), 1u)
+        << "z-provider must sort after a-provider";
+
+    auto params = offsetField(first, *functionTable, 10);
+    auto locals = offsetField(first, *functionTable, 12);
+    ASSERT_TRUE(params && locals);
+    auto parameter = vectorTableElement(first, *params, 0);
+    auto local = vectorTableElement(first, *locals, 0);
+    auto unreportedLocal = vectorTableElement(first, *locals, 1);
+    ASSERT_TRUE(parameter && local && unreportedLocal);
+    auto parameterEvidenceTable = offsetField(first, *parameter, 16);
+    auto localEvidenceTable = offsetField(first, *local, 16);
+    auto unreportedEvidenceTable = offsetField(first, *unreportedLocal, 16);
+    ASSERT_TRUE(parameterEvidenceTable && localEvidenceTable &&
+                unreportedEvidenceTable);
+    auto parameterOrigin = tableField(
+        first, *parameterEvidenceTable, 14, sizeof(uint32_t));
+    ASSERT_TRUE(parameterOrigin);
+    EXPECT_EQ(*readScalar<uint32_t>(first, *parameterOrigin), 0u);
+    auto localState = tableField(
+        first, *localEvidenceTable, 6, sizeof(uint8_t));
+    ASSERT_TRUE(localState);
+    EXPECT_EQ(first[*localState], 2u);
+    EXPECT_TRUE(offsetField(first, *localEvidenceTable, 12));
+    auto unreportedState = tableField(
+        first, *unreportedEvidenceTable, 6, sizeof(uint8_t));
+    EXPECT_TRUE(!unreportedState || first[*unreportedState] == 0u);
+    EXPECT_FALSE(tableField(
+        first, *unreportedEvidenceTable, 14, sizeof(uint32_t)));
+
+    if (const char* output = std::getenv("HELIX_HAST_V12_FIXTURE_OUT");
+        output && *output) {
+        const std::filesystem::path outputPath(output);
+        std::filesystem::create_directories(outputPath.parent_path());
+        std::ofstream stream(
+            outputPath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        stream.write(reinterpret_cast<const char*>(first.data()),
+                     static_cast<std::streamsize>(first.size()));
+        stream.close();
+        ASSERT_TRUE(stream.good());
+    }
+}
+
+TEST(TypeEvidenceContractTest, PresentationScoreDoesNotPromoteHeuristicEvidence) {
+    auto scoreWithParameter = [](CTypePtr parameterType,
+                                 std::optional<CTypeEvidence> evidence) {
+        CFuncDecl function("score_separation", 0x402000, CType::int64());
+        function.params.emplace_back(
+            "input", std::move(parameterType), 1, 0, uint32_t(1),
+            std::move(evidence));
+        function.localVars.emplace_back(
+            2, "placeholder", CType::int64(), StorageKind::Stack);
+        function.synthesizedVarNames.push_back("placeholder");
+        function.body.push_back(std::make_unique<CReturnStmt>(makeInt(0)));
+        CAstOptimizer().reanalyzeConfidence(function);
+        return function.confidenceScore;
+    };
+
+    CTypeEvidence heuristic;
+    heuristic.source = CTypeEvidenceSource::Legacy;
+    heuristic.state = CTypeEvidenceState::Selected;
+    heuristic.authority = CTypeEvidenceAuthority::Heuristic;
+    heuristic.strength = 30;
+
+    const double heuristicTypedScore = scoreWithParameter(
+        CType::pointerTo(CType::structTy("Input")), heuristic);
+    const double unreportedScore = scoreWithParameter(
+        CType::int64(), std::nullopt);
+    EXPECT_GT(heuristicTypedScore, unreportedScore)
+        << "Readable heuristic types may improve presentation only";
+    EXPECT_EQ(heuristic.authority, CTypeEvidenceAuthority::Heuristic)
+        << "Presentation scoring must not mutate semantic authority";
 }
 
 TEST(PseudoCEmitterHeuristicsTest, InfersWin64StackParameterIndices) {
@@ -530,6 +772,241 @@ TEST(CAstOptimizerTest, RemovesOnlyLiteralNullDerefSelfStores) {
     const std::string code = printer.print(func);
     EXPECT_EQ(code.find("(void*)0"), std::string::npos) << code;
     EXPECT_NE(code.find("*ptr"), std::string::npos) << code;
+}
+
+TEST(CAstOptimizerTest, LiteralNullMemoryAccessCapsConfidence) {
+    auto nullPointer = []() -> ExprPtr {
+        return std::make_unique<CCastExpr>(
+            CType::pointerTo(CType::int32()),
+            std::make_unique<CAddrLitExpr>(0));
+    };
+
+    CFuncDecl invalid("literal_null_store", 0x1000, CType::voidTy());
+    invalid.body.push_back(std::make_unique<CAssignStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref, nullPointer(), CType::int32()),
+        makeInt(7)));
+
+    auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.literalNullAccess);
+    EXPECT_EQ(defect.literalNullAccessCount, 1);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+    EXPECT_TRUE(std::any_of(
+        invalid.confidenceIssues.begin(), invalid.confidenceIssues.end(),
+        [](const std::string& issue) {
+            return issue.find("literal null memory access") != std::string::npos;
+        }));
+
+    CFuncDecl nullable("nullable_pointer_value", 0x2000, CType::voidTy());
+    nullable.localVars.emplace_back(
+        1, "ptr", CType::pointerTo(CType::int32()), StorageKind::Stack,
+        std::nullopt, nullPointer());
+    EXPECT_FALSE(detectDamningDefects(nullable).literalNullAccess);
+}
+
+TEST(CAstOptimizerTest, NullDerivedOffsetMemoryAccessCapsConfidence) {
+    using namespace helix::cast;
+
+    auto nullBase = std::make_unique<CCastExpr>(
+        CType::pointerTo(CType::int8()),
+        std::make_unique<CAddrLitExpr>(0));
+    auto lowAddress = std::make_unique<CBinaryExpr>(
+        BinaryOp::Add, std::move(nullBase),
+        std::make_unique<CIntLitExpr>(0x8A9, CType::int64()),
+        CType::pointerTo(CType::int8()));
+
+    CFuncDecl invalid("null_derived_load", 0x1000, CType::int8());
+    invalid.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref, std::move(lowAddress), CType::int8())));
+
+    auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.literalNullAccess);
+    EXPECT_EQ(defect.literalNullAccessCount, 1);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+
+    CFuncDecl nullableOffset(
+        "nullable_offset_value", 0x2000, CType::pointerTo(CType::int8()));
+    nullableOffset.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CBinaryExpr>(
+            BinaryOp::Add,
+            std::make_unique<CCastExpr>(
+                CType::pointerTo(CType::int8()),
+                std::make_unique<CAddrLitExpr>(0)),
+            std::make_unique<CIntLitExpr>(0x20, CType::int64()),
+            CType::pointerTo(CType::int8()))));
+    EXPECT_FALSE(detectDamningDefects(nullableOffset).literalNullAccess);
+}
+
+TEST(CAstOptimizerTest, DefinitelyZeroLocalMemoryAccessCapsConfidence) {
+    using namespace helix::cast;
+
+    CFuncDecl invalid("zero_local_store", 0x3000, CType::voidTy());
+    invalid.localVars.emplace_back(
+        1, "base", CType::int64(), StorageKind::Temporary,
+        std::nullopt, makeInt(0));
+    auto offset = std::make_unique<CBinaryExpr>(
+        BinaryOp::Add, makeVar("base"), makeInt(56), CType::int64());
+    auto pointer = std::make_unique<CCastExpr>(
+        CType::pointerTo(CType::int64()), std::move(offset));
+    invalid.body.push_back(std::make_unique<CAssignStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref, std::move(pointer), CType::int64()),
+        makeInt(7)));
+
+    const auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.literalNullAccess);
+    EXPECT_EQ(defect.literalNullAccessCount, 1);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+
+    CFuncDecl pointerParam("pointer_param", 0x4000, CType::int64());
+    pointerParam.params.emplace_back(
+        "ptr", CType::pointerTo(CType::int64()), 0);
+    pointerParam.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref,
+            std::make_unique<CVarRefExpr>(
+                0, "ptr", CType::pointerTo(CType::int64())),
+            CType::int64())));
+    EXPECT_FALSE(detectDamningDefects(pointerParam).literalNullAccess);
+
+    CFuncDecl laterReassigned("zero_then_reassigned", 0x4100, CType::voidTy());
+    laterReassigned.localVars.emplace_back(
+        2, "base", CType::int64(), StorageKind::Temporary,
+        std::nullopt, makeInt(0));
+    laterReassigned.body.push_back(std::make_unique<CAssignStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref,
+            std::make_unique<CCastExpr>(
+                CType::pointerTo(CType::int64()),
+                std::make_unique<CBinaryExpr>(
+                    BinaryOp::Add, makeVar("base"), makeInt(48),
+                    CType::int64())),
+            CType::int64()),
+        makeInt(1)));
+    laterReassigned.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("base"), makeInt(0x1000)));
+    EXPECT_TRUE(detectDamningDefects(laterReassigned).literalNullAccess);
+
+    CFuncDecl reassignedFirst("reassigned_before_access", 0x4200, CType::voidTy());
+    reassignedFirst.localVars.emplace_back(
+        3, "base", CType::int64(), StorageKind::Temporary,
+        std::nullopt, makeInt(0));
+    reassignedFirst.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("base"), makeInt(0x1000)));
+    reassignedFirst.body.push_back(std::make_unique<CExprStmt>(
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref,
+            std::make_unique<CCastExpr>(
+                CType::pointerTo(CType::int64()), makeVar("base")),
+            CType::int64())));
+    EXPECT_FALSE(detectDamningDefects(reassignedFirst).literalNullAccess);
+}
+
+TEST(CAstOptimizerTest, ScalarIntegerSubscriptCapsConfidence) {
+    using namespace helix::cast;
+
+    CFuncDecl invalid("scalar_subscript", 0x5000, CType::int64());
+    invalid.localVars.emplace_back(
+        1, "value", CType::int64(), StorageKind::Temporary,
+        std::nullopt, makeInt(9));
+    invalid.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CSubscriptExpr>(
+            makeVar("value"), makeInt(1), CType::int64())));
+
+    const auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.scalarSubscript);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+
+    CFuncDecl pointerBase("pointer_subscript", 0x6000, CType::int64());
+    pointerBase.params.emplace_back(
+        "values", CType::pointerTo(CType::int64()), 0);
+    pointerBase.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CSubscriptExpr>(
+            std::make_unique<CVarRefExpr>(
+                0, "values", CType::pointerTo(CType::int64())),
+            makeInt(1), CType::int64())));
+    EXPECT_FALSE(detectDamningDefects(pointerBase).scalarSubscript);
+}
+
+TEST(CAstOptimizerTest, UndefinedConstantShiftCapsConfidence) {
+    using namespace helix::cast;
+
+    CFuncDecl invalid("shift_by_width", 0x7000, CType::uint64());
+    invalid.params.emplace_back("value", CType::uint64(), 0);
+    invalid.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CBinaryExpr>(
+            BinaryOp::Shr,
+            std::make_unique<CVarRefExpr>(0, "value", CType::uint64()),
+            makeInt(64), CType::uint64())));
+
+    const auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.invalidShiftCount);
+    EXPECT_EQ(defect.invalidShiftCountOccurrences, 1);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+
+    CFuncDecl valid("shift_within_width", 0x7100, CType::uint64());
+    valid.params.emplace_back("value", CType::uint64(), 0);
+    valid.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CBinaryExpr>(
+            BinaryOp::Shl,
+            std::make_unique<CVarRefExpr>(0, "value", CType::uint64()),
+            makeInt(63), CType::uint64())));
+    EXPECT_FALSE(detectDamningDefects(valid).invalidShiftCount);
+
+    CFuncDecl promoted("promoted_narrow_shift", 0x7200, CType::int32());
+    promoted.params.emplace_back("value", CType::int8(), 0);
+    promoted.body.push_back(std::make_unique<CReturnStmt>(
+        std::make_unique<CBinaryExpr>(
+            BinaryOp::Shl,
+            std::make_unique<CVarRefExpr>(0, "value", CType::int8()),
+            makeInt(8), CType::int32())));
+    EXPECT_FALSE(detectDamningDefects(promoted).invalidShiftCount);
+}
+
+TEST(CAstOptimizerTest, InvalidPointerScalarOperationsCapConfidence) {
+    using namespace helix::cast;
+
+    auto pointer = []() -> ExprPtr {
+        return std::make_unique<CVarRefExpr>(
+            1, "ptr", CType::pointerTo(CType::int64()));
+    };
+
+    CFuncDecl invalid("pointer_as_integer", 0x7300, CType::voidTy());
+    invalid.localVars.emplace_back(
+        1, "ptr", CType::pointerTo(CType::int64()), StorageKind::Temporary,
+        std::nullopt,
+        std::make_unique<CCastExpr>(
+            CType::pointerTo(CType::int64()), makeInt(0)));
+    invalid.body.push_back(std::make_unique<CAssignStmt>(
+        pointer(), makeInt(100)));
+    invalid.body.push_back(std::make_unique<CAssignStmt>(
+        pointer(), pointer(), "*="));
+
+    const auto defect = detectDamningDefects(invalid);
+    EXPECT_TRUE(defect.invalidPointerOperation);
+    EXPECT_GE(defect.invalidPointerOperationCount, 2);
+    CAstOptimizer().reanalyzeConfidence(invalid);
+    EXPECT_LE(invalid.confidenceScore, 50.0);
+
+    CFuncDecl valid("valid_pointer_arithmetic", 0x7400, CType::voidTy());
+    valid.localVars.emplace_back(
+        1, "ptr", CType::pointerTo(CType::int64()), StorageKind::Temporary,
+        std::nullopt,
+        std::make_unique<CCastExpr>(
+            CType::pointerTo(CType::int64()), makeInt(0)));
+    valid.body.push_back(std::make_unique<CAssignStmt>(
+        pointer(), makeInt(0)));
+    valid.body.push_back(std::make_unique<CAssignStmt>(
+        pointer(), makeInt(1), "+="));
+    valid.body.push_back(std::make_unique<CAssignStmt>(
+        pointer(), nullptr, "--"));
+    EXPECT_FALSE(detectDamningDefects(valid).invalidPointerOperation);
 }
 
 TEST(CAstOptimizerTest, PreservesConstantZeroComparisonOperands) {
@@ -1633,7 +2110,7 @@ TEST(CAstOptimizerTest, ConditionalPreserveUpdateIsNotSuspiciousSelfReference) {
     }
 }
 
-TEST(CAstOptimizerTest, ConditionalSelfDependentReplacementRemainsSuspicious) {
+TEST(CAstOptimizerTest, PlainConditionalSelfDependentReplacementIsCanonical) {
     for (unsigned shape = 0; shape < 3; ++shape) {
         CFuncDecl func("conditional_self_dependency", 0x1000, CType::int64());
         func.params.emplace_back("condition", CType::boolTy(), 0);
@@ -1656,8 +2133,7 @@ TEST(CAstOptimizerTest, ConditionalSelfDependentReplacementRemainsSuspicious) {
                 makeVar("value"), CType::int64())));
         func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
         CAstOptimizer().reanalyzeConfidence(func);
-        EXPECT_EQ(func.suspiciousSelfReferences, 1u) << shape;
-        EXPECT_LE(func.confidenceScore, 95.0) << shape;
+        EXPECT_EQ(func.suspiciousSelfReferences, 0u) << shape;
     }
 }
 
@@ -1687,6 +2163,76 @@ TEST(CAstOptimizerTest, CanonicalIncrementDecrementIsNotSuspiciousSelfReference)
     dependent.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
     CAstOptimizer().reanalyzeConfidence(dependent);
     EXPECT_EQ(dependent.suspiciousSelfReferences, 1u);
+}
+
+TEST(CAstOptimizerTest, PlainDestructiveUpdatesAreNotSuspiciousSelfReferences) {
+    CFuncDecl func("canonical_destructive_updates", 0x1000, CType::int64());
+    func.localVars.emplace_back(
+        1, "value", CType::int64(), StorageKind::Stack,
+        std::nullopt, makeInt(3));
+    func.localVars.emplace_back(
+        2, "delta", CType::int64(), StorageKind::Stack,
+        std::nullopt, makeInt(4));
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"), std::make_unique<CBinaryExpr>(
+            BinaryOp::Add, makeVar("value"), makeVar("delta"), CType::int64())));
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"), std::make_unique<CBinaryExpr>(
+            BinaryOp::Mul, makeVar("value"), makeVar("value"), CType::int64())));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
+
+    CAstOptimizer().reanalyzeConfidence(func);
+    EXPECT_EQ(func.suspiciousSelfReferences, 0u);
+    EXPECT_TRUE(collectSelfRefObservations(func).empty());
+}
+
+TEST(CAstOptimizerTest, SelfReferenceWitnessesPreservePrePostStructuralInterval) {
+    CFuncDecl func("witnessed_self_reference", 0x401000, CType::int64());
+    func.params.emplace_back("condition", CType::boolTy(), 0);
+    func.params.emplace_back("value", CType::int64(), 1);
+    auto value = std::make_unique<CBinaryExpr>(
+        BinaryOp::Sub, makeVar("value"), makeInt(16),
+        CType::int64(), 0x401010);
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"), std::move(value), "+=", 0x401010));
+    func.body.push_back(std::make_unique<CReturnStmt>(makeVar("value")));
+
+    auto before = collectSelfRefObservations(func);
+    ASSERT_EQ(before.size(), 1u);
+    EXPECT_EQ(before[0].sourceAddress, 0x401010u);
+    EXPECT_EQ(before[0].targetName, "value");
+
+    CAstOptimizer().reanalyzeConfidence(func);
+    auto after = collectSelfRefObservations(func);
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].matchKey(), before[0].matchKey());
+
+    const auto reportPath = std::filesystem::temp_directory_path() /
+        "helix-self-ref-witness-test.json";
+    std::string error;
+    ASSERT_TRUE(writeSelfRefWitnessReport(reportPath, {{
+        .functionEntry = func.entryAddr,
+        .functionName = func.name,
+        .beforeOptimizer = std::move(before),
+        .afterOptimizer = std::move(after),
+    }}, error)) << error;
+    const std::string report = [&] {
+        std::ifstream input(reportPath, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    }();
+    std::filesystem::remove(reportPath);
+    EXPECT_NE(report.find("before_c_ast_optimizer"), std::string::npos);
+    EXPECT_NE(report.find("not-collected"), std::string::npos);
+}
+
+TEST(CAstOptimizerTest, SelfReferenceWitnessesExcludePointerWalks) {
+    CFuncDecl func("pointer_walk", 0x402000, CType::int64());
+    func.body.push_back(std::make_unique<CAssignStmt>(
+        makeVar("value"),
+        std::make_unique<CUnaryExpr>(
+            UnaryOp::Deref, makeVar("value"), CType::int64(), 0x402010),
+        "", 0x402010));
+    EXPECT_TRUE(collectSelfRefObservations(func).empty());
 }
 
 TEST(CAstOptimizerTest, SynthesizedPlaceholderIssueListsDeterministicNames) {
