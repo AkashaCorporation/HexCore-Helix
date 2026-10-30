@@ -2,13 +2,13 @@
 
 Date: 2026-10-30
 
-Status: SOURCE-QUALIFIED / LOCAL-COMMITS-READY
+Status: SOURCE-QUALIFIED / PR-19-RELEASE-CANDIDATE
 
 ## Base and method
 
 - Official base and RC.2 tag: `585606d0609062ab705f495e733399c747109551`.
-- Qualified engine commit: `0a60fb72140a82fcf666bc79c97e29c3d44ca583`.
-- Qualified engine tree: `af0baa87475f492366c41ea135555720defa88a8`.
+- Qualified implementation commit: `6e4d830d8726538833ae5e9ee535628840a35981`.
+- Qualified engine tree: `54da92a26cd717d5c4479d3011ab1d0d575bcdda`.
 - Local development history was unrelated to the official Git history, so it
   was not merged or force-pushed.
 - Forty-one code/build/schema files were copied by the named
@@ -35,6 +35,7 @@ Status: SOURCE-QUALIFIED / LOCAL-COMMITS-READY
 
 - Offline release build succeeded against the exact library above.
 - Workspace tests: 192 PASS, 0 FAIL; two documentation examples ignored.
+- Strict Clippy and rustfmt gates pass.
 - Final RC.3 Windows addon SHA-256:
   `e4cf25f9bd3dc99555fad7abbaa89de03b8de4f7f70d6e0e1058009138053231`.
 - Addon size: 15,417,856 bytes.
@@ -42,6 +43,20 @@ Status: SOURCE-QUALIFIED / LOCAL-COMMITS-READY
 The addon reports `helix-js=0.9.4-rc.3 native=0.9.4-rc.3`. Its local hash is
 qualification evidence; the published workflow asset receives its own recorded
 hash before HexCore updates the Function Atlas lock.
+
+### Remote CI closure
+
+PR [#19](https://github.com/AkashaCorporation/HexCore-Helix/pull/19) exposed and
+repaired three release-infrastructure defects before merge:
+
+- Linux no longer mixes static LLVM component archives with the monolithic
+  LLVM shared library used transitively by the distro MLIR package;
+- the Rust workspace satisfies check, tests, strict Clippy and rustfmt;
+- the NAPI job stages exactly one discovered `.node` under the canonical name
+  consumed by `index.js`, failing closed on zero or multiple candidates.
+
+All PR checks remain release-blocking. The branch must not merge or publish
+while any C++, Rust or NAPI gate is pending or failed.
 
 ## Semantic controls
 
@@ -71,10 +86,10 @@ Windows N-API binary.
 
 ## Remaining authorized sequence
 
-1. After separate push authorization, push the branch and merge/fast-forward
-   official main without rewriting history.
-2. After separate publication authorization, create the prerelease, upload the
-   source-bound dependency ZIP, trigger Windows prebuilds and verify the node.
+1. Merge PR #19 without rewriting official history after all checks pass.
+2. Regenerate the source-bound dependency ZIP from the merged commit.
+3. Create prerelease `v0.9.4-rc.3`, upload the dependency ZIP, trigger Windows
+   prebuilds and record the official node hash before updating HexCore.
 
-Local allowlisted commits were created. No push, tag, release or asset upload
-was performed by this checkpoint.
+The release branch and PR exist. No tag, release or asset upload had been
+performed when this checkpoint was written.
