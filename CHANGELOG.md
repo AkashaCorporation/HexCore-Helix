@@ -2,7 +2,23 @@
 
 All notable changes to HexCore Helix are documented here.
 
-## [0.9.4-rc.2] - Unreleased
+## [0.9.4-rc.3] - Unreleased
+
+- Reconcile the latest qualified engine source onto the official RC.2 Git
+  history through an explicit 41-file code/build/schema allowlist. Generated
+  corpora, dumps, caches and scratch build files remain excluded.
+- Preserve transactional CFG-to-SCF failure, honest residual goto, exact entry
+  identity, canonical HAST 1.2 type provenance and one-pass pseudo-C/HAST
+  production across the official source line.
+- Expand final-AST honesty gates for scalar subscripts, ordered zero-derived
+  memory access, invalid constant shift widths and forbidden pointer/scalar
+  operations. Demonstrably invalid output is capped rather than presented at
+  High confidence.
+- Qualify the official-history source with 412 native PASS / 1 optional SKIP,
+  192 Rust PASS and Windows N-API controls for clean, baseline and obfuscated
+  functions.
+
+## [0.9.4-rc.2] - 2026-09-23
 
 - Reconcile the post-RC.1 semantic fixes from the validated v2 development
   tree while retaining canonical package identity, build hardening, required
