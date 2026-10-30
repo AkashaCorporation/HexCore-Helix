@@ -369,25 +369,32 @@ endif()
 
 # Link LLVM/MLIR
 if(HELIX_USE_LLVM)
-    # Core LLVM libraries needed for decompilation
-    llvm_map_components_to_libnames(LLVM_LIBS
-        core
-        support
-        irreader
-        analysis
-        passes
-        target
-        x86codegen
-        x86asmparser
-        x86desc
-        x86info
-        aarch64codegen
-        aarch64asmparser
-        aarch64desc
-        aarch64info
-    )
-
-    target_link_libraries(helix_engine PRIVATE ${LLVM_LIBS})
+    # Some Linux distributions build MLIR against the monolithic LLVM shared
+    # library. Mixing that target with static LLVM component archives registers
+    # command-line options twice when a test executable starts. Match the LLVM
+    # package's own link model; Windows bundles continue using static components.
+    if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
+        message(STATUS "Linking Helix against the monolithic LLVM shared library")
+        target_link_libraries(helix_engine PRIVATE LLVM)
+    else()
+        llvm_map_components_to_libnames(LLVM_LIBS
+            core
+            support
+            irreader
+            analysis
+            passes
+            target
+            x86codegen
+            x86asmparser
+            x86desc
+            x86info
+            aarch64codegen
+            aarch64asmparser
+            aarch64desc
+            aarch64info
+        )
+        target_link_libraries(helix_engine PRIVATE ${LLVM_LIBS})
+    endif()
 
     # MLIR libraries for dialect infrastructure and translation
     target_link_libraries(helix_engine PRIVATE

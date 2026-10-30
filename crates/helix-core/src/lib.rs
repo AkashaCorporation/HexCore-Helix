@@ -36,7 +36,10 @@ pub mod types;
 
 // Re-export core types at crate root for ergonomic access
 pub use ast::{AstNode, DataType, Expression, Function, Statement, Variable};
-pub use decompile::{decompile_ir, decompile_ir_via_hir};
+pub use decompile::decompile_ir;
+// Kept at the crate root for source compatibility with pre-MLIR callers.
+#[allow(deprecated)]
+pub use decompile::decompile_ir_via_hir;
 pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSink, Severity};
 pub use error::HelixError;
 pub use metrics::PipelineMetrics;
