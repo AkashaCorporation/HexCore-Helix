@@ -25,7 +25,7 @@
 //       escapes via `goto loc_irr_*` (the structurer could not recover any
 //       control-flow exit; the live epilogue was lost).
 //   (4) dropped control flow        -- surviving `__helix_unhandled_*` (FIX-110)
-//   (5) scalar float subscript      -- non-compilable `float v[0]` (FIX-111)
+//   (5) scalar subscript            -- non-compilable `scalar[0]` (FIX-111)
 //   (6) post-return junk (issue #31) -- statements still present after a same-
 //       scope `return` once optimizers have run.  Soft penalty alone could leave
 //       Medium/High confidence on non-faithful sequential C; hard-cap at 50%.
@@ -48,6 +48,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -68,18 +69,26 @@ struct DamningDefectInfo {
     bool irreducibleNoReturn = false; // (3) goto loc_irr_* with no return path
     bool droppedControlFlow = false; // (4) FIX-110: __helix_unhandled_cf_* survived
     std::string droppedOp;           //     the un-lowered op name (for the reason)
-    bool floatSubscript = false;     // (5) FIX-111: scalar `float v[0]` / `[0.0f]`
+    bool scalarSubscript = false;    // (5) FIX-111: scalar `v[0]` / float index
     bool postReturnUnreachable = false; // (6) #31: stmts after same-scope return
     int postReturnCount = 0;            //     how many (for the reason string)
     bool emptyStubBody = false;         // (7) #56: no body or only bare return
     bool explicitUnknown = false;       // (8) localized semantic gap survived
     bool uninitRead = false;            // (9) intermediate read has no reaching initialization
     std::string uninitReadVarName;
+    bool literalNullAccess = false;     // (10) read/write through literal address zero
+    int literalNullAccessCount = 0;
+    bool invalidShiftCount = false;     // (11) constant shift outside operand width
+    int invalidShiftCountOccurrences = 0;
+    bool invalidPointerOperation = false; // (12) pointer used in forbidden scalar arithmetic
+    int invalidPointerOperationCount = 0;
 
     bool any() const {
         return codeAddrLeak || uninitReturn || irreducibleNoReturn ||
-               droppedControlFlow || floatSubscript || postReturnUnreachable ||
-               emptyStubBody || explicitUnknown || uninitRead;
+               droppedControlFlow || scalarSubscript || postReturnUnreachable ||
+               emptyStubBody || explicitUnknown || uninitRead ||
+               literalNullAccess || invalidShiftCount ||
+               invalidPointerOperation;
     }
 
     /// One-line, ASCII, located reason naming the ACTUAL surviving defect(s).
@@ -102,8 +111,8 @@ struct DamningDefectInfo {
             add("irreducible CFG; no return path recovered");
         if (droppedControlFlow)
             add("unrecovered control flow (" + droppedOp + ")");
-        if (floatSubscript)
-            add("non-compilable scalar-float subscript (v[0] on a float)");
+        if (scalarSubscript)
+            add("non-compilable scalar subscript (base is not a pointer or array)");
         if (postReturnUnreachable) {
             char buf[80];
             std::snprintf(buf, sizeof(buf),
@@ -117,6 +126,29 @@ struct DamningDefectInfo {
             add("explicit unknown machine semantics survived");
         if (uninitRead)
             add("read without any reaching initialization '" + uninitReadVarName + "'");
+        if (literalNullAccess) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "%d literal null memory access(es) survived",
+                          literalNullAccessCount > 0 ? literalNullAccessCount : 1);
+            add(buf);
+        }
+        if (invalidShiftCount) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "%d undefined constant shift count(s) survived",
+                          invalidShiftCountOccurrences > 0
+                              ? invalidShiftCountOccurrences : 1);
+            add(buf);
+        }
+        if (invalidPointerOperation) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "%d invalid pointer/scalar operation(s) survived",
+                          invalidPointerOperationCount > 0
+                              ? invalidPointerOperationCount : 1);
+            add(buf);
+        }
         return r;
     }
 };
@@ -810,88 +842,397 @@ inline bool scanForExplicitUnknown(const std::vector<StmtPtr>& body) {
     return false;
 }
 
-// ── FIX-111: non-compilable scalar-float subscript ──────────────────────────
-// The SSE scalar-compare lowering models an xmm lane-0 extract as a subscript
-// `v[0]`, but emits it on a value declared as a SCALAR `float` (or with a
-// float-literal index `[0.0f]`).  You cannot subscript a scalar float in C, so
-// the body does not compile -- a faithfulness defect that must not read High.
-// (A genuine pointer/array base has kind Pointer/Array, never Float, so this is
-// precise: it fires only on the broken scalar-subscript, not on `ptr[i]`.)
-inline bool isScalarFloatBase(const CExpr* e,
-                              const std::unordered_set<std::string>& floatVars) {
+// ── FIX-111: non-compilable scalar subscript ────────────────────────────────
+// A subscript requires a pointer or array base. Lowering defects previously
+// emitted both `float_value[0]` and `int_value[1]`; the float-only detector let
+// the latter report High confidence. Declaration types are authoritative here
+// because use-site VarRef types can drift during SSA destruction.
+inline bool isKnownNonSubscriptableBase(
+        const CExpr* e,
+        const std::unordered_set<std::string>& scalarVars) {
     if (!e) return false;
-    if (auto* c = llvm::dyn_cast<CCastExpr>(e))
-        return isScalarFloatBase(c->operand.get(), floatVars);
+    if (auto* c = llvm::dyn_cast<CCastExpr>(e)) {
+        if (c->targetType) {
+            if (c->targetType->kind == TypeKind::Pointer ||
+                c->targetType->kind == TypeKind::Array)
+                return false;
+            if (c->targetType->kind != TypeKind::Unknown)
+                return true;
+        }
+        return isKnownNonSubscriptableBase(c->operand.get(), scalarVars);
+    }
     if (auto* v = llvm::dyn_cast<CVarRefExpr>(e))
-        if (floatVars.count(v->varName)) return true;   // declared `float` (decl is authoritative; the use-site var-ref type can drift)
-    return e->type && e->type->kind == TypeKind::Float;  // or the ref is itself typed float
+        if (scalarVars.count(v->varName)) return true;
+    if (!e->type || e->type->kind == TypeKind::Unknown)
+        return false;
+    return e->type->kind != TypeKind::Pointer &&
+           e->type->kind != TypeKind::Array;
 }
 
-inline bool exprHasFloatSubscript(
-        const CExpr* e, const std::unordered_set<std::string>& floatVars) {
+inline bool exprHasScalarSubscript(
+        const CExpr* e, const std::unordered_set<std::string>& scalarVars) {
     if (!e) return false;
     if (auto* s = llvm::dyn_cast<CSubscriptExpr>(e)) {
-        if (isScalarFloatBase(s->base.get(), floatVars)) return true;   // float v[0]
-        if (s->index && llvm::isa<CFloatLitExpr>(s->index.get()))       // v[0.0f]
+        if (isKnownNonSubscriptableBase(s->base.get(), scalarVars))
             return true;
-        return exprHasFloatSubscript(s->base.get(), floatVars) ||
-               exprHasFloatSubscript(s->index.get(), floatVars);
+        if (s->index && llvm::isa<CFloatLitExpr>(s->index.get()))
+            return true;
+        return exprHasScalarSubscript(s->base.get(), scalarVars) ||
+               exprHasScalarSubscript(s->index.get(), scalarVars);
     }
     if (auto* c = llvm::dyn_cast<CCastExpr>(e))
-        return exprHasFloatSubscript(c->operand.get(), floatVars);
+        return exprHasScalarSubscript(c->operand.get(), scalarVars);
     if (auto* u = llvm::dyn_cast<CUnaryExpr>(e))
-        return exprHasFloatSubscript(u->operand.get(), floatVars);
+        return exprHasScalarSubscript(u->operand.get(), scalarVars);
     if (auto* b = llvm::dyn_cast<CBinaryExpr>(e))
-        return exprHasFloatSubscript(b->lhs.get(), floatVars) ||
-               exprHasFloatSubscript(b->rhs.get(), floatVars);
+        return exprHasScalarSubscript(b->lhs.get(), scalarVars) ||
+               exprHasScalarSubscript(b->rhs.get(), scalarVars);
     if (auto* t = llvm::dyn_cast<CTernaryExpr>(e))
-        return exprHasFloatSubscript(t->cond.get(), floatVars) ||
-               exprHasFloatSubscript(t->trueVal.get(), floatVars) ||
-               exprHasFloatSubscript(t->falseVal.get(), floatVars);
+        return exprHasScalarSubscript(t->cond.get(), scalarVars) ||
+               exprHasScalarSubscript(t->trueVal.get(), scalarVars) ||
+               exprHasScalarSubscript(t->falseVal.get(), scalarVars);
     if (auto* fa = llvm::dyn_cast<CFieldAccessExpr>(e))
-        return exprHasFloatSubscript(fa->base.get(), floatVars);
+        return exprHasScalarSubscript(fa->base.get(), scalarVars);
     if (auto* call = llvm::dyn_cast<CCallExpr>(e)) {
         for (auto& a : call->args)
-            if (exprHasFloatSubscript(a.get(), floatVars)) return true;
+            if (exprHasScalarSubscript(a.get(), scalarVars)) return true;
         return false;
     }
     return false;
 }
 
-inline bool scanForFloatSubscript(
+inline bool scanForScalarSubscript(
         const std::vector<StmtPtr>& body,
-        const std::unordered_set<std::string>& floatVars) {
+        const std::unordered_set<std::string>& scalarVars) {
     for (auto& sp : body) {
         const CStmt* s = sp.get();
         if (!s) continue;
         if (auto* es = llvm::dyn_cast<CExprStmt>(s)) {
-            if (exprHasFloatSubscript(es->expr.get(), floatVars)) return true;
+            if (exprHasScalarSubscript(es->expr.get(), scalarVars)) return true;
         } else if (auto* as = llvm::dyn_cast<CAssignStmt>(s)) {
-            if (exprHasFloatSubscript(as->value.get(), floatVars)) return true;
-            if (exprHasFloatSubscript(as->target.get(), floatVars)) return true;
+            if (exprHasScalarSubscript(as->value.get(), scalarVars)) return true;
+            if (exprHasScalarSubscript(as->target.get(), scalarVars)) return true;
         } else if (auto* rs = llvm::dyn_cast<CReturnStmt>(s)) {
-            if (rs->value && exprHasFloatSubscript(rs->value.get(), floatVars)) return true;
+            if (rs->value && exprHasScalarSubscript(rs->value.get(), scalarVars)) return true;
         } else if (auto* ifS = llvm::dyn_cast<CIfStmt>(s)) {
-            if (exprHasFloatSubscript(ifS->condition.get(), floatVars)) return true;
-            if (scanForFloatSubscript(ifS->thenBody, floatVars)) return true;
-            if (scanForFloatSubscript(ifS->elseBody, floatVars)) return true;
+            if (exprHasScalarSubscript(ifS->condition.get(), scalarVars)) return true;
+            if (scanForScalarSubscript(ifS->thenBody, scalarVars)) return true;
+            if (scanForScalarSubscript(ifS->elseBody, scalarVars)) return true;
         } else if (auto* wh = llvm::dyn_cast<CWhileStmt>(s)) {
-            if (exprHasFloatSubscript(wh->condition.get(), floatVars)) return true;
-            if (scanForFloatSubscript(wh->body, floatVars)) return true;
+            if (exprHasScalarSubscript(wh->condition.get(), scalarVars)) return true;
+            if (scanForScalarSubscript(wh->body, scalarVars)) return true;
         } else if (auto* dw = llvm::dyn_cast<CDoWhileStmt>(s)) {
-            if (exprHasFloatSubscript(dw->condition.get(), floatVars)) return true;
-            if (scanForFloatSubscript(dw->body, floatVars)) return true;
+            if (exprHasScalarSubscript(dw->condition.get(), scalarVars)) return true;
+            if (scanForScalarSubscript(dw->body, scalarVars)) return true;
         } else if (auto* fr = llvm::dyn_cast<CForStmt>(s)) {
-            if (scanForFloatSubscript(fr->body, floatVars)) return true;
+            if (scanForScalarSubscript(fr->body, scalarVars)) return true;
         } else if (auto* sw = llvm::dyn_cast<CSwitchStmt>(s)) {
-            if (exprHasFloatSubscript(sw->selector.get(), floatVars)) return true;
+            if (exprHasScalarSubscript(sw->selector.get(), scalarVars)) return true;
             for (auto& c : sw->cases)
-                if (scanForFloatSubscript(c.body, floatVars)) return true;
+                if (scanForScalarSubscript(c.body, scalarVars)) return true;
         } else if (auto* blk = llvm::dyn_cast<CBlockStmt>(s)) {
-            if (scanForFloatSubscript(blk->stmts, floatVars)) return true;
+            if (scanForScalarSubscript(blk->stmts, scalarVars)) return true;
         }
     }
     return false;
+}
+
+// A constant C shift is undefined when its count is negative or is not less
+// than the promoted left operand width. Unknown types stay unclassified: this
+// is an honesty cap, so it only fires when the final AST proves the defect.
+inline std::optional<int64_t> integerLiteralValue(const CExpr* expr) {
+    if (!expr) return std::nullopt;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return integerLiteralValue(cast->operand.get());
+    if (auto* integer = llvm::dyn_cast<CIntLitExpr>(expr))
+        return integer->value;
+    return std::nullopt;
+}
+
+inline bool isNullConstantExpr(const CExpr* expr) {
+    if (!expr) return false;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isNullConstantExpr(cast->operand.get());
+    if (auto* address = llvm::dyn_cast<CAddrLitExpr>(expr))
+        return address->addrValue == 0;
+    const auto integer = integerLiteralValue(expr);
+    return integer && *integer == 0;
+}
+
+inline unsigned promotedIntegerWidth(const CExpr* expr) {
+    if (!expr || !expr->type) return 0;
+    const auto& type = expr->type;
+    if (type->kind == TypeKind::Bool)
+        return 32;
+    if (type->kind != TypeKind::Int || type->bitWidth == 0)
+        return 0;
+    return std::max(32u, type->bitWidth);
+}
+
+inline int countInvalidShiftCountsInExpr(const CExpr* expr) {
+    if (!expr) return 0;
+    int count = 0;
+    if (auto* binary = llvm::dyn_cast<CBinaryExpr>(expr)) {
+        if (binary->op == BinaryOp::Shl || binary->op == BinaryOp::Shr ||
+            binary->op == BinaryOp::Sar) {
+            const auto shift = integerLiteralValue(binary->rhs.get());
+            const unsigned width = promotedIntegerWidth(binary->lhs.get());
+            if (shift && width > 0 &&
+                (*shift < 0 || static_cast<uint64_t>(*shift) >= width))
+                ++count;
+        }
+        return count + countInvalidShiftCountsInExpr(binary->lhs.get()) +
+               countInvalidShiftCountsInExpr(binary->rhs.get());
+    }
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return countInvalidShiftCountsInExpr(cast->operand.get());
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(expr))
+        return countInvalidShiftCountsInExpr(unary->operand.get());
+    if (auto* ternary = llvm::dyn_cast<CTernaryExpr>(expr))
+        return countInvalidShiftCountsInExpr(ternary->cond.get()) +
+               countInvalidShiftCountsInExpr(ternary->trueVal.get()) +
+               countInvalidShiftCountsInExpr(ternary->falseVal.get());
+    if (auto* subscript = llvm::dyn_cast<CSubscriptExpr>(expr))
+        return countInvalidShiftCountsInExpr(subscript->base.get()) +
+               countInvalidShiftCountsInExpr(subscript->index.get());
+    if (auto* field = llvm::dyn_cast<CFieldAccessExpr>(expr))
+        return countInvalidShiftCountsInExpr(field->base.get());
+    if (auto* call = llvm::dyn_cast<CCallExpr>(expr)) {
+        for (const auto& argument : call->args)
+            count += countInvalidShiftCountsInExpr(argument.get());
+    }
+    return count;
+}
+
+inline int countInvalidShiftCounts(const std::vector<StmtPtr>& body) {
+    int count = 0;
+    for (const auto& statementPtr : body) {
+        const CStmt* statement = statementPtr.get();
+        if (!statement) continue;
+        if (auto* assign = llvm::dyn_cast<CAssignStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(assign->target.get());
+            count += countInvalidShiftCountsInExpr(assign->value.get());
+        } else if (auto* expression = llvm::dyn_cast<CExprStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(expression->expr.get());
+        } else if (auto* result = llvm::dyn_cast<CReturnStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(result->value.get());
+        } else if (auto* branch = llvm::dyn_cast<CIfStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(branch->condition.get());
+            count += countInvalidShiftCounts(branch->thenBody);
+            count += countInvalidShiftCounts(branch->elseBody);
+        } else if (auto* loop = llvm::dyn_cast<CWhileStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(loop->condition.get());
+            count += countInvalidShiftCounts(loop->body);
+        } else if (auto* loop = llvm::dyn_cast<CDoWhileStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(loop->condition.get());
+            count += countInvalidShiftCounts(loop->body);
+        } else if (auto* loop = llvm::dyn_cast<CForStmt>(statement)) {
+            if (loop->init) {
+                if (auto* initAssign = llvm::dyn_cast<CAssignStmt>(loop->init.get())) {
+                    count += countInvalidShiftCountsInExpr(initAssign->target.get());
+                    count += countInvalidShiftCountsInExpr(initAssign->value.get());
+                } else if (auto* initExpr = llvm::dyn_cast<CExprStmt>(loop->init.get())) {
+                    count += countInvalidShiftCountsInExpr(initExpr->expr.get());
+                }
+            }
+            count += countInvalidShiftCountsInExpr(loop->condition.get());
+            if (auto* stepAssign = llvm::dyn_cast_or_null<CAssignStmt>(loop->step.get())) {
+                count += countInvalidShiftCountsInExpr(stepAssign->target.get());
+                count += countInvalidShiftCountsInExpr(stepAssign->value.get());
+            } else if (auto* stepExpr = llvm::dyn_cast_or_null<CExprStmt>(loop->step.get())) {
+                count += countInvalidShiftCountsInExpr(stepExpr->expr.get());
+            }
+            count += countInvalidShiftCounts(loop->body);
+        } else if (auto* selection = llvm::dyn_cast<CSwitchStmt>(statement)) {
+            count += countInvalidShiftCountsInExpr(selection->selector.get());
+            for (const auto& arm : selection->cases)
+                count += countInvalidShiftCounts(arm.body);
+        } else if (auto* block = llvm::dyn_cast<CBlockStmt>(statement)) {
+            count += countInvalidShiftCounts(block->stmts);
+        }
+    }
+    return count;
+}
+
+inline bool isKnownPointerExpr(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& pointerVars) {
+    if (!expr) return false;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return cast->targetType &&
+               (cast->targetType->kind == TypeKind::Pointer ||
+                cast->targetType->kind == TypeKind::Array ||
+                cast->targetType->kind == TypeKind::FuncPtr);
+    if (auto* variable = llvm::dyn_cast<CVarRefExpr>(expr))
+        if (pointerVars.count(variable->varName)) return true;
+    return expr->type &&
+           (expr->type->kind == TypeKind::Pointer ||
+            expr->type->kind == TypeKind::Array ||
+            expr->type->kind == TypeKind::FuncPtr);
+}
+
+inline bool isKnownScalarExpr(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& scalarVars) {
+    if (!expr) return false;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return cast->targetType &&
+               (cast->targetType->kind == TypeKind::Bool ||
+                cast->targetType->kind == TypeKind::Int ||
+                cast->targetType->kind == TypeKind::Float);
+    if (auto* variable = llvm::dyn_cast<CVarRefExpr>(expr))
+        if (scalarVars.count(variable->varName)) return true;
+    return expr->type &&
+           (expr->type->kind == TypeKind::Bool ||
+            expr->type->kind == TypeKind::Int ||
+            expr->type->kind == TypeKind::Float);
+}
+
+inline int countInvalidPointerOpsInExpr(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& pointerVars,
+        const std::unordered_set<std::string>& scalarVars) {
+    if (!expr) return 0;
+    int count = 0;
+    if (auto* binary = llvm::dyn_cast<CBinaryExpr>(expr)) {
+        const bool lhsPointer = isKnownPointerExpr(binary->lhs.get(), pointerVars);
+        const bool rhsPointer = isKnownPointerExpr(binary->rhs.get(), pointerVars);
+        switch (binary->op) {
+        case BinaryOp::Mul:
+        case BinaryOp::Div:
+        case BinaryOp::Mod:
+        case BinaryOp::Shl:
+        case BinaryOp::Shr:
+        case BinaryOp::Sar:
+        case BinaryOp::BitAnd:
+        case BinaryOp::BitOr:
+        case BinaryOp::BitXor:
+            if (lhsPointer || rhsPointer) ++count;
+            break;
+        case BinaryOp::Add:
+            if (lhsPointer && rhsPointer) ++count;
+            break;
+        case BinaryOp::Eq:
+        case BinaryOp::Ne:
+            if ((lhsPointer && isKnownScalarExpr(binary->rhs.get(), scalarVars) &&
+                 !isNullConstantExpr(binary->rhs.get())) ||
+                (rhsPointer && isKnownScalarExpr(binary->lhs.get(), scalarVars) &&
+                 !isNullConstantExpr(binary->lhs.get())))
+                ++count;
+            break;
+        case BinaryOp::Lt:
+        case BinaryOp::Le:
+        case BinaryOp::Gt:
+        case BinaryOp::Ge:
+            if (lhsPointer != rhsPointer) ++count;
+            break;
+        default:
+            break;
+        }
+        return count + countInvalidPointerOpsInExpr(
+                           binary->lhs.get(), pointerVars, scalarVars) +
+                       countInvalidPointerOpsInExpr(
+                           binary->rhs.get(), pointerVars, scalarVars);
+    }
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return countInvalidPointerOpsInExpr(
+            cast->operand.get(), pointerVars, scalarVars);
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(expr))
+        return countInvalidPointerOpsInExpr(
+            unary->operand.get(), pointerVars, scalarVars);
+    if (auto* ternary = llvm::dyn_cast<CTernaryExpr>(expr))
+        return countInvalidPointerOpsInExpr(ternary->cond.get(), pointerVars, scalarVars) +
+               countInvalidPointerOpsInExpr(ternary->trueVal.get(), pointerVars, scalarVars) +
+               countInvalidPointerOpsInExpr(ternary->falseVal.get(), pointerVars, scalarVars);
+    if (auto* subscript = llvm::dyn_cast<CSubscriptExpr>(expr))
+        return countInvalidPointerOpsInExpr(subscript->base.get(), pointerVars, scalarVars) +
+               countInvalidPointerOpsInExpr(subscript->index.get(), pointerVars, scalarVars);
+    if (auto* field = llvm::dyn_cast<CFieldAccessExpr>(expr))
+        return countInvalidPointerOpsInExpr(field->base.get(), pointerVars, scalarVars);
+    if (auto* call = llvm::dyn_cast<CCallExpr>(expr))
+        for (const auto& argument : call->args)
+            count += countInvalidPointerOpsInExpr(
+                argument.get(), pointerVars, scalarVars);
+    return count;
+}
+
+inline int countInvalidPointerOperations(
+        const std::vector<StmtPtr>& body,
+        const std::unordered_set<std::string>& pointerVars,
+        const std::unordered_set<std::string>& scalarVars) {
+    int count = 0;
+    for (const auto& statementPtr : body) {
+        const CStmt* statement = statementPtr.get();
+        if (!statement) continue;
+        if (auto* assign = llvm::dyn_cast<CAssignStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                assign->target.get(), pointerVars, scalarVars);
+            count += countInvalidPointerOpsInExpr(
+                assign->value.get(), pointerVars, scalarVars);
+            const bool pointerTarget =
+                isKnownPointerExpr(assign->target.get(), pointerVars);
+            if (pointerTarget && assign->compoundOp.empty() &&
+                isKnownScalarExpr(assign->value.get(), scalarVars) &&
+                !isNullConstantExpr(assign->value.get()))
+                ++count;
+            if (pointerTarget && !assign->compoundOp.empty() &&
+                assign->compoundOp != "+=" && assign->compoundOp != "-=" &&
+                assign->compoundOp != "++" && assign->compoundOp != "--")
+                ++count;
+        } else if (auto* expression = llvm::dyn_cast<CExprStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                expression->expr.get(), pointerVars, scalarVars);
+        } else if (auto* result = llvm::dyn_cast<CReturnStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                result->value.get(), pointerVars, scalarVars);
+        } else if (auto* branch = llvm::dyn_cast<CIfStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                branch->condition.get(), pointerVars, scalarVars);
+            count += countInvalidPointerOperations(
+                branch->thenBody, pointerVars, scalarVars);
+            count += countInvalidPointerOperations(
+                branch->elseBody, pointerVars, scalarVars);
+        } else if (auto* loop = llvm::dyn_cast<CWhileStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                loop->condition.get(), pointerVars, scalarVars);
+            count += countInvalidPointerOperations(
+                loop->body, pointerVars, scalarVars);
+        } else if (auto* loop = llvm::dyn_cast<CDoWhileStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                loop->condition.get(), pointerVars, scalarVars);
+            count += countInvalidPointerOperations(
+                loop->body, pointerVars, scalarVars);
+        } else if (auto* loop = llvm::dyn_cast<CForStmt>(statement)) {
+            if (loop->init) {
+                if (auto* assign = llvm::dyn_cast<CAssignStmt>(loop->init.get())) {
+                    count += countInvalidPointerOpsInExpr(
+                        assign->target.get(), pointerVars, scalarVars);
+                    count += countInvalidPointerOpsInExpr(
+                        assign->value.get(), pointerVars, scalarVars);
+                }
+            }
+            count += countInvalidPointerOpsInExpr(
+                loop->condition.get(), pointerVars, scalarVars);
+            if (auto* assign = llvm::dyn_cast_or_null<CAssignStmt>(loop->step.get())) {
+                count += countInvalidPointerOpsInExpr(
+                    assign->target.get(), pointerVars, scalarVars);
+                count += countInvalidPointerOpsInExpr(
+                    assign->value.get(), pointerVars, scalarVars);
+            }
+            count += countInvalidPointerOperations(
+                loop->body, pointerVars, scalarVars);
+        } else if (auto* selection = llvm::dyn_cast<CSwitchStmt>(statement)) {
+            count += countInvalidPointerOpsInExpr(
+                selection->selector.get(), pointerVars, scalarVars);
+            for (const auto& arm : selection->cases)
+                count += countInvalidPointerOperations(
+                    arm.body, pointerVars, scalarVars);
+        } else if (auto* block = llvm::dyn_cast<CBlockStmt>(statement)) {
+            count += countInvalidPointerOperations(
+                block->stmts, pointerVars, scalarVars);
+        }
+    }
+    return count;
 }
 
 // Forward decl for mutual recursion through control-flow stmts.
@@ -1032,6 +1373,196 @@ inline int countUnreachableAfterReturn(const std::vector<StmtPtr>& body) {
     return n;
 }
 
+inline bool isLiteralNullPointer(const CExpr* expr) {
+    if (!expr) return false;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isLiteralNullPointer(cast->operand.get());
+    if (auto* address = llvm::dyn_cast<CAddrLitExpr>(expr))
+        return address->addrValue == 0;
+    if (auto* integer = llvm::dyn_cast<CIntLitExpr>(expr))
+        return integer->value == 0;
+    return false;
+}
+
+inline bool isLiteralIntegerOffset(const CExpr* expr) {
+    if (!expr) return false;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isLiteralIntegerOffset(cast->operand.get());
+    return llvm::isa<CIntLitExpr>(expr) || llvm::isa<CAddrLitExpr>(expr);
+}
+
+// A GEP rooted at a missing State/base expression is emitted as
+// `(void*)0 + constant`. It is not a nullable pointer value: dereferencing it
+// still accesses an unproven low address and must retain the same honesty cap
+// as a direct null dereference.
+inline bool isNullDerivedPointer(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& zeroLocals = {}) {
+    if (isLiteralNullPointer(expr)) return true;
+    if (!expr) return false;
+    if (auto* variable = llvm::dyn_cast<CVarRefExpr>(expr))
+        return zeroLocals.count(variable->varName) != 0;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isNullDerivedPointer(cast->operand.get(), zeroLocals);
+    auto* binary = llvm::dyn_cast<CBinaryExpr>(expr);
+    if (!binary || (binary->op != BinaryOp::Add &&
+                    binary->op != BinaryOp::Sub))
+        return false;
+    if (isNullDerivedPointer(binary->lhs.get(), zeroLocals) &&
+        isLiteralIntegerOffset(binary->rhs.get()))
+        return true;
+    return binary->op == BinaryOp::Add &&
+           isLiteralIntegerOffset(binary->lhs.get()) &&
+           isNullDerivedPointer(binary->rhs.get(), zeroLocals);
+}
+
+inline int countLiteralNullAccessesInExpr(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& zeroLocals = {}) {
+    if (!expr) return 0;
+    if (auto* unary = llvm::dyn_cast<CUnaryExpr>(expr)) {
+        int count = unary->op == UnaryOp::Deref &&
+                    isNullDerivedPointer(unary->operand.get(), zeroLocals) ? 1 : 0;
+        return count + countLiteralNullAccessesInExpr(
+            unary->operand.get(), zeroLocals);
+    }
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return countLiteralNullAccessesInExpr(cast->operand.get(), zeroLocals);
+    if (auto* binary = llvm::dyn_cast<CBinaryExpr>(expr))
+        return countLiteralNullAccessesInExpr(binary->lhs.get(), zeroLocals) +
+               countLiteralNullAccessesInExpr(binary->rhs.get(), zeroLocals);
+    if (auto* ternary = llvm::dyn_cast<CTernaryExpr>(expr))
+        return countLiteralNullAccessesInExpr(ternary->cond.get(), zeroLocals) +
+               countLiteralNullAccessesInExpr(ternary->trueVal.get(), zeroLocals) +
+               countLiteralNullAccessesInExpr(ternary->falseVal.get(), zeroLocals);
+    if (auto* subscript = llvm::dyn_cast<CSubscriptExpr>(expr)) {
+        int count = isNullDerivedPointer(
+            subscript->base.get(), zeroLocals) ? 1 : 0;
+        return count + countLiteralNullAccessesInExpr(
+                           subscript->base.get(), zeroLocals) +
+                       countLiteralNullAccessesInExpr(
+                           subscript->index.get(), zeroLocals);
+    }
+    if (auto* field = llvm::dyn_cast<CFieldAccessExpr>(expr)) {
+        int count = isNullDerivedPointer(field->base.get(), zeroLocals) ? 1 : 0;
+        return count + countLiteralNullAccessesInExpr(
+                           field->base.get(), zeroLocals);
+    }
+    if (auto* call = llvm::dyn_cast<CCallExpr>(expr)) {
+        int count = 0;
+        for (const auto& argument : call->args)
+            count += countLiteralNullAccessesInExpr(argument.get(), zeroLocals);
+        return count;
+    }
+    return 0;
+}
+
+inline std::unordered_set<std::string> intersectZeroStates(
+        const std::unordered_set<std::string>& lhs,
+        const std::unordered_set<std::string>& rhs) {
+    std::unordered_set<std::string> result;
+    for (const auto& name : lhs)
+        if (rhs.count(name)) result.insert(name);
+    return result;
+}
+
+inline bool isDefinitelyZeroValue(
+        const CExpr* expr,
+        const std::unordered_set<std::string>& zeroLocals) {
+    if (!expr) return false;
+    if (isLiteralNullPointer(expr)) return true;
+    if (auto* cast = llvm::dyn_cast<CCastExpr>(expr))
+        return isDefinitelyZeroValue(cast->operand.get(), zeroLocals);
+    if (auto* variable = llvm::dyn_cast<CVarRefExpr>(expr))
+        return zeroLocals.count(variable->varName) != 0;
+    return false;
+}
+
+inline int countOrderedNullAccessesInStmt(
+        const CStmt* statement,
+        std::unordered_set<std::string>& zeroLocals);
+
+inline int countOrderedNullAccesses(
+        const std::vector<StmtPtr>& body,
+        std::unordered_set<std::string>& zeroLocals) {
+    int count = 0;
+    for (const auto& statementPtr : body) {
+        count += countOrderedNullAccessesInStmt(statementPtr.get(), zeroLocals);
+    }
+    return count;
+}
+
+inline int countOrderedNullAccessesInStmt(
+        const CStmt* statement,
+        std::unordered_set<std::string>& zeroLocals) {
+    if (!statement) return 0;
+    int count = 0;
+    if (auto* assign = llvm::dyn_cast<CAssignStmt>(statement)) {
+        count += countLiteralNullAccessesInExpr(assign->target.get(), zeroLocals);
+        count += countLiteralNullAccessesInExpr(assign->value.get(), zeroLocals);
+        if (const auto name = plainVarName(assign->target.get()); !name.empty()) {
+            if (assign->compoundOp.empty() &&
+                isDefinitelyZeroValue(assign->value.get(), zeroLocals))
+                zeroLocals.insert(name);
+            else
+                zeroLocals.erase(name);
+        }
+        return count;
+    }
+    if (auto* expression = llvm::dyn_cast<CExprStmt>(statement))
+        return countLiteralNullAccessesInExpr(expression->expr.get(), zeroLocals);
+    if (auto* result = llvm::dyn_cast<CReturnStmt>(statement))
+        return countLiteralNullAccessesInExpr(result->value.get(), zeroLocals);
+    if (auto* branch = llvm::dyn_cast<CIfStmt>(statement)) {
+        count += countLiteralNullAccessesInExpr(branch->condition.get(), zeroLocals);
+        auto thenState = zeroLocals;
+        auto elseState = zeroLocals;
+        count += countOrderedNullAccesses(branch->thenBody, thenState);
+        count += countOrderedNullAccesses(branch->elseBody, elseState);
+        zeroLocals = intersectZeroStates(thenState, elseState);
+        return count;
+    }
+    if (auto* loop = llvm::dyn_cast<CWhileStmt>(statement)) {
+        count += countLiteralNullAccessesInExpr(loop->condition.get(), zeroLocals);
+        auto bodyState = zeroLocals;
+        count += countOrderedNullAccesses(loop->body, bodyState);
+        zeroLocals = intersectZeroStates(zeroLocals, bodyState);
+        return count;
+    }
+    if (auto* loop = llvm::dyn_cast<CDoWhileStmt>(statement)) {
+        auto bodyState = zeroLocals;
+        count += countOrderedNullAccesses(loop->body, bodyState);
+        count += countLiteralNullAccessesInExpr(loop->condition.get(), bodyState);
+        zeroLocals = intersectZeroStates(zeroLocals, bodyState);
+        return count;
+    }
+    if (auto* loop = llvm::dyn_cast<CForStmt>(statement)) {
+        if (loop->init)
+            count += countOrderedNullAccessesInStmt(loop->init.get(), zeroLocals);
+        count += countLiteralNullAccessesInExpr(loop->condition.get(), zeroLocals);
+        auto bodyState = zeroLocals;
+        count += countOrderedNullAccesses(loop->body, bodyState);
+        if (loop->step)
+            count += countOrderedNullAccessesInStmt(loop->step.get(), bodyState);
+        zeroLocals = intersectZeroStates(zeroLocals, bodyState);
+        return count;
+    }
+    if (auto* selection = llvm::dyn_cast<CSwitchStmt>(statement)) {
+        count += countLiteralNullAccessesInExpr(selection->selector.get(), zeroLocals);
+        auto joinedState = zeroLocals;
+        for (const auto& arm : selection->cases) {
+            auto armState = zeroLocals;
+            count += countOrderedNullAccesses(arm.body, armState);
+            joinedState = intersectZeroStates(joinedState, armState);
+        }
+        zeroLocals = std::move(joinedState);
+        return count;
+    }
+    if (auto* block = llvm::dyn_cast<CBlockStmt>(statement))
+        return countOrderedNullAccesses(block->stmts, zeroLocals);
+    return count;
+}
+
 } // namespace detail
 
 /// Scan the FINAL function AST for surviving damning defects (located).
@@ -1147,21 +1678,23 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
         }
     }
 
-    // (5) FIX-111: a non-compilable scalar-float subscript (`float v; ... v[0]`
-    //     or a `[0.0f]` index) -- the SSE scalar-compare lowering emitted an xmm
-    //     lane extract on a scalar.  The body does not compile, so it must not
-    //     read High.  The DECLARED type is authoritative (the use-site var-ref
-    //     type can drift away from `float`), so feed the declared-float names.
+    // (5) FIX-111: a subscript whose declared base is not a pointer or array.
+    //     The declared type is authoritative because use-site VarRef types can
+    //     drift during SSA destruction.
     {
-        std::unordered_set<std::string> floatVars;
+        std::unordered_set<std::string> scalarVars;
+        auto recordScalar = [&](const std::string& name, const CTypePtr& type) {
+            if (!type || type->kind == TypeKind::Unknown ||
+                type->kind == TypeKind::Pointer || type->kind == TypeKind::Array)
+                return;
+            scalarVars.insert(name);
+        };
         for (const auto& lv : func.localVars)
-            if (lv.type && lv.type->kind == TypeKind::Float)
-                floatVars.insert(lv.varName);
+            recordScalar(lv.varName, lv.type);
         for (const auto& p : func.params)
-            if (p.type && p.type->kind == TypeKind::Float)
-                floatVars.insert(p.name);
-        if (detail::scanForFloatSubscript(func.body, floatVars))
-            info.floatSubscript = true;
+            recordScalar(p.name, p.type);
+        if (detail::scanForScalarSubscript(func.body, scalarVars))
+            info.scalarSubscript = true;
     }
 
     // (6) issue #31 — surviving post-return statements (D3 honesty).
@@ -1190,6 +1723,64 @@ inline DamningDefectInfo detectDamningDefects(const CFuncDecl& func) {
     // equivalence is incomplete. It must remain visible and cap confidence.
     if (detail::scanForExplicitUnknown(func.body))
         info.explicitUnknown = true;
+
+    // (10) A provably-zero dereference is not the same as a nullable pointer
+    // value. This includes a local that is initialized to zero and never
+    // reassigned before it is used as an address base.
+    std::unordered_set<std::string> orderedZeroLocals;
+    const bool canTrackOrderedZeroLocals =
+        detail::supportsDefiniteAssignmentScan(func.body);
+    for (const auto& local : func.localVars) {
+        info.literalNullAccessCount +=
+            detail::countLiteralNullAccessesInExpr(
+                local.initExpr.get(), orderedZeroLocals);
+        if (canTrackOrderedZeroLocals && local.initExpr &&
+            !addressTaken.count(local.varName) &&
+            detail::isDefinitelyZeroValue(
+                local.initExpr.get(), orderedZeroLocals))
+            orderedZeroLocals.insert(local.varName);
+    }
+    info.literalNullAccessCount += detail::countOrderedNullAccesses(
+        func.body, orderedZeroLocals);
+    info.literalNullAccess = info.literalNullAccessCount > 0;
+
+    // (11) The final C contains an undefined constant shift such as `x >> 64`
+    // for a 64-bit operand. Keep the code visible, but never call it High.
+    info.invalidShiftCountOccurrences =
+        detail::countInvalidShiftCounts(func.body);
+    for (const auto& local : func.localVars)
+        info.invalidShiftCountOccurrences +=
+            detail::countInvalidShiftCountsInExpr(local.initExpr.get());
+    info.invalidShiftCount = info.invalidShiftCountOccurrences > 0;
+
+    // (12) Pointer values participating in multiplication/bitwise/shift
+    // arithmetic, or receiving a proven non-zero scalar without a cast, make
+    // the emitted C ill-typed. Pointer addition/subtraction and null assignment
+    // remain valid and are explicit negative controls.
+    {
+        std::unordered_set<std::string> pointerVars;
+        std::unordered_set<std::string> scalarVars;
+        auto recordType = [&](const std::string& name, const CTypePtr& type) {
+            if (!type) return;
+            if (type->kind == TypeKind::Pointer ||
+                type->kind == TypeKind::Array ||
+                type->kind == TypeKind::FuncPtr)
+                pointerVars.insert(name);
+            else if (type->kind == TypeKind::Bool ||
+                     type->kind == TypeKind::Int ||
+                     type->kind == TypeKind::Float)
+                scalarVars.insert(name);
+        };
+        for (const auto& local : func.localVars)
+            recordType(local.varName, local.type);
+        for (const auto& param : func.params)
+            recordType(param.name, param.type);
+        info.invalidPointerOperationCount =
+            detail::countInvalidPointerOperations(
+                func.body, pointerVars, scalarVars);
+        info.invalidPointerOperation =
+            info.invalidPointerOperationCount > 0;
+    }
 
     return info;
 }

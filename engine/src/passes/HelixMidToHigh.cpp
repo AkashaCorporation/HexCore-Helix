@@ -1302,6 +1302,12 @@ struct LegalizeFunctionContainersPass
                         "inferred_type")) {
                     metadata.set("helix.inferred_type", inferred);
                 }
+                for (llvm::StringRef key : {
+                         "helix.type.source", "helix.type.strength",
+                         "helix.type.conflict", "helix.type.rejected"}) {
+                    if (auto evidence = parameter.declaration->getAttr(key))
+                        metadata.set(key, evidence);
+                }
                 if (auto debugName = parameter.declaration->getAttr(
                         "helix.debug_name")) {
                     metadata.set("helix.debug_name", debugName);

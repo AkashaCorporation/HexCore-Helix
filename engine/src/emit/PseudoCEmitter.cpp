@@ -10,6 +10,7 @@
 ///   - Header comment: "// Decompiled by HexCore Helix"
 
 #include "helix/emit/PseudoCEmitter.h"
+#include "helix/Engine.h"
 #include "helix/analysis/RemillDemangler.h"
 #include "helix/analysis/SignatureDb.h"
 #include "helix/dialects/HelixHighOps.h"
@@ -1434,7 +1435,7 @@ bool PseudoCEmitter::isNearBlockStart(Operation* op, unsigned budget) {
 
 void PseudoCEmitter::emitHeader(llvm::raw_ostream& os, ModuleOp /*module*/) {
     os << "// Decompiled by HexCore Helix\n";
-    os << "// Engine version: 0.8.0-nightly\n";
+    os << "// Engine version: " << Engine::version() << "\n";
     os << "\n";
 }
 
@@ -1967,9 +1968,10 @@ void PseudoCEmitter::emitFunction(Operation* op, llvm::raw_ostream& os) {
     os << "// " << funcName.str() << " (0x" << std::format("{:x}", entryAddr) << ")\n";
     os << "// Confidence: " << std::format("{:.1f}%", stats.score);
     
-    if (stats.score > 80.0) os << " (High)\n";
-    else if (stats.score > 50.0) os << " (Medium)\n";
-    else os << " (Low)\n";
+    if (stats.score > 80.0) os << " (High)";
+    else if (stats.score > 50.0) os << " (Medium)";
+    else os << " (Low)";
+    os << " [translation/structuring axis only]\n";
 
     if (!stats.issues.empty()) {
         os << "// Issues:\n";

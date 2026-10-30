@@ -55,6 +55,10 @@ struct DebugStruct {
 struct DebugDatabase {
     std::unordered_map<std::string, DebugFunction> functions;
     std::unordered_map<std::string, DebugStruct> structs;
+    std::string originProducer;
+    std::optional<uint64_t> originGeneration;
+    std::string targetIdentity;
+    std::string snapshotHash;
 };
 
 static std::optional<uint64_t> parseUnsigned(const llvm::json::Value& value) {
@@ -78,6 +82,35 @@ static std::optional<DebugDatabase> parseDatabase(llvm::StringRef raw) {
         return std::nullopt;
 
     DebugDatabase db;
+    if (auto* context = root->getObject("hexcoreContext")) {
+        db.originProducer = "hexcore-analysis-context";
+        if (auto* identity = context->getObject("queryIdentity")) {
+            if (auto target = identity->getString("targetIdentity"))
+                db.targetIdentity = target->str();
+            if (auto snapshot = identity->getString("snapshotSha256"))
+                db.snapshotHash = snapshot->str();
+            if (auto generation = identity->getInteger("generation"))
+                db.originGeneration = static_cast<uint64_t>(*generation);
+        }
+        if (db.targetIdentity.empty()) {
+            if (auto* target = context->getObject("target")) {
+                if (auto id = target->getString("id"))
+                    db.targetIdentity = id->str();
+            }
+        }
+        if (db.snapshotHash.empty()) {
+            if (auto* semantic = context->getObject("semantic")) {
+                if (auto hash = semantic->getString("storeHash"))
+                    db.snapshotHash = hash->str();
+            }
+        }
+        if (!db.originGeneration) {
+            if (auto* analysis = context->getObject("analysis")) {
+                if (auto generation = analysis->getInteger("generation"))
+                    db.originGeneration = static_cast<uint64_t>(*generation);
+            }
+        }
+    }
     if (auto* functions = root->getObject("functions")) {
         for (const auto& [key, value] : *functions) {
             auto* obj = value.getAsObject();
@@ -447,6 +480,19 @@ struct ApplyDebugTypesPass
         auto db = parseDatabase(jsonAttr.getValue());
         if (!db)
             return;
+        if (!db->originProducer.empty())
+            module->setAttr("helix.type_origin.producer",
+                StringAttr::get(module.getContext(), db->originProducer));
+        if (db->originGeneration)
+            module->setAttr("helix.type_origin.generation",
+                IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                 *db->originGeneration));
+        if (!db->targetIdentity.empty())
+            module->setAttr("helix.type_origin.target_identity",
+                StringAttr::get(module.getContext(), db->targetIdentity));
+        if (!db->snapshotHash.empty())
+            module->setAttr("helix.type_origin.snapshot_hash",
+                StringAttr::get(module.getContext(), db->snapshotHash));
         const bool resolveCallAliases =
             module->hasAttr("helix.debug_types_seeded");
         bool sawRecoveredDeclarations = false;
@@ -466,6 +512,14 @@ struct ApplyDebugTypesPass
                 if (!signature.returnType.empty()) {
                     func->setAttr("inferred_return_type",
                         StringAttr::get(func.getContext(), signature.returnType));
+                    func->setAttr("helix.return_type.source",
+                        StringAttr::get(func.getContext(), "debug-info"));
+                    func->setAttr("helix.return_type.strength",
+                        IntegerAttr::get(IntegerType::get(func.getContext(), 32),
+                            helix::defaultTypeEvidenceStrength(
+                                helix::TypeEvidenceSource::DebugInfo)));
+                    func->removeAttr("helix.return_type.conflict");
+                    func->removeAttr("helix.return_type.rejected");
                 }
                 if (signature.isVariadic) {
                     func->setAttr("is_variadic",

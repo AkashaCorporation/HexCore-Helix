@@ -14,6 +14,7 @@
 #include "helix/cast/CAstBuilder.h"
 #include "helix/cast/CAstOptimizer.h"
 #include "helix/cast/CAstPrinter.h"
+#include "helix/cast/SelfRefWitness.h"
 #include "helix/dialects/HelixLowDialect.h"
 #include "helix/dialects/HelixMidDialect.h"
 #include "helix/dialects/HelixHighDialect.h"
@@ -60,6 +61,8 @@
 #include <cassert>
 #include <format>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace helix {
@@ -845,9 +848,65 @@ PipelineResult<std::string> Pipeline::emitPseudoC(mlir::ModuleOp module) {
 
             cast::CAstOptimizer optimizer;
             cast::CAstPrinter printer;
+			std::vector<cast::SelfRefFunctionWitnesses> selfRefWitnesses;
+			const char* selfRefWitnessPath = std::getenv("HELIX_SELF_REF_WITNESS_PATH");
 
             for (auto& func : funcs) {
-                optimizer.optimize(*func);
+				auto beforeOptimizer = selfRefWitnessPath
+					? cast::collectSelfRefObservations(*func)
+					: std::vector<cast::SelfRefObservation>{};
+				auto identityBeforeOptimizer = selfRefWitnessPath
+					? cast::collectSelfRefIdentityObservations(*func)
+					: std::vector<cast::SelfRefObservation>{};
+				std::unordered_map<std::string, std::string> firstSeenPassByKey;
+				std::unordered_map<std::string, cast::SelfRefObservation> identityBeforeFirstVisibleByKey;
+				std::unordered_map<std::string, cast::SelfRefObservation> assignmentBeforeFirstVisibleByKey;
+				if (selfRefWitnessPath) {
+					std::unordered_set<std::string> beforeKeys;
+					for (const auto& observation : beforeOptimizer)
+						beforeKeys.insert(observation.matchKey());
+					auto previousIdentity = identityBeforeOptimizer;
+					auto previousAssignments = cast::collectAssignmentObservations(*func);
+					optimizer.optimizeWithObserver(*func,
+						[&](std::string_view pass, const cast::CFuncDecl& current) {
+							auto currentIdentity = cast::collectSelfRefIdentityObservations(current);
+							auto currentAssignments = cast::collectAssignmentObservations(current);
+							std::unordered_map<std::string, const cast::SelfRefObservation*> previousIdentityByKey;
+							for (const auto& observation : previousIdentity)
+								previousIdentityByKey.emplace(observation.identityKey(), &observation);
+							std::unordered_map<std::string, const cast::SelfRefObservation*> previousAssignmentByKey;
+							for (const auto& observation : previousAssignments)
+								previousAssignmentByKey.emplace(observation.identityKey(), &observation);
+							for (const auto& observation : cast::collectSelfRefObservations(current)) {
+								const std::string key = observation.matchKey();
+								if (!beforeKeys.contains(key) && !firstSeenPassByKey.contains(key)) {
+									firstSeenPassByKey.emplace(key, pass);
+									const auto identity = previousIdentityByKey.find(observation.identityKey());
+									if (identity != previousIdentityByKey.end())
+										identityBeforeFirstVisibleByKey.emplace(key, *identity->second);
+									const auto assignment = previousAssignmentByKey.find(observation.identityKey());
+									if (assignment != previousAssignmentByKey.end())
+										assignmentBeforeFirstVisibleByKey.emplace(key, *assignment->second);
+								}
+							}
+							previousIdentity = std::move(currentIdentity);
+							previousAssignments = std::move(currentAssignments);
+						});
+				} else {
+					optimizer.optimize(*func);
+				}
+				if (selfRefWitnessPath) {
+					selfRefWitnesses.push_back(cast::SelfRefFunctionWitnesses{
+						.functionEntry = func->entryAddr,
+						.functionName = func->name,
+						.beforeOptimizer = std::move(beforeOptimizer),
+						.identityBeforeOptimizer = std::move(identityBeforeOptimizer),
+						.afterOptimizer = cast::collectSelfRefObservations(*func),
+						.firstSeenPassByKey = std::move(firstSeenPassByKey),
+						.identityBeforeFirstVisibleByKey = std::move(identityBeforeFirstVisibleByKey),
+						.assignmentBeforeFirstVisibleByKey = std::move(assignmentBeforeFirstVisibleByKey),
+					});
+				}
                 // Apply user-defined variable renames (P3: hydrateHAST).
                 if (!variable_renames_.empty()) {
                     optimizer.applyVariableRenames(*func, variable_renames_);
@@ -855,6 +914,13 @@ PipelineResult<std::string> Pipeline::emitPseudoC(mlir::ModuleOp module) {
                 code += printer.print(*func);
                 code += "\n";
             }
+			if (selfRefWitnessPath) {
+				std::string witnessError;
+				if (!cast::writeSelfRefWitnessReport(
+						selfRefWitnessPath, selfRefWitnesses, witnessError)) {
+					return std::unexpected("emitPseudoC: " + witnessError);
+				}
+			}
         } else {
             // EXISTING PATH: PseudoCEmitter (default)
             PseudoCEmitter emitter;

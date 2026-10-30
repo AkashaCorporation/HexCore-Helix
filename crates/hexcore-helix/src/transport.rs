@@ -53,47 +53,6 @@ pub fn read_cfg_function_name(buffer: Buffer) -> Result<Option<String>> {
         .map_err(|e| Error::from_reason(format!("CFG read error: {}", e)))
 }
 
-// ── Helpers internos para construir CfgData/AstData ──────────────────
-
-/// Constrói CfgData a partir de dados do pipeline Helix.
-#[cfg(feature = "rust-pipeline")]
-pub(crate) fn build_cfg_data(
-    module_name: &str,
-    function_count: usize,
-    instruction_count: usize,
-) -> CfgData {
-    // Cria uma entrada de função simplificada a partir dos dados do pipeline
-    let functions = vec![CfgFunctionData {
-        name: format!("module_{}", function_count),
-        entry_address: 0,
-        instruction_count: instruction_count as u32,
-        block_count: function_count as u32,
-    }];
-
-    CfgData {
-        module_name: module_name.to_string(),
-        functions,
-    }
-}
-
-/// Constrói AstData a partir de dados do pipeline Helix.
-#[cfg(feature = "rust-pipeline")]
-pub(crate) fn build_ast_data(module_name: &str, source: &str, function_count: usize) -> AstData {
-    let functions = vec![AstFunctionData {
-        name: format!("module_{}", function_count),
-        address: 0,
-        source: source.to_string(),
-        param_count: 0,
-        local_count: 0,
-        stmt_count: 0,
-    }];
-
-    AstData {
-        module_name: module_name.to_string(),
-        functions,
-    }
-}
-
 /// Parse simplificado de JSON para CfgData (formato mínimo)
 fn parse_cfg_json(json: &str) -> std::result::Result<CfgData, String> {
     // Formato esperado: {"name": "...", "functions": [{"name": "...", "entry": N, "instructions": N}]}

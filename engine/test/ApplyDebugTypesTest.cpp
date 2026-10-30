@@ -738,6 +738,84 @@ TEST(ApplyDebugTypesTest, DebugVoidReturnOverridesRaxWriteHeuristic) {
         << "The early signature-only run must not consume the late type seed";
 }
 
+TEST(ApplyDebugTypesTest, DebugDeclarationEvidenceReachesCAstWithBoundOrigin) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    module->setAttr(
+        "helix.debug_type_info_json",
+        builder.getStringAttr(R"json({
+          "hexcoreContext": {
+            "queryIdentity": {
+              "targetIdentity": "sha256:target-a",
+              "snapshotSha256": "sha256:snapshot-a",
+              "generation": 42
+            }
+          },
+          "functions": {
+            "debug_evidence": {
+              "returnType": "uint64_t",
+              "params": [
+                {"index": 0, "name": "count", "type": "uint64_t"}
+              ]
+            }
+          },
+          "structs": {}
+        })json"));
+
+    builder.setInsertionPointToEnd(module.getBody());
+    auto func = builder.create<helix::low::FuncOp>(
+        loc, "debug_evidence", /*entry_address=*/0x2100,
+        /*original_name=*/mlir::StringAttr{});
+    auto* block = builder.createBlock(&func.getBody());
+    builder.setInsertionPointToStart(block);
+    auto parameter = builder.create<helix::high::VarDeclOp>(
+        loc, builder.getUI32IntegerAttr(1),
+        builder.getStringAttr("param_1"),
+        helix::high::StorageKindAttr::get(
+            &ctx, helix::high::StorageKind::Parameter),
+        mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+    auto parameterRef = builder.create<helix::high::VarRefOp>(
+        loc, builder.getI64Type(), parameter.getVarId(),
+        parameter.getVarName(), mlir::IntegerAttr{});
+    builder.create<helix::high::ReturnOp>(
+        loc, parameterRef.getResult(), mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.addPass(helix::createApplyDebugTypesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+
+    helix::cast::CAstBuilder astBuilder;
+    auto declaration = astBuilder.buildFunction(func.getOperation());
+    ASSERT_TRUE(declaration);
+    ASSERT_TRUE(declaration->returnTypeEvidence);
+    ASSERT_EQ(declaration->params.size(), 1u);
+    ASSERT_TRUE(declaration->params[0].typeEvidence);
+    EXPECT_EQ(declaration->params[0].name, "count");
+
+    auto assertDebugEvidence = [](const helix::cast::CTypeEvidence& evidence) {
+        EXPECT_EQ(evidence.source,
+                  helix::cast::CTypeEvidenceSource::DebugInfo);
+        EXPECT_EQ(evidence.state,
+                  helix::cast::CTypeEvidenceState::Selected);
+        EXPECT_EQ(evidence.authority,
+                  helix::cast::CTypeEvidenceAuthority::Authoritative);
+        ASSERT_TRUE(evidence.origin);
+        EXPECT_EQ(evidence.origin->producer, "hexcore-analysis-context");
+        ASSERT_TRUE(evidence.origin->generation);
+        EXPECT_EQ(*evidence.origin->generation, 42u);
+        EXPECT_EQ(evidence.origin->targetIdentity, "sha256:target-a");
+        EXPECT_EQ(evidence.origin->snapshotHash, "sha256:snapshot-a");
+    };
+
+    assertDebugEvidence(*declaration->returnTypeEvidence);
+    assertDebugEvidence(*declaration->params[0].typeEvidence);
+}
+
 TEST(ApplyDebugTypesTest, ExactDebugSignatureConstrainsAapcsParameters) {
     mlir::MLIRContext ctx;
     auto module = buildAapcsSignatureFixture(ctx, /*variadic=*/false);

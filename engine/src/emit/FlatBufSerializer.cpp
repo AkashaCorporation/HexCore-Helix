@@ -20,11 +20,13 @@
 #endif
 
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -48,7 +50,20 @@ enum : uint16_t {
 // Variable: legacy prefix followed by HAST 1.x append-only fields.
 enum : uint16_t {
     V_NAME = 4, V_TYPE = 6, V_STORAGE = 8, V_STACK_OFFSET = 10,
-    V_IDENTITY_ID = 12, V_PARAMETER_INDEX = 14,
+    V_IDENTITY_ID = 12, V_PARAMETER_INDEX = 14, V_TYPE_EVIDENCE = 16,
+};
+
+// EvidenceOrigin: producer, generation, target_identity, snapshot_hash.
+enum : uint16_t {
+    EO_PRODUCER = 4, EO_GENERATION = 6,
+    EO_TARGET_IDENTITY = 8, EO_SNAPSHOT_HASH = 10,
+};
+
+// TypeEvidence: source, state, authority, strength, rejected_spelling,
+//               origin_id.
+enum : uint16_t {
+    TE_SOURCE = 4, TE_STATE = 6, TE_AUTHORITY = 8, TE_STRENGTH = 10,
+    TE_REJECTED_SPELLING = 12, TE_ORIGIN_ID = 14,
 };
 
 // Expression: legacy prefix followed by HAST 1.x append-only fields.
@@ -77,6 +92,7 @@ enum : uint16_t {
     F_PARAMS = 10, F_LOCALS = 12, F_BODY = 14,
     F_CALLING_CONVENTION = 16, F_IS_VARIADIC = 18,
     F_NATIVE_QUALITY_REPORTED = 20, F_NATIVE_QUALITY_ISSUES = 22,
+    F_RETURN_TYPE_EVIDENCE = 24,
 };
 
 // AstModule: legacy prefix followed by HAST 1.x negotiation fields.
@@ -84,6 +100,7 @@ enum : uint16_t {
     M_NAME = 4, M_FUNCTIONS = 6, M_GLOBAL_VARS = 8, M_TYPE_DEFS = 10,
     M_SCHEMA_MAJOR = 12, M_SCHEMA_MINOR = 14, M_CAPABILITIES = 16,
     M_PRODUCER = 18, M_VERSION = 20, M_ARCH = 22, M_POINTER_BITS = 24,
+    M_EVIDENCE_ORIGINS = 26,
 };
 
 enum class ChildRole : uint8_t {
@@ -97,8 +114,8 @@ enum class ChildRole : uint8_t {
 };
 
 constexpr uint16_t kHastSchemaMajor = 1;
-constexpr uint16_t kHastSchemaMinor = 1;
-constexpr std::array<uint8_t, 8> kHastCapabilities = {0, 1, 2, 3, 4, 5, 6, 7};
+constexpr uint16_t kHastSchemaMinor = 2;
+constexpr std::array<uint8_t, 9> kHastCapabilities = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 
 // ── Alias for readability ──────────────────────────────────────────────────
 
@@ -128,6 +145,60 @@ public:
 private:
     uint64_t next_ = 1; // zero is reserved by the HAST contract
     std::unordered_map<const cast::CAstNode*, uint64_t> ids_;
+};
+
+static std::string originKey(const cast::CTypeEvidenceOrigin& origin) {
+    return std::format("{}\x1f{}\x1f{}\x1f{}",
+        origin.producer,
+        origin.generation ? std::to_string(*origin.generation) : std::string{},
+        origin.targetIdentity, origin.snapshotHash);
+}
+
+class EvidenceRegistry {
+public:
+    explicit EvidenceRegistry(
+            const std::vector<std::unique_ptr<cast::CFuncDecl>>& functions) {
+        auto collect = [&](const std::optional<cast::CTypeEvidence>& evidence) {
+            if (evidence && evidence->origin)
+                origins_.push_back(*evidence->origin);
+        };
+        for (const auto& function : functions) {
+            collect(function->returnTypeEvidence);
+            for (const auto& parameter : function->params)
+                collect(parameter.typeEvidence);
+            for (const auto& local : function->localVars)
+                collect(local.typeEvidence);
+        }
+        std::sort(origins_.begin(), origins_.end(),
+            [](const auto& left, const auto& right) {
+                return std::tie(left.producer, left.generation,
+                                left.targetIdentity, left.snapshotHash) <
+                       std::tie(right.producer, right.generation,
+                                right.targetIdentity, right.snapshotHash);
+            });
+        origins_.erase(std::unique(origins_.begin(), origins_.end()),
+                       origins_.end());
+        for (uint32_t index = 0; index < origins_.size(); ++index)
+            indices_.emplace(originKey(origins_[index]), index);
+    }
+
+    std::optional<uint32_t> idFor(
+            const std::optional<cast::CTypeEvidence>& evidence) const {
+        if (!evidence || !evidence->origin)
+            return std::nullopt;
+        auto iterator = indices_.find(originKey(*evidence->origin));
+        if (iterator == indices_.end())
+            return std::nullopt;
+        return iterator->second;
+    }
+
+    const std::vector<cast::CTypeEvidenceOrigin>& origins() const {
+        return origins_;
+    }
+
+private:
+    std::vector<cast::CTypeEvidenceOrigin> origins_;
+    std::unordered_map<std::string, uint32_t> indices_;
 };
 
 static uint8_t archToFB(HelixArch arch) {
@@ -333,14 +404,63 @@ static TableOff emitDataType(FBB& fbb, const cast::CType* type) {
 
 // ── Variable ───────────────────────────────────────────────────────────────
 
+static TableOff emitEvidenceOrigin(
+        FBB& fbb, const cast::CTypeEvidenceOrigin& origin) {
+    auto producer = origin.producer.empty()
+        ? StringOff{} : fbb.CreateString(origin.producer);
+    auto target = origin.targetIdentity.empty()
+        ? StringOff{} : fbb.CreateString(origin.targetIdentity);
+    auto snapshot = origin.snapshotHash.empty()
+        ? StringOff{} : fbb.CreateString(origin.snapshotHash);
+    auto table = fbb.StartTable();
+    if (!producer.IsNull()) fbb.AddOffset(EO_PRODUCER, producer);
+    if (origin.generation) {
+        fbb.AddElement<uint64_t>(EO_GENERATION, *origin.generation,
+                                 std::numeric_limits<uint64_t>::max());
+    }
+    if (!target.IsNull()) fbb.AddOffset(EO_TARGET_IDENTITY, target);
+    if (!snapshot.IsNull()) fbb.AddOffset(EO_SNAPSHOT_HASH, snapshot);
+    return TableOff(fbb.EndTable(table));
+}
+
+static TableOff emitTypeEvidence(
+        FBB& fbb, const std::optional<cast::CTypeEvidence>& evidence,
+        const EvidenceRegistry* registry) {
+    const auto source = evidence
+        ? static_cast<uint8_t>(evidence->source) : uint8_t(0);
+    const auto state = evidence
+        ? static_cast<uint8_t>(evidence->state) : uint8_t(0);
+    const auto authority = evidence
+        ? static_cast<uint8_t>(evidence->authority) : uint8_t(0);
+    const auto strength = evidence ? evidence->strength : uint16_t(0);
+    auto rejected = evidence && !evidence->rejectedSpelling.empty()
+        ? fbb.CreateString(evidence->rejectedSpelling) : StringOff{};
+    const auto originId = registry
+        ? registry->idFor(evidence) : std::optional<uint32_t>{};
+    auto table = fbb.StartTable();
+    fbb.AddElement<uint8_t>(TE_SOURCE, source, uint8_t(0));
+    fbb.AddElement<uint8_t>(TE_STATE, state, uint8_t(0));
+    fbb.AddElement<uint8_t>(TE_AUTHORITY, authority, uint8_t(0));
+    fbb.AddElement<uint16_t>(TE_STRENGTH, strength, uint16_t(0));
+    if (!rejected.IsNull()) fbb.AddOffset(TE_REJECTED_SPELLING, rejected);
+    if (originId) {
+        fbb.AddElement<uint32_t>(TE_ORIGIN_ID, *originId,
+                                 std::numeric_limits<uint32_t>::max());
+    }
+    return TableOff(fbb.EndTable(table));
+}
+
 static TableOff emitVariable(FBB& fbb, const std::string& name,
                                const cast::CType* type,
                                cast::StorageKind storage,
                                int64_t stackOffset,
                                std::optional<uint64_t> identityId,
-                               std::optional<uint32_t> parameterIndex) {
+                               std::optional<uint32_t> parameterIndex,
+                               const std::optional<cast::CTypeEvidence>& evidence,
+                               const EvidenceRegistry* registry) {
     auto typeOff = emitDataType(fbb, type);
     auto nameOff = fbb.CreateString(name);
+    auto evidenceOff = emitTypeEvidence(fbb, evidence, registry);
 
     auto s = fbb.StartTable();
     fbb.AddOffset(V_NAME, nameOff);
@@ -357,22 +477,25 @@ static TableOff emitVariable(FBB& fbb, const std::string& name,
         fbb.AddElement<uint32_t>(V_PARAMETER_INDEX, *parameterIndex,
                                  std::numeric_limits<uint32_t>::max());
     }
+    fbb.AddOffset(V_TYPE_EVIDENCE, evidenceOff);
     return TableOff(fbb.EndTable(s));
 }
 
-static TableOff emitVarDecl(FBB& fbb, const cast::CVarDecl& v) {
+static TableOff emitVarDecl(FBB& fbb, const cast::CVarDecl& v,
+                            const EvidenceRegistry& registry) {
     return emitVariable(fbb, v.varName, v.type.get(), v.storage,
                         v.stackOffset.value_or(0), uint64_t(v.varId),
-                        std::nullopt);
+                        std::nullopt, v.typeEvidence, &registry);
 }
 
-static TableOff emitParamAsVar(FBB& fbb, const cast::CParamDecl& p) {
+static TableOff emitParamAsVar(FBB& fbb, const cast::CParamDecl& p,
+                               const EvidenceRegistry& registry) {
     std::optional<uint64_t> identityId;
     if (p.varId)
         identityId = uint64_t(*p.varId);
     return emitVariable(fbb, p.name, p.type.get(),
                         cast::StorageKind::Parameter, 0, identityId,
-                        uint32_t(p.index));
+                        uint32_t(p.index), p.typeEvidence, &registry);
 }
 
 // ── Expression ─────────────────────────────────────────────────────────────
@@ -429,7 +552,8 @@ static TableOff emitExpression(FBB& fbb, const cast::CExpr* expr,
         strVal = fbb.CreateString(ref->varName);
         varRef = emitVariable(fbb, ref->varName, ref->type.get(),
                               cast::StorageKind::Stack, 0,
-                              uint64_t(ref->varId), std::nullopt);
+                              uint64_t(ref->varId), std::nullopt,
+                              std::nullopt, nullptr);
         break;
     }
     case cast::NodeKind::BinaryExpr: {
@@ -795,19 +919,22 @@ static TableOff emitStatement(FBB& fbb, const cast::CStmt* stmt,
 // ── DecompiledFunction ─────────────────────────────────────────────────────
 
 static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func,
-                             NodeIdState& nodeIds) {
+                             NodeIdState& nodeIds,
+                             const EvidenceRegistry& registry) {
     // 1. Recursively create all child objects
     auto retTypeOff = emitDataType(fbb, func.returnType.get());
 
     std::vector<TableOff> paramOffs;
     for (auto& p : func.params)
-        paramOffs.push_back(emitParamAsVar(fbb, p));
+        paramOffs.push_back(emitParamAsVar(fbb, p, registry));
 
     std::vector<TableOff> localOffs;
     for (auto& lv : func.localVars)
-        localOffs.push_back(emitVarDecl(fbb, lv));
+        localOffs.push_back(emitVarDecl(fbb, lv, registry));
 
     auto bodyOffs = emitStmtList(fbb, func.body, nodeIds);
+    auto returnEvidence = emitTypeEvidence(
+        fbb, func.returnTypeEvidence, &registry);
 
     // 2. Create strings
     auto nameOff = fbb.CreateString(func.name);
@@ -852,6 +979,7 @@ static TableOff emitFunction(FBB& fbb, const cast::CFuncDecl& func,
     fbb.AddElement<uint8_t>(F_NATIVE_QUALITY_REPORTED,
         func.nativeQualityEvaluated || !qualityIssues.empty() ? uint8_t(1) : uint8_t(0), uint8_t(0));
     fbb.AddOffset(F_NATIVE_QUALITY_ISSUES, qualityVec);
+    fbb.AddOffset(F_RETURN_TYPE_EVIDENCE, returnEvidence);
     return TableOff(fbb.EndTable(s));
 }
 
@@ -866,11 +994,17 @@ std::vector<uint8_t> FlatBufSerializer::serialize(
 {
     flatbuffers::FlatBufferBuilder fbb(8192);
     NodeIdState nodeIds;
+    EvidenceRegistry evidenceRegistry(funcs);
 
     // Serialize all functions
     std::vector<TableOff> funcOffs;
     for (auto& func : funcs)
-        funcOffs.push_back(emitFunction(fbb, *func, nodeIds));
+        funcOffs.push_back(emitFunction(
+            fbb, *func, nodeIds, evidenceRegistry));
+
+    std::vector<TableOff> originOffs;
+    for (const auto& origin : evidenceRegistry.origins())
+        originOffs.push_back(emitEvidenceOrigin(fbb, origin));
 
     // Pre-create every root child before starting the AstModule table.
     auto modNameOff = fbb.CreateString(moduleName);
@@ -881,6 +1015,9 @@ std::vector<uint8_t> FlatBufSerializer::serialize(
     auto funcsVec = funcOffs.empty()
         ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
         : fbb.CreateVector(funcOffs);
+    auto originsVec = originOffs.empty()
+        ? flatbuffers::Offset<flatbuffers::Vector<TableOff>>{0}
+        : fbb.CreateVector(originOffs);
 
     auto root = fbb.StartTable();
     fbb.AddOffset(M_NAME, modNameOff);
@@ -895,6 +1032,7 @@ std::vector<uint8_t> FlatBufSerializer::serialize(
     fbb.AddElement<uint8_t>(M_ARCH, archToFB(arch), uint8_t(255));
     fbb.AddElement<uint16_t>(M_POINTER_BITS, pointerBitsForArch(arch),
                              uint16_t(0));
+    if (!originsVec.IsNull()) fbb.AddOffset(M_EVIDENCE_ORIGINS, originsVec);
     auto rootOff = fbb.EndTable(root);
 
     fbb.Finish(flatbuffers::Offset<flatbuffers::Table>(rootOff), "HAST");

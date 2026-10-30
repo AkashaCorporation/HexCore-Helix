@@ -19,6 +19,50 @@ enum TypeKind : byte {
     Unknown = -1,
 }
 
+/// Source category for one declaration-to-type association.
+enum TypeEvidenceSource : byte {
+    Unknown = 0,
+    Legacy = 1,
+    DataFlow = 2,
+    Structural = 3,
+    Interprocedural = 4,
+    SignatureDatabase = 5,
+    DebugInfo = 6,
+    User = 7,
+}
+
+enum TypeEvidenceState : byte {
+    Unreported = 0,
+    Selected = 1,
+    SelectedWithConflict = 2,
+    Unresolved = 3,
+}
+
+enum TypeEvidenceAuthority : byte {
+    Unknown = 0,
+    Heuristic = 1,
+    Derived = 2,
+    Authoritative = 3,
+}
+
+/// Canonical origin shared by declaration evidence records in one module.
+table EvidenceOrigin {
+    producer: string;
+    generation: uint64 = null;
+    target_identity: string;
+    snapshot_hash: string;
+}
+
+/// Evidence attached to a declaration/type binding, never to DataType itself.
+table TypeEvidence {
+    source: TypeEvidenceSource;
+    state: TypeEvidenceState;
+    authority: TypeEvidenceAuthority;
+    strength: uint16;
+    rejected_spelling: string;
+    origin_id: uint32 = null;
+}
+
 /// A recovered/inferred data type.
 table DataType {
     kind: TypeKind;
@@ -68,6 +112,8 @@ table Variable {
     /// Source/ABI parameter ordinal. Present only for parameters; ordinal zero
     /// remains representable and distinct from an absent ordinal.
     parameter_index: uint32 = null;
+    /// HAST 1.2: explicit even when state is Unreported.
+    type_evidence: TypeEvidence;
 }
 
 /// Expression node types.
@@ -200,6 +246,8 @@ table DecompiledFunction {
     /// HAST 1.1: absence means native quality was not reported.
     native_quality_reported: bool;
     native_quality_issues: [NativeQualityIssue];
+    /// HAST 1.2: evidence for return_type.
+    return_type_evidence: TypeEvidence;
 }
 
 /// Features guaranteed by a canonical HAST producer. Values are append-only.
@@ -212,6 +260,7 @@ enum HastCapability : byte {
     StructFieldOffsets = 5,
     StatementChildRoles = 6,
     NativeFunctionQuality = 7,
+    DeclarationTypeEvidence = 8,
 }
 
 /// Top-level decompiled module.
@@ -231,6 +280,8 @@ table AstModule {
     version: string;
     arch: Arch;
     pointer_bits: uint16;
+    /// HAST 1.2: sorted, deduplicated declaration evidence origins.
+    evidence_origins: [EvidenceOrigin];
 }
 
 root_type AstModule;

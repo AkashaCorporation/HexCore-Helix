@@ -202,7 +202,9 @@ pub struct DecompileResult {
 }
 
 /// Pipeline metrics exposed to JavaScript.
-#[cfg(feature = "rust-pipeline")]
+// Reserved for the combined decompile-and-metrics N-API without removing the
+// published object shape before that entry point lands.
+#[allow(dead_code)]
 #[napi(object)]
 pub struct PipelineMetricsResult {
     /// Total pipeline duration in milliseconds.
