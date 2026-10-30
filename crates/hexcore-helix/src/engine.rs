@@ -56,56 +56,125 @@ impl From<Architecture> for helix_core::ArchKind {
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    bytes.get(offset..offset.checked_add(2)?)?.try_into().ok().map(u16::from_le_bytes)
+    bytes
+        .get(offset..offset.checked_add(2)?)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
 }
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    bytes.get(offset..offset.checked_add(4)?)?.try_into().ok().map(u32::from_le_bytes)
+    bytes
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
 }
 fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
-    bytes.get(offset..offset.checked_add(4)?)?.try_into().ok().map(i32::from_le_bytes)
+    bytes
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()
+        .map(i32::from_le_bytes)
 }
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    bytes.get(offset..offset.checked_add(8)?)?.try_into().ok().map(u64::from_le_bytes)
+    bytes
+        .get(offset..offset.checked_add(8)?)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
 }
-fn canonical_table_field(bytes: &[u8], table: usize, slot: usize, width: usize) -> std::result::Result<Option<usize>, String> {
+fn canonical_table_field(
+    bytes: &[u8],
+    table: usize,
+    slot: usize,
+    width: usize,
+) -> std::result::Result<Option<usize>, String> {
     let distance = read_i32(bytes, table).ok_or("HAST table is truncated")?;
-    if distance <= 0 { return Err("HAST vtable distance is invalid".into()); }
-    let vtable = table.checked_sub(distance as usize).ok_or("HAST vtable underflow")?;
+    if distance <= 0 {
+        return Err("HAST vtable distance is invalid".into());
+    }
+    let vtable = table
+        .checked_sub(distance as usize)
+        .ok_or("HAST vtable underflow")?;
     let vtable_size = read_u16(bytes, vtable).ok_or("HAST vtable is truncated")? as usize;
     let object_size = read_u16(bytes, vtable + 2).ok_or("HAST object size is truncated")? as usize;
-    if vtable_size < 4 || table.checked_add(object_size).filter(|end| *end <= bytes.len()).is_none() { return Err("HAST table bounds are invalid".into()); }
-    if slot + 2 > vtable_size { return Ok(None); }
+    if vtable_size < 4
+        || table
+            .checked_add(object_size)
+            .filter(|end| *end <= bytes.len())
+            .is_none()
+    {
+        return Err("HAST table bounds are invalid".into());
+    }
+    if slot + 2 > vtable_size {
+        return Ok(None);
+    }
     let relative = read_u16(bytes, vtable + slot).ok_or("HAST field offset is truncated")? as usize;
-    if relative == 0 { return Ok(None); }
-    if relative.checked_add(width).filter(|end| *end <= object_size).is_none() { return Err("HAST field exceeds its table".into()); }
+    if relative == 0 {
+        return Ok(None);
+    }
+    if relative
+        .checked_add(width)
+        .filter(|end| *end <= object_size)
+        .is_none()
+    {
+        return Err("HAST field exceeds its table".into());
+    }
     Ok(Some(table + relative))
 }
 fn canonical_offset(bytes: &[u8], field: usize) -> std::result::Result<usize, String> {
     let relative = read_u32(bytes, field).ok_or("HAST offset is truncated")? as usize;
-    if relative == 0 { return Err("HAST relative offset is zero".into()); }
-    field.checked_add(relative).filter(|offset| *offset < bytes.len()).ok_or_else(|| "HAST offset exceeds its buffer".into())
+    if relative == 0 {
+        return Err("HAST relative offset is zero".into());
+    }
+    field
+        .checked_add(relative)
+        .filter(|offset| *offset < bytes.len())
+        .ok_or_else(|| "HAST offset exceeds its buffer".into())
 }
 
 /// Read only the stable v1 module/function identity fields from canonical HAST.
-fn canonical_hast_single_identity(bytes: &[u8]) -> std::result::Result<Option<(String, u64)>, String> {
-    if bytes.len() < 8 || &bytes[4..8] != b"HAST" { return Err("canonical HAST identifier is missing".into()); }
+fn canonical_hast_single_identity(
+    bytes: &[u8],
+) -> std::result::Result<Option<(String, u64)>, String> {
+    if bytes.len() < 8 || &bytes[4..8] != b"HAST" {
+        return Err("canonical HAST identifier is missing".into());
+    }
     let root = read_u32(bytes, 0).ok_or("HAST root is truncated")? as usize;
-    if root < 8 || root >= bytes.len() { return Err("HAST root offset is invalid".into()); }
-    let vector_field = match canonical_table_field(bytes, root, 6, 4)? { Some(value) => value, None => return Ok(None) };
+    if root < 8 || root >= bytes.len() {
+        return Err("HAST root offset is invalid".into());
+    }
+    let vector_field = match canonical_table_field(bytes, root, 6, 4)? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
     let vector = canonical_offset(bytes, vector_field)?;
     let count = read_u32(bytes, vector).ok_or("HAST function vector is truncated")? as usize;
-    if count != 1 { return Ok(None); }
+    if count != 1 {
+        return Ok(None);
+    }
     let element = vector.checked_add(4).ok_or("HAST vector overflow")?;
     let function = canonical_offset(bytes, element)?;
-    let name_field = canonical_table_field(bytes, function, 4, 4)?.ok_or("HAST function name is missing")?;
+    let name_field =
+        canonical_table_field(bytes, function, 4, 4)?.ok_or("HAST function name is missing")?;
     let name_at = canonical_offset(bytes, name_field)?;
     let length = read_u32(bytes, name_at).ok_or("HAST name length is truncated")? as usize;
-    if length > 4096 { return Err("HAST function name exceeds its limit".into()); }
+    if length > 4096 {
+        return Err("HAST function name exceeds its limit".into());
+    }
     let name_start = name_at.checked_add(4).ok_or("HAST name overflow")?;
-    let name_bytes = bytes.get(name_start..name_start.checked_add(length).ok_or("HAST name overflow")?).ok_or("HAST name is truncated")?;
-    let name = std::str::from_utf8(name_bytes).map_err(|_| "HAST function name is not UTF-8")?.to_owned();
-    if name.is_empty() { return Err("HAST function name is empty".into()); }
-    let address = canonical_table_field(bytes, function, 6, 8)?.and_then(|field| read_u64(bytes, field)).unwrap_or(0);
+    let name_bytes = bytes
+        .get(name_start..name_start.checked_add(length).ok_or("HAST name overflow")?)
+        .ok_or("HAST name is truncated")?;
+    let name = std::str::from_utf8(name_bytes)
+        .map_err(|_| "HAST function name is not UTF-8")?
+        .to_owned();
+    if name.is_empty() {
+        return Err("HAST function name is empty".into());
+    }
+    let address = canonical_table_field(bytes, function, 6, 8)?
+        .and_then(|field| read_u64(bytes, field))
+        .unwrap_or(0);
     Ok(Some((name, address)))
 }
 
@@ -194,9 +263,10 @@ impl HelixEngine {
     /// Must be called before the first decompile call.
     #[napi]
     pub fn set_skip_optimization(&mut self, skip: bool) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_skip_optimization(skip);
         Ok(())
     }
@@ -207,9 +277,10 @@ impl HelixEngine {
     /// Must be called before the first decompile call.
     #[napi]
     pub fn set_use_cast_layer(&mut self, use_cast: bool) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_use_cast_layer(use_cast);
         Ok(())
     }
@@ -220,9 +291,10 @@ impl HelixEngine {
     /// Call before decompileIr(). Multiple renames accumulate.
     #[napi]
     pub fn add_variable_rename(&mut self, old_name: String, new_name: String) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.add_variable_rename(&old_name, &new_name);
         Ok(())
     }
@@ -231,9 +303,10 @@ impl HelixEngine {
     /// if the rename set changes.
     #[napi]
     pub fn clear_variable_renames(&mut self) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.clear_variable_renames();
         Ok(())
     }
@@ -250,9 +323,10 @@ impl HelixEngine {
     /// Replaces the full set on each call; pass the complete table.
     #[napi]
     pub fn set_function_starts(&mut self, starts: Vec<i64>) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_function_starts(&starts);
         Ok(())
     }
@@ -261,9 +335,10 @@ impl HelixEngine {
     /// DWARF/BTF/PDB. Pass an empty string to clear metadata between files.
     #[napi]
     pub fn set_debug_type_info_json(&mut self, json: String) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.set_debug_type_info_json(&json);
         Ok(())
     }
@@ -280,9 +355,10 @@ impl HelixEngine {
     /// section's virtual address + bytes here once per file.
     #[napi]
     pub fn add_data_section(&mut self, va_start: BigInt, bytes: Buffer) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         let (_signed, va, _lossless) = va_start.get_u64();
         handle.add_data_section(va, &bytes);
         Ok(())
@@ -291,9 +367,10 @@ impl HelixEngine {
     /// Drop every registered data section.  Call between binaries.
     #[napi]
     pub fn clear_data_sections(&mut self) -> Result<()> {
-        let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason("Engine is disposed")
-        })?;
+        let handle = self
+            .mlir_handle
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Engine is disposed"))?;
         handle.clear_data_sections();
         Ok(())
     }
@@ -412,9 +489,7 @@ impl HelixEngine {
 
         // ── MLIR C++ pipeline (sole pipeline since v0.7) ──
         let handle = self.mlir_handle.as_mut().ok_or_else(|| {
-            Error::from_reason(
-                "MLIR engine not initialized. Cannot decompile without C++ engine.",
-            )
+            Error::from_reason("MLIR engine not initialized. Cannot decompile without C++ engine.")
         })?;
 
         let output = handle
@@ -462,7 +537,11 @@ mod canonical_hast_identity_tests {
 
     #[test]
     fn rejects_legacy_and_truncated_buffers() {
-        for bytes in [&b""[..], &b"\x08\0\0\0HRST"[..], &b"\xff\xff\xff\x7fHAST"[..]] {
+        for bytes in [
+            &b""[..],
+            &b"\x08\0\0\0HRST"[..],
+            &b"\xff\xff\xff\x7fHAST"[..],
+        ] {
             assert!(canonical_hast_single_identity(bytes).is_err());
         }
     }

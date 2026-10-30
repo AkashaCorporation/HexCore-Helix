@@ -258,11 +258,7 @@ impl EngineHandle {
     /// free immediately.  An empty slice clears the side-channel.
     pub fn set_function_starts(&mut self, starts: &[i64]) {
         unsafe {
-            helix_engine_set_function_starts(
-                self.handle,
-                starts.as_ptr(),
-                starts.len(),
-            );
+            helix_engine_set_function_starts(self.handle, starts.as_ptr(), starts.len());
         }
     }
 

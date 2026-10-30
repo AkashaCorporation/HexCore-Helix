@@ -13,7 +13,11 @@ fn main() {
     // ─── Paths ─────────────────────────────────────────────────────────
     // Try to find pre-built engine lib in deps first (CI), then local build
     let engine_lib_search_paths = [
-        project_root.join("engine").join("deps").join("llvm-mlir").join("engine"),
+        project_root
+            .join("engine")
+            .join("deps")
+            .join("llvm-mlir")
+            .join("engine"),
         project_root.join("engine").join("build").join("Release"),
         project_root.join("engine").join("build"),
     ];
@@ -40,13 +44,20 @@ fn main() {
         Some(directory) => {
             let directory = PathBuf::from(directory);
             if !directory.join(engine_lib_name).is_file() {
-                panic!("HELIX_ENGINE_LIB_DIR does not contain {}: {}", engine_lib_name, directory.display());
+                panic!(
+                    "HELIX_ENGINE_LIB_DIR does not contain {}: {}",
+                    engine_lib_name,
+                    directory.display()
+                );
             }
             directory
         }
         None => default_engine_build_dir,
     };
-    println!("cargo:warning=Using Helix engine from: {}", engine_build_dir.display());
+    println!(
+        "cargo:warning=Using Helix engine from: {}",
+        engine_build_dir.display()
+    );
 
     // LLVM/MLIR lib directory — simplified detection
     let llvm_lib_dir = if let Ok(dir) = env::var("LLVM_LIB_DIR") {
@@ -80,7 +91,10 @@ fn main() {
         );
     }
 
-    println!("cargo:warning=Using LLVM libs from: {}", llvm_lib_dir.display());
+    println!(
+        "cargo:warning=Using LLVM libs from: {}",
+        llvm_lib_dir.display()
+    );
 
     // ─── Link the Helix engine static library ──────────────────────────
     println!(
