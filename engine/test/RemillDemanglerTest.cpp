@@ -116,6 +116,44 @@ TEST(RemillDemanglerTest, DemangleMovzxKeepsSourceAndDestinationWidths) {
 	EXPECT_EQ(result->dst_width, 32u);
 }
 
+TEST(RemillDemanglerTest, ArithmeticKeepsArchitecturalDestinationWidth) {
+    struct Case {
+        const char* name;
+        unsigned width;
+    };
+    for (const auto& test : {
+             Case{"_ZN12_GLOBAL__N_13XORI3RnWIhE2RnIhLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_", 8},
+             Case{"_ZN12_GLOBAL__N_13XORI3RnWItE2RnItLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_", 16},
+             Case{"_ZN12_GLOBAL__N_13XORI3RnWIjE2RnIjLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_", 32},
+             Case{"_ZN12_GLOBAL__N_13XORI3RnWImE2RnImLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_", 64},
+         }) {
+        auto result = demangleRemillSemantic(test.name);
+        ASSERT_TRUE(result.has_value()) << test.name;
+        EXPECT_EQ(result->semantic, RemillSemantic::XOR);
+        EXPECT_EQ(result->dst_width, test.width) << test.name;
+    }
+}
+
+TEST(RemillDemanglerTest, ReadModifyWriteSeparatesOperationAndStorageWidths) {
+    struct Case {
+        const char* name;
+        RemillSemantic semantic;
+        unsigned operationWidth;
+    };
+    for (const auto& test : {
+             Case{"_ZN12_GLOBAL__N_13NOTI3RnWImE2RnIhLb1EEEEP6MemoryS6_R5StateT_T0_", RemillSemantic::NOT, 8},
+             Case{"_ZN12_GLOBAL__N_13NEGI3RnWImE2RnItLb1EEEEP6MemoryS6_R5StateT_T0_", RemillSemantic::NEG, 16},
+             Case{"_ZN12_GLOBAL__N_13INCI3RnWImE2RnIjLb1EEEEP6MemoryS6_R5StateT_T0_", RemillSemantic::INC, 32},
+             Case{"_ZN12_GLOBAL__N_13DECI3RnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_", RemillSemantic::DEC, 64},
+         }) {
+        auto result = demangleRemillSemantic(test.name);
+        ASSERT_TRUE(result.has_value()) << test.name;
+        EXPECT_EQ(result->semantic, test.semantic);
+        EXPECT_EQ(result->dst_width, 64u) << test.name;
+        EXPECT_EQ(result->src_width, test.operationWidth) << test.name;
+    }
+}
+
 TEST(RemillDemanglerTest, DemangleJz) {
     auto result = demangleRemillSemantic(
         "_ZN12_GLOBAL__N_12JZI2InImEEEP6MemoryS4_R5StateT_");

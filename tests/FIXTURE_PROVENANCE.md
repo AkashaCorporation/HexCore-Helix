@@ -46,3 +46,24 @@ has no function at that exact address; its nearest candidate begins at
 `Desktop/benchmark/lifted/wwz-current-20260804`, with Remill versions and addon
 hash in its sidecar JSON. It must not replace the legacy fixture without an
 independent identity oracle.
+
+## current-remill / NUCLEO CRC32 (2026-11-14)
+
+`current-remill/g03-nucleo-crc32.ll` is an authoritative G03 regression
+fixture, not a legacy compatibility sample. It was freshly lifted from the
+exact source-known NUCLEO build used by HexCore 3.8.6 acceptance:
+
+```text
+binary:       NUCLEO.exe
+binary SHA:   fe8fa1c4553db5435f2d2e21b5d54769d657b57acf59393ac6b385cdf9277e87
+source ASM:   asm/obf.asm
+ASM SHA:      883b09ddd0bd3eea7104f29793cfa2f36e5c730bc123a9c32b413bae9045a41b
+entry:        0x140022197
+endExclusive: 0x1400221DC
+IR SHA:       a0ad485e37833b995698b80e35f6f5d10f3a954a9e0c81ee52a120994efb8822
+```
+
+The source oracle contains `xor al, dl`, `dec ecx`/`jnz`,
+`dec rsi`/`jnz`, and `not eax`. The fixture gates parent-register
+preservation, single evaluation of flag-producing decrements, and x86-64
+zero-extension after a 32-bit destination write.

@@ -501,6 +501,7 @@ install(DIRECTORY include/ DESTINATION include)
 
 option(HELIX_BUILD_TESTS "Build Helix engine tests" OFF)
 if(HELIX_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(test)
 endif()
 

@@ -32,6 +32,11 @@
 
 using namespace helix;
 
+namespace {
+constexpr uint16_t kHastSchemaMajor = 1;
+constexpr uint16_t kHastSchemaMinor = 2;
+} // namespace
+
 #ifdef HELIX_HAS_FLATBUFFERS
 
 namespace {
@@ -113,8 +118,6 @@ enum class ChildRole : uint8_t {
     BlockItem = 6,
 };
 
-constexpr uint16_t kHastSchemaMajor = 1;
-constexpr uint16_t kHastSchemaMinor = 2;
 constexpr std::array<uint8_t, 9> kHastCapabilities = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 
 // ── Alias for readability ──────────────────────────────────────────────────

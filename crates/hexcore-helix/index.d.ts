@@ -55,6 +55,11 @@ export declare class HelixEngine {
    */
   setFunctionStarts(starts: Array<number>): void
   /**
+   * Provide versioned function signatures and nominal struct layouts from
+   * DWARF/BTF/PDB. Pass an empty string to clear metadata between files.
+   */
+  setDebugTypeInfoJson(json: string): void
+  /**
    * Register a virtual-address range with the engine's data-section
    * store.  REQUIRED for switch-table recovery — without at least one
    * section, `RecoverSwitchTables` skips itself and every `switch (...)`

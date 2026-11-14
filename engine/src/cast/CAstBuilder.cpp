@@ -2312,10 +2312,36 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         // variable, later users of that exact Value must read the materialized
         // variable instead of recursively rebuilding the expression against
         // possibly-mutated operands.
-        auto* valueDef = assign.getValue().getDefiningOp();
+        Value semanticValue = assign.getValue();
+        while (true) {
+            if (auto cast = semanticValue.getDefiningOp<
+                    helix::high::CastOp>()) {
+                semanticValue = cast.getInput();
+                continue;
+            }
+            if (auto cast = semanticValue.getDefiningOp<LLVM::ZExtOp>()) {
+                semanticValue = cast.getArg();
+                continue;
+            }
+            if (auto cast = semanticValue.getDefiningOp<LLVM::SExtOp>()) {
+                semanticValue = cast.getArg();
+                continue;
+            }
+            if (auto cast = semanticValue.getDefiningOp<LLVM::TruncOp>()) {
+                semanticValue = cast.getArg();
+                continue;
+            }
+            break;
+        }
+        auto* assignedDef = assign.getValue().getDefiningOp();
+        auto* semanticDef = semanticValue.getDefiningOp();
+        const bool materializeSharedArithmetic =
+            (assignedDef && !assign.getValue().hasOneUse() &&
+             assignedDef->hasAttr("helix.fixed_width_unsigned")) ||
+            (semanticDef && !semanticValue.hasOneUse() &&
+             isa<helix::high::BinaryOp, helix::high::UnaryOp>(semanticDef));
         if (auto* targetVar = llvm::dyn_cast<CVarRefExpr>(targetExpr.get());
-            targetVar && valueDef &&
-            valueDef->hasAttr("helix.fixed_width_unsigned")) {
+            targetVar && materializeSharedArithmetic) {
             for (auto it = materializedValues_.begin();
                  it != materializedValues_.end();) {
                 if (it->second.varName == targetVar->varName) {
@@ -2325,8 +2351,11 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
                     ++it;
                 }
             }
-            materializedValues_[assign.getValue()] = MaterializedValue{
+            MaterializedValue materialized{
                 targetVar->varId, targetVar->varName, targetVar->type};
+            materializedValues_[assign.getValue()] = materialized;
+            if (semanticValue != assign.getValue())
+                materializedValues_[semanticValue] = materialized;
         }
 
         return std::make_unique<CAssignStmt>(

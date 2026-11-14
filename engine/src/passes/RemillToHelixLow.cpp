@@ -2745,11 +2745,15 @@ private:
                                    Value destination, Value originalValue,
                                    Value widenedResult,
                                    const RegisterTracker& regs,
-                                   IntegerAttr addrAttr) {
+                                   IntegerAttr addrAttr,
+                                   unsigned semanticWidth = 0) {
         auto regName = regs.getRegName(destination);
-        unsigned width = regName
-            ? RegisterTracker::inferRegWidth(*regName)
-            : inferValueWidth(originalValue);
+        unsigned width = semanticWidth;
+        if (width == 0) {
+            width = regName
+                ? RegisterTracker::inferRegWidth(*regName)
+                : inferValueWidth(originalValue);
+        }
 
         Value resultVal = widenedResult;
         if (width < 64) {
@@ -3499,18 +3503,25 @@ private:
                                isSameRegisterOperand(lhs, rhs, regs);
 
                 auto regName = regs.getRegName(destRegPtr);
-                unsigned width = 64;
-                if (regName) {
+                // Remill transports scalar operands as i64 and may expose a
+                // 64-bit parent storage even for EAX. The read operand's
+                // RnI<T> view is the RMW operation width; RnWI<T> describes
+                // only the destination storage used for write-back.
+                unsigned width = semInfo.src_width;
+                if (width == 0)
+                    width = semInfo.dst_width;
+                if (width == 0 && regName)
                     width = RegisterTracker::inferRegWidth(*regName);
+                if (semInfo.has_memory_dst && semInfo.src_width != 0)
+                    width = semInfo.src_width;
+                if (width == 0) {
+                    if (auto lhsInt = dyn_cast<IntegerType>(lhs.getType()))
+                        width = lhsInt.getWidth();
+                    else if (auto rhsInt = dyn_cast<IntegerType>(rhs.getType()))
+                        width = rhsInt.getWidth();
+                    else
+                        width = 64;
                 }
-				if (semInfo.has_memory_src || semInfo.has_memory_dst) {
-					if (semInfo.src_width != 0)
-						width = semInfo.src_width;
-				} else if (auto lhsInt = dyn_cast<IntegerType>(lhs.getType())) {
-					width = lhsInt.getWidth();
-				} else if (auto rhsInt = dyn_cast<IntegerType>(rhs.getType())) {
-					width = rhsInt.getWidth();
-				}
 				auto operationType = builder.getIntegerType(width);
 
                 if (selfXor) {
@@ -5348,24 +5359,29 @@ private:
             if (call.getNumOperands() >= 4) {
                 auto destRegPtr = call.getOperand(2);
                 auto src = call.getOperand(3);
+                const unsigned width = semInfo.src_width != 0
+                    ? semInfo.src_width
+                    : (semInfo.dst_width != 0 ? semInfo.dst_width : 64);
+                auto operationType = builder.getIntegerType(width);
                 Value val = semInfo.has_memory_src
-                    ? ensureInt64(
-                          builder
-                              .create<helix::low::MemReadOp>(
-                                  loc, i64Ty,
-                                  ensureInt64(src, builder, loc, &regs,
-                                              &pcTracker),
-                                  builder.getUI32IntegerAttr(64), addrAttr)
-                              .getResult(),
-                          builder, loc)
-                    : ensureInt64(src, builder, loc, &regs, &pcTracker);
+                    ? builder
+                          .create<helix::low::MemReadOp>(
+                              loc, operationType,
+                              ensureInt64(src, builder, loc, &regs,
+                                          &pcTracker),
+                              builder.getUI32IntegerAttr(width), addrAttr)
+                          .getResult()
+                    : coerceIntegerWidth(
+                          ensureInt64(src, builder, loc, &regs, &pcTracker),
+                          width, builder, loc);
                 auto unOp = builder.create<helix::low::UnaryOp>(
-                    loc, i64Ty, i1Ty, i1Ty,
+                    loc, operationType, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Neg,
                     val, addrAttr);
 
                 emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
-                                          unOp.getResult(), regs, addrAttr);
+                                          unOp.getResult(), regs, addrAttr,
+                                          width);
                 builder.create<helix::low::RegWriteOp>(
                     loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
                     builder.getUI32IntegerAttr(1), addrAttr);
@@ -5376,15 +5392,30 @@ private:
         case RemillSemantic::NOT: {
             if (call.getNumOperands() >= 4) {
                 auto destRegPtr = call.getOperand(2);
-                auto val = call.getOperand(3);
+                auto src = call.getOperand(3);
+                const unsigned width = semInfo.src_width != 0
+                    ? semInfo.src_width
+                    : (semInfo.dst_width != 0 ? semInfo.dst_width : 64);
+                auto operationType = builder.getIntegerType(width);
+                Value val = semInfo.has_memory_src
+                    ? builder
+                          .create<helix::low::MemReadOp>(
+                              loc, operationType,
+                              ensureInt64(src, builder, loc, &regs,
+                                          &pcTracker),
+                              builder.getUI32IntegerAttr(width), addrAttr)
+                          .getResult()
+                    : coerceIntegerWidth(
+                          ensureInt64(src, builder, loc, &regs, &pcTracker),
+                          width, builder, loc);
                 auto unOp = builder.create<helix::low::UnaryOp>(
-                    loc, i64Ty, i1Ty, i1Ty,
+                    loc, operationType, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Not,
-                    ensureInt64(val, builder, loc, &regs, &pcTracker),
-                    addrAttr);
+                    val, addrAttr);
 
-                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, val,
-                                          unOp.getResult(), regs, addrAttr);
+                emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
+                                          unOp.getResult(), regs, addrAttr,
+                                          width);
             }
             break;
         }
@@ -5393,28 +5424,33 @@ private:
             if (call.getNumOperands() >= 4) {
                 auto destRegPtr = call.getOperand(2);
                 auto src = call.getOperand(3);
+                const unsigned width = semInfo.src_width != 0
+                    ? semInfo.src_width
+                    : (semInfo.dst_width != 0 ? semInfo.dst_width : 64);
+                auto operationType = builder.getIntegerType(width);
                 // A MEMORY-operand INC (`inc qword [mem]`, e.g. `lock inc`) passes
                 // the ADDRESS as operand 3, not the value.  The handler must LOAD
                 // from it first -- without this it used the address itself as the
                 // value, emitting `*addr = addr + 1` instead of `*addr = *addr + 1`
                 // and corrupting every memory increment (refcounts, counters).
                 Value val = semInfo.has_memory_src
-                    ? ensureInt64(
-                          builder
-                              .create<helix::low::MemReadOp>(
-                                  loc, i64Ty,
-                                  ensureInt64(src, builder, loc, &regs,
-                                              &pcTracker),
-                                  builder.getUI32IntegerAttr(64), addrAttr)
-                              .getResult(),
-                          builder, loc)
-                    : ensureInt64(src, builder, loc, &regs, &pcTracker);
+                    ? builder
+                          .create<helix::low::MemReadOp>(
+                              loc, operationType,
+                              ensureInt64(src, builder, loc, &regs,
+                                          &pcTracker),
+                              builder.getUI32IntegerAttr(width), addrAttr)
+                          .getResult()
+                    : coerceIntegerWidth(
+                          ensureInt64(src, builder, loc, &regs, &pcTracker),
+                          width, builder, loc);
                 auto unOp = builder.create<helix::low::UnaryOp>(
-                    loc, i64Ty, i1Ty, i1Ty,
+                    loc, operationType, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Inc, val, addrAttr);
 
                 emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
-                                          unOp.getResult(), regs, addrAttr);
+                                          unOp.getResult(), regs, addrAttr,
+                                          width);
                 builder.create<helix::low::RegWriteOp>(
                     loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
                     builder.getUI32IntegerAttr(1), addrAttr);
@@ -5426,25 +5462,30 @@ private:
             if (call.getNumOperands() >= 4) {
                 auto destRegPtr = call.getOperand(2);
                 auto src = call.getOperand(3);
+                const unsigned width = semInfo.src_width != 0
+                    ? semInfo.src_width
+                    : (semInfo.dst_width != 0 ? semInfo.dst_width : 64);
+                auto operationType = builder.getIntegerType(width);
                 // Memory-operand DEC: load from the address operand before
                 // decrementing (see the INC case for the full rationale).
                 Value val = semInfo.has_memory_src
-                    ? ensureInt64(
-                          builder
-                              .create<helix::low::MemReadOp>(
-                                  loc, i64Ty,
-                                  ensureInt64(src, builder, loc, &regs,
-                                              &pcTracker),
-                                  builder.getUI32IntegerAttr(64), addrAttr)
-                              .getResult(),
-                          builder, loc)
-                    : ensureInt64(src, builder, loc, &regs, &pcTracker);
+                    ? builder
+                          .create<helix::low::MemReadOp>(
+                              loc, operationType,
+                              ensureInt64(src, builder, loc, &regs,
+                                          &pcTracker),
+                              builder.getUI32IntegerAttr(width), addrAttr)
+                          .getResult()
+                    : coerceIntegerWidth(
+                          ensureInt64(src, builder, loc, &regs, &pcTracker),
+                          width, builder, loc);
                 auto unOp = builder.create<helix::low::UnaryOp>(
-                    loc, i64Ty, i1Ty, i1Ty,
+                    loc, operationType, i1Ty, i1Ty,
                     helix::low::UnaryOpKind::Dec, val, addrAttr);
 
                 emitRegisterOrMemoryWrite(builder, loc, destRegPtr, src,
-                                          unOp.getResult(), regs, addrAttr);
+                                          unOp.getResult(), regs, addrAttr,
+                                          width);
                 builder.create<helix::low::RegWriteOp>(
                     loc, unOp.getZeroFlag(), builder.getStringAttr("ZF"),
                     builder.getUI32IntegerAttr(1), addrAttr);
