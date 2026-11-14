@@ -7,6 +7,7 @@
 /engine/build/
 /engine/build-tests/
 /engine/build-tests-*/
+/engine/build-*/
 /engine/out/
 /engine/deps/flatbuffers/
 /engine/deps/llvm-mlir/

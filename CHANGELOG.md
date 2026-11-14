@@ -2,7 +2,19 @@
 
 All notable changes to HexCore Helix are documented here.
 
-## [0.9.4-rc.3] - Unreleased
+## [0.9.4-rc.4] - Unreleased
+
+- Preserve x86 architectural RMW width independently from parent-register
+  storage, including AL/AH/AX retention and EAX zero extension in structured
+  regions.
+- Prevent shared decrement expressions from being emitted twice across
+  assignments and branch conditions.
+- Carry authoritative debug type evidence, conflicts, and origins through
+  function declarations, calls, C-AST, and HAST 1.2 without promoting inferred
+  or conflicting nominal types.
+- Qualify the combined G03/G04 source as the HexCore 3.8.6 native candidate.
+
+## [0.9.4-rc.3] - 2026-10-29
 
 - Reconcile the latest qualified engine source onto the official RC.2 Git
   history through an explicit 41-file code/build/schema allowlist. Generated
