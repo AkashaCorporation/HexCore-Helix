@@ -366,6 +366,83 @@ TEST(RecoverVariablesTest, PreservesX86Cdecl32ParentAndSubregisterWidths) {
     });
 }
 
+TEST(RecoverVariablesTest, StructuredX64WritesPreserveParentRegisterSemantics) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    struct Case {
+        const char* suffix;
+        const char* regName;
+        unsigned width;
+    };
+    unsigned entry = 0x3900;
+    for (const auto& test : {
+             Case{"al", "RAX", 8},
+             Case{"ah", "AH", 8},
+             Case{"ax", "AX", 16},
+             Case{"eax", "RAX", 32},
+             Case{"rax", "RAX", 64},
+         }) {
+        builder.setInsertionPointToEnd(module.getBody());
+        auto func = builder.create<helix::low::FuncOp>(
+            loc, std::string("structured_") + test.suffix, entry++,
+            mlir::StringAttr{});
+        func->setAttr("calling_convention", builder.getStringAttr("win64"));
+        auto* block = builder.createBlock(&func.getBody());
+        builder.setInsertionPointToStart(block);
+        auto initial = builder.create<mlir::arith::ConstantIntOp>(
+            loc, 0x11223344, 64);
+        builder.create<helix::low::RegWriteOp>(
+            loc, initial.getResult(), "RAX", 64, mlir::IntegerAttr{});
+        auto condition = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+        auto branch = builder.create<mlir::scf::IfOp>(
+            loc, mlir::TypeRange{}, condition.getResult());
+        auto* thenBlock = builder.createBlock(&branch.getThenRegion());
+        builder.setInsertionPointToStart(thenBlock);
+        auto nested = builder.create<mlir::arith::ConstantIntOp>(
+            loc, 0x5a, test.width);
+        builder.create<helix::low::RegWriteOp>(
+            loc, nested.getResult(), test.regName, test.width,
+            mlir::IntegerAttr{});
+        builder.create<mlir::scf::YieldOp>(loc);
+        auto* elseBlock = builder.createBlock(&branch.getElseRegion());
+        builder.setInsertionPointToStart(elseBlock);
+        builder.create<mlir::scf::YieldOp>(loc);
+        builder.setInsertionPointToEnd(block);
+        builder.create<helix::low::RetOp>(loc, mlir::IntegerAttr{});
+    }
+
+    mlir::PassManager pm(&ctx);
+    pm.addPass(helix::createRecoverVariablesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+
+    unsigned survivingWrites = 0;
+    unsigned parentMerges = 0;
+    unsigned highByteShifts = 0;
+    unsigned eaxWidenings = 0;
+    module.walk([&](helix::low::RegWriteOp) { ++survivingWrites; });
+    module.walk([&](mlir::arith::OrIOp) { ++parentMerges; });
+    module.walk([&](mlir::arith::ShLIOp) { ++highByteShifts; });
+    module.walk([&](helix::high::CastOp cast) {
+        auto source = mlir::dyn_cast<mlir::IntegerType>(cast.getInput().getType());
+        auto target = mlir::dyn_cast<mlir::IntegerType>(cast.getType());
+        if (source && target && source.getWidth() == 32 &&
+            target.getWidth() == 64)
+            ++eaxWidenings;
+    });
+    EXPECT_EQ(survivingWrites, 0u);
+    EXPECT_EQ(parentMerges, 3u);
+    EXPECT_GE(highByteShifts, 1u);
+    EXPECT_GE(eaxWidenings, 1u);
+}
+
 TEST(RecoverVariablesTest, KeepsAddressBearingAndPureValueVersionsSeparate) {
     mlir::MLIRContext ctx;
     auto module = buildAddressAndScalarVersions(ctx);

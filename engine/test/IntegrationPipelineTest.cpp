@@ -519,6 +519,32 @@ TEST(IntegrationPipelineRegressionTest, NegWritesResultBackToDestinationRegister
 }
 
 TEST(IntegrationPipelineRegressionTest,
+     NucleoCrc32PreservesPartialRaxAndSingleDecJnzEvaluation) {
+    const std::string ir = readFileToString(
+        HELIX_TEST_DATA_DIR "/current-remill/g03-nucleo-crc32.ll");
+    ASSERT_FALSE(ir.empty());
+
+    mlir::MLIRContext context;
+    helix::Pipeline pipeline(&context, HELIX_ARCH_X86_64);
+    auto output = pipeline.decompile(ir);
+    ASSERT_TRUE(output.has_value()) << output.error();
+    ASSERT_FALSE(output->pseudo_c.empty());
+
+    EXPECT_EQ(output->pseudo_c.find("if (v7 - 1)"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("if (v5 - 1)"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_NE(output->pseudo_c.find("if (v7)"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_NE(output->pseudo_c.find("if (v5)"), std::string::npos)
+        << output->pseudo_c;
+    EXPECT_NE(output->pseudo_c.find("result &"), std::string::npos)
+        << "xor al, dl must preserve the upper RAX bits\n" << output->pseudo_c;
+    EXPECT_EQ(output->pseudo_c.find("return ~result;"), std::string::npos)
+        << "not eax must zero-extend into RAX\n" << output->pseudo_c;
+}
+
+TEST(IntegrationPipelineRegressionTest,
      AArch64BitfieldSemanticsDoNotLeakNativePlaceholders) {
     constexpr const char* ir = R"(
         target triple = "aarch64-unknown-linux-gnu"

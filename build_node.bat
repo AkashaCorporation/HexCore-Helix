@@ -30,6 +30,8 @@ copy /Y "%HELIX_BUILD_DIR%\helix_engine.lib" engine\deps\llvm-mlir\engine\helix_
 if errorlevel 1 exit /b 1
 call npm run build
 if errorlevel 1 exit /b 1
+copy /Y crates\hexcore-helix\hexcore-helix.win32-x64-msvc.node hexcore-helix.win32-x64-msvc.node >nul
+if errorlevel 1 exit /b 1
 node tools\smoke_napi.cjs
 if errorlevel 1 exit /b 1
 endlocal

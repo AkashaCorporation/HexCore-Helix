@@ -362,6 +362,21 @@ demangleRemillSemantic(llvm::StringRef mangled_name) {
             }
         }
 
+        // Read-modify-write helpers may expose the full parent storage as
+        // RnWIm while encoding the architectural operation width in the
+        // source accessor (for example NOT EAX is RnWIm + RnIj). The source
+        // view is therefore tracked independently from the write storage.
+        if (auto rniPos = suffix.find("2RnI");
+            rniPos != std::string_view::npos && rniPos + 4 < suffix.size()) {
+            switch (suffix[rniPos + 4]) {
+            case 'h': case 'a': src_w = 8; break;
+            case 't': case 's': src_w = 16; break;
+            case 'j': case 'i': src_w = 32; break;
+            case 'm': case 'l': src_w = 64; break;
+            default: break;
+            }
+        }
+
 		// Register destinations encode their exact view in RnWI<T>.
 		// Keep this separate from the source width for MOVZX/MOVSX.
 		if (auto rnwPos = suffix.find("RnWI");

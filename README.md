@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-v0.9.4--rc.3-8a6d3b">
+  <img alt="version" src="https://img.shields.io/badge/version-v0.9.4--rc.4-8a6d3b">
   <img alt="engine" src="https://img.shields.io/badge/engine-C%2B%2B23%20%2F%20MLIR%2018-8a6d3b">
   <img alt="lifter" src="https://img.shields.io/badge/lifter-Remill%20(LLVM%20IR)-8a6d3b">
   <img alt="bridge" src="https://img.shields.io/badge/bridge-Rust%20%2F%20N--API-8a6d3b">
@@ -35,7 +35,8 @@
 
 ## Overview
 
-The `0.9.4-rc.3` candidate consolidates the validated native implementation into
+The `0.9.4-rc.4` candidate adds the qualified x86 flag/subregister and
+authoritative debug-type contracts to the validated native implementation in
 the canonical repository. It retains LLVM/MLIR 18; the upstream toolchain migration
 is a separate future release. Candidate status is not stable-release acceptance.
 
@@ -57,10 +58,10 @@ The whole pipeline runs natively in C++23. It ships into the HexCore IDE as a pr
 
 The guiding principle is **fidelity over polish**: correct C, or an *honestly flagged* approximation when the lift cannot be trusted &mdash; never a clean-looking lie. See [The Honesty Layer](#the-honesty-layer).
 
-> **Status:** `v0.9.4-rc.3` release candidate. The qualified development source
+> **Status:** `v0.9.4-rc.4` release candidate. The qualified development source
 > is reconciled onto the official RC.2 history; the development sandbox is not
 > a separate product line. Publication remains gated on the source-bound Windows
-> dependency bundle, Windows prebuild and fresh HexCore 3.8.5 package E2E. See
+> dependency bundle, Windows prebuild and fresh HexCore 3.8.6 package E2E. See
 > the [changelog](CHANGELOG.md).
 
 ---

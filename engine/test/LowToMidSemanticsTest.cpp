@@ -13,6 +13,7 @@
 #include "helix/passes/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
@@ -32,6 +33,7 @@ void loadDialects(mlir::MLIRContext& context) {
     context.getOrLoadDialect<helix::mid::HelixMidDialect>();
     context.getOrLoadDialect<helix::high::HelixHighDialect>();
     context.getOrLoadDialect<mlir::arith::ArithDialect>();
+    context.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
     context.getOrLoadDialect<mlir::func::FuncDialect>();
 }
 
@@ -1138,6 +1140,92 @@ TEST(LowToMidSemanticsTest, ResultAndFlagsShareOneAddSubDefinition) {
     ASSERT_TRUE(zeroFlag);
     EXPECT_EQ(zeroFlag.getKind(), helix::mid::BinExprKind::Eq);
     EXPECT_EQ(zeroFlag.getLhs(), subOps.front().getResult());
+}
+
+TEST(LowToMidSemanticsTest, FlagProducersPreserveWidthIntoBranches) {
+    mlir::MLIRContext context;
+    loadDialects(context);
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+
+    for (unsigned width : {8u, 16u, 32u, 64u}) {
+        builder.setInsertionPointToEnd(module.getBody());
+        auto integer = builder.getIntegerType(width);
+        auto function = builder.create<mlir::func::FuncOp>(
+            loc, std::string("flag_width_") + std::to_string(width),
+            builder.getFunctionType({integer, integer}, {}));
+        auto* entry = function.addEntryBlock();
+        auto* taken = builder.createBlock(&function.getBody());
+        auto* fallthrough = builder.createBlock(&function.getBody());
+        builder.setInsertionPointToStart(entry);
+
+        auto inc = builder.create<helix::low::UnaryOp>(
+            loc, integer, builder.getI1Type(), builder.getI1Type(),
+            helix::low::UnaryOpKind::Inc, entry->getArgument(0),
+            mlir::IntegerAttr{});
+        auto dec = builder.create<helix::low::UnaryOp>(
+            loc, integer, builder.getI1Type(), builder.getI1Type(),
+            helix::low::UnaryOpKind::Dec, inc.getResult(),
+            mlir::IntegerAttr{});
+        auto sub = builder.create<helix::low::BinOp>(
+            loc, integer, builder.getI1Type(), builder.getI1Type(),
+            builder.getI1Type(), builder.getI1Type(),
+            helix::low::BinOpKind::Sub, dec.getResult(),
+            entry->getArgument(1), mlir::IntegerAttr{}, mlir::UnitAttr{});
+        auto cmp = builder.create<helix::low::CmpOp>(
+            loc, builder.getI1Type(), builder.getI1Type(),
+            builder.getI1Type(), builder.getI1Type(), sub.getResult(),
+            entry->getArgument(0), mlir::IntegerAttr{});
+        auto test = builder.create<helix::low::TestOp>(
+            loc, builder.getI1Type(), builder.getI1Type(), sub.getResult(),
+            entry->getArgument(1), mlir::IntegerAttr{});
+        auto incOrDec = builder.create<mlir::arith::XOrIOp>(
+            loc, inc.getZeroFlag(), dec.getZeroFlag());
+        auto subOrCmp = builder.create<mlir::arith::XOrIOp>(
+            loc, sub.getZeroFlag(), cmp.getZeroFlag());
+        auto arithmetic = builder.create<mlir::arith::XOrIOp>(
+            loc, incOrDec, subOrCmp);
+        auto condition = builder.create<mlir::arith::XOrIOp>(
+            loc, arithmetic, test.getZeroFlag());
+        builder.create<mlir::cf::CondBranchOp>(
+            loc, condition, taken, mlir::ValueRange{}, fallthrough,
+            mlir::ValueRange{});
+        builder.setInsertionPointToStart(taken);
+        builder.create<mlir::func::ReturnOp>(loc);
+        builder.setInsertionPointToStart(fallthrough);
+        builder.create<mlir::func::ReturnOp>(loc);
+    }
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    mlir::PassManager manager(&context);
+    manager.enableVerifier(true);
+    manager.addPass(helix::createHelixLowToMidPass());
+    ASSERT_TRUE(mlir::succeeded(manager.run(module)));
+
+    unsigned residualLowOps = 0;
+    module.walk([&](mlir::Operation* op) {
+        residualLowOps += op->getDialect() ==
+            context.getLoadedDialect<helix::low::HelixLowDialect>();
+    });
+    EXPECT_EQ(residualLowOps, 0u);
+    for (auto function : module.getOps<mlir::func::FuncOp>()) {
+        const unsigned expectedWidth = static_cast<unsigned>(
+            function.getArgumentTypes().front().getIntOrFloatBitWidth());
+        unsigned branchCount = 0;
+        function.walk([&](mlir::cf::CondBranchOp branch) {
+            ++branchCount;
+            EXPECT_TRUE(branch.getCondition().getType().isInteger(1));
+        });
+        function.walk([&](helix::mid::BinExprOp expression) {
+            auto type = mlir::dyn_cast<mlir::IntegerType>(
+                expression.getResult().getType());
+            ASSERT_TRUE(type);
+            if (type.getWidth() != 1)
+                EXPECT_EQ(type.getWidth(), expectedWidth);
+        });
+        EXPECT_EQ(branchCount, 1u);
+    }
 }
 
 TEST(LowToMidSemanticsTest, CAstPrintsExplicitOrderedComparisonSignedness) {

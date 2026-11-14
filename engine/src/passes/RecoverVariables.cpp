@@ -780,7 +780,8 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
         // This is a simple zero-extension cast.
         return builder.create<helix::high::CastOp>(
 			loc, parentTy, newValue, mlir::IntegerAttr{},
-            helix::high::CastKindAttr{});
+            helix::high::CastKindAttr::get(
+                builder.getContext(), helix::high::CastKind::ZeroExtend));
     }
 
     // For 16-bit and 8-bit writes, we need a read-modify-write pattern:
@@ -805,7 +806,8 @@ static Value emitSubRegInsert(Value parentVar, Value newValue,
 	if (newValue.getType() != parentTy) {
         extendedNew = builder.create<helix::high::CastOp>(
 			loc, parentTy, newValue, mlir::IntegerAttr{},
-            helix::high::CastKindAttr{});
+            helix::high::CastKindAttr::get(
+                builder.getContext(), helix::high::CastKind::ZeroExtend));
     } else {
         extendedNew = newValue;
     }
@@ -2194,11 +2196,9 @@ private:
                 ++NumReadsReplaced;
             }
 
-            // Writes: full-width only (sub-register writes need a read-
-            // modify-write of the current version, which Strategy B
-            // intentionally doesn't model inside regions). Sub-register
-            // writes that survive here continue to fall through to the
-            // HelixLowToMid path, matching prior behaviour.
+            // Writes inside structured regions share the reaching parent
+            // version. Partial x86 writes must update that parent explicitly:
+            // AL/AH/AX preserve unaffected bits, while EAX zero-extends.
             for (auto writeOp : survivingWrites) {
                 auto regName = writeOp.getRegName();
                 auto subRegOpt = getSubRegInfo(regName);
@@ -2221,10 +2221,6 @@ private:
 						subReg.width,
 						std::min(parentWidth, writeType.getWidth()));
 				}
-				if (!(subReg.width == parentWidth &&
-						subReg.bitOffset == 0))
-                    continue;
-
                 const SSAVersionTracker::Version* verPtr = nullptr;
                 if (useResultOverrideForRAX && subReg.parent == "RAX"
                     && isInsideLoopOrIfRegion(writeOp)) {
@@ -2237,16 +2233,27 @@ private:
                 const SSAVersionTracker::Version& ver = *verPtr;
 
                 OpBuilder b(writeOp);
+                auto parentType = b.getIntegerType(parentWidth);
                 auto targetRef = b.create<helix::high::VarRefOp>(
                     writeOp.getLoc(),
-                    writeOp.getValue().getType(),
+                    parentType,
                     ver.varId,
                     b.getStringAttr(ver.varName),
                     mlir::IntegerAttr{});
+                Value assignedValue = writeOp.getValue();
+                if (subReg.width != parentWidth || subReg.bitOffset != 0) {
+                    assignedValue = emitSubRegInsert(
+                        targetRef.getResult(), assignedValue, subReg,
+                        b, writeOp.getLoc());
+                    ++NumAliasesResolved;
+                } else if (assignedValue.getType() != parentType) {
+                    assignedValue = emitTruncation(
+                        assignedValue, parentWidth, b, writeOp.getLoc());
+                }
                 auto assignOp = b.create<helix::high::AssignOp>(
                     writeOp.getLoc(),
                     targetRef.getResult(),
-                    writeOp.getValue(),
+                    assignedValue,
                     mlir::IntegerAttr{});
 
                 if (writeOp->hasAttr("helix.infrastructure"))

@@ -816,6 +816,75 @@ TEST(ApplyDebugTypesTest, DebugDeclarationEvidenceReachesCAstWithBoundOrigin) {
     assertDebugEvidence(*declaration->params[0].typeEvidence);
 }
 
+TEST(ApplyDebugTypesTest, ConflictedDebugDeclarationsEmitMachineTypes) {
+    mlir::MLIRContext ctx;
+    ctx.getOrLoadDialect<helix::high::HelixHighDialect>();
+    ctx.getOrLoadDialect<helix::low::HelixLowDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    auto loc = builder.getUnknownLoc();
+    auto module = mlir::ModuleOp::create(loc);
+    module->setAttr(
+        "helix.debug_type_info_json",
+        builder.getStringAttr(R"json({
+          "functions": {
+            "debug_conflict": {
+              "returnType": "struct right *",
+              "params": [
+                {"index": 0, "name": "input", "type": "struct left *"}
+              ]
+            }
+          },
+          "structs": {}
+        })json"));
+
+    builder.setInsertionPointToEnd(module.getBody());
+    auto func = builder.create<helix::low::FuncOp>(
+        loc, "debug_conflict", /*entry_address=*/0x2200,
+        /*original_name=*/mlir::StringAttr{});
+    auto* block = builder.createBlock(&func.getBody());
+    builder.setInsertionPointToStart(block);
+    auto parameter = builder.create<helix::high::VarDeclOp>(
+        loc, builder.getUI32IntegerAttr(1),
+        builder.getStringAttr("param_1"),
+        helix::high::StorageKindAttr::get(
+            &ctx, helix::high::StorageKind::Parameter),
+        mlir::IntegerAttr{}, mlir::Value{}, mlir::IntegerAttr{});
+    auto parameterRef = builder.create<helix::high::VarRefOp>(
+        loc, builder.getI64Type(), parameter.getVarId(),
+        parameter.getVarName(), mlir::IntegerAttr{});
+    builder.create<helix::high::ReturnOp>(
+        loc, parameterRef.getResult(), mlir::IntegerAttr{});
+
+    mlir::PassManager pm(&ctx);
+    pm.addPass(helix::createApplyDebugTypesPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+    parameter->setAttr("helix.type.conflict", builder.getUnitAttr());
+    parameter->setAttr("helix.type.rejected",
+                       builder.getStringAttr("struct alternate *"));
+    func->setAttr("has_return_value", builder.getUnitAttr());
+    func->setAttr("helix.return_type.conflict", builder.getUnitAttr());
+    func->setAttr("helix.return_type.rejected",
+                  builder.getStringAttr("struct alternate_result *"));
+
+    helix::cast::CAstBuilder astBuilder;
+    auto declaration = astBuilder.buildFunction(func.getOperation());
+    ASSERT_TRUE(declaration);
+    ASSERT_EQ(declaration->params.size(), 1u);
+    EXPECT_EQ(declaration->params[0].type->kind,
+              helix::cast::TypeKind::Int);
+    EXPECT_EQ(declaration->params[0].type->bitWidth, 64u);
+    EXPECT_EQ(declaration->returnType->kind,
+              helix::cast::TypeKind::Int);
+    EXPECT_EQ(declaration->returnType->bitWidth, 64u);
+    ASSERT_TRUE(declaration->params[0].typeEvidence);
+    ASSERT_TRUE(declaration->returnTypeEvidence);
+    EXPECT_EQ(declaration->params[0].typeEvidence->state,
+              helix::cast::CTypeEvidenceState::SelectedWithConflict);
+    EXPECT_EQ(declaration->returnTypeEvidence->state,
+              helix::cast::CTypeEvidenceState::SelectedWithConflict);
+}
+
 TEST(ApplyDebugTypesTest, ExactDebugSignatureConstrainsAapcsParameters) {
     mlir::MLIRContext ctx;
     auto module = buildAapcsSignatureFixture(ctx, /*variadic=*/false);
