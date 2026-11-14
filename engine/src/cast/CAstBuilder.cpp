@@ -203,6 +203,13 @@ static std::optional<CTypeEvidence> convertReturnTypeEvidence(
     return result;
 }
 
+static bool hasUnresolvedTypeEvidence(
+        const std::optional<CTypeEvidence>& evidence) {
+    return evidence &&
+        (evidence->state == CTypeEvidenceState::SelectedWithConflict ||
+         evidence->state == CTypeEvidenceState::Unresolved);
+}
+
 /// Parse "param_N" → N, or nullopt.
 static std::optional<unsigned> parseParamIndex(std::string_view name) {
     constexpr std::string_view prefix = "param_";
@@ -1379,9 +1386,10 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             return;
 
         CTypePtr varType = CType::int64(); // default
+        auto typeEvidence = convertTypeEvidence(decl.getOperation());
         const auto inferredType =
             decl->getAttrOfType<StringAttr>("inferred_type");
-        if (inferredType)
+        if (inferredType && !hasUnresolvedTypeEvidence(typeEvidence))
             varType = cTypeFromString(inferredType.getValue().str());
 
         // Legacy fallback for untyped XMM/YMM storage. Do not overwrite
@@ -1408,7 +1416,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             stackOffset,
             /*initExpr=*/nullptr,
             extractAddress(decl),
-            convertTypeEvidence(decl.getOperation()));
+            std::move(typeEvidence));
     });
 
     // ── Infer parameters (Win64 ABI) ────────────────────────────────────
@@ -1424,11 +1432,17 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
                            const std::string& rawName,
                            std::optional<uint32_t> varId,
                            std::optional<CTypeEvidence> typeEvidence = std::nullopt) {
+        const bool unresolved = hasUnresolvedTypeEvidence(typeEvidence);
+        const std::string selectedType = unresolved ? "int64_t" : typeStr;
         auto [it, inserted] =
             paramInfoByIndex.try_emplace(
-                index, ParamInfo{typeStr, rawName, varId, typeEvidence});
+                index, ParamInfo{selectedType, rawName, varId, typeEvidence});
         if (!inserted) {
-            if (it->second.typeStr == "int64_t" && typeStr != "int64_t")
+            if (unresolved)
+                it->second.typeStr = "int64_t";
+            else if (!hasUnresolvedTypeEvidence(it->second.typeEvidence) &&
+                     it->second.typeStr == "int64_t" &&
+                     typeStr != "int64_t")
                 it->second.typeStr = typeStr;
             if (it->second.rawName.empty())
                 it->second.rawName = rawName;
@@ -1476,13 +1490,15 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
                     displayName = debugName.getValue().str();
                     nameAliases_[identityName] = displayName;
                 }
+                auto typeEvidence = convertTypeEvidence(metadata, op);
                 std::string typeName = "int64_t";
                 if (auto inferred = metadata.getAs<StringAttr>(
-                        "helix.inferred_type")) {
+                        "helix.inferred_type");
+                    inferred && !hasUnresolvedTypeEvidence(typeEvidence)) {
                     typeName = inferred.getValue().str();
                 }
                 recordParam(sourceIndex, typeName, displayName, varId,
-                            convertTypeEvidence(metadata, op));
+                            typeEvidence);
                 functionArguments_[entry.getArgument(i)] = MaterializedValue{
                     varId, identityName, cTypeFromString(typeName)};
             }
@@ -1494,8 +1510,10 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         if (decl.getStorage() != helix::high::StorageKind::Parameter)
             return;
 
+        auto typeEvidence = convertTypeEvidence(decl.getOperation());
         std::string paramType = "int64_t";
-        if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type"))
+        if (auto inferredType = decl->getAttrOfType<StringAttr>("inferred_type");
+            inferredType && !hasUnresolvedTypeEvidence(typeEvidence))
             paramType = inferredType.getValue().str();
         auto declarationType = cTypeFromString(paramType);
         declaredVarTypes_[decl.getVarId()] = declarationType;
@@ -1510,7 +1528,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
                 nameAliases_[identityName] = displayName;
             }
             recordParam(*index, paramType, displayName, decl.getVarId(),
-                        convertTypeEvidence(decl.getOperation()));
+                        typeEvidence);
         }
     });
 
@@ -1557,7 +1575,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
             : info.rawName;
         paramName = applyNameAliases(paramName);
 
-        CTypePtr paramType = cTypeFromString(info.typeStr);
+        CTypePtr paramType = hasUnresolvedTypeEvidence(info.typeEvidence)
+            ? CType::int64() : cTypeFromString(info.typeStr);
         if (info.varId && paramType->kind == TypeKind::Pointer)
             declaredPointerTypes_[*info.varId] = paramType;
 
@@ -1581,10 +1600,12 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     }
 
     // ── Return type ─────────────────────────────────────────────────────
+    auto returnTypeEvidence = convertReturnTypeEvidence(op);
     CTypePtr returnType =
         currentFunctionHasReturnValue_ ? CType::int64() : CType::voidTy();
     if (auto inferredReturn =
-            op->getAttrOfType<StringAttr>("inferred_return_type")) {
+            op->getAttrOfType<StringAttr>("inferred_return_type");
+        inferredReturn && !hasUnresolvedTypeEvidence(returnTypeEvidence)) {
         returnType = cTypeFromString(inferredReturn.getValue().str());
     }
 
@@ -1625,7 +1646,7 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
         std::move(localVars),
         callingConv,
         entryAddr,
-        convertReturnTypeEvidence(op));
+        std::move(returnTypeEvidence));
 
     // ── Confidence analysis ───────────────────────────────────────────
     // D4 (charter exit-metric 4): stamp the damning-honesty flag onto the decl
