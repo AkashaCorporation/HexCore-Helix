@@ -76,11 +76,12 @@ public:
     /// When any pass is selectively enabled, ONLY those passes run.
     void enablePass(std::string_view name);
 
-    /// Enable the C AST layer for emission (Phase 4d).
-    /// When true, uses CAstBuilder → CAstOptimizer → CAstPrinter
-    /// instead of PseudoCEmitter.
+    /// The C AST layer (CAstBuilder → CAstOptimizer → CAstPrinter) is the
+    /// only emitter.  FIX-145 removed the legacy PseudoCEmitter; the setter is
+    /// kept for API compatibility and `false` is ignored.
     void setUseCastLayer(bool use) {
-        use_cast_layer_ = use;
+        (void)use;
+        use_cast_layer_ = true;
         // Emission and pass construction both depend on this flag: the C-AST
         // path keeps native SCF until source legalization, while the legacy
         // emitter requires the compatibility High bridge. Always invalidate:
@@ -231,8 +232,7 @@ private:
     bool enable_escape_analysis_ = false;
     bool enable_struct_recovery_ = false;
 
-    /// When true, emit via C AST layer (default since v0.8.0).
-    /// When false, emit via legacy PseudoCEmitter (--legacy-emitter).
+    /// Always true: the C AST layer is the only emitter (FIX-145).
     bool use_cast_layer_ = true;
 
     /// Variable rename map: original name → user-chosen name.

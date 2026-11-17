@@ -152,12 +152,10 @@ static void printUsage(const char* argv0) {
         << "Flags:\n"
         << "  --no-opt              Skip optimization passes\n"
         << "  --preserve-cfg        Preserve intra-function jmp edges (deflatten path)\n"
-        << "  --legacy-emitter      Use legacy PseudoCEmitter instead of C AST\n"
         << "  --enable-pass=Name    Enable a specific pass\n\n"
         << "Examples:\n"
         << "  " << argv0 << " function.ll\n"
-        << "  " << argv0 << " --dir tests/\n"
-        << "  " << argv0 << " --legacy-emitter function.ll\n";
+        << "  " << argv0 << " --dir tests/\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -183,7 +181,9 @@ int main(int argc, char* argv[]) {
         } else if (a == "--preserve-cfg") {
             preserve_cfg = true;
         } else if (a == "--legacy-emitter") {
-            legacy_emitter = true;
+            std::cerr << "error: --legacy-emitter was removed in FIX-145; "
+                         "the C AST layer is the only emitter\n";
+            return 2;
         } else if (a == "--use-cast-layer") {
             // Backwards compat — now the default, silently accept
             (void)0;

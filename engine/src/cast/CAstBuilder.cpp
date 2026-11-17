@@ -29,7 +29,9 @@
 
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 
@@ -558,7 +560,39 @@ static bool isCommutativeOp(helix::high::BinaryOpKind kind) {
     }
 }
 
+/// FIX-145: checked APInt -> int64_t conversion.
+///
+/// `APInt::getSExtValue()` asserts (LLVM_ENABLE_ASSERTIONS) when the value
+/// needs more than 64 significant bits.  Remill lifts 128-bit XMM struct
+/// copies as i128 constants (NUCLEO `makePlayer`), and the unchecked call
+/// aborted the host process through the CRT assertion dialog.  Every int64
+/// conversion of an IR constant in the C-AST builder goes through here; a
+/// value that does not fit is reported as not representable instead of
+/// being truncated.
+static std::optional<int64_t> apIntToInt64(const llvm::APInt& value) {
+    if (value.getSignificantBits() > 64)
+        return std::nullopt;
+    return value.getSExtValue();
+}
+
+/// FIX-145: exact source form of an integer constant wider than 64 bits.
+/// Emitted as `__helix_wide_constant(<bits>, "0x<hex>")` so the full value
+/// stays visible and nothing silently truncates it.
+static ExprPtr buildWideIntegerConstant(const llvm::APInt& value,
+                                        CTypePtr type, uint64_t addr) {
+    llvm::SmallString<64> hex;
+    value.toStringUnsigned(hex, 16);
+    std::vector<ExprPtr> args;
+    args.push_back(std::make_unique<CIntLitExpr>(
+        static_cast<int64_t>(value.getBitWidth()), CType::int32(), addr));
+    args.push_back(std::make_unique<CStringLitExpr>(
+        "0x" + std::string(hex.str()), addr));
+    return std::make_unique<CCallExpr>(
+        "__helix_wide_constant", 0, std::move(args), std::move(type), addr);
+}
+
 /// Try to extract an integer literal value from an MLIR Value.
+/// Constants wider than 64 bits are not integer literals here (FIX-145).
 static std::optional<int64_t> tryExtractIntLiteral(Value value) {
     if (!value)
         return std::nullopt;
@@ -572,14 +606,14 @@ static std::optional<int64_t> tryExtractIntLiteral(Value value) {
     // LLVM / arith constants store their value in a typed attribute.
     if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
         if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
-            return intAttr.getValue().getSExtValue();
+            return apIntToInt64(intAttr.getValue());
     }
     if (auto arithConst = dyn_cast<arith::ConstantOp>(defOp)) {
         if (auto intAttr = dyn_cast<IntegerAttr>(arithConst.getValue()))
-            return intAttr.getValue().getSExtValue();
+            return apIntToInt64(intAttr.getValue());
     }
     if (auto intAttr = defOp->getAttrOfType<IntegerAttr>("value"))
-        return intAttr.getValue().getSExtValue();
+        return apIntToInt64(intAttr.getValue());
     return std::nullopt;
 }
 
@@ -1253,8 +1287,8 @@ std::unique_ptr<CFuncDecl> CAstBuilder::buildFunction(Operation* op) {
     }
     if (auto rbpBaseAttr =
             op->getAttrOfType<IntegerAttr>("win64_rbp_param_base_offset")) {
-        currentWin64RbpStackParamBaseOffset_ =
-            rbpBaseAttr.getValue().getSExtValue();
+        if (auto offset = apIntToInt64(rbpBaseAttr.getValue()))
+            currentWin64RbpStackParamBaseOffset_ = *offset;
     }
 
     bool isVariadic = op->hasAttr("is_variadic");
@@ -2085,8 +2119,17 @@ StmtPtr CAstBuilder::buildStatement(Operation* op) {
         auto destinations = switchOp.getCaseDestinations();
         for (unsigned i = 0; i < destinations.size(); ++i) {
             CSwitchStmt::SwitchCase switchCase;
-            if (values)
-                switchCase.value = (*values).getValues<APInt>()[i].getSExtValue();
+            if (values) {
+                // FIX-145: a case value wider than 64 bits keeps its low
+                // 64 bits (sign-extended) instead of asserting.
+                // Only truncate when the value really is wider than 64 bits:
+                // APInt::trunc(64) asserts on narrower (e.g. i32) values.
+                llvm::APInt caseValue = (*values).getValues<APInt>()[i];
+                if (auto narrow = apIntToInt64(caseValue))
+                    switchCase.value = *narrow;
+                else
+                    switchCase.value = caseValue.trunc(64).getSExtValue();
+            }
             switchCase.body = buildCfgEdge(
                 destinations[i], switchOp.getCaseOperands(i));
             cases.push_back(std::move(switchCase));
@@ -3983,10 +4026,14 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── llvm.mlir.constant ────────────────────────────────────────────
     if (auto constOp = dyn_cast<LLVM::ConstantOp>(defOp)) {
         if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+            // FIX-145: constants wider than 64 bits are emitted exactly.
+            auto narrow = apIntToInt64(intAttr.getValue());
+            if (!narrow)
+                return buildWideIntegerConstant(
+                    intAttr.getValue(), convertType(constOp.getType()), addr);
             // FIX-089 (D1): resolve a code-typed constant through the registry.
             return buildIntegerConstant(
-                intAttr.getValue().getSExtValue(),
-                convertType(constOp.getType()), addr);
+                *narrow, convertType(constOp.getType()), addr);
         }
         if (auto floatAttr = dyn_cast<FloatAttr>(constOp.getValue())) {
             return std::make_unique<CFloatLitExpr>(
@@ -4577,10 +4624,14 @@ ExprPtr CAstBuilder::buildExpression(Value val) {
     // ─── arith.constant ────────────────────────────────────────────────
     if (auto arithConst = dyn_cast<arith::ConstantOp>(defOp)) {
         if (auto intAttr = dyn_cast<IntegerAttr>(arithConst.getValue())) {
+            // FIX-145: constants wider than 64 bits are emitted exactly.
+            auto narrow = apIntToInt64(intAttr.getValue());
+            if (!narrow)
+                return buildWideIntegerConstant(
+                    intAttr.getValue(), convertType(arithConst.getType()), addr);
             // FIX-089 (D1): resolve a code-typed constant through the registry.
             return buildIntegerConstant(
-                intAttr.getValue().getSExtValue(),
-                convertType(arithConst.getType()), addr);
+                *narrow, convertType(arithConst.getType()), addr);
         }
         if (auto floatAttr = dyn_cast<FloatAttr>(arithConst.getValue())) {
             return std::make_unique<CFloatLitExpr>(

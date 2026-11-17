@@ -113,9 +113,8 @@ public:
     /// Call before first decompile. Enables selective mode.
     void enablePass(const char* name);
 
-    /// Enable the C AST layer for emission (--use-cast-layer).
-    /// When true, uses CAstBuilder → CAstOptimizer → CAstPrinter
-    /// instead of PseudoCEmitter.
+    /// Kept for API compatibility: the C AST layer is the only emitter
+    /// (FIX-145 removed the legacy PseudoCEmitter) and `false` is ignored.
     void setUseCastLayer(bool use);
 
     /// Add a variable rename mapping (old_name → new_name).
@@ -284,9 +283,8 @@ void helix_engine_enable_pass(HelixEngineHandle* engine, const char* name);
 /// Get the last error message. Returns nullptr if no error.
 const char* helix_engine_last_error(HelixEngineHandle* engine);
 
-/// Enable the C AST layer for emission. Call before first decompile.
-/// When enabled, uses CAstBuilder + CAstOptimizer + CAstPrinter
-/// instead of PseudoCEmitter.
+/// Kept for API compatibility. The C AST layer is the only emitter since
+/// FIX-145 (legacy PseudoCEmitter removed); `use == 0` is ignored.
 void helix_engine_set_use_cast_layer(HelixEngineHandle* engine, int use);
 
 /// Add a variable rename mapping. Call before decompile.

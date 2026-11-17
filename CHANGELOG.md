@@ -2,6 +2,23 @@
 
 All notable changes to HexCore Helix are documented here.
 
+## [Unreleased] - FIX-145
+
+- C-AST: never convert an IR integer constant wider than 64 bits with an
+  unchecked `APInt::getSExtValue()`. Remill lifts 128-bit XMM struct copies as
+  i128 constants; on NUCLEO `makePlayer` (0x14000CEC0) the unchecked call hit
+  the LLVM assertion `getSignificantBits() <= 64`, which raised the CRT modal
+  dialog and aborted the HexCore Extension Host. Wide constants are now
+  emitted exactly as `__helix_wide_constant(<bits>, "0x<hex>")`; literal
+  helpers treat them as not representable, and wide switch case values keep
+  their low 64 bits.
+- Remove the legacy `PseudoCEmitter`. The C-AST layer is the only emitter;
+  `setUseCastLayer(false)` / `helix_engine_set_use_cast_layer(..., 0)` are kept
+  for API compatibility and ignored, and `helix_tool --legacy-emitter` now
+  fails with an explicit error. On the Khimera and NUCLEO benchmark checklist
+  functions the C-AST layer matched or beat the legacy emitter on 26 of 26
+  functions, and the legacy emitter asserted on three of them.
+
 ## [0.9.4-rc.4] - Unreleased
 
 - Preserve x86 architectural RMW width independently from parent-register

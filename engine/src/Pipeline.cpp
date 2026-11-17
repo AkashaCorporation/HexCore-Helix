@@ -9,7 +9,6 @@
 
 #include "helix/Pipeline.h"
 #include "helix/passes/Passes.h"
-#include "helix/emit/PseudoCEmitter.h"
 #include "helix/emit/FlatBufSerializer.h"
 #include "helix/cast/CAstBuilder.h"
 #include "helix/cast/CAstOptimizer.h"
@@ -840,8 +839,8 @@ PipelineResult<std::string> Pipeline::emitPseudoC(mlir::ModuleOp module) {
     try {
         std::string code;
 
-        if (use_cast_layer_) {
-            // NEW PATH: C AST layer (Phase 4d)
+        {
+            // C AST layer: the only emitter since FIX-145 (legacy PseudoCEmitter removed).
             // CAstBuilder → CAstOptimizer → CAstPrinter
             cast::CAstBuilder builder;
             auto funcs = builder.buildModule(module);
@@ -921,10 +920,6 @@ PipelineResult<std::string> Pipeline::emitPseudoC(mlir::ModuleOp module) {
 					return std::unexpected("emitPseudoC: " + witnessError);
 				}
 			}
-        } else {
-            // EXISTING PATH: PseudoCEmitter (default)
-            PseudoCEmitter emitter;
-            code = emitter.emit(module);
         }
 
         if (code.empty()) {

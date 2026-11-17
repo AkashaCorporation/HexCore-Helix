@@ -288,7 +288,6 @@ set(HELIX_SOURCES
     src/passes/HelixLowToMid.cpp              # NEW v1.0
     src/passes/HelixMidToHigh.cpp             # NEW v1.0
     # Emitters
-    src/emit/PseudoCEmitter.cpp
     src/emit/FlatBufSerializer.cpp
 
     # C AST Layer — Phase 4
@@ -319,7 +318,6 @@ set(HELIX_HEADERS
     include/helix/dialects/HelixHighTypes.h
     include/helix/dialects/HelixHighOps.h
     # Emitters & Analysis
-    include/helix/emit/PseudoCEmitter.h
     include/helix/emit/FlatBufSerializer.h
     include/helix/analysis/RemillDemangler.h
     include/helix/analysis/SignatureDb.h
